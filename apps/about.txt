@@ -1,0 +1,7 @@
+Socrates BSD 9 Operating System
+Custom TrueType Rasterizer Engine
+Hardware Abstraction Layer (HAL)
+Ramdisk Tar File System (Tarfs)
+Integer-Only Graphics Pipeline
+Comic Neue OFL Font
+Built for bare-metal x86_64

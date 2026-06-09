@@ -1,0 +1,4 @@
+Welcome to Socrates BSD 9.
+Type 'help' for available commands.
+Type 'ls' to list files on the ramdisk.
+Type 'cat <filename>' to read a file.
