@@ -18,11 +18,13 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 
 ---
 
-## Screenshots
+## Demo
 
-> *Boot animation → Login screen → Desktop*
+▶️ **[Watch the boot animation](boot.mp4)** — a full-color RGB565 video decoded and played by the kernel itself at boot (no GPU, no codec library).
 
-<!-- Add screenshots here -->
+> Sequence: boot animation → login screen → windowed desktop.
+
+<!-- Screenshots: drop PNGs in docs/ and embed, e.g. ![desktop](docs/desktop.png) -->
 
 ---
 
