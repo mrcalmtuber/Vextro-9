@@ -20,3 +20,6 @@ limine-12.3.2/
 
 # Claude session data
 .claude/
+
+# Generated FAT32 system disk (user data lives here)
+disk.img

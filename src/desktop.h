@@ -3,251 +3,100 @@
 
 #include <stdint.h>
 #include "ttf.h"
+#include "gfx.h"
+#include "fat32.h"
 
-/* ===== STRING HELPERS ===== */
-static int str_eq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
-    }
-    return *a == *b;
-}
+/*
+ * Socrates BSD 9 desktop.
+ *
+ * Layout of this file:
+ *   1. shared globals + dock config + window-kind registry
+ *   2. tarfs (ustar ramdisk, single-TU inline)
+ *   3. forward declarations
+ *   4. syscall gateway + ELF64 loader ("hello" canvas app)
+ *   5. app modules  (term.h / browser.h / apps.h)
+ *   6. window manager (z-order, focus, drag, close)
+ *   7. wallpaper cache
+ *   8. menubar + menus
+ *   9. dock
+ *  10. desktop_render / desktop_key_input glue
+ */
 
-static int str_starts_with(const char *str, const char *prefix) {
-    while (*prefix) {
-        if (*str != *prefix) return 0;
-        str++; prefix++;
-    }
-    return 1;
-}
+/* ===== 1. GLOBALS ===== */
 
-static void uint_to_str(uint32_t val, char *out) {
-    if (val == 0) { out[0] = '0'; out[1] = '\0'; return; }
-    char tmp[12];
-    int i = 0;
-    while (val > 0) { tmp[i++] = (char)('0' + val % 10); val /= 10; }
-    int j = 0;
-    while (i > 0) out[j++] = tmp[--i];
-    out[j] = '\0';
-}
+#define MENUBAR_H   30
+#define WIN_TITLE_H 26
+#define WIN_BORDER  1
 
-/* ===== CMOS RTC CLOCK ===== */
-static inline uint8_t cmos_read(uint8_t reg) {
-    outb(0x70, reg);
-    uint8_t v = inb(0x71);
-    return v;
-}
+static uint32_t desktop_tick = 0;
+static uint32_t scr_w_cache = 1024;
+static uint32_t scr_h_cache = 768;
+static uint64_t system_total_memory_mb = 0;
 
-static inline uint8_t bcd_to_bin(uint8_t bcd) {
-    return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F));
-}
+/* --- dock configuration --- */
 
-static void clock_string(char *out) {
-    uint8_t statusB = cmos_read(0x0B);
-    int is_binary = statusB & 0x04;
+#define DOCK_EDGE_BOTTOM 0
+#define DOCK_EDGE_LEFT   1
+#define DOCK_EDGE_RIGHT  2
 
-    uint8_t hrs = cmos_read(0x04);
-    uint8_t min = cmos_read(0x02);
-    uint8_t sec = cmos_read(0x00);
-
-    if (!is_binary) {
-        hrs = bcd_to_bin(hrs);
-        min = bcd_to_bin(min);
-        sec = bcd_to_bin(sec);
-    }
-
-    out[0] = (char)('0' + hrs / 10);
-    out[1] = (char)('0' + hrs % 10);
-    out[2] = ':';
-    out[3] = (char)('0' + min / 10);
-    out[4] = (char)('0' + min % 10);
-    out[5] = ':';
-    out[6] = (char)('0' + sec / 10);
-    out[7] = (char)('0' + sec % 10);
-    out[8] = '\0';
-}
-
-/* ===== GEOMETRY HELPERS ===== */
-
-#define MENUBAR_H 28
-
-/* Default dock geometry (overridable at runtime via dock_cfg) */
-#define DOCK_BAR_Y_DEFAULT  718
-#define DOCK_BAR_H_DEFAULT   40
-#define DOCK_BAR_W_DEFAULT  562
-#define DOCK_ICON_SZ_DEFAULT 28
-#define DOCK_APP_COUNT    7
-
-/* Dock edge placement */
-#define DOCK_EDGE_BOTTOM  0
-#define DOCK_EDGE_LEFT    1
-#define DOCK_EDGE_RIGHT   2
+#define DOCK_APP_COUNT 8
 
 typedef struct {
-    int32_t bar_y;
-    int32_t bar_h;
-    int32_t bar_w;
+    int32_t bar_y;      /* bottom edge: top y of bar; sides: top of column */
+    int32_t bar_h;      /* thickness */
+    int32_t bar_w;      /* length along the edge */
     int32_t icon_sz;
     int     edge;
 } dock_config_t;
 
 static dock_config_t dock_cfg = {
-    .bar_y   = DOCK_BAR_Y_DEFAULT,
-    .bar_h   = DOCK_BAR_H_DEFAULT,
-    .bar_w   = DOCK_BAR_W_DEFAULT,
-    .icon_sz = DOCK_ICON_SZ_DEFAULT,
-    .edge    = DOCK_EDGE_BOTTOM,
+    .bar_y = 0, .bar_h = 44, .bar_w = 420, .icon_sz = 32,
+    .edge = DOCK_EDGE_BOTTOM,
 };
 
-/* Backward-compat macros — read from live config struct */
-#define DOCK_BAR_Y    (dock_cfg.bar_y)
-#define DOCK_BAR_H    (dock_cfg.bar_h)
-#define DOCK_BAR_W    (dock_cfg.bar_w)
-#define DOCK_ICON_SZ  (dock_cfg.icon_sz)
-
 static void dock_recalc(uint32_t scr_w, uint32_t scr_h) {
-    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
-        dock_cfg.bar_y = (int32_t)scr_h - dock_cfg.bar_h - 2;
-    } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
-        dock_cfg.bar_y = ((int32_t)scr_h - dock_cfg.bar_w) / 2;
-    } else {
-        dock_cfg.bar_y = ((int32_t)scr_h - dock_cfg.bar_w) / 2;
-    }
     (void)scr_w;
+    dock_cfg.bar_h = dock_cfg.icon_sz + 12;
+    dock_cfg.bar_w = DOCK_APP_COUNT * (dock_cfg.icon_sz + 16) + 14;
+    if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
+        dock_cfg.bar_y = (int32_t)scr_h - dock_cfg.bar_h - 4;
+    else
+        dock_cfg.bar_y = ((int32_t)scr_h - dock_cfg.bar_w) / 2;
 }
 
-static void fill_tri(uint32_t *buf, uint32_t bw, uint32_t bh,
-                     int x0, int y0, int x1, int y1, int x2, int y2,
-                     uint32_t color) {
-    int tmp;
-    if (y0 > y1) { tmp=x0;x0=x1;x1=tmp; tmp=y0;y0=y1;y1=tmp; }
-    if (y0 > y2) { tmp=x0;x0=x2;x2=tmp; tmp=y0;y0=y2;y2=tmp; }
-    if (y1 > y2) { tmp=x1;x1=x2;x2=tmp; tmp=y1;y1=y2;y2=tmp; }
-    if (y2 == y0) return;
-    for (int y = y0; y <= y2; y++) {
-        if (y < 0 || y >= (int)bh) continue;
-        int xa = x0 + (x2 - x0) * (y - y0) / (y2 - y0);
-        int xb;
-        if (y < y1)
-            xb = (y1 == y0) ? x0 : x0 + (x1 - x0) * (y - y0) / (y1 - y0);
-        else
-            xb = (y2 == y1) ? x1 : x1 + (x2 - x1) * (y - y1) / (y2 - y1);
-        if (xa > xb) { tmp = xa; xa = xb; xb = tmp; }
-        if (xa < 0) xa = 0;
-        if (xb >= (int)bw) xb = (int)bw - 1;
-        for (int x = xa; x <= xb; x++)
-            buf[y * (int)bw + x] = color;
-    }
-}
+/* --- window kinds --- */
 
-static void thick_line(uint32_t *buf, uint32_t bw, uint32_t bh,
-                       int x0, int y0, int x1, int y1,
-                       int thick, uint32_t color) {
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
-    int sx = x0 < x1 ? 1 : -1;
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx - dy;
-    int half = thick / 2;
-    for (;;) {
-        for (int ry = -half; ry <= half; ry++)
-            for (int rx = -half; rx <= half; rx++) {
-                int px = x0 + rx, py = y0 + ry;
-                if (px >= 0 && px < (int)bw && py >= 0 && py < (int)bh)
-                    buf[py * (int)bw + px] = color;
-            }
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 < dx)  { err += dx; y0 += sy; }
-    }
-}
+enum {
+    WK_TERM = 0,
+    WK_BROWSER,
+    WK_FILES,
+    WK_PAINT,
+    WK_SYSMON,
+    WK_MATRIX,
+    WK_HELLO,
+    WK_SETTINGS,
+    WK_ABOUT,
+    WK_COUNT
+};
 
-/* ===== DRAGON WALLPAPER ===== */
+typedef struct {
+    const char *title;
+    int32_t w, h;
+} wk_meta_t;
 
-static void draw_dragon_logo(uint32_t *buf, uint32_t w, uint32_t h) {
-    int cx = (int)w / 2;
-    int cy = ((int)h + MENUBAR_H) / 2;
-    uint32_t B = 0x000000u;
-    uint32_t G = 0xD4AF37u;
+static const wk_meta_t wk_meta[WK_COUNT] = {
+    { "Terminal",         740, 480 },
+    { "Socrates Browser", 800, 560 },
+    { "Files",            600, 430 },
+    { "Goldsmith",        640, 470 },
+    { "Monolith",         400, 480 },
+    { "Matrix",           620, 420 },
+    { "hello",            600, 430 },
+    { "Settings",         470, 390 },
+    { "About Socrates",   380, 270 },
+};
 
-    /* --- Wing (drawn first, behind body) --- */
-    fill_tri(buf, w, h, cx+80,cy-50,  cx-300,cy-350, cx-20,cy-35,   B);
-    fill_tri(buf, w, h, cx-20,cy-35,  cx-300,cy-350, cx-360,cy-15,  B);
-    fill_tri(buf, w, h, cx-300,cy-350, cx-360,cy-15, cx-400,cy-120, B);
-
-    /* Wing bone lines (gold) */
-    thick_line(buf, w, h, cx+60,cy-45,  cx-280,cy-330, 2, G);
-    thick_line(buf, w, h, cx+60,cy-45,  cx-380,cy-100, 2, G);
-    thick_line(buf, w, h, cx-340,cy-10, cx-380,cy-100, 2, G);
-
-    /* --- Tail --- */
-    fill_tri(buf, w, h, cx-180,cy+20,  cx-160,cy+120, cx-290,cy+80,  B);
-    fill_tri(buf, w, h, cx-180,cy+20,  cx-290,cy+80,  cx-420,cy+50,  B);
-    fill_tri(buf, w, h, cx-290,cy+80,  cx-420,cy+50,  cx-480,cy-50,  B);
-
-    /* Tail tip accent (gold) */
-    fill_tri(buf, w, h, cx-460,cy-40,  cx-485,cy-25,  cx-465,cy+5,   G);
-
-    /* --- Body / torso --- */
-    fill_tri(buf, w, h, cx+80,cy-50,   cx+130,cy+80,  cx-20,cy-35,   B);
-    fill_tri(buf, w, h, cx+130,cy+80,  cx-20,cy-35,   cx+80,cy+100,  B);
-    fill_tri(buf, w, h, cx-20,cy-35,   cx+80,cy+100,  cx-180,cy+20,  B);
-    fill_tri(buf, w, h, cx+80,cy+100,  cx-180,cy+20,  cx-120,cy+140, B);
-    fill_tri(buf, w, h, cx-180,cy+20,  cx-120,cy+140, cx-160,cy+120, B);
-
-    /* --- Neck --- */
-    fill_tri(buf, w, h, cx+190,cy-95,  cx+340,cy+25,  cx+80,cy-50,   B);
-    fill_tri(buf, w, h, cx+340,cy+25,  cx+80,cy-50,   cx+130,cy+80,  B);
-
-    /* --- Head --- */
-    fill_tri(buf, w, h, cx+260,cy-210, cx+400,cy-30,  cx+190,cy-95,  B);
-    fill_tri(buf, w, h, cx+400,cy-30,  cx+190,cy-95,  cx+340,cy+25,  B);
-    fill_tri(buf, w, h, cx+400,cy-30,  cx+340,cy+25,  cx+390,cy+60,  B);
-
-    /* --- Horns --- */
-    fill_tri(buf, w, h, cx+255,cy-205, cx+225,cy-320, cx+200,cy-180, B);
-    fill_tri(buf, w, h, cx+185,cy-175, cx+150,cy-290, cx+150,cy-150, B);
-
-    /* Horn tips (gold) */
-    fill_tri(buf, w, h, cx+225,cy-320, cx+240,cy-270, cx+210,cy-265, G);
-    fill_tri(buf, w, h, cx+150,cy-290, cx+165,cy-245, cx+135,cy-240, G);
-
-    /* --- Eye (gold diamond) --- */
-    fill_tri(buf, w, h, cx+340,cy-80,  cx+352,cy-60,  cx+340,cy-40,  G);
-    fill_tri(buf, w, h, cx+340,cy-80,  cx+328,cy-60,  cx+340,cy-40,  G);
-
-    /* --- Spine ridges (gold triangles along back) --- */
-    fill_tri(buf, w, h, cx+55,cy-53,   cx+40,cy-78,   cx+25,cy-53,   G);
-    fill_tri(buf, w, h, cx+15,cy-42,   cx+0,cy-65,    cx-15,cy-42,   G);
-    fill_tri(buf, w, h, cx-25,cy-38,   cx-40,cy-58,   cx-55,cy-38,   G);
-    fill_tri(buf, w, h, cx-70,cy-25,   cx-85,cy-45,   cx-100,cy-25,  G);
-    fill_tri(buf, w, h, cx-115,cy-12,  cx-130,cy-32,  cx-145,cy-12,  G);
-
-    /* --- Belly scales (gold) --- */
-    fill_tri(buf, w, h, cx+100,cy+95,  cx+80,cy+112,  cx+100,cy+112, G);
-    fill_tri(buf, w, h, cx+65,cy+110,  cx+45,cy+125,  cx+65,cy+125,  G);
-    fill_tri(buf, w, h, cx+30,cy+122,  cx+10,cy+136,  cx+30,cy+136,  G);
-    fill_tri(buf, w, h, cx-5,cy+132,   cx-25,cy+145,  cx-5,cy+145,   G);
-
-    /* --- Legs (thick black lines) --- */
-    thick_line(buf, w, h, cx+90,cy+95,   cx+140,cy+220, 5, B);
-    thick_line(buf, w, h, cx+140,cy+220, cx+110,cy+300, 4, B);
-    thick_line(buf, w, h, cx-100,cy+130, cx-80,cy+230,  5, B);
-    thick_line(buf, w, h, cx-80,cy+230,  cx-120,cy+300, 4, B);
-
-    /* --- Claws (gold) --- */
-    /* Front foot */
-    fill_tri(buf, w, h, cx+110,cy+298, cx+95,cy+318,  cx+108,cy+318, G);
-    fill_tri(buf, w, h, cx+110,cy+298, cx+112,cy+320, cx+122,cy+315, G);
-    fill_tri(buf, w, h, cx+110,cy+298, cx+128,cy+312, cx+132,cy+302, G);
-    /* Hind foot */
-    fill_tri(buf, w, h, cx-120,cy+298, cx-135,cy+318, cx-122,cy+318, G);
-    fill_tri(buf, w, h, cx-120,cy+298, cx-118,cy+320, cx-108,cy+315, G);
-    fill_tri(buf, w, h, cx-120,cy+298, cx-102,cy+312, cx-98,cy+302,  G);
-}
-
-/* ===== TARFS INTEGRATION (inline for single-TU build) ===== */
+/* ===== 2. TARFS ===== */
 
 #define TAR_BLOCK_SIZE 512
 
@@ -286,12 +135,11 @@ static void tarfs_init(void *base, uint64_t size) {
     tarfs_size = size;
 }
 
-static const void *fs_read_file(const char *filename, uint64_t *out_size) {
+static const void *tar_read_file(const char *filename, uint64_t *out_size) {
     if (!tarfs_base || !filename) {
         if (out_size) *out_size = 0;
         return 0;
     }
-
     uint8_t *ptr = tarfs_base;
     uint8_t *end = tarfs_base + tarfs_size;
 
@@ -299,605 +147,146 @@ static const void *fs_read_file(const char *filename, uint64_t *out_size) {
         tar_header_t *hdr = (tar_header_t *)ptr;
         if (hdr->name[0] == '\0')
             break;
-
         uint64_t file_size = octal_parse(hdr->size, 12);
 
         const char *entry_name = hdr->name;
         if (entry_name[0] == '.' && entry_name[1] == '/')
             entry_name += 2;
-
         const char *query = filename;
         if (query[0] == '/')
             query++;
 
         if (str_eq(entry_name, query) || str_eq(hdr->name, filename)) {
-            if (out_size)
-                *out_size = file_size;
+            if (out_size) *out_size = file_size;
             return (const void *)(ptr + TAR_BLOCK_SIZE);
         }
-
         uint64_t blocks = (file_size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
         ptr += TAR_BLOCK_SIZE + blocks * TAR_BLOCK_SIZE;
     }
-
     if (out_size) *out_size = 0;
     return 0;
 }
 
-/* ===== FORWARD DECLARATIONS (explorer) ===== */
-static int explorer_open = 0;
-static uint32_t explorer_scr_w = 0;
-static uint32_t explorer_scr_h = 0;
-static void explorer_open_window(uint32_t scr_w, uint32_t scr_h);
-
-/* ===== SETTINGS APPLICATION STATE ===== */
-
-static uint32_t desktop_bg_color = 0xFFFFFFu;
-static uint64_t system_total_memory_mb = 0;
-
-#define SETTINGS_WIN_W   420
-#define SETTINGS_WIN_H   340
-#define SETTINGS_TITLE_H  20
-#define SETTINGS_BORDER    1
-
-#define SETTINGS_BG_COUNT 5
-static const uint32_t settings_bg_colors[SETTINGS_BG_COUNT] = {
-    0xFFFFFFu, 0xFFF5E1u, 0x1E1E2Eu, 0xE8DFD0u, 0xC8D0D8u,
-};
-static const char *settings_bg_names[SETTINGS_BG_COUNT] = {
-    "White", "Gold Tint", "Midnight", "Parchment", "Slate",
-};
-static int settings_bg_index = 0;
-
-static int     settings_open = 0;
-static int32_t set_win_x = -1;
-static int32_t set_win_y = -1;
-static int32_t set_win_w = SETTINGS_WIN_W;
-static int32_t set_win_h = SETTINGS_WIN_H;
-static int32_t set_win_disp_x_fp = -1;
-static int32_t set_win_disp_y_fp = -1;
-static int     set_win_dragging = 0;
-static int32_t set_win_drag_ox = 0;
-static int32_t set_win_drag_oy = 0;
-static uint8_t set_win_prev_lmb = 0;
-static uint8_t set_close_prev_lmb = 0;
-static uint8_t set_btn_prev_lmb = 0;
-
-static void settings_open_window(uint32_t scr_w, uint32_t scr_h);
-
-/* ===== WEB BROWSER APPLICATION STATE ===== */
-
-#define BROWSER_WIN_W   680
-#define BROWSER_WIN_H   480
-#define BROWSER_TITLE_H  24
-#define BROWSER_ADDR_H   26
-#define BROWSER_BORDER     1
-
-static int     browser_open = 0;
-static int32_t brw_win_x = -1;
-static int32_t brw_win_y = -1;
-static int32_t brw_win_w = BROWSER_WIN_W;
-static int32_t brw_win_h = BROWSER_WIN_H;
-static int32_t brw_win_disp_x_fp = -1;
-static int32_t brw_win_disp_y_fp = -1;
-static int     brw_win_dragging = 0;
-static int32_t brw_win_drag_ox = 0;
-static int32_t brw_win_drag_oy = 0;
-static uint8_t brw_win_prev_lmb = 0;
-static uint8_t brw_close_prev_lmb = 0;
-
-static char    brw_address[128] = "socrates://home";
-static int     brw_addr_len = 15;
-static uint8_t brw_page_buf[4096];
-static int     brw_page_len = 0;
-
-static void browser_open_window(uint32_t scr_w, uint32_t scr_h);
-
-/* ===== DROPDOWN MENU STATE ===== */
-
-static int dropdown_open = 0;      /* 1 = Tools dropdown is visible */
-static int is_terminal_open = 0;   /* 0 = hidden on boot */
-static uint8_t menu_prev_lmb = 0;
-
-/* "Tools" menu item hit box (pixel coords in menubar)
- * Menu string: "File   Edit   View   Tools   About"
- * Font size 16 with 1/8 inter-char padding, advance ~10.8 px/char, drawn at x=14.
- * "Tools" starts at char 21 → x ≈ 14+21*11 = 245, spans 5 chars = 55px.
- * Use generous bounds for reliable clicking. */
-#define TOOLS_MENU_X  238
-#define TOOLS_MENU_W   64
-#define DROPDOWN_W    140
-#define DROPDOWN_H     28
-#define DROPDOWN_Y    MENUBAR_H
-
-/* ===== DOCK APP REGISTRY ===== */
-
-typedef struct {
-    const char *name;
-    const char *cmd;
-    char        icon_letter;
-} dock_app_entry_t;
-
-static const dock_app_entry_t dock_apps[DOCK_APP_COUNT] = {
-    { "hello",     "run hello",     'H' },
-    { "goldsmith", "run goldsmith", 'G' },
-    { "monolith",  "run monolith",  'M' },
-    { "matrix",    "run matrix",    'X' },
-    { "browser",   "run browser",   'B' },
-    { "explorer",  "__explorer__",  'E' },
-    { "settings",  "__settings__",  '*' },
-};
-
-static void dock_icon_rect(uint32_t scr_w, int idx,
-                           int32_t *ox, int32_t *oy,
-                           int32_t *ow, int32_t *oh) {
-    int32_t bw = dock_cfg.bar_w;
-    int32_t bh = dock_cfg.bar_h;
-    int32_t by = dock_cfg.bar_y;
-    int32_t isz = dock_cfg.icon_sz;
-
-    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
-        int32_t dock_x = ((int32_t)scr_w - bw) / 2;
-        int32_t inner_x = dock_x + 1;
-        int32_t inner_w = bw - 2;
-        int32_t cell_w  = inner_w / DOCK_APP_COUNT;
-        *ox = inner_x + idx * cell_w + (cell_w - isz) / 2;
-        *oy = by + (bh - isz) / 2;
-    } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
-        int32_t dock_y = by;
-        int32_t inner_y = dock_y + 1;
-        int32_t inner_h = bw - 2;
-        int32_t cell_h  = inner_h / DOCK_APP_COUNT;
-        *ox = 2 + (bh - isz) / 2;
-        *oy = inner_y + idx * cell_h + (cell_h - isz) / 2;
-    } else {
-        int32_t dock_y = by;
-        int32_t inner_y = dock_y + 1;
-        int32_t inner_h = bw - 2;
-        int32_t cell_h  = inner_h / DOCK_APP_COUNT;
-        *ox = (int32_t)scr_w - bh - 2 + (bh - isz) / 2;
-        *oy = inner_y + idx * cell_h + (cell_h - isz) / 2;
-    }
-    *ow = isz;
-    *oh = isz;
-}
-
-/* ===== MENU BAR ===== */
-
-static void desktop_draw_menubar(uint32_t *buf, uint32_t w, uint32_t h) {
-    for (uint32_t row = 0; row < MENUBAR_H && row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            buf[row * w + col] = 0xD4AF37u;
-
-    int fs = 16;
-    int ty = (MENUBAR_H - fs) / 2;
-    ttf_draw_string(buf, (int)w, (int)h, 14, ty,
-                    "File   Edit   View   Tools   About",
-                    0xFFFFFFu, fs);
-
-    char clk[16];
-    clock_string(clk);
-    int clk_w = 8 * (fs * 6 / 10 + fs / 8);
-    int clk_x = (int)w - clk_w - 16;
-    ttf_draw_string(buf, (int)w, (int)h, clk_x, ty, clk, 0xFFFFFFu, fs);
-}
-
-static void desktop_draw_dropdown(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!dropdown_open) return;
-
-    int dx = TOOLS_MENU_X;
-    int dy = DROPDOWN_Y;
-
-    /* Dropdown background */
-    for (int row = dy; row < dy + DROPDOWN_H && row < (int)h; row++)
-        for (int col = dx; col < dx + DROPDOWN_W && col < (int)w; col++) {
-            int is_border = (row == dy || row == dy + DROPDOWN_H - 1 ||
-                             col == dx || col == dx + DROPDOWN_W - 1);
-            buf[row * (int)w + col] = is_border ? 0xD4AF37u : 0x1A1508u;
-        }
-
-    /* "Terminal" label — centered vertically in the taller dropdown */
-    int fs = 15;
-    int tx = dx + 10;
-    int tty = dy + (DROPDOWN_H - fs) / 2;
-    ttf_draw_string(buf, (int)w, (int)h, tx, tty, "Terminal", 0xD4AF37u, fs);
-}
-
-static void desktop_handle_menu_click(int32_t mx, int32_t my, uint8_t lmb) {
-    int click = (lmb && !menu_prev_lmb);
-    menu_prev_lmb = lmb;
-
-    if (!click) return;
-
-    /* Click on "Tools" text in menubar */
-    if (my >= 0 && my < MENUBAR_H &&
-        mx >= TOOLS_MENU_X && mx < TOOLS_MENU_X + TOOLS_MENU_W) {
-        dropdown_open = !dropdown_open;
-        return;
-    }
-
-    /* Click inside dropdown */
-    if (dropdown_open) {
-        int dx = TOOLS_MENU_X;
-        int dy = DROPDOWN_Y;
-        if (mx >= dx && mx < dx + DROPDOWN_W &&
-            my >= dy && my < dy + DROPDOWN_H) {
-            is_terminal_open = 1;
-            dropdown_open = 0;
-            return;
-        }
-    }
-
-    /* Click anywhere else closes dropdown */
-    if (dropdown_open)
-        dropdown_open = 0;
-}
-
-/* ===== TERMINAL WINDOW ===== */
-
-#define TERM_WIN_W   700
-#define TERM_WIN_H   420
-#define TERM_TITLE_H  24
-#define TERM_BORDER    1
-#define TERM_FONT_SZ  16
-#define TERM_LINE_H   20
-#define TERM_PAD_X     6
-#define TERM_PAD_Y     4
-
-#define TERM_COLS     80
-#define TERM_ROWS     20
-#define TERM_BUF_SZ   (TERM_COLS * TERM_ROWS)
-
-static char  term_buf[TERM_BUF_SZ];
-static int   term_cx = 0;
-static int   term_cy = 0;
-static int   term_inited = 0;
-static int   term_ready = 0;
-
-#define TERM_CMD_MAX 80
-static char  term_cmd_buf[TERM_CMD_MAX];
-static int   term_cmd_len = 0;
-
-/* ===== CLOSE BUTTON GEOMETRY ===== */
-
-#define CLOSE_BTN_SIZE  14
-#define CLOSE_BTN_PAD    3
-
-/* ===== UNIFIED SPAWN ANIMATION (for all Dock apps) ===== */
-
-#define SPAWN_ANIM_FRAMES 15
-
-typedef struct {
-    int     active;
-    int     tick;
-    int32_t src_x, src_y;
-    int32_t dst_x, dst_y;
-    int32_t dst_w, dst_h;
-} spawn_anim_t;
-
-static spawn_anim_t spawn_anim = {0};
-
-static void spawn_anim_start(int32_t icon_cx, int32_t icon_cy,
-                              int32_t win_x, int32_t win_y,
-                              int32_t win_w, int32_t win_h) {
-    spawn_anim.active = 1;
-    spawn_anim.tick   = 0;
-    spawn_anim.src_x  = icon_cx;
-    spawn_anim.src_y  = icon_cy;
-    spawn_anim.dst_x  = win_x;
-    spawn_anim.dst_y  = win_y;
-    spawn_anim.dst_w  = win_w;
-    spawn_anim.dst_h  = win_h;
-}
-
-static void spawn_anim_draw(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!spawn_anim.active) return;
-    spawn_anim.tick++;
-    int t = spawn_anim.tick;
-    if (t > SPAWN_ANIM_FRAMES) t = SPAWN_ANIM_FRAMES;
-
-    int32_t src_w = 4, src_h = 4;
-    int32_t cur_x = spawn_anim.src_x + (spawn_anim.dst_x - spawn_anim.src_x) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_y = spawn_anim.src_y + (spawn_anim.dst_y - spawn_anim.src_y) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_w = src_w + (spawn_anim.dst_w - src_w) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_h = src_h + (spawn_anim.dst_h - src_h) * t / SPAWN_ANIM_FRAMES;
-
-    uint32_t alpha = (uint32_t)t * 255u / SPAWN_ANIM_FRAMES;
-    for (int32_t row = cur_y; row < cur_y + cur_h && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = cur_x; col < cur_x + cur_w && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == cur_y || row == cur_y + cur_h - 1 ||
-                             col == cur_x || col == cur_x + cur_w - 1);
-            int is_titlebar = (row > cur_y && row < cur_y + TERM_TITLE_H + 1 &&
-                               col > cur_x && col < cur_x + cur_w - 1);
-            if (is_border || is_titlebar) {
-                uint32_t idx = (uint32_t)row * w + (uint32_t)col;
-                uint32_t bg_px = buf[idx];
-                uint32_t br = (bg_px >> 16) & 0xFF;
-                uint32_t bg_g = (bg_px >> 8) & 0xFF;
-                uint32_t bb = bg_px & 0xFF;
-                uint32_t r = (0xD4u * alpha + br * (255u - alpha)) / 255u;
-                uint32_t g = (0xAFu * alpha + bg_g * (255u - alpha)) / 255u;
-                uint32_t b = (0x37u * alpha + bb * (255u - alpha)) / 255u;
-                buf[idx] = (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-
-    if (spawn_anim.tick >= SPAWN_ANIM_FRAMES)
-        spawn_anim.active = 0;
-}
-
-/* ===== DYNAMIC WINDOW STATE (Step 4: drag-and-drop) ===== */
-
-static int32_t window_x = -1;
-static int32_t window_y = -1;
-static int32_t window_width  = TERM_WIN_W;
-static int32_t window_height = TERM_WIN_H;
-
-static int     is_dragging = 0;
-static int32_t drag_offset_x = 0;
-static int32_t drag_offset_y = 0;
-static uint8_t drag_prev_lmb = 0;
-static uint8_t close_prev_lmb = 0;
-
-/* Smooth display position (spring physics) — 8-bit fixed point */
-static int32_t window_disp_x_fp = -1;
-static int32_t window_disp_y_fp = -1;
-
-/* Trail history for liquid glass decay effect */
-#define TRAIL_LEN 4
-static int32_t trail_x[TRAIL_LEN];
-static int32_t trail_y[TRAIL_LEN];
-static int     trail_count = 0;
-static int     trail_active = 0;
-
-/* Open animation state */
-#define OPEN_ANIM_FRAMES 15
-static int open_anim_tick = 0;
-static int open_anim_active = 0;
-
-static void window_init_pos(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    window_width  = TERM_WIN_W;
-    window_height = TERM_WIN_H;
-    window_x = ((int32_t)scr_w - window_width) / 2;
-    window_y = ((DOCK_BAR_Y - MENUBAR_H - window_height) / 2) + MENUBAR_H;
-    if (window_x < 0) window_x = 0;
-    if (window_y < MENUBAR_H) window_y = MENUBAR_H;
-    window_disp_x_fp = window_x << 8;
-    window_disp_y_fp = window_y << 8;
-    trail_count = 0;
-    trail_active = 0;
-}
-
-static void draw_close_button(uint32_t *buf, uint32_t bw, uint32_t bh,
-                              int32_t wx, int32_t wy, int32_t ww) {
-    int32_t btn_x = wx + ww - TERM_BORDER - CLOSE_BTN_PAD - CLOSE_BTN_SIZE;
-    int32_t btn_y = wy + TERM_BORDER + (TERM_TITLE_H - CLOSE_BTN_SIZE) / 2;
-    int32_t sz = CLOSE_BTN_SIZE;
-
-    for (int i = 0; i < sz; i++) {
-        int32_t px, py;
-
-        /* Top-left to bottom-right diagonal */
-        px = btn_x + i; py = btn_y + i;
-        if (px >= 0 && px < (int32_t)bw && py >= 0 && py < (int32_t)bh)
-            buf[(uint32_t)py * bw + (uint32_t)px] = 0xFFFFFFu;
-        px = btn_x + i + 1; py = btn_y + i;
-        if (px >= 0 && px < (int32_t)bw && py >= 0 && py < (int32_t)bh)
-            buf[(uint32_t)py * bw + (uint32_t)px] = 0xFFFFFFu;
-
-        /* Top-right to bottom-left diagonal */
-        px = btn_x + sz - 1 - i; py = btn_y + i;
-        if (px >= 0 && px < (int32_t)bw && py >= 0 && py < (int32_t)bh)
-            buf[(uint32_t)py * bw + (uint32_t)px] = 0xFFFFFFu;
-        px = btn_x + sz - 2 - i; py = btn_y + i;
-        if (px >= 0 && px < (int32_t)bw && py >= 0 && py < (int32_t)bh)
-            buf[(uint32_t)py * bw + (uint32_t)px] = 0xFFFFFFu;
-    }
-}
-
-static int hit_close_button(int32_t mx, int32_t my,
-                            int32_t wx, int32_t wy, int32_t ww) {
-    int32_t btn_x = wx + ww - TERM_BORDER - CLOSE_BTN_PAD - CLOSE_BTN_SIZE;
-    int32_t btn_y = wy + TERM_BORDER + (TERM_TITLE_H - CLOSE_BTN_SIZE) / 2;
-    return (mx >= btn_x && mx < btn_x + CLOSE_BTN_SIZE &&
-            my >= btn_y && my < btn_y + CLOSE_BTN_SIZE);
-}
-
-static void window_handle_drag(int32_t mx, int32_t my, uint8_t lmb,
-                                uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    int click  = (lmb && !drag_prev_lmb);
-    int release = (!lmb && drag_prev_lmb);
-    drag_prev_lmb = lmb;
-
-    /* Close button check — on click, test before drag */
-    int close_click = (lmb && !close_prev_lmb);
-    close_prev_lmb = lmb;
-    if (close_click && hit_close_button(mx, my, window_x, window_y, window_width)) {
-        is_terminal_open = 0;
-        term_ready = 0;
-        term_inited = 0;
-        is_dragging = 0;
-        trail_active = 0;
-        trail_count = 0;
-        window_x = -1;
-        return;
-    }
-
-    if (click && !is_dragging) {
-        if (mx >= window_x && mx < window_x + window_width &&
-            my >= window_y && my < window_y + TERM_TITLE_H + TERM_BORDER) {
-            is_dragging = 1;
-            drag_offset_x = mx - window_x;
-            drag_offset_y = my - window_y;
-        }
-    }
-    if (release) {
-        if (is_dragging) trail_active = 0;
-        is_dragging = 0;
-    }
-
-    if (is_dragging) {
-        int32_t new_x = mx - drag_offset_x;
-        int32_t new_y = my - drag_offset_y;
-
-        if (new_x < 0) new_x = 0;
-        if (new_y < MENUBAR_H) new_y = MENUBAR_H;
-        if (new_x + window_width > (int32_t)scr_w)
-            new_x = (int32_t)scr_w - window_width;
-        if (new_y + window_height > DOCK_BAR_Y)
-            new_y = DOCK_BAR_Y - window_height;
-
-        window_x = new_x;
-        window_y = new_y;
-        trail_active = 1;
-    }
-
-    /* Spring-dampened display position: lerp 3/4 toward target each frame */
-    int32_t target_x_fp = window_x << 8;
-    int32_t target_y_fp = window_y << 8;
-    window_disp_x_fp += (target_x_fp - window_disp_x_fp) * 3 / 4;
-    window_disp_y_fp += (target_y_fp - window_disp_y_fp) * 3 / 4;
-
-    /* Snap when close enough */
-    int32_t dx = target_x_fp - window_disp_x_fp;
-    int32_t dy = target_y_fp - window_disp_y_fp;
-    if (dx < 0) dx = -dx;
-    if (dy < 0) dy = -dy;
-    if (dx < 128 && dy < 128) {
-        window_disp_x_fp = target_x_fp;
-        window_disp_y_fp = target_y_fp;
-    }
-
-    /* Shift trail history */
-    if (trail_active && is_dragging) {
-        for (int i = TRAIL_LEN - 1; i > 0; i--) {
-            trail_x[i] = trail_x[i - 1];
-            trail_y[i] = trail_y[i - 1];
-        }
-        trail_x[0] = window_disp_x_fp >> 8;
-        trail_y[0] = window_disp_y_fp >> 8;
-        if (trail_count < TRAIL_LEN) trail_count++;
-    } else {
-        trail_count = 0;
-    }
-}
-
-static void term_init(void) {
-    for (int i = 0; i < TERM_BUF_SZ; i++) term_buf[i] = '\0';
-    term_cx = 0;
-    term_cy = 0;
-    term_inited = 1;
-}
-
-static void term_scroll(void) {
-    for (int r = 0; r < TERM_ROWS - 1; r++)
-        for (int c = 0; c < TERM_COLS; c++)
-            term_buf[r * TERM_COLS + c] = term_buf[(r + 1) * TERM_COLS + c];
-    for (int c = 0; c < TERM_COLS; c++)
-        term_buf[(TERM_ROWS - 1) * TERM_COLS + c] = '\0';
-    term_cy = TERM_ROWS - 1;
-}
-
-static void term_putc(char ch) {
-    if (!term_inited) term_init();
-
-    if (ch == '\n') {
-        term_cx = 0;
-        term_cy++;
-        if (term_cy >= TERM_ROWS) term_scroll();
-        return;
-    }
-    if (ch == '\b') {
-        if (term_cx > 0) {
-            term_cx--;
-            term_buf[term_cy * TERM_COLS + term_cx] = '\0';
-        }
-        return;
-    }
-    if (ch == '\t') {
-        int spaces = 4 - (term_cx % 4);
-        for (int i = 0; i < spaces && term_cx < TERM_COLS; i++)
-            term_putc(' ');
-        return;
-    }
-
-    if (term_cx >= TERM_COLS) {
-        term_cx = 0;
-        term_cy++;
-        if (term_cy >= TERM_ROWS) term_scroll();
-    }
-    term_buf[term_cy * TERM_COLS + term_cx] = ch;
-    term_cx++;
-}
-
-static void term_print(const char *s) {
-    while (*s) term_putc(*s++);
-}
-
-static void term_prompt(void) {
-    term_print("> ");
-}
-
-/* Tarfs ls callback: print each filename into terminal */
-static void term_ls_callback(const char *name, uint64_t size) {
-    (void)size;
-    term_print("  ");
-    term_print(name);
-    term_print("\n");
-}
-
-static void tarfs_list_to_terminal(void) {
-    if (!tarfs_base) {
-        term_print("  (no ramdisk loaded)\n");
-        return;
-    }
-
-    uint8_t *ptr = tarfs_base;
-    uint8_t *end = tarfs_base + tarfs_size;
-
-    while (ptr + TAR_BLOCK_SIZE <= end) {
-        tar_header_t *hdr = (tar_header_t *)ptr;
-        if (hdr->name[0] == '\0') break;
-
-        uint64_t file_size = octal_parse(hdr->size, 12);
-
-        if (hdr->typeflag == '0' || hdr->typeflag == '\0') {
-            const char *name = hdr->name;
-            if (name[0] == '.' && name[1] == '/')
-                name += 2;
-            if (name[0] != '\0')
-                term_ls_callback(name, file_size);
-        }
-
-        uint64_t blocks = (file_size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
-        ptr += TAR_BLOCK_SIZE + blocks * TAR_BLOCK_SIZE;
-    }
-}
-
-/* ===== SYSCALL GATEWAY (int 0x80) ===== */
-
-/*
- * Syscall ABI (matches apps/socrates.h wrapper convention):
- *   RAX = syscall number
- *   RDI = arg0, RSI = arg1, RDX = arg2
+/* ===== 2.5 UNIFIED FILESYSTEM LAYER =====
  *
- * Syscall 1 (sys_print):      RDI = pointer to null-terminated string
- * Syscall 2 (sys_draw_pixel): RDI = x, RSI = y, RDX = color (0xRRGGBB)
- * Syscall 3 (sys_get_mouse):  RDI = pointer to int32_t[4] output buffer
- *                              [0]=x, [1]=y, [2]=buttons, [3]=reserved
+ * FAT32 on the ATA disk is the real filesystem: writable, persistent,
+ * host-mountable.  The tar ramdisk remains only as a read-only fallback
+ * so ISO-only boots (no hard disk attached) still work.
  */
 
-#define APP_CANVAS_W (TERM_WIN_W - 2 * TERM_BORDER)
-#define APP_CANVAS_H (TERM_WIN_H - TERM_BORDER - TERM_TITLE_H - TERM_BORDER)
+#define FS_FILEBUF_MAX (256 * 1024)
+static uint8_t fs_filebuf[FS_FILEBUF_MAX];
+static const char *fs_errstr = "";
+
+static int fs_writable(void) {
+    return fat_vol.mounted;
+}
+
+static const void *fs_read_file(const char *filename, uint64_t *out_size) {
+    if (fat_vol.mounted) {
+        fat_dirent_t e;
+        char abs[256];
+        if (filename[0] != '/') {
+            abs[0] = '/';
+            str_copy(abs + 1, filename, 255);
+        } else {
+            str_copy(abs, filename, 256);
+        }
+        if (!fat_lookup(abs, &e) || (e.attr & FAT_ATTR_DIR)) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        uint32_t got = 0;
+        if (fat_read_file(&e, fs_filebuf, FS_FILEBUF_MAX, &got) != 0) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        if (out_size) *out_size = got;
+        return fs_filebuf;
+    }
+    return tar_read_file(filename, out_size);
+}
+
+static int fs_write_file(const char *path, const void *data, uint32_t len) {
+    if (!fat_vol.mounted) {
+        fs_errstr = "read-only filesystem (no disk attached)";
+        return -1;
+    }
+    if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
+        fs_errstr = fat_errstr;
+        return -1;
+    }
+    return 0;
+}
+
+static int fs_delete(const char *path) {
+    if (!fat_vol.mounted) {
+        fs_errstr = "read-only filesystem (no disk attached)";
+        return -1;
+    }
+    if (fat_delete(path) != 0) {
+        fs_errstr = fat_errstr;
+        return -1;
+    }
+    return 0;
+}
+
+static int fs_mkdir(const char *path) {
+    if (!fat_vol.mounted) {
+        fs_errstr = "read-only filesystem (no disk attached)";
+        return -1;
+    }
+    if (fat_mkdir(path) != 0) {
+        fs_errstr = fat_errstr;
+        return -1;
+    }
+    return 0;
+}
+
+/* FAT32-only directory listing (callers fall back to tar walks) */
+typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
+
+static int fs_list(const char *path, fs_list_cb cb) {
+    if (!fat_vol.mounted) return -1;
+    fat_dirent_t d;
+    if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
+        fs_errstr = "no such directory";
+        return -1;
+    }
+    fat_iter_t it;
+    fat_iter_init(&it, d.first_clus);
+    fat_dirent_t e;
+    while (fat_iter_next(&it, &e) == 1)
+        cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
+    return 0;
+}
+
+/* ===== 3. FORWARD DECLARATIONS ===== */
+
+static void term_print(const char *s);
+static void term_print_c(const char *s, int color);
+static void wm_open(int kind);
+static void wm_close(int kind);
+static int  wm_is_open(int kind);
+static void wallpaper_set_theme(int idx);
+static int  desktop_open_app_by_name(const char *name);
+static void brw_navigate(const char *url);
+static int  execute_bin(const char *filepath);
+
+/* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
+
+/*
+ * Syscall ABI (see apps/socrates.h):
+ *   RAX = number, RDI = arg0, RSI = arg1, RDX = arg2, via int 0x80
+ *   1 = print string    2 = draw pixel on app canvas    3 = mouse state
+ */
+
+#define APP_CANVAS_W 598
+#define APP_CANVAS_H 402
 
 static uint32_t app_canvas[APP_CANVAS_W * APP_CANVAS_H];
-static int app_canvas_active = 0;
-static int silent_launch = 0;
+static char     app_win_title[64] = "hello";
+static int      silent_launch = 0;
 
 __attribute__((noinline, used))
 void syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
@@ -910,11 +299,8 @@ void syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 2: {
         int32_t px = (int32_t)a0;
         int32_t py = (int32_t)a1;
-        uint32_t color = (uint32_t)a2;
-        if (px >= 0 && px < APP_CANVAS_W &&
-            py >= 0 && py < APP_CANVAS_H) {
-            app_canvas[py * APP_CANVAS_W + px] = color;
-        }
+        if (px >= 0 && px < APP_CANVAS_W && py >= 0 && py < APP_CANVAS_H)
+            app_canvas[py * APP_CANVAS_W + px] = (uint32_t)a2;
         break;
     }
     case 3: {
@@ -931,8 +317,6 @@ void syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         break;
     }
 }
-
-/* ===== ELF64 BINARY LOADER ===== */
 
 typedef struct {
     uint8_t  e_ident[16];
@@ -968,54 +352,26 @@ typedef struct {
 static uint8_t app_memory[APP_MEM_SIZE] __attribute__((aligned(4096)));
 static uint8_t app_stack[8192] __attribute__((aligned(16)));
 
-/* App window state — independent of terminal */
-static int     app_window_open   = 0;
-static int32_t app_win_x         = -1;
-static int32_t app_win_y         = -1;
-static int32_t app_win_w         = TERM_WIN_W;
-static int32_t app_win_h         = TERM_WIN_H;
-static char    app_win_title[64];
-static int     app_win_dragging  = 0;
-static int32_t app_win_drag_ox   = 0;
-static int32_t app_win_drag_oy   = 0;
-static uint8_t app_win_prev_lmb  = 0;
-static int32_t app_win_disp_x_fp = -1;
-static int32_t app_win_disp_y_fp = -1;
-
-static void app_window_init_pos(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    app_win_w = TERM_WIN_W;
-    app_win_h = TERM_WIN_H;
-    app_win_x = ((int32_t)scr_w - app_win_w) / 2;
-    app_win_y = ((DOCK_BAR_Y - MENUBAR_H - app_win_h) / 2) + MENUBAR_H;
-    if (app_win_x < 0) app_win_x = 0;
-    if (app_win_y < MENUBAR_H) app_win_y = MENUBAR_H;
-    app_win_disp_x_fp = app_win_x << 8;
-    app_win_disp_y_fp = app_win_y << 8;
-}
-
 static int execute_bin_internal(const char *filepath, int verbose) {
     uint64_t fsize = 0;
     const void *fdata = fs_read_file(filepath, &fsize);
     if (!fdata || fsize < sizeof(Elf64_Ehdr)) {
         if (verbose) {
-            term_print("Error: file not found: ");
-            term_print(filepath);
+            term_print_c("run: file not found: ", 2);
+            term_print_c(filepath, 2);
             term_print("\n");
         }
         return -1;
     }
 
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)fdata;
-
     if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-        if (verbose) term_print("Error: invalid ELF magic\n");
+        if (verbose) term_print_c("run: invalid ELF magic\n", 2);
         return -1;
     }
-
     if (ehdr->e_ident[4] != 2) {
-        if (verbose) term_print("Error: not a 64-bit ELF\n");
+        if (verbose) term_print_c("run: not a 64-bit ELF\n", 2);
         return -1;
     }
 
@@ -1028,9 +384,8 @@ static int execute_bin_internal(const char *filepath, int verbose) {
         if (ph->p_type == ELF_PT_LOAD && ph->p_vaddr < base_vaddr)
             base_vaddr = ph->p_vaddr;
     }
-
     if (base_vaddr == ~(uint64_t)0) {
-        if (verbose) term_print("Error: no loadable segments\n");
+        if (verbose) term_print_c("run: no loadable segments\n", 2);
         return -1;
     }
 
@@ -1041,13 +396,11 @@ static int execute_bin_internal(const char *filepath, int verbose) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
             (file_bytes + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type != ELF_PT_LOAD) continue;
-
         uint64_t offset = ph->p_vaddr - base_vaddr;
         if (offset + ph->p_memsz > APP_MEM_SIZE) {
-            if (verbose) term_print("Error: segment too large\n");
+            if (verbose) term_print_c("run: segment too large\n", 2);
             return -1;
         }
-
         const uint8_t *src = file_bytes + ph->p_offset;
         uint8_t *dst = app_memory + offset;
         for (uint64_t j = 0; j < ph->p_filesz; j++)
@@ -1059,14 +412,21 @@ static int execute_bin_internal(const char *filepath, int verbose) {
     uint64_t stack_top  = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
 
     if (verbose) {
-        term_print("Loading ELF64: ");
-        term_print(filepath);
+        term_print_c("loading ELF64: ", 3);
+        term_print_c(filepath, 3);
         term_print("\n");
     }
 
     for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++)
         app_canvas[i] = 0;
-    app_canvas_active = 1;
+
+    /* window title = program name */
+    {
+        int ti = 0;
+        const char *p = filepath;
+        while (*p && ti < 60) app_win_title[ti++] = *p++;
+        app_win_title[ti] = '\0';
+    }
 
     uint64_t saved_rsp;
     __asm__ volatile(
@@ -1081,6 +441,7 @@ static int execute_bin_internal(const char *filepath, int verbose) {
           "rax", "memory", "cc"
     );
 
+    wm_open(WK_HELLO);
     return 0;
 }
 
@@ -1088,1789 +449,969 @@ static int execute_bin(const char *filepath) {
     return execute_bin_internal(filepath, 1);
 }
 
-static void term_exec(void) {
-    term_cmd_buf[term_cmd_len] = '\0';
+/* ===== 5. APP MODULES ===== */
 
-    if (str_eq(term_cmd_buf, "help")) {
-        term_print("Socrates BSD 9 OS Active Commands:\n");
-        term_print("  help, clear, about, ls, cat <f>, run <p>, files\n");
-    } else if (str_eq(term_cmd_buf, "clear")) {
-        for (int i = 0; i < TERM_BUF_SZ; i++) term_buf[i] = '\0';
-        term_cx = 0;
-        term_cy = 0;
-        app_canvas_active = 0;
-    } else if (str_eq(term_cmd_buf, "about")) {
-        term_print("Socrates BSD 9 Operating System\n");
-        term_print("Custom TrueType Rasterizer Engine\n");
-        term_print("Hardware Abstraction Layer Active\n");
-    } else if (str_eq(term_cmd_buf, "ls")) {
-        term_print("Ramdisk contents:\n");
-        tarfs_list_to_terminal();
-    } else if (str_starts_with(term_cmd_buf, "cat ")) {
-        const char *fname = term_cmd_buf + 4;
-        /* Skip leading whitespace */
-        while (*fname == ' ') fname++;
-        if (*fname == '\0') {
-            term_print("Usage: cat <filename>\n");
-        } else {
-            uint64_t fsize = 0;
-            const void *data = fs_read_file(fname, &fsize);
-            if (!data) {
-                term_print("File not found: ");
-                term_print(fname);
-                term_print("\n");
-            } else {
-                const char *text = (const char *)data;
-                for (uint64_t i = 0; i < fsize; i++) {
-                    if (text[i] == '\0') break;
-                    term_putc(text[i]);
-                }
-                if (fsize > 0 && text[fsize - 1] != '\n')
-                    term_putc('\n');
-            }
-        }
-    } else if (str_eq(term_cmd_buf, "files")) {
-        explorer_open_window(explorer_scr_w, explorer_scr_h);
-    } else if (str_starts_with(term_cmd_buf, "run ")) {
-        const char *prog = term_cmd_buf + 4;
-        while (*prog == ' ') prog++;
-        if (*prog == '\0') {
-            term_print("Usage: run <program>\n");
-        } else {
-            execute_bin(prog);
-        }
-    } else if (term_cmd_len > 0) {
-        term_print("Unknown command: ");
-        term_print(term_cmd_buf);
-        term_print("\n");
-    }
-}
+#include "term.h"
+#include "browser.h"
+#include "apps.h"
 
-static void term_input(char ch) {
-    if (!term_ready) {
-        term_init();
-        term_print("Socrates Terminal v1.0\n");
-        term_prompt();
-        term_ready = 1;
-    }
-
-    if (ch == '\n') {
-        term_putc('\n');
-        if (term_cmd_len > 0)
-            term_exec();
-        term_cmd_len = 0;
-        term_cmd_buf[0] = '\0';
-        term_prompt();
-    } else if (ch == '\b') {
-        if (term_cmd_len > 0) {
-            term_cmd_len--;
-            term_cmd_buf[term_cmd_len] = '\0';
-            term_putc('\b');
-        }
-    } else if (ch >= 0x20 && ch < 0x7F) {
-        if (term_cmd_len < TERM_CMD_MAX - 1) {
-            term_cmd_buf[term_cmd_len++] = ch;
-            term_cmd_buf[term_cmd_len] = '\0';
-            term_putc(ch);
+/* Canvas app (WK_HELLO) content drawer */
+static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                       int32_t cx, int32_t cy, int32_t cw, int32_t chh,
+                       uint32_t tick, int focused) {
+    (void)tick; (void)focused;
+    int32_t bw2 = cw < APP_CANVAS_W ? cw : APP_CANVAS_W;
+    int32_t bh2 = chh < APP_CANVAS_H ? chh : APP_CANVAS_H;
+    for (int32_t y = 0; y < bh2; y++) {
+        int32_t dy = cy + y;
+        if (dy < 0 || dy >= (int32_t)h) continue;
+        for (int32_t x = 0; x < bw2; x++) {
+            int32_t dx = cx + x;
+            if (dx < 0 || dx >= (int32_t)w) continue;
+            buf[(uint32_t)dy * w + (uint32_t)dx] =
+                app_canvas[y * APP_CANVAS_W + x];
         }
     }
 }
 
-/* ===== DOCK LAUNCH CONTROLLER ===== */
-
-static void dock_launch_app_from_icon(const char *app_name, int icon_idx);
-
-static uint8_t dock_prev_lmb = 0;
-
-static void desktop_handle_dock_click(int32_t mx, int32_t my,
-                                       uint8_t lmb, uint32_t scr_w) {
-    int click = (lmb && !dock_prev_lmb);
-    dock_prev_lmb = lmb;
-    if (!click) return;
-
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
-        int32_t ix, iy, iw, ih;
-        dock_icon_rect(scr_w, i, &ix, &iy, &iw, &ih);
-        if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
-            dock_launch_app_from_icon(dock_apps[i].name, i);
-            return;
-        }
-    }
-}
-
-/* Draw a glass trail ghost at a given position with alpha blend (0-255) */
-static void draw_trail_ghost(uint32_t *buf, uint32_t w, uint32_t h,
-                             int32_t gx, int32_t gy,
-                             int32_t gw, int32_t gh, int alpha) {
-    uint32_t border_color = 0xD4AF37u;
-    for (int32_t row = gy; row < gy + gh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = gx; col < gx + gw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == gy || row == gy + gh - 1 ||
-                             col == gx || col == gx + gw - 1);
-            if (!is_border) continue;
-            uint32_t idx = (uint32_t)row * w + (uint32_t)col;
-            uint32_t bg = buf[idx];
-            uint32_t br = (bg >> 16) & 0xFF;
-            uint32_t bg_g = (bg >> 8) & 0xFF;
-            uint32_t bb = bg & 0xFF;
-            uint32_t fr = (border_color >> 16) & 0xFF;
-            uint32_t fg = (border_color >> 8) & 0xFF;
-            uint32_t fb = border_color & 0xFF;
-            uint32_t r = (fr * (uint32_t)alpha + br * (255u - (uint32_t)alpha)) / 255u;
-            uint32_t g = (fg * (uint32_t)alpha + bg_g * (255u - (uint32_t)alpha)) / 255u;
-            uint32_t b = (fb * (uint32_t)alpha + bb * (255u - (uint32_t)alpha)) / 255u;
-            buf[idx] = (r << 16) | (g << 8) | b;
-        }
-    }
-}
-
-static void desktop_draw_terminal(uint32_t *buf, uint32_t w, uint32_t h,
-                                  uint32_t tick) {
-    if (!is_terminal_open) return;
-    if (!term_ready) return;
-
-    /* Initialize window position on first draw */
-    if (window_x < 0) window_init_pos(w, h);
-
-    /* Open animation: scale from menubar origin to full size over 15 frames */
-    if (open_anim_active) {
-        open_anim_tick++;
-        int t = open_anim_tick;
-        if (t > OPEN_ANIM_FRAMES) t = OPEN_ANIM_FRAMES;
-
-        /* Source: center of Tools menu in menubar */
-        int32_t src_x = TOOLS_MENU_X + TOOLS_MENU_W / 2;
-        int32_t src_y = MENUBAR_H / 2;
-        int32_t src_w = 4;
-        int32_t src_h = 4;
-
-        /* Lerp from source to target */
-        int32_t cur_x = src_x + (window_x - src_x) * t / OPEN_ANIM_FRAMES;
-        int32_t cur_y = src_y + (window_y - src_y) * t / OPEN_ANIM_FRAMES;
-        int32_t cur_w = src_w + (window_width  - src_w) * t / OPEN_ANIM_FRAMES;
-        int32_t cur_h = src_h + (window_height - src_h) * t / OPEN_ANIM_FRAMES;
-
-        /* Draw the growing outline */
-        for (int32_t row = cur_y; row < cur_y + cur_h && row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = cur_x; col < cur_x + cur_w && col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_border = (row == cur_y || row == cur_y + cur_h - 1 ||
-                                 col == cur_x || col == cur_x + cur_w - 1);
-                int is_titlebar = (row > cur_y && row < cur_y + TERM_TITLE_H + 1 &&
-                                   col > cur_x && col < cur_x + cur_w - 1);
-                if (is_border || is_titlebar) {
-                    uint32_t idx = (uint32_t)row * w + (uint32_t)col;
-                    uint32_t bg_px = buf[idx];
-                    uint32_t alpha = (uint32_t)t * 255u / OPEN_ANIM_FRAMES;
-                    uint32_t br = (bg_px >> 16) & 0xFF;
-                    uint32_t bg_g = (bg_px >> 8) & 0xFF;
-                    uint32_t bb = bg_px & 0xFF;
-                    uint32_t r = (0xD4u * alpha + br * (255u - alpha)) / 255u;
-                    uint32_t g = (0xAFu * alpha + bg_g * (255u - alpha)) / 255u;
-                    uint32_t b = (0x37u * alpha + bb * (255u - alpha)) / 255u;
-                    buf[idx] = (r << 16) | (g << 8) | b;
-                }
-            }
-        }
-
-        if (open_anim_tick >= OPEN_ANIM_FRAMES)
-            open_anim_active = 0;
-        return;
-    }
-
-    /* Display coordinates from spring physics */
-    int32_t wx = window_disp_x_fp >> 8;
-    int32_t wy = window_disp_y_fp >> 8;
-    int32_t ww = window_width;
-    int32_t wh = window_height;
-
-    /* Draw liquid glass trails behind the window */
-    if (trail_active && trail_count > 0) {
-        for (int i = trail_count - 1; i >= 0; i--) {
-            int alpha = 50 - i * (50 / TRAIL_LEN);
-            if (alpha < 8) alpha = 8;
-            draw_trail_ghost(buf, w, h, trail_x[i], trail_y[i], ww, wh, alpha);
-        }
-    }
-
-    /* Gold outer border (1px) */
-    for (int32_t row = wy; row < wy + wh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx; col < wx + ww && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == wy || row == wy + wh - 1 ||
-                             col == wx || col == wx + ww - 1);
-            if (is_border)
-                buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title bar: 20px solid gold below the top border */
-    int32_t tb_y = wy + TERM_BORDER;
-    for (int32_t row = tb_y; row < tb_y + TERM_TITLE_H && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + TERM_BORDER; col < wx + ww - TERM_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title text in black */
-    int title_fs = 14;
-    const char *title = "Socrates Terminal v1.0";
-    int tlen = 0;
-    const char *tp = title;
-    while (*tp++) tlen++;
-    int title_tw = tlen * (title_fs * 6 / 10 + title_fs / 8);
-    int title_tx = wx + (ww - title_tw) / 2;
-    int title_ty = tb_y + (TERM_TITLE_H - title_fs) / 2;
-    ttf_draw_string(buf, (int)w, (int)h, title_tx, title_ty,
-                    title, 0x000000u, title_fs);
-
-    /* Close "X" button */
-    draw_close_button(buf, w, h, wx, wy, ww);
-
-    /* Interior canvas: true black */
-    int32_t ix = wx + TERM_BORDER;
-    int32_t iy = tb_y + TERM_TITLE_H;
-    int32_t iw = ww - 2 * TERM_BORDER;
-    int32_t ih = wh - TERM_BORDER - TERM_TITLE_H - TERM_BORDER;
-    for (int32_t row = iy; row < iy + ih && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = ix; col < ix + iw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0x000000u;
-        }
-    }
-
-    /* Render terminal text lines */
-    char linebuf[TERM_COLS + 1];
-    for (int r = 0; r < TERM_ROWS; r++) {
-        int len = 0;
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = term_buf[r * TERM_COLS + c];
-            if (ch == '\0') break;
-            linebuf[len++] = ch;
-        }
-        if (len == 0) continue;
-        linebuf[len] = '\0';
-        int lx = ix + TERM_PAD_X;
-        int ly = iy + TERM_PAD_Y + r * TERM_LINE_H;
-        if (ly + TERM_FONT_SZ > iy + ih) break;
-        ttf_draw_string(buf, (int)w, (int)h, lx, ly,
-                        linebuf, 0xD4AF37u, TERM_FONT_SZ);
-    }
-
-    /* Composite app canvas overlay (only when app was launched from terminal) */
-    if (app_canvas_active && !app_window_open) {
-        for (int32_t cy = 0; cy < APP_CANVAS_H && (iy + cy) < (int32_t)h; cy++) {
-            if (iy + cy < 0) continue;
-            for (int32_t cx = 0; cx < APP_CANVAS_W && (ix + cx) < (int32_t)w; cx++) {
-                if (ix + cx < 0) continue;
-                uint32_t pix = app_canvas[cy * APP_CANVAS_W + cx];
-                if (pix != 0x000000u)
-                    buf[(uint32_t)(iy + cy) * w + (uint32_t)(ix + cx)] = pix;
-            }
-        }
-    }
-
-    /* Blinking underscore cursor */
-    int caret_on = ((tick / 30) & 1) == 0;
-    if (caret_on) {
-        int cur_x = ix + TERM_PAD_X + term_cx * (TERM_FONT_SZ * 6 / 10);
-        int cur_y = iy + TERM_PAD_Y + term_cy * TERM_LINE_H + TERM_FONT_SZ;
-        int cur_w = TERM_FONT_SZ * 6 / 10;
-        for (int rr = 0; rr < 2; rr++)
-            for (int cc = 0; cc < cur_w; cc++) {
-                int px = cur_x + cc;
-                int py = cur_y + rr;
-                if (px >= ix && px < ix + iw && py >= iy && py < iy + ih &&
-                    px < (int)w && py < (int)h)
-                    buf[(uint32_t)py * w + (uint32_t)px] = 0xD4AF37u;
-            }
-    }
-}
-
-/* ===== GEAR ICON FOR SETTINGS ===== */
-
-static void draw_gear_icon(uint32_t *buf, uint32_t bw, uint32_t bh,
-                           int32_t ox, int32_t oy) {
-    uint32_t G = 0xD4AF37u;
-    int32_t cx = ox + DOCK_ICON_SZ / 2;
-    int32_t cy = oy + DOCK_ICON_SZ / 2;
-
-    for (int32_t dy = -12; dy <= 12; dy++) {
-        for (int32_t dx = -12; dx <= 12; dx++) {
-            int32_t px = cx + dx;
-            int32_t py = cy + dy;
-            if (px < 0 || px >= (int32_t)bw || py < 0 || py >= (int32_t)bh)
-                continue;
-
-            int32_t d2 = dx * dx + dy * dy;
-            int32_t adx = dx < 0 ? -dx : dx;
-            int32_t ady = dy < 0 ? -dy : dy;
-
-            if (d2 <= 9) continue;
-
-            if (d2 <= 49) {
-                buf[(uint32_t)py * bw + (uint32_t)px] = G;
-                continue;
-            }
-
-            if (d2 <= 121) {
-                int is_tooth = 0;
-                if (adx <= 2) is_tooth = 1;
-                if (ady <= 2) is_tooth = 1;
-                int diff = adx - ady;
-                if (diff < 0) diff = -diff;
-                if (diff <= 2 && adx > 1 && ady > 1) is_tooth = 1;
-                if (is_tooth)
-                    buf[(uint32_t)py * bw + (uint32_t)px] = G;
-            }
-        }
-    }
-}
-
-/* ===== DESKTOP DOCK ===== */
-
-#define DOCK_RADIUS 12
-
-static int dock_inside_rrect(int32_t px, int32_t py,
-                             int32_t rx, int32_t ry,
-                             int32_t rw, int32_t rh, int32_t rad) {
-    if (px < rx || px >= rx + rw || py < ry || py >= ry + rh)
-        return 0;
-    int32_t dx = 0, dy = 0;
-    if (px < rx + rad && py < ry + rad) {
-        dx = rx + rad - px; dy = ry + rad - py;
-    } else if (px >= rx + rw - rad && py < ry + rad) {
-        dx = px - (rx + rw - rad - 1); dy = ry + rad - py;
-    } else if (px < rx + rad && py >= ry + rh - rad) {
-        dx = rx + rad - px; dy = py - (ry + rh - rad - 1);
-    } else if (px >= rx + rw - rad && py >= ry + rh - rad) {
-        dx = px - (rx + rw - rad - 1); dy = py - (ry + rh - rad - 1);
-    }
-    return (dx * dx + dy * dy) <= (rad * rad);
-}
-
-static int dock_on_border_rrect(int32_t px, int32_t py,
-                                int32_t rx, int32_t ry,
-                                int32_t rw, int32_t rh, int32_t rad) {
-    if (!dock_inside_rrect(px, py, rx, ry, rw, rh, rad))
-        return 0;
-    if (!dock_inside_rrect(px, py, rx + 1, ry + 1, rw - 2, rh - 2, rad - 1))
-        return 1;
-    return 0;
-}
-
-static void desktop_draw_dock(uint32_t *buf, uint32_t w, uint32_t h) {
-    int32_t bw = dock_cfg.bar_w;
-    int32_t bh = dock_cfg.bar_h;
-    int32_t by = dock_cfg.bar_y;
-    int32_t isz = dock_cfg.icon_sz;
-
-    int32_t dock_rx, dock_ry, dock_rw, dock_rh;
-    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
-        dock_rx = ((int32_t)w - bw) / 2;
-        dock_ry = by;
-        dock_rw = bw;
-        dock_rh = bh;
-    } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
-        dock_rx = 2;
-        dock_ry = by;
-        dock_rw = bh;
-        dock_rh = bw;
-    } else {
-        dock_rx = (int32_t)w - bh - 2;
-        dock_ry = by;
-        dock_rw = bh;
-        dock_rh = bw;
-    }
-
-    for (int32_t row = dock_ry; row < dock_ry + dock_rh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = dock_rx; col < dock_rx + dock_rw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            if (!dock_inside_rrect(col, row, dock_rx, dock_ry,
-                                   dock_rw, dock_rh, DOCK_RADIUS))
-                continue;
-            int is_border = dock_on_border_rrect(col, row, dock_rx, dock_ry,
-                                                 dock_rw, dock_rh, DOCK_RADIUS);
-            buf[row * (int32_t)w + col] = is_border ? 0xD4AF37u : 0x000000u;
-        }
-    }
-
-    /* Draw each app icon box with its identifier letter */
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
-        int32_t ix, iy, iw, ih;
-        dock_icon_rect(w, i, &ix, &iy, &iw, &ih);
-
-        /* Metallic Gold outlined icon box */
-        for (int32_t row = iy; row < iy + ih && row < (int32_t)h; row++)
-            for (int32_t col = ix; col < ix + iw && col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_border = (row == iy || row == iy + ih - 1 ||
-                                 col == ix || col == ix + iw - 1);
-                if (is_border)
-                    buf[row * (int32_t)w + col] = 0xD4AF37u;
-            }
-
-        /* Icon: gear shape for settings, letter for everything else */
-        if (dock_apps[i].icon_letter == '*') {
-            draw_gear_icon(buf, w, h, ix, iy);
-        } else {
-            int fs = isz > 24 ? 16 : 12;
-            char letter[2] = { dock_apps[i].icon_letter, '\0' };
-            int lw = fs * 6 / 10;
-            int lx = ix + (iw - lw) / 2;
-            int ly = iy + (ih - fs) / 2;
-            ttf_draw_string(buf, (int)w, (int)h, lx, ly,
-                            letter, 0xD4AF37u, fs);
-        }
-    }
-}
-
-/* ===== APP WINDOW (standalone, terminal-independent) ===== */
-
-static uint8_t app_close_prev_lmb = 0;
-
-static void app_window_handle_drag(int32_t mx, int32_t my, uint8_t lmb,
-                                    uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    if (!app_window_open) return;
-    int click   = (lmb && !app_win_prev_lmb);
-    int release = (!lmb && app_win_prev_lmb);
-    app_win_prev_lmb = lmb;
-
-    /* Close button check */
-    int app_close_click = (lmb && !app_close_prev_lmb);
-    app_close_prev_lmb = lmb;
-    if (app_close_click && hit_close_button(mx, my, app_win_x, app_win_y, app_win_w)) {
-        app_window_open = 0;
-        app_canvas_active = 0;
-        app_win_dragging = 0;
-        app_win_x = -1;
-        return;
-    }
-
-    if (click && !app_win_dragging) {
-        if (mx >= app_win_x && mx < app_win_x + app_win_w &&
-            my >= app_win_y && my < app_win_y + TERM_TITLE_H + TERM_BORDER) {
-            app_win_dragging = 1;
-            app_win_drag_ox = mx - app_win_x;
-            app_win_drag_oy = my - app_win_y;
-        }
-    }
-    if (release) app_win_dragging = 0;
-
-    if (app_win_dragging) {
-        int32_t nx = mx - app_win_drag_ox;
-        int32_t ny = my - app_win_drag_oy;
-        if (nx < 0) nx = 0;
-        if (ny < MENUBAR_H) ny = MENUBAR_H;
-        if (nx + app_win_w > (int32_t)scr_w) nx = (int32_t)scr_w - app_win_w;
-        if (ny + app_win_h > DOCK_BAR_Y) ny = DOCK_BAR_Y - app_win_h;
-        app_win_x = nx;
-        app_win_y = ny;
-    }
-
-    int32_t tx = app_win_x << 8;
-    int32_t ty = app_win_y << 8;
-    app_win_disp_x_fp += (tx - app_win_disp_x_fp) * 3 / 4;
-    app_win_disp_y_fp += (ty - app_win_disp_y_fp) * 3 / 4;
-    int32_t ddx = tx - app_win_disp_x_fp; if (ddx < 0) ddx = -ddx;
-    int32_t ddy = ty - app_win_disp_y_fp; if (ddy < 0) ddy = -ddy;
-    if (ddx < 128 && ddy < 128) {
-        app_win_disp_x_fp = tx;
-        app_win_disp_y_fp = ty;
-    }
-}
-
-static void desktop_draw_app_window(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!app_window_open || !app_canvas_active) return;
-    if (spawn_anim.active) return;
-    if (app_win_x < 0) app_window_init_pos(w, h);
-
-    int32_t wx = app_win_disp_x_fp >> 8;
-    int32_t wy = app_win_disp_y_fp >> 8;
-    int32_t ww = app_win_w;
-    int32_t wh = app_win_h;
-
-    /* Gold border */
-    for (int32_t row = wy; row < wy + wh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx; col < wx + ww && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == wy || row == wy + wh - 1 ||
-                             col == wx || col == wx + ww - 1);
-            if (is_border)
-                buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title bar */
-    int32_t tb_y = wy + TERM_BORDER;
-    for (int32_t row = tb_y; row < tb_y + TERM_TITLE_H && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + TERM_BORDER; col < wx + ww - TERM_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title text */
-    {
-    int title_fs = 14;
-    int tlen2 = 0;
-    const char *tp2 = app_win_title;
-    while (*tp2++) tlen2++;
-    int title_tw = tlen2 * (title_fs * 6 / 10 + title_fs / 8);
-    int title_tx = wx + (ww - title_tw) / 2;
-    int title_ty = tb_y + (TERM_TITLE_H - title_fs) / 2;
-    ttf_draw_string(buf, (int)w, (int)h, title_tx, title_ty,
-                    app_win_title, 0x000000u, title_fs);
-    }
-
-    /* Close "X" button */
-    draw_close_button(buf, w, h, wx, wy, ww);
-
-    /* Black interior canvas */
-    int32_t ix = wx + TERM_BORDER;
-    int32_t iy = tb_y + TERM_TITLE_H;
-    int32_t iw = ww - 2 * TERM_BORDER;
-    int32_t ih = wh - TERM_BORDER - TERM_TITLE_H - TERM_BORDER;
-    for (int32_t row = iy; row < iy + ih && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = ix; col < ix + iw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0x000000u;
-        }
-    }
-
-    /* Composite app canvas pixels */
-    for (int32_t cy = 0; cy < APP_CANVAS_H && (iy + cy) < (int32_t)h; cy++) {
-        if (iy + cy < 0) continue;
-        for (int32_t cx = 0; cx < APP_CANVAS_W && (ix + cx) < (int32_t)w; cx++) {
-            if (ix + cx < 0) continue;
-            uint32_t pix = app_canvas[cy * APP_CANVAS_W + cx];
-            if (pix != 0x000000u)
-                buf[(uint32_t)(iy + cy) * w + (uint32_t)(ix + cx)] = pix;
-        }
-    }
-}
-
-/* ===== FILE EXPLORER APPLICATION ===== */
-
-#define EXPLORER_WIN_W  560
-#define EXPLORER_WIN_H  440
-#define EXPLORER_TITLE_H TERM_TITLE_H
-#define EXPLORER_PATH_H  22
-#define EXPLORER_BORDER   1
-
-#define EXPLORER_ICON_W   64
-#define EXPLORER_ICON_H   72
-#define EXPLORER_GRID_PAD 12
-#define EXPLORER_MAX_ENTRIES 64
-#define EXPLORER_PATH_MAX   256
+/* ===== 6. WINDOW MANAGER ===== */
 
 typedef struct {
-    char name[100];
-    uint64_t size;
-    int is_dir;
-} explorer_entry_t;
+    int     open;
+    int32_t x, y, w, h;
+} win_t;
 
-static int32_t  exp_win_x = -1;
-static int32_t  exp_win_y = -1;
-static int32_t  exp_win_w = EXPLORER_WIN_W;
-static int32_t  exp_win_h = EXPLORER_WIN_H;
-static int32_t  exp_win_disp_x_fp = -1;
-static int32_t  exp_win_disp_y_fp = -1;
-static int      exp_win_dragging = 0;
-static int32_t  exp_win_drag_ox = 0;
-static int32_t  exp_win_drag_oy = 0;
-static uint8_t  exp_win_prev_lmb = 0;
-static uint8_t  exp_close_prev_lmb = 0;
+static win_t wins[WK_COUNT];
+static int wm_stack[WK_COUNT];
+static int wm_stack_n = 0;
+static int wm_focus = -1;
+static int wm_drag = -1;
+static int32_t wm_drag_ox = 0, wm_drag_oy = 0;
 
-static char     exp_current_path[EXPLORER_PATH_MAX];
-static explorer_entry_t exp_entries[EXPLORER_MAX_ENTRIES];
-static int      exp_entry_count = 0;
-static int      exp_path_inited = 0;
+/* spawn animation (dock icon -> window) */
+static struct {
+    int active;
+    int tick;
+    int kind;
+    int32_t src_x, src_y;
+} spawn_anim = {0, 0, -1, 0, 0};
 
-static uint8_t  exp_dblclick_prev_lmb = 0;
-static uint32_t exp_last_click_tick = 0;
-static int32_t  exp_last_click_idx = -1;
-#define EXPLORER_DBLCLICK_TICKS 20
+#define SPAWN_ANIM_FRAMES 12
 
-static int str_len(const char *s) {
-    int n = 0;
-    while (s[n]) n++;
-    return n;
+static int wm_is_open(int kind) {
+    return wins[kind].open;
 }
 
-static void str_copy(char *dst, const char *src, int max) {
-    int i = 0;
-    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
+static void wm_stack_remove(int kind) {
+    int j = 0;
+    for (int i = 0; i < wm_stack_n; i++)
+        if (wm_stack[i] != kind)
+            wm_stack[j++] = wm_stack[i];
+    wm_stack_n = j;
 }
 
-static void str_append(char *dst, const char *src, int max) {
-    int len = str_len(dst);
-    int i = 0;
-    while (src[i] && len < max - 1) { dst[len++] = src[i++]; }
-    dst[len] = '\0';
+static void wm_raise(int kind) {
+    wm_stack_remove(kind);
+    wm_stack[wm_stack_n++] = kind;
+    wm_focus = kind;
 }
 
-static void explorer_scan_directory(void) {
-    exp_entry_count = 0;
-    if (!tarfs_base) return;
-
-    const char *dir = exp_current_path;
-    int dlen = str_len(dir);
-    int has_slash_prefix = (dlen > 0 && dir[0] == '/');
-    const char *dir_norm = has_slash_prefix ? dir + 1 : dir;
-    int dir_norm_len = str_len(dir_norm);
-    int is_root = (dir_norm_len == 0);
-
-    uint8_t *ptr = tarfs_base;
-    uint8_t *end = tarfs_base + tarfs_size;
-
-    char seen_dirs[EXPLORER_MAX_ENTRIES][100];
-    int seen_dir_count = 0;
-
-    while (ptr + TAR_BLOCK_SIZE <= end) {
-        tar_header_t *hdr = (tar_header_t *)ptr;
-        if (hdr->name[0] == '\0') break;
-        uint64_t file_size = octal_parse(hdr->size, 12);
-
-        const char *name = hdr->name;
-        if (name[0] == '.' && name[1] == '/') name += 2;
-
-        if (name[0] != '\0') {
-            const char *rel = name;
-            if (!is_root) {
-                int match = 1;
-                for (int i = 0; i < dir_norm_len; i++) {
-                    if (name[i] != dir_norm[i]) { match = 0; break; }
-                }
-                if (!match || name[dir_norm_len] != '/') goto next;
-                rel = name + dir_norm_len + 1;
-            }
-
-            if (rel[0] == '\0') goto next;
-
-            int slash_pos = -1;
-            for (int i = 0; rel[i]; i++) {
-                if (rel[i] == '/') { slash_pos = i; break; }
-            }
-
-            if (slash_pos >= 0) {
-                char dir_name[100];
-                for (int i = 0; i < slash_pos && i < 99; i++) dir_name[i] = rel[i];
-                dir_name[slash_pos < 99 ? slash_pos : 99] = '\0';
-
-                int already = 0;
-                for (int d = 0; d < seen_dir_count; d++) {
-                    if (str_eq(seen_dirs[d], dir_name)) { already = 1; break; }
-                }
-                if (!already && seen_dir_count < EXPLORER_MAX_ENTRIES &&
-                    exp_entry_count < EXPLORER_MAX_ENTRIES) {
-                    str_copy(seen_dirs[seen_dir_count], dir_name, 100);
-                    seen_dir_count++;
-                    explorer_entry_t *e = &exp_entries[exp_entry_count++];
-                    str_copy(e->name, dir_name, 100);
-                    e->size = 0;
-                    e->is_dir = 1;
-                }
-            } else {
-                int trailing_slash = 0;
-                int rlen = str_len(rel);
-                if (rlen > 0 && rel[rlen - 1] == '/') trailing_slash = 1;
-
-                if (!trailing_slash && exp_entry_count < EXPLORER_MAX_ENTRIES) {
-                    explorer_entry_t *e = &exp_entries[exp_entry_count++];
-                    str_copy(e->name, rel, 100);
-                    e->size = file_size;
-                    e->is_dir = (hdr->typeflag == '5');
-                }
-            }
-        }
-next:;
-        uint64_t blocks = (file_size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
-        ptr += TAR_BLOCK_SIZE + blocks * TAR_BLOCK_SIZE;
-    }
-}
-
-static void explorer_open_window(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    explorer_open = 1;
-    exp_win_w = EXPLORER_WIN_W;
-    exp_win_h = EXPLORER_WIN_H;
-    exp_win_x = ((int32_t)scr_w - exp_win_w) / 2 + 40;
-    exp_win_y = MENUBAR_H + 30;
-    if (exp_win_x < 0) exp_win_x = 0;
-    if (exp_win_y < MENUBAR_H) exp_win_y = MENUBAR_H;
-    exp_win_disp_x_fp = exp_win_x << 8;
-    exp_win_disp_y_fp = exp_win_y << 8;
-    exp_win_dragging = 0;
-
-    if (!exp_path_inited) {
-        str_copy(exp_current_path, "/", EXPLORER_PATH_MAX);
-        exp_path_inited = 1;
-    }
-    explorer_scan_directory();
-}
-
-static void explorer_navigate_up(void) {
-    int len = str_len(exp_current_path);
-    if (len <= 1) return;
-
-    if (exp_current_path[len - 1] == '/')
-        exp_current_path[--len] = '\0';
-
-    int last_slash = -1;
-    for (int i = 0; i < len; i++)
-        if (exp_current_path[i] == '/') last_slash = i;
-
-    if (last_slash == 0)
-        exp_current_path[1] = '\0';
-    else if (last_slash > 0)
-        exp_current_path[last_slash] = '\0';
-
-    explorer_scan_directory();
-}
-
-static void explorer_navigate_into(const char *dirname) {
-    int len = str_len(exp_current_path);
-    if (len > 1)
-        str_append(exp_current_path, "/", EXPLORER_PATH_MAX);
-    str_append(exp_current_path, dirname, EXPLORER_PATH_MAX);
-    explorer_scan_directory();
-}
-
-static void explorer_icon_rect(int idx, int32_t content_x, int32_t content_y,
-                                int32_t content_w,
-                                int32_t *ox, int32_t *oy) {
-    int cols = (content_w - EXPLORER_GRID_PAD) /
-               (EXPLORER_ICON_W + EXPLORER_GRID_PAD);
-    if (cols < 1) cols = 1;
-    int col = idx % cols;
-    int row = idx / cols;
-    *ox = content_x + EXPLORER_GRID_PAD + col * (EXPLORER_ICON_W + EXPLORER_GRID_PAD);
-    *oy = content_y + EXPLORER_GRID_PAD + row * (EXPLORER_ICON_H + EXPLORER_GRID_PAD);
-}
-
-static void draw_folder_icon(uint32_t *buf, uint32_t bw, uint32_t bh,
-                             int32_t cx, int32_t cy) {
-    uint32_t G = 0xD4AF37u;
-    /* Folder tab */
-    for (int32_t r = cy; r < cy + 4 && r < (int32_t)bh; r++) {
-        if (r < 0) continue;
-        for (int32_t c = cx; c < cx + 16 && c < (int32_t)bw; c++) {
-            if (c < 0) continue;
-            buf[(uint32_t)r * bw + (uint32_t)c] = G;
-        }
-    }
-    /* Folder body */
-    for (int32_t r = cy + 4; r < cy + 28 && r < (int32_t)bh; r++) {
-        if (r < 0) continue;
-        for (int32_t c = cx; c < cx + 36 && c < (int32_t)bw; c++) {
-            if (c < 0) continue;
-            int is_edge = (r == cy + 4 || r == cy + 27 ||
-                           c == cx || c == cx + 35);
-            buf[(uint32_t)r * bw + (uint32_t)c] = is_edge ? G : 0x3D2E00u;
-        }
-    }
-}
-
-static void draw_file_icon(uint32_t *buf, uint32_t bw, uint32_t bh,
-                           int32_t cx, int32_t cy) {
-    uint32_t W = 0xFFFFFFu;
-    uint32_t G = 0xD4AF37u;
-    for (int32_t r = cy; r < cy + 30 && r < (int32_t)bh; r++) {
-        if (r < 0) continue;
-        for (int32_t c = cx; c < cx + 24 && c < (int32_t)bw; c++) {
-            if (c < 0) continue;
-            int is_edge = (r == cy || r == cy + 29 ||
-                           c == cx || c == cx + 23);
-            buf[(uint32_t)r * bw + (uint32_t)c] = is_edge ? G : W;
-        }
-    }
-    /* Corner fold */
-    for (int32_t r = cy; r < cy + 6 && r < (int32_t)bh; r++) {
-        if (r < 0) continue;
-        int fold_end = cx + 24 - (r - cy);
-        for (int32_t c = fold_end; c < cx + 24 && c < (int32_t)bw; c++) {
-            if (c < 0) continue;
-            buf[(uint32_t)r * bw + (uint32_t)c] = G;
-        }
-    }
-    /* Text lines */
-    for (int line = 0; line < 3; line++) {
-        int32_t ly = cy + 10 + line * 5;
-        int32_t lw = 16 - line * 3;
-        for (int32_t c = cx + 4; c < cx + 4 + lw && c < (int32_t)bw; c++) {
-            if (c < 0 || ly < 0 || ly >= (int32_t)bh) continue;
-            buf[(uint32_t)ly * bw + (uint32_t)c] = 0xAAAAAA;
-        }
-    }
-}
-
-static void explorer_handle_drag(int32_t mx, int32_t my, uint8_t lmb,
-                                  uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    if (!explorer_open) return;
-
-    int click   = (lmb && !exp_win_prev_lmb);
-    int release = (!lmb && exp_win_prev_lmb);
-    exp_win_prev_lmb = lmb;
-
-    int close_click = (lmb && !exp_close_prev_lmb);
-    exp_close_prev_lmb = lmb;
-    if (close_click && hit_close_button(mx, my, exp_win_x, exp_win_y, exp_win_w)) {
-        explorer_open = 0;
-        exp_win_dragging = 0;
-        exp_win_x = -1;
+static void wm_open(int kind) {
+    if (kind < 0 || kind >= WK_COUNT) return;
+    if (wins[kind].open) {
+        wm_raise(kind);
         return;
     }
+    win_t *win = &wins[kind];
+    win->open = 1;
+    win->w = wk_meta[kind].w;
+    win->h = wk_meta[kind].h;
 
-    if (click && !exp_win_dragging) {
-        if (mx >= exp_win_x && mx < exp_win_x + exp_win_w &&
-            my >= exp_win_y && my < exp_win_y + EXPLORER_TITLE_H + EXPLORER_BORDER) {
-            exp_win_dragging = 1;
-            exp_win_drag_ox = mx - exp_win_x;
-            exp_win_drag_oy = my - exp_win_y;
+    /* cascade around the center, per-kind offset */
+    int32_t off = (kind % 3) * 28 - 28;
+    int32_t off2 = (kind % 4) * 22 - 33;
+    win->x = ((int32_t)scr_w_cache - win->w) / 2 + off;
+    win->y = MENUBAR_H +
+             ((int32_t)scr_h_cache - MENUBAR_H - dock_cfg.bar_h - win->h) / 2 +
+             off2;
+    if (win->x < 0) win->x = 0;
+    if (win->y < MENUBAR_H) win->y = MENUBAR_H;
+
+    /* first-open hooks */
+    if (kind == WK_BROWSER && brw_line_count == 0)
+        brw_navigate_no_hist("socrates://home");
+    if (kind == WK_FILES)
+        exp_scan();
+
+    wm_raise(kind);
+}
+
+static void wm_close(int kind) {
+    if (!wins[kind].open) return;
+    wins[kind].open = 0;
+    wm_stack_remove(kind);
+    if (wm_drag == kind) wm_drag = -1;
+    wm_focus = wm_stack_n > 0 ? wm_stack[wm_stack_n - 1] : -1;
+}
+
+static void wm_content_rect(int kind, int32_t *cx, int32_t *cy,
+                            int32_t *cw, int32_t *chh) {
+    win_t *win = &wins[kind];
+    *cx = win->x + WIN_BORDER;
+    *cy = win->y + WIN_BORDER + WIN_TITLE_H;
+    *cw = win->w - 2 * WIN_BORDER;
+    *chh = win->h - 2 * WIN_BORDER - WIN_TITLE_H;
+}
+
+static int wm_hit_close(int kind, int32_t mx, int32_t my) {
+    win_t *win = &wins[kind];
+    int32_t bx = win->x + win->w - 22;
+    int32_t by = win->y + WIN_TITLE_H / 2 + WIN_BORDER;
+    int32_t dx = mx - bx, dy = my - by;
+    return dx * dx + dy * dy <= 81;   /* r=9 hit circle */
+}
+
+static int wm_hit_window(int kind, int32_t mx, int32_t my) {
+    win_t *win = &wins[kind];
+    return mx >= win->x && mx < win->x + win->w &&
+           my >= win->y && my < win->y + win->h;
+}
+
+/* topmost open window containing the point, or -1 */
+static int wm_top_at(int32_t mx, int32_t my) {
+    for (int i = wm_stack_n - 1; i >= 0; i--)
+        if (wm_hit_window(wm_stack[i], mx, my))
+            return wm_stack[i];
+    return -1;
+}
+
+static const char *wm_title_for(int kind) {
+    if (kind == WK_BROWSER) return brw_title;
+    if (kind == WK_HELLO)   return app_win_title;
+    return wk_meta[kind].title;
+}
+
+static void wm_draw_frame(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
+    win_t *win = &wins[kind];
+    int focused = (wm_focus == kind);
+
+    /* soft shadow */
+    gfx_rect_blend(buf, w, h, win->x + 4, win->y + win->h, win->w, 4,
+                   0x000000u, 60);
+    gfx_rect_blend(buf, w, h, win->x + win->w, win->y + 4, 4, win->h,
+                   0x000000u, 60);
+
+    /* border */
+    gfx_rect_outline(buf, w, h, win->x, win->y, win->w, win->h,
+                     focused ? C_GOLD : C_BORDER_UNF);
+
+    /* titlebar */
+    gfx_rect(buf, w, h, win->x + 1, win->y + 1, win->w - 2, WIN_TITLE_H,
+             focused ? C_TITLE_FOC : C_TITLE_UNF);
+    gfx_rect(buf, w, h, win->x + 1, win->y + WIN_TITLE_H, win->w - 2, 1,
+             focused ? C_GOLD_DIM : 0x262B38u);
+
+    /* title text */
+    {
+        const char *title = wm_title_for(kind);
+        int tw = ttf_text_width(title, 13);
+        int tx = win->x + (win->w - tw) / 2;
+        if (tx < win->x + 30) tx = win->x + 30;
+        ttf_draw_string(buf, (int)w, (int)h, tx, win->y + 5, title,
+                        focused ? C_TEXT : C_TEXT_DIM, 13);
+    }
+
+    /* close button */
+    {
+        int32_t bx = win->x + win->w - 22;
+        int32_t by = win->y + WIN_TITLE_H / 2 + WIN_BORDER;
+        gfx_circle(buf, w, h, bx, by, 7, focused ? C_RED : 0x4A5060u);
+        if (focused) {
+            gfx_line(buf, w, h, bx - 3, by - 3, bx + 3, by + 3, 1, 0x5A1616u);
+            gfx_line(buf, w, h, bx - 3, by + 3, bx + 3, by - 3, 1, 0x5A1616u);
         }
     }
-    if (release) exp_win_dragging = 0;
+}
 
-    if (exp_win_dragging) {
-        int32_t nx = mx - exp_win_drag_ox;
-        int32_t ny = my - exp_win_drag_oy;
-        if (nx < 0) nx = 0;
+static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
+    int32_t cx, cy, cw, chh;
+    wm_content_rect(kind, &cx, &cy, &cw, &chh);
+    int focused = (wm_focus == kind);
+
+    switch (kind) {
+    case WK_TERM:
+        term_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_BROWSER:
+        brw_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_FILES:
+        exp_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_PAINT:
+        paint_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_SYSMON:
+        sysmon_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_MATRIX:
+        mtx_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_HELLO:
+        hello_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_SETTINGS:
+        settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_ABOUT:
+        about_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    default:
+        break;
+    }
+}
+
+static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
+                      int click_consumed) {
+    int click = (lmb && !prev_lmb) && !click_consumed;
+
+    if (!lmb)
+        wm_drag = -1;
+
+    if (click) {
+        int hit = wm_top_at(mx, my);
+        if (hit >= 0) {
+            wm_raise(hit);
+            if (wm_hit_close(hit, mx, my)) {
+                wm_close(hit);
+            } else if (my < wins[hit].y + WIN_TITLE_H + WIN_BORDER) {
+                wm_drag = hit;
+                wm_drag_ox = mx - wins[hit].x;
+                wm_drag_oy = my - wins[hit].y;
+            }
+        } else {
+            wm_focus = -1;
+        }
+    }
+
+    if (wm_drag >= 0 && lmb) {
+        win_t *win = &wins[wm_drag];
+        int32_t nx = mx - wm_drag_ox;
+        int32_t ny = my - wm_drag_oy;
+        /* keep a grabbable strip on screen */
+        if (nx < -win->w + 80) nx = -win->w + 80;
+        if (nx > (int32_t)scr_w_cache - 80) nx = (int32_t)scr_w_cache - 80;
         if (ny < MENUBAR_H) ny = MENUBAR_H;
-        if (nx + exp_win_w > (int32_t)scr_w) nx = (int32_t)scr_w - exp_win_w;
-        if (ny + exp_win_h > DOCK_BAR_Y) ny = DOCK_BAR_Y - exp_win_h;
-        exp_win_x = nx;
-        exp_win_y = ny;
+        if (ny > (int32_t)scr_h_cache - 60) ny = (int32_t)scr_h_cache - 60;
+        win->x = nx;
+        win->y = ny;
     }
 
-    int32_t tx = exp_win_x << 8;
-    int32_t ty = exp_win_y << 8;
-    exp_win_disp_x_fp += (tx - exp_win_disp_x_fp) * 3 / 4;
-    exp_win_disp_y_fp += (ty - exp_win_disp_y_fp) * 3 / 4;
-    int32_t ddx = tx - exp_win_disp_x_fp; if (ddx < 0) ddx = -ddx;
-    int32_t ddy = ty - exp_win_disp_y_fp; if (ddy < 0) ddy = -ddy;
-    if (ddx < 128 && ddy < 128) {
-        exp_win_disp_x_fp = tx;
-        exp_win_disp_y_fp = ty;
-    }
-}
-
-static void explorer_handle_click(int32_t mx, int32_t my, uint8_t lmb,
-                                   uint32_t tick) {
-    if (!explorer_open) return;
-
-    int click = (lmb && !exp_dblclick_prev_lmb);
-    exp_dblclick_prev_lmb = lmb;
-    if (!click) return;
-
-    int32_t wx = exp_win_disp_x_fp >> 8;
-    int32_t wy = exp_win_disp_y_fp >> 8;
-    int32_t content_x = wx + EXPLORER_BORDER;
-    int32_t content_y = wy + EXPLORER_BORDER + EXPLORER_TITLE_H + EXPLORER_PATH_H;
-    int32_t content_w = exp_win_w - 2 * EXPLORER_BORDER;
-
-    /* Check "Up" button in path bar */
-    int32_t up_x = wx + exp_win_w - EXPLORER_BORDER - 30;
-    int32_t up_y = wy + EXPLORER_BORDER + EXPLORER_TITLE_H + 2;
-    if (mx >= up_x && mx < up_x + 26 && my >= up_y && my < up_y + 18) {
-        explorer_navigate_up();
-        exp_last_click_idx = -1;
-        return;
-    }
-
-    int hit_idx = -1;
-    for (int i = 0; i < exp_entry_count; i++) {
-        int32_t ix, iy;
-        explorer_icon_rect(i, content_x, content_y, content_w, &ix, &iy);
-        if (mx >= ix && mx < ix + EXPLORER_ICON_W &&
-            my >= iy && my < iy + EXPLORER_ICON_H) {
-            hit_idx = i;
+    /* route mouse to the focused window's content handler */
+    if (wm_focus >= 0 && wins[wm_focus].open && wm_drag < 0) {
+        int32_t cx, cy, cw, chh;
+        wm_content_rect(wm_focus, &cx, &cy, &cw, &chh);
+        uint8_t eff_lmb = click_consumed ? 0 : lmb;
+        switch (wm_focus) {
+        case WK_BROWSER:
+            brw_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_FILES:
+            exp_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
+                      desktop_tick);
+            break;
+        case WK_SETTINGS:
+            settings_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_PAINT:
+            paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
+                        wm_top_at(mx, my) == WK_PAINT);
+            break;
+        default:
             break;
         }
     }
+}
 
-    if (hit_idx >= 0 && exp_entries[hit_idx].is_dir) {
-        if (hit_idx == exp_last_click_idx &&
-            (tick - exp_last_click_tick) < EXPLORER_DBLCLICK_TICKS) {
-            explorer_navigate_into(exp_entries[hit_idx].name);
-            exp_last_click_idx = -1;
+static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
+    for (int i = 0; i < wm_stack_n; i++) {
+        int kind = wm_stack[i];
+        if (spawn_anim.active && spawn_anim.kind == kind)
+            continue;   /* revealed when the animation lands */
+        wm_draw_frame(buf, w, h, kind);
+        wm_draw_content(buf, w, h, kind);
+    }
+}
+
+/* --- spawn animation --- */
+
+static void spawn_anim_start(int kind, int32_t icon_cx, int32_t icon_cy) {
+    spawn_anim.active = 1;
+    spawn_anim.tick = 0;
+    spawn_anim.kind = kind;
+    spawn_anim.src_x = icon_cx;
+    spawn_anim.src_y = icon_cy;
+}
+
+static void spawn_anim_draw(uint32_t *buf, uint32_t w, uint32_t h) {
+    if (!spawn_anim.active) return;
+    int kind = spawn_anim.kind;
+    if (kind < 0 || !wins[kind].open) {
+        spawn_anim.active = 0;
+        return;
+    }
+    spawn_anim.tick++;
+    int t = spawn_anim.tick;
+    if (t >= SPAWN_ANIM_FRAMES) {
+        spawn_anim.active = 0;
+        return;
+    }
+    win_t *win = &wins[kind];
+    int32_t cur_x = spawn_anim.src_x + (win->x - spawn_anim.src_x) * t / SPAWN_ANIM_FRAMES;
+    int32_t cur_y = spawn_anim.src_y + (win->y - spawn_anim.src_y) * t / SPAWN_ANIM_FRAMES;
+    int32_t cur_w = 6 + (win->w - 6) * t / SPAWN_ANIM_FRAMES;
+    int32_t cur_h = 6 + (win->h - 6) * t / SPAWN_ANIM_FRAMES;
+
+    uint32_t alpha = (uint32_t)t * 220u / SPAWN_ANIM_FRAMES;
+    gfx_rect_blend(buf, w, h, cur_x, cur_y, cur_w, 2, C_GOLD, alpha);
+    gfx_rect_blend(buf, w, h, cur_x, cur_y + cur_h - 2, cur_w, 2, C_GOLD, alpha);
+    gfx_rect_blend(buf, w, h, cur_x, cur_y, 2, cur_h, C_GOLD, alpha);
+    gfx_rect_blend(buf, w, h, cur_x + cur_w - 2, cur_y, 2, cur_h, C_GOLD, alpha);
+    gfx_rect_blend(buf, w, h, cur_x, cur_y, cur_w, WIN_TITLE_H * t / SPAWN_ANIM_FRAMES,
+                   C_TITLE_FOC, alpha);
+}
+
+/* ===== 7. WALLPAPER (cached, regenerated on theme/size change) ===== */
+
+#define WALL_MAX_W 1920
+#define WALL_MAX_H 1080
+
+static uint32_t wallpaper[WALL_MAX_W * WALL_MAX_H];
+static int      wall_cur_theme = 0;
+static uint32_t wall_gen_w = 0;
+static uint32_t wall_gen_h = 0;
+
+static void wall_dragon(uint32_t *buf, uint32_t w, uint32_t h,
+                        uint32_t body, uint32_t accent, uint32_t bright) {
+    int cx = (int)w / 2;
+    int cy = ((int)h + MENUBAR_H) / 2;
+
+    /* wing */
+    gfx_tri(buf, w, h, cx+80,cy-50,  cx-300,cy-350, cx-20,cy-35,   body);
+    gfx_tri(buf, w, h, cx-20,cy-35,  cx-300,cy-350, cx-360,cy-15,  body);
+    gfx_tri(buf, w, h, cx-300,cy-350, cx-360,cy-15, cx-400,cy-120, body);
+    gfx_line(buf, w, h, cx+60,cy-45,  cx-280,cy-330, 2, accent);
+    gfx_line(buf, w, h, cx+60,cy-45,  cx-380,cy-100, 2, accent);
+    gfx_line(buf, w, h, cx-340,cy-10, cx-380,cy-100, 2, accent);
+
+    /* tail */
+    gfx_tri(buf, w, h, cx-180,cy+20,  cx-160,cy+120, cx-290,cy+80,  body);
+    gfx_tri(buf, w, h, cx-180,cy+20,  cx-290,cy+80,  cx-420,cy+50,  body);
+    gfx_tri(buf, w, h, cx-290,cy+80,  cx-420,cy+50,  cx-480,cy-50,  body);
+    gfx_tri(buf, w, h, cx-460,cy-40,  cx-485,cy-25,  cx-465,cy+5,   accent);
+
+    /* body */
+    gfx_tri(buf, w, h, cx+80,cy-50,   cx+130,cy+80,  cx-20,cy-35,   body);
+    gfx_tri(buf, w, h, cx+130,cy+80,  cx-20,cy-35,   cx+80,cy+100,  body);
+    gfx_tri(buf, w, h, cx-20,cy-35,   cx+80,cy+100,  cx-180,cy+20,  body);
+    gfx_tri(buf, w, h, cx+80,cy+100,  cx-180,cy+20,  cx-120,cy+140, body);
+    gfx_tri(buf, w, h, cx-180,cy+20,  cx-120,cy+140, cx-160,cy+120, body);
+
+    /* neck + head */
+    gfx_tri(buf, w, h, cx+190,cy-95,  cx+340,cy+25,  cx+80,cy-50,   body);
+    gfx_tri(buf, w, h, cx+340,cy+25,  cx+80,cy-50,   cx+130,cy+80,  body);
+    gfx_tri(buf, w, h, cx+260,cy-210, cx+400,cy-30,  cx+190,cy-95,  body);
+    gfx_tri(buf, w, h, cx+400,cy-30,  cx+190,cy-95,  cx+340,cy+25,  body);
+    gfx_tri(buf, w, h, cx+400,cy-30,  cx+340,cy+25,  cx+390,cy+60,  body);
+
+    /* horns */
+    gfx_tri(buf, w, h, cx+255,cy-205, cx+225,cy-320, cx+200,cy-180, body);
+    gfx_tri(buf, w, h, cx+185,cy-175, cx+150,cy-290, cx+150,cy-150, body);
+    gfx_tri(buf, w, h, cx+225,cy-320, cx+240,cy-270, cx+210,cy-265, accent);
+    gfx_tri(buf, w, h, cx+150,cy-290, cx+165,cy-245, cx+135,cy-240, accent);
+
+    /* eye */
+    gfx_tri(buf, w, h, cx+340,cy-80,  cx+352,cy-60,  cx+340,cy-40,  bright);
+    gfx_tri(buf, w, h, cx+340,cy-80,  cx+328,cy-60,  cx+340,cy-40,  bright);
+
+    /* spine ridges */
+    gfx_tri(buf, w, h, cx+55,cy-53,   cx+40,cy-78,   cx+25,cy-53,   accent);
+    gfx_tri(buf, w, h, cx+15,cy-42,   cx+0,cy-65,    cx-15,cy-42,   accent);
+    gfx_tri(buf, w, h, cx-25,cy-38,   cx-40,cy-58,   cx-55,cy-38,   accent);
+    gfx_tri(buf, w, h, cx-70,cy-25,   cx-85,cy-45,   cx-100,cy-25,  accent);
+    gfx_tri(buf, w, h, cx-115,cy-12,  cx-130,cy-32,  cx-145,cy-12,  accent);
+
+    /* belly scales */
+    gfx_tri(buf, w, h, cx+100,cy+95,  cx+80,cy+112,  cx+100,cy+112, accent);
+    gfx_tri(buf, w, h, cx+65,cy+110,  cx+45,cy+125,  cx+65,cy+125,  accent);
+    gfx_tri(buf, w, h, cx+30,cy+122,  cx+10,cy+136,  cx+30,cy+136,  accent);
+    gfx_tri(buf, w, h, cx-5,cy+132,   cx-25,cy+145,  cx-5,cy+145,   accent);
+
+    /* legs + claws */
+    gfx_line(buf, w, h, cx+90,cy+95,   cx+140,cy+220, 5, body);
+    gfx_line(buf, w, h, cx+140,cy+220, cx+110,cy+300, 4, body);
+    gfx_line(buf, w, h, cx-100,cy+130, cx-80,cy+230,  5, body);
+    gfx_line(buf, w, h, cx-80,cy+230,  cx-120,cy+300, 4, body);
+    gfx_tri(buf, w, h, cx+110,cy+298, cx+95,cy+318,  cx+108,cy+318, accent);
+    gfx_tri(buf, w, h, cx+110,cy+298, cx+112,cy+320, cx+122,cy+315, accent);
+    gfx_tri(buf, w, h, cx+110,cy+298, cx+128,cy+312, cx+132,cy+302, accent);
+    gfx_tri(buf, w, h, cx-120,cy+298, cx-135,cy+318, cx-122,cy+318, accent);
+    gfx_tri(buf, w, h, cx-120,cy+298, cx-118,cy+320, cx-108,cy+315, accent);
+    gfx_tri(buf, w, h, cx-120,cy+298, cx-102,cy+312, cx-98,cy+302,  accent);
+}
+
+static void wallpaper_regen(uint32_t w, uint32_t h) {
+    if (w > WALL_MAX_W) w = WALL_MAX_W;
+    if (h > WALL_MAX_H) h = WALL_MAX_H;
+
+    uint32_t top = wall_theme_top[wall_cur_theme];
+    uint32_t bot = wall_theme_bot[wall_cur_theme];
+    gfx_vgrad(wallpaper, w, h, 0, 0, (int32_t)w, (int32_t)h, top, bot);
+
+    /* faint horizon glow band */
+    for (int32_t y = (int32_t)h * 2 / 5; y < (int32_t)h * 3 / 5; y++) {
+        int32_t band = (int32_t)h / 5;
+        int32_t d = y - (int32_t)h / 2;
+        if (d < 0) d = -d;
+        uint32_t a = (uint32_t)(18 - 18 * d * 2 / band);
+        if (a > 0)
+            gfx_rect_blend(wallpaper, w, h, 0, y, (int32_t)w, 1, C_GOLD, a);
+    }
+
+    uint32_t body   = gfx_mix(0x000000u, bot, 150);
+    uint32_t accent = C_GOLD_DIM;
+    wall_dragon(wallpaper, w, h, body, accent, C_GOLD);
+
+    /* signature bottom-left */
+    ttf_draw_string(wallpaper, (int)w, (int)h, 24, (int)h - 46,
+                    "SOCRATES BSD 9", gfx_mix(C_GOLD, bot, 140), 15);
+    gfx_rect(wallpaper, w, h, 24, (int32_t)h - 24, 120, 1,
+             gfx_mix(C_GOLD, bot, 90));
+
+    wall_gen_w = w;
+    wall_gen_h = h;
+}
+
+static void wallpaper_set_theme(int idx) {
+    if (idx < 0 || idx >= WALL_THEME_COUNT) return;
+    wall_cur_theme = idx;
+    wallpaper_regen(scr_w_cache, scr_h_cache);
+}
+
+/* ===== 8. MENUBAR ===== */
+
+typedef struct {
+    const char *label;
+    int action;      /* >=0: open window kind; 100 reboot; 101 shutdown; -1 sep */
+} menu_item_t;
+
+static const menu_item_t menu_system[] = {
+    { "About Socrates", WK_ABOUT },
+    { "Settings",       WK_SETTINGS },
+    { "-",              -1 },
+    { "Restart",        100 },
+    { "Shut Down",      101 },
+};
+
+static const menu_item_t menu_apps[] = {
+    { "Terminal",  WK_TERM },
+    { "Browser",   WK_BROWSER },
+    { "Files",     WK_FILES },
+    { "-",         -1 },
+    { "Goldsmith", WK_PAINT },
+    { "Monolith",  WK_SYSMON },
+    { "Matrix",    WK_MATRIX },
+    { "hello.elf", WK_HELLO },
+};
+
+#define MENU_COUNT 2
+static const char *menu_labels[MENU_COUNT] = { "Socrates", "Apps" };
+static const menu_item_t *menu_items[MENU_COUNT] = { menu_system, menu_apps };
+static const int menu_item_count[MENU_COUNT] = { 5, 8 };
+
+static int menu_open_idx = -1;
+
+#define MENU_ITEM_H 26
+#define MENU_DD_W   170
+
+/* label x range in the bar */
+static void menu_label_rect(int idx, int32_t *x0, int32_t *x1) {
+    int32_t x = 40;   /* after the logo mark */
+    for (int i = 0; i < MENU_COUNT; i++) {
+        int lw = ttf_text_width(menu_labels[i], 14) + 24;
+        if (i == idx) {
+            *x0 = x;
+            *x1 = x + lw;
             return;
         }
-        exp_last_click_idx = hit_idx;
-        exp_last_click_tick = tick;
+        x += lw;
+    }
+    *x0 = 0; *x1 = 0;
+}
+
+static void menu_action(int action) {
+    if (action >= 0 && action < WK_COUNT) {
+        if (action == WK_HELLO) {
+            silent_launch = 1;
+            execute_bin_internal("hello", 0);
+            silent_launch = 0;
+        }
+        wm_open(action);
+    } else if (action == 100) {
+        outb(0x64, 0xFE);
+    } else if (action == 101) {
+        __asm__ volatile("outw %0, %1" :: "a"((uint16_t)0x2000),
+                         "Nd"((uint16_t)0x604) : "memory");
+        __asm__ volatile("outw %0, %1" :: "a"((uint16_t)0x2000),
+                         "Nd"((uint16_t)0xB004) : "memory");
+    }
+}
+
+/* returns 1 if the click was consumed by the menubar/menus */
+static int menu_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
+    int click = (lmb && !prev_lmb);
+    if (!click) return 0;
+
+    /* click on a bar label */
+    if (my >= 0 && my < MENUBAR_H) {
+        for (int i = 0; i < MENU_COUNT; i++) {
+            int32_t x0, x1;
+            menu_label_rect(i, &x0, &x1);
+            if (mx >= x0 && mx < x1) {
+                menu_open_idx = (menu_open_idx == i) ? -1 : i;
+                return 1;
+            }
+        }
+        menu_open_idx = -1;
+        return 1;    /* clicks on the bar never fall through */
+    }
+
+    /* click inside an open dropdown */
+    if (menu_open_idx >= 0) {
+        int32_t x0, x1;
+        menu_label_rect(menu_open_idx, &x0, &x1);
+        int n = menu_item_count[menu_open_idx];
+        int32_t dy = MENUBAR_H;
+        if (mx >= x0 && mx < x0 + MENU_DD_W &&
+            my >= dy && my < dy + n * MENU_ITEM_H) {
+            int idx = (my - dy) / MENU_ITEM_H;
+            if (idx >= 0 && idx < n && menu_items[menu_open_idx][idx].action >= 0) {
+                menu_action(menu_items[menu_open_idx][idx].action);
+            }
+            menu_open_idx = -1;
+            return 1;
+        }
+        menu_open_idx = -1;
+        /* fall through: the click still hits whatever was underneath? no —
+         * closing a menu consumes the click, like every other desktop */
+        return 1;
+    }
+    return 0;
+}
+
+static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                         int32_t mx, int32_t my) {
+    gfx_rect(buf, w, h, 0, 0, (int32_t)w, MENUBAR_H, C_BG_PANEL);
+    gfx_rect(buf, w, h, 0, MENUBAR_H - 1, (int32_t)w, 1, 0x2A3040u);
+
+    /* logo mark: gold diamond */
+    {
+        int32_t lx = 20, ly = MENUBAR_H / 2;
+        gfx_tri(buf, w, h, lx, ly - 7, lx - 6, ly, lx, ly + 7, C_GOLD);
+        gfx_tri(buf, w, h, lx, ly - 7, lx + 6, ly, lx, ly + 7, C_GOLD);
+    }
+
+    /* menu labels */
+    for (int i = 0; i < MENU_COUNT; i++) {
+        int32_t x0, x1;
+        menu_label_rect(i, &x0, &x1);
+        int hot = (menu_open_idx == i) ||
+                  (my >= 0 && my < MENUBAR_H && mx >= x0 && mx < x1);
+        if (hot)
+            gfx_rect(buf, w, h, x0, 2, x1 - x0, MENUBAR_H - 5, 0x252B3Cu);
+        ttf_draw_string(buf, (int)w, (int)h, x0 + 12, 6, menu_labels[i],
+                        i == 0 ? C_GOLD : C_TEXT, 14);
+    }
+
+    /* right side: net indicator + date + clock */
+    {
+        char clk[10];
+        clock_string(clk);
+        int cw2 = ttf_text_width(clk, 14);
+        int32_t x = (int32_t)w - cw2 - 16;
+        ttf_draw_string(buf, (int)w, (int)h, x, 6, clk, C_TEXT, 14);
+
+        char dt[16];
+        date_string(dt);
+        int dw = ttf_text_width(dt, 13);
+        x -= dw + 18;
+        ttf_draw_string(buf, (int)w, (int)h, x, 7, dt, C_TEXT_DIM, 13);
+
+        /* net dot */
+        x -= 22;
+        int up = 0;
+        if (e1000_found) {
+            uint32_t status = e1000_read(E1000_STATUS);
+            up = (status & E1000_STATUS_LU) ? 1 : 0;
+        }
+        gfx_circle(buf, w, h, x, MENUBAR_H / 2, 4, up ? C_GREEN : 0x555C6Eu);
+    }
+}
+
+static void menu_dropdown_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                               int32_t mx, int32_t my) {
+    if (menu_open_idx < 0) return;
+
+    int32_t x0, x1;
+    menu_label_rect(menu_open_idx, &x0, &x1);
+    int n = menu_item_count[menu_open_idx];
+    int32_t dy = MENUBAR_H;
+    int32_t dh = n * MENU_ITEM_H;
+
+    gfx_rect_blend(buf, w, h, x0 + 3, dy + 3, MENU_DD_W, dh, 0x000000u, 70);
+    gfx_rect(buf, w, h, x0, dy, MENU_DD_W, dh, 0x1A1E2Au);
+    gfx_rect_outline(buf, w, h, x0, dy, MENU_DD_W, dh, C_GOLD_DIM);
+
+    for (int i = 0; i < n; i++) {
+        const menu_item_t *it = &menu_items[menu_open_idx][i];
+        int32_t iy = dy + i * MENU_ITEM_H;
+        if (it->action < 0) {
+            gfx_rect(buf, w, h, x0 + 10, iy + MENU_ITEM_H / 2, MENU_DD_W - 20,
+                     1, 0x2E3444u);
+            continue;
+        }
+        int hot = (mx >= x0 && mx < x0 + MENU_DD_W &&
+                   my >= iy && my < iy + MENU_ITEM_H);
+        if (hot)
+            gfx_rect(buf, w, h, x0 + 1, iy, MENU_DD_W - 2, MENU_ITEM_H,
+                     0x2A2410u);
+        ttf_draw_string(buf, (int)w, (int)h, x0 + 14, iy + 5, it->label,
+                        hot ? C_GOLD : C_TEXT, 13);
+        /* open-window marker */
+        if (it->action < WK_COUNT && wm_is_open(it->action))
+            gfx_circle(buf, w, h, x0 + MENU_DD_W - 12, iy + MENU_ITEM_H / 2,
+                       2, C_GOLD);
+    }
+}
+
+/* ===== 9. DOCK ===== */
+
+static const int dock_kinds[DOCK_APP_COUNT] = {
+    WK_TERM, WK_BROWSER, WK_FILES, WK_PAINT,
+    WK_SYSMON, WK_MATRIX, WK_HELLO, WK_SETTINGS,
+};
+
+static void dock_bar_rect(uint32_t scr_w, int32_t *rx, int32_t *ry,
+                          int32_t *rw, int32_t *rh) {
+    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
+        *rx = ((int32_t)scr_w - dock_cfg.bar_w) / 2;
+        *ry = dock_cfg.bar_y;
+        *rw = dock_cfg.bar_w;
+        *rh = dock_cfg.bar_h;
+    } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
+        *rx = 4;
+        *ry = dock_cfg.bar_y;
+        *rw = dock_cfg.bar_h;
+        *rh = dock_cfg.bar_w;
     } else {
-        exp_last_click_idx = -1;
+        *rx = (int32_t)scr_w - dock_cfg.bar_h - 4;
+        *ry = dock_cfg.bar_y;
+        *rw = dock_cfg.bar_h;
+        *rh = dock_cfg.bar_w;
     }
 }
 
-static void desktop_draw_explorer(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!explorer_open) return;
-    if (spawn_anim.active) return;
-    if (exp_win_x < 0) return;
-
-    int32_t wx = exp_win_disp_x_fp >> 8;
-    int32_t wy = exp_win_disp_y_fp >> 8;
-    int32_t ww = exp_win_w;
-    int32_t wh = exp_win_h;
-
-    /* Gold border */
-    for (int32_t row = wy; row < wy + wh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx; col < wx + ww && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == wy || row == wy + wh - 1 ||
-                             col == wx || col == wx + ww - 1);
-            if (is_border)
-                buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title bar */
-    int32_t tb_y = wy + EXPLORER_BORDER;
-    for (int32_t row = tb_y; row < tb_y + EXPLORER_TITLE_H && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + EXPLORER_BORDER;
-             col < wx + ww - EXPLORER_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title text */
-    {
-        int title_fs = 14;
-        const char *title = "File Explorer";
-        int tlen = 13;
-        int title_tw = tlen * (title_fs * 6 / 10 + title_fs / 8);
-        int title_tx = wx + (ww - title_tw) / 2;
-        int title_ty = tb_y + (EXPLORER_TITLE_H - title_fs) / 2;
-        ttf_draw_string(buf, (int)w, (int)h, title_tx, title_ty,
-                        title, 0x000000u, title_fs);
-    }
-
-    draw_close_button(buf, w, h, wx, wy, ww);
-
-    /* Path bar */
-    int32_t pb_y = tb_y + EXPLORER_TITLE_H;
-    for (int32_t row = pb_y; row < pb_y + EXPLORER_PATH_H && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + EXPLORER_BORDER;
-             col < wx + ww - EXPLORER_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0x1A1508u;
-        }
-    }
-
-    /* Path text */
-    {
-        int pfs = 13;
-        int px = wx + EXPLORER_BORDER + 6;
-        int py = pb_y + (EXPLORER_PATH_H - pfs) / 2;
-        ttf_draw_string(buf, (int)w, (int)h, px, py,
-                        exp_current_path, 0xD4AF37u, pfs);
-    }
-
-    /* Up button */
-    {
-        int32_t up_x = wx + ww - EXPLORER_BORDER - 30;
-        int32_t up_y = pb_y + 2;
-        for (int32_t r = up_y; r < up_y + 18 && r < (int32_t)h; r++) {
-            if (r < 0) continue;
-            for (int32_t c = up_x; c < up_x + 26 && c < (int32_t)w; c++) {
-                if (c < 0) continue;
-                int is_edge = (r == up_y || r == up_y + 17 ||
-                               c == up_x || c == up_x + 25);
-                buf[(uint32_t)r * w + (uint32_t)c] = is_edge ? 0xD4AF37u : 0x1A1508u;
-            }
-        }
-        int ufs = 12;
-        int ux = up_x + 4;
-        int uy = up_y + 3;
-        ttf_draw_string(buf, (int)w, (int)h, ux, uy, "Up", 0xD4AF37u, ufs);
-    }
-
-    /* Content area: black background */
-    int32_t cx = wx + EXPLORER_BORDER;
-    int32_t cy = pb_y + EXPLORER_PATH_H;
-    int32_t cw = ww - 2 * EXPLORER_BORDER;
-    int32_t ch = wh - EXPLORER_BORDER - EXPLORER_TITLE_H -
-                 EXPLORER_PATH_H - EXPLORER_BORDER;
-    for (int32_t row = cy; row < cy + ch && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = cx; col < cx + cw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0x000000u;
-        }
-    }
-
-    /* Draw file/folder icons in grid */
-    for (int i = 0; i < exp_entry_count; i++) {
-        int32_t ix, iy;
-        explorer_icon_rect(i, cx, cy, cw, &ix, &iy);
-
-        if (iy + EXPLORER_ICON_H < cy || iy > cy + ch) continue;
-
-        int32_t icon_cx = ix + (EXPLORER_ICON_W - 36) / 2;
-        int32_t icon_cy = iy + 4;
-
-        if (exp_entries[i].is_dir)
-            draw_folder_icon(buf, w, h, icon_cx, icon_cy);
-        else
-            draw_file_icon(buf, w, h, icon_cx + 6, icon_cy);
-
-        /* Filename label beneath icon */
-        int nfs = 12;
-        int nlen = str_len(exp_entries[i].name);
-        int max_chars = EXPLORER_ICON_W / (nfs * 6 / 10 + nfs / 8);
-        if (nlen > max_chars) nlen = max_chars;
-        char label[32];
-        for (int c = 0; c < nlen && c < 31; c++) label[c] = exp_entries[i].name[c];
-        label[nlen < 31 ? nlen : 31] = '\0';
-        int lw = nlen * (nfs * 6 / 10 + nfs / 8);
-        int lx = ix + (EXPLORER_ICON_W - lw) / 2;
-        int ly = iy + EXPLORER_ICON_H - 16;
-        ttf_draw_string(buf, (int)w, (int)h, lx, ly,
-                        label, 0xFFFFFFu, nfs);
-    }
-
-    /* Empty directory message */
-    if (exp_entry_count == 0) {
-        int efs = 12;
-        const char *empty = "(empty)";
-        int elen = 7;
-        int etw = elen * (efs * 6 / 10);
-        int ex = cx + (cw - etw) / 2;
-        int ey = cy + ch / 2 - efs / 2;
-        ttf_draw_string(buf, (int)w, (int)h, ex, ey,
-                        empty, 0x666666u, efs);
-    }
-}
-
-/* ===== SETTINGS APPLICATION ===== */
-
-static void settings_open_window(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    settings_open = 1;
-    set_win_w = SETTINGS_WIN_W;
-    set_win_h = SETTINGS_WIN_H;
-    set_win_x = ((int32_t)scr_w - set_win_w) / 2 - 60;
-    set_win_y = MENUBAR_H + 50;
-    if (set_win_x < 0) set_win_x = 0;
-    if (set_win_y < MENUBAR_H) set_win_y = MENUBAR_H;
-    set_win_disp_x_fp = set_win_x << 8;
-    set_win_disp_y_fp = set_win_y << 8;
-    set_win_dragging = 0;
-}
-
-static void settings_handle_drag(int32_t mx, int32_t my, uint8_t lmb,
-                                  uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    if (!settings_open) return;
-
-    int click   = (lmb && !set_win_prev_lmb);
-    int release = (!lmb && set_win_prev_lmb);
-    set_win_prev_lmb = lmb;
-
-    int close_click = (lmb && !set_close_prev_lmb);
-    set_close_prev_lmb = lmb;
-    if (close_click &&
-        hit_close_button(mx, my, set_win_x, set_win_y, set_win_w)) {
-        settings_open = 0;
-        set_win_dragging = 0;
-        set_win_x = -1;
-        return;
-    }
-
-    if (click && !set_win_dragging) {
-        if (mx >= set_win_x && mx < set_win_x + set_win_w &&
-            my >= set_win_y && my < set_win_y + SETTINGS_TITLE_H +
-            SETTINGS_BORDER) {
-            set_win_dragging = 1;
-            set_win_drag_ox = mx - set_win_x;
-            set_win_drag_oy = my - set_win_y;
-        }
-    }
-    if (release) set_win_dragging = 0;
-
-    if (set_win_dragging) {
-        int32_t nx = mx - set_win_drag_ox;
-        int32_t ny = my - set_win_drag_oy;
-        if (nx < 0) nx = 0;
-        if (ny < MENUBAR_H) ny = MENUBAR_H;
-        if (nx + set_win_w > (int32_t)scr_w)
-            nx = (int32_t)scr_w - set_win_w;
-        if (ny + set_win_h > DOCK_BAR_Y)
-            ny = DOCK_BAR_Y - set_win_h;
-        set_win_x = nx;
-        set_win_y = ny;
-    }
-
-    int32_t tx = set_win_x << 8;
-    int32_t ty = set_win_y << 8;
-    set_win_disp_x_fp += (tx - set_win_disp_x_fp) * 3 / 4;
-    set_win_disp_y_fp += (ty - set_win_disp_y_fp) * 3 / 4;
-    int32_t ddx = tx - set_win_disp_x_fp;
-    if (ddx < 0) ddx = -ddx;
-    int32_t ddy = ty - set_win_disp_y_fp;
-    if (ddy < 0) ddy = -ddy;
-    if (ddx < 128 && ddy < 128) {
-        set_win_disp_x_fp = tx;
-        set_win_disp_y_fp = ty;
-    }
-}
-
-static const char *dock_edge_names[] = { "Bottom", "Left", "Right" };
-
-static void settings_handle_click(int32_t mx, int32_t my, uint8_t lmb) {
-    if (!settings_open) return;
-
-    int click = (lmb && !set_btn_prev_lmb);
-    set_btn_prev_lmb = lmb;
-    if (!click) return;
-
-    int32_t wx = set_win_disp_x_fp >> 8;
-    int32_t wy = set_win_disp_y_fp >> 8;
-    int32_t btn_x = wx + SETTINGS_BORDER + 20;
-    int32_t btn_y = wy + SETTINGS_BORDER + SETTINGS_TITLE_H + 140;
-
-    if (mx >= btn_x && mx < btn_x + 200 &&
-        my >= btn_y && my < btn_y + 30) {
-        settings_bg_index = (settings_bg_index + 1) % SETTINGS_BG_COUNT;
-        desktop_bg_color = settings_bg_colors[settings_bg_index];
-    }
-
-    /* Dock position button */
-    int32_t dock_btn_y = wy + SETTINGS_BORDER + SETTINGS_TITLE_H + 220;
-    if (mx >= btn_x && mx < btn_x + 200 &&
-        my >= dock_btn_y && my < dock_btn_y + 30) {
-        dock_cfg.edge = (dock_cfg.edge + 1) % 3;
-    }
-
-    /* Dock scale buttons: [-] and [+] for icon size */
-    int32_t scale_y = wy + SETTINGS_BORDER + SETTINGS_TITLE_H + 260;
-    if (mx >= btn_x && mx < btn_x + 40 &&
-        my >= scale_y && my < scale_y + 28) {
-        if (dock_cfg.icon_sz > 20) {
-            dock_cfg.icon_sz -= 4;
-            dock_cfg.bar_h -= 4;
-            dock_cfg.bar_w -= 28;
-        }
-    }
-    if (mx >= btn_x + 50 && mx < btn_x + 90 &&
-        my >= scale_y && my < scale_y + 28) {
-        if (dock_cfg.icon_sz < 48) {
-            dock_cfg.icon_sz += 4;
-            dock_cfg.bar_h += 4;
-            dock_cfg.bar_w += 28;
-        }
-    }
-}
-
-static void desktop_draw_settings(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!settings_open) return;
-    if (spawn_anim.active) return;
-    if (set_win_x < 0) return;
-
-    int32_t wx = set_win_disp_x_fp >> 8;
-    int32_t wy = set_win_disp_y_fp >> 8;
-    int32_t ww = set_win_w;
-    int32_t wh = set_win_h;
-
-    /* Gold border */
-    for (int32_t row = wy; row < wy + wh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx; col < wx + ww && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == wy || row == wy + wh - 1 ||
-                             col == wx || col == wx + ww - 1);
-            if (is_border)
-                buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title bar */
-    int32_t tb_y = wy + SETTINGS_BORDER;
-    for (int32_t row = tb_y; row < tb_y + SETTINGS_TITLE_H &&
-         row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + SETTINGS_BORDER;
-             col < wx + ww - SETTINGS_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    {
-        int title_fs = 14;
-        const char *title = "Settings";
-        int tlen = 8;
-        int title_tw = tlen * (title_fs * 6 / 10 + title_fs / 8);
-        int title_tx = wx + (ww - title_tw) / 2;
-        int title_ty = tb_y + (SETTINGS_TITLE_H - title_fs) / 2;
-        ttf_draw_string(buf, (int)w, (int)h, title_tx, title_ty,
-                        title, 0x000000u, title_fs);
-    }
-
-    draw_close_button(buf, w, h, wx, wy, ww);
-
-    /* Interior: True White canvas */
-    int32_t ix = wx + SETTINGS_BORDER;
-    int32_t iy = tb_y + SETTINGS_TITLE_H;
-    int32_t iw = ww - 2 * SETTINGS_BORDER;
-    int32_t ih = wh - 2 * SETTINGS_BORDER - SETTINGS_TITLE_H;
-    for (int32_t row = iy; row < iy + ih && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = ix; col < ix + iw && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xFFFFFFu;
-        }
-    }
-
-    /* "System Information" header */
-    ttf_draw_string(buf, (int)w, (int)h, ix + 20, iy + 15,
-                    "System Information", 0xD4AF37u, 16);
-
-    /* Gold separator line */
-    {
-        int32_t sep_y = iy + 35;
-        if (sep_y >= 0 && sep_y < (int32_t)h) {
-            for (int32_t c = ix + 20; c < ix + iw - 20 &&
-                 c < (int32_t)w; c++) {
-                if (c < 0) continue;
-                buf[(uint32_t)sep_y * w + (uint32_t)c] = 0xD4AF37u;
-            }
-        }
-    }
-
-    /* Resolution display */
-    {
-        char res_str[64];
-        char num[12];
-        str_copy(res_str, "Resolution: ", 64);
-        uint_to_str(w, num);
-        str_append(res_str, num, 64);
-        str_append(res_str, " x ", 64);
-        uint_to_str(h, num);
-        str_append(res_str, num, 64);
-        ttf_draw_string(buf, (int)w, (int)h, ix + 20, iy + 50,
-                        res_str, 0x000000u, 14);
-    }
-
-    /* Memory display */
-    {
-        char mem_str[64];
-        char num[12];
-        str_copy(mem_str, "System Memory: ", 64);
-        uint_to_str((uint32_t)system_total_memory_mb, num);
-        str_append(mem_str, num, 64);
-        str_append(mem_str, " MB", 64);
-        ttf_draw_string(buf, (int)w, (int)h, ix + 20, iy + 75,
-                        mem_str, 0x000000u, 14);
-    }
-
-    /* Background Color section header */
-    ttf_draw_string(buf, (int)w, (int)h, ix + 20, iy + 110,
-                    "Background Color", 0xD4AF37u, 14);
-
-    /* Toggle button */
-    {
-        int32_t btn_x = ix + 20;
-        int32_t btn_y = iy + 140;
-        int32_t btn_w = 200;
-        int32_t btn_h = 30;
-        for (int32_t row = btn_y; row < btn_y + btn_h &&
-             row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = btn_x; col < btn_x + btn_w &&
-                 col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == btn_y || row == btn_y + btn_h - 1 ||
-                               col == btn_x || col == btn_x + btn_w - 1);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : 0x1A1508u;
-            }
-        }
-        ttf_draw_string(buf, (int)w, (int)h, btn_x + 12, btn_y + 8,
-                        "Change Background", 0xD4AF37u, 13);
-    }
-
-    /* Color swatch showing current background */
-    {
-        int32_t sw_x = ix + 240;
-        int32_t sw_y = iy + 143;
-        int32_t sw_sz = 24;
-        for (int32_t row = sw_y; row < sw_y + sw_sz &&
-             row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = sw_x; col < sw_x + sw_sz &&
-                 col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == sw_y || row == sw_y + sw_sz - 1 ||
-                               col == sw_x || col == sw_x + sw_sz - 1);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : desktop_bg_color;
-            }
-        }
-    }
-
-    /* Color name label */
-    ttf_draw_string(buf, (int)w, (int)h, ix + 270, iy + 150,
-                    settings_bg_names[settings_bg_index], 0x000000u, 13);
-
-    /* Dock Configuration section header */
-    ttf_draw_string(buf, (int)w, (int)h, ix + 20, iy + 190,
-                    "Dock Configuration", 0xD4AF37u, 14);
-
-    /* Dock Edge toggle button */
-    {
-        int32_t btn_x = ix + 20;
-        int32_t btn_y = iy + 220;
-        int32_t btn_w = 200;
-        int32_t btn_h = 30;
-        for (int32_t row = btn_y; row < btn_y + btn_h &&
-             row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = btn_x; col < btn_x + btn_w &&
-                 col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == btn_y || row == btn_y + btn_h - 1 ||
-                               col == btn_x || col == btn_x + btn_w - 1);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : 0x1A1508u;
-            }
-        }
-        char edge_label[64];
-        str_copy(edge_label, "Position: ", 64);
-        str_append(edge_label, dock_edge_names[dock_cfg.edge], 64);
-        ttf_draw_string(buf, (int)w, (int)h, btn_x + 12, btn_y + 8,
-                        edge_label, 0xD4AF37u, 13);
-    }
-
-    /* Dock scale buttons */
-    {
-        int32_t btn_x = ix + 20;
-        int32_t btn_y = iy + 260;
-        /* [-] button */
-        for (int32_t row = btn_y; row < btn_y + 28 && row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = btn_x; col < btn_x + 40 && col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == btn_y || row == btn_y + 27 ||
-                               col == btn_x || col == btn_x + 39);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : 0x1A1508u;
-            }
-        }
-        ttf_draw_string(buf, (int)w, (int)h, btn_x + 14, btn_y + 6,
-                        "-", 0xD4AF37u, 14);
-
-        /* [+] button */
-        int32_t btn2_x = btn_x + 50;
-        for (int32_t row = btn_y; row < btn_y + 28 && row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = btn2_x; col < btn2_x + 40 && col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == btn_y || row == btn_y + 27 ||
-                               col == btn2_x || col == btn2_x + 39);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : 0x1A1508u;
-            }
-        }
-        ttf_draw_string(buf, (int)w, (int)h, btn2_x + 12, btn_y + 6,
-                        "+", 0xD4AF37u, 14);
-
-        /* Scale label */
-        char sz_label[32];
-        str_copy(sz_label, "Icon Size: ", 32);
-        char num[8];
-        uint_to_str((uint32_t)dock_cfg.icon_sz, num);
-        str_append(sz_label, num, 32);
-        ttf_draw_string(buf, (int)w, (int)h, btn2_x + 50, btn_y + 6,
-                        sz_label, 0x000000u, 13);
-    }
-}
-
-/* ===== DOCK LAUNCH IMPLEMENTATION (after all window state is declared) ===== */
-
-static void dock_launch_app_from_icon(const char *app_name, int icon_idx) {
-    int32_t icx, icy, icw, ich;
-    dock_icon_rect(explorer_scr_w, icon_idx, &icx, &icy, &icw, &ich);
-    int32_t icon_cx = icx + icw / 2;
-    int32_t icon_cy = icy + ich / 2;
-
-    if (str_eq(app_name, "explorer")) {
-        explorer_open_window(explorer_scr_w, explorer_scr_h);
-        spawn_anim_start(icon_cx, icon_cy, exp_win_x, exp_win_y,
-                          exp_win_w, exp_win_h);
-        return;
-    }
-    if (str_eq(app_name, "settings")) {
-        settings_open_window(explorer_scr_w, explorer_scr_h);
-        spawn_anim_start(icon_cx, icon_cy, set_win_x, set_win_y,
-                          set_win_w, set_win_h);
-        return;
-    }
-    if (str_eq(app_name, "browser")) {
-        browser_open_window(explorer_scr_w, explorer_scr_h);
-        spawn_anim_start(icon_cx, icon_cy, brw_win_x, brw_win_y,
-                          brw_win_w, brw_win_h);
-        return;
-    }
-
-    /* Generic ELF app — copy name into window title */
-    int ti = 0;
-    const char *p = app_name;
-    while (*p && ti < 60)
-        app_win_title[ti++] = *p++;
-    app_win_title[ti] = '\0';
-
-    for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++)
-        app_canvas[i] = 0;
-
-    silent_launch = 1;
-    execute_bin_internal(app_name, 0);
-    silent_launch = 0;
-
-    app_window_open = 1;
-    app_canvas_active = 1;
-    app_window_init_pos(explorer_scr_w, explorer_scr_h);
-    spawn_anim_start(icon_cx, icon_cy, app_win_x, app_win_y,
-                      app_win_w, app_win_h);
-}
-
-/* ===== WEB BROWSER APPLICATION ===== */
-
-static void browser_open_window(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    browser_open = 1;
-    brw_win_w = BROWSER_WIN_W;
-    brw_win_h = BROWSER_WIN_H;
-    brw_win_x = ((int32_t)scr_w - brw_win_w) / 2 + 20;
-    brw_win_y = MENUBAR_H + 20;
-    if (brw_win_x < 0) brw_win_x = 0;
-    if (brw_win_y < MENUBAR_H) brw_win_y = MENUBAR_H;
-    brw_win_disp_x_fp = brw_win_x << 8;
-    brw_win_disp_y_fp = brw_win_y << 8;
-    brw_win_dragging = 0;
-    brw_page_len = 0;
-    str_copy(brw_address, "socrates://home", 128);
-    brw_addr_len = 15;
-}
-
-static void browser_addr_input(char ch) {
-    if (ch == '\b') {
-        if (brw_addr_len > 0) {
-            brw_addr_len--;
-            brw_address[brw_addr_len] = '\0';
-        }
-    } else if (ch >= 0x20 && ch < 0x7F) {
-        if (brw_addr_len < 126) {
-            brw_address[brw_addr_len++] = ch;
-            brw_address[brw_addr_len] = '\0';
-        }
-    }
-}
-
-static void browser_handle_drag(int32_t mx, int32_t my, uint8_t lmb,
-                                 uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_h;
-    if (!browser_open) return;
-
-    int click   = (lmb && !brw_win_prev_lmb);
-    int release = (!lmb && brw_win_prev_lmb);
-    brw_win_prev_lmb = lmb;
-
-    int close_click = (lmb && !brw_close_prev_lmb);
-    brw_close_prev_lmb = lmb;
-    if (close_click &&
-        hit_close_button(mx, my, brw_win_x, brw_win_y, brw_win_w)) {
-        browser_open = 0;
-        brw_win_dragging = 0;
-        brw_win_x = -1;
-        return;
-    }
-
-    if (click && !brw_win_dragging) {
-        if (mx >= brw_win_x && mx < brw_win_x + brw_win_w &&
-            my >= brw_win_y && my < brw_win_y + BROWSER_TITLE_H +
-            BROWSER_BORDER) {
-            brw_win_dragging = 1;
-            brw_win_drag_ox = mx - brw_win_x;
-            brw_win_drag_oy = my - brw_win_y;
-        }
-    }
-    if (release) brw_win_dragging = 0;
-
-    if (brw_win_dragging) {
-        int32_t nx = mx - brw_win_drag_ox;
-        int32_t ny = my - brw_win_drag_oy;
-        if (nx < 0) nx = 0;
-        if (ny < MENUBAR_H) ny = MENUBAR_H;
-        if (nx + brw_win_w > (int32_t)scr_w)
-            nx = (int32_t)scr_w - brw_win_w;
-        if (ny + brw_win_h > DOCK_BAR_Y)
-            ny = DOCK_BAR_Y - brw_win_h;
-        brw_win_x = nx;
-        brw_win_y = ny;
-    }
-
-    int32_t tx = brw_win_x << 8;
-    int32_t ty = brw_win_y << 8;
-    brw_win_disp_x_fp += (tx - brw_win_disp_x_fp) * 3 / 4;
-    brw_win_disp_y_fp += (ty - brw_win_disp_y_fp) * 3 / 4;
-    int32_t ddx = tx - brw_win_disp_x_fp;
-    if (ddx < 0) ddx = -ddx;
-    int32_t ddy = ty - brw_win_disp_y_fp;
-    if (ddy < 0) ddy = -ddy;
-    if (ddx < 128 && ddy < 128) {
-        brw_win_disp_x_fp = tx;
-        brw_win_disp_y_fp = ty;
-    }
-}
-
-static void desktop_draw_browser(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!browser_open) return;
-    if (spawn_anim.active) return;
-    if (brw_win_x < 0) return;
-
-    int32_t wx = brw_win_disp_x_fp >> 8;
-    int32_t wy = brw_win_disp_y_fp >> 8;
-    int32_t ww = brw_win_w;
-    int32_t wh = brw_win_h;
-
-    /* Gold border */
-    for (int32_t row = wy; row < wy + wh && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx; col < wx + ww && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_border = (row == wy || row == wy + wh - 1 ||
-                             col == wx || col == wx + ww - 1);
-            if (is_border)
-                buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title bar */
-    int32_t tb_y = wy + BROWSER_BORDER;
-    for (int32_t row = tb_y; row < tb_y + BROWSER_TITLE_H &&
-         row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + BROWSER_BORDER;
-             col < wx + ww - BROWSER_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xD4AF37u;
-        }
-    }
-
-    /* Title text */
-    {
-        int title_fs = 14;
-        const char *title = "Socrates Browser";
-        int tlen = 16;
-        int title_tw = tlen * (title_fs * 6 / 10 + title_fs / 8);
-        int title_tx = wx + (ww - title_tw) / 2;
-        int title_ty = tb_y + (BROWSER_TITLE_H - title_fs) / 2;
-        ttf_draw_string(buf, (int)w, (int)h, title_tx, title_ty,
-                        title, 0x000000u, title_fs);
-    }
-
-    draw_close_button(buf, w, h, wx, wy, ww);
-
-    /* Address bar: dark background with gold border */
-    int32_t ab_y = tb_y + BROWSER_TITLE_H;
-    for (int32_t row = ab_y; row < ab_y + BROWSER_ADDR_H &&
-         row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = wx + BROWSER_BORDER;
-             col < wx + ww - BROWSER_BORDER && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            int is_edge = (row == ab_y || row == ab_y + BROWSER_ADDR_H - 1);
-            buf[(uint32_t)row * w + (uint32_t)col] =
-                is_edge ? 0xD4AF37u : 0x1A1508u;
-        }
-    }
-
-    /* Address bar text field: inset rounded rect */
-    {
-        int32_t field_x = wx + BROWSER_BORDER + 8;
-        int32_t field_y = ab_y + 3;
-        int32_t field_w = ww - 2 * BROWSER_BORDER - 16;
-        int32_t field_h = BROWSER_ADDR_H - 6;
-        for (int32_t row = field_y; row < field_y + field_h &&
-             row < (int32_t)h; row++) {
-            if (row < 0) continue;
-            for (int32_t col = field_x; col < field_x + field_w &&
-                 col < (int32_t)w; col++) {
-                if (col < 0) continue;
-                int is_edge = (row == field_y || row == field_y + field_h - 1 ||
-                               col == field_x || col == field_x + field_w - 1);
-                buf[(uint32_t)row * w + (uint32_t)col] =
-                    is_edge ? 0xD4AF37u : 0x0D0A04u;
-            }
-        }
-
-        /* URL text */
-        int afs = 13;
-        int ax = field_x + 6;
-        int ay = field_y + (field_h - afs) / 2;
-        ttf_draw_string(buf, (int)w, (int)h, ax, ay,
-                        brw_address, 0xD4AF37u, afs);
-    }
-
-    /* Viewport canvas: True White */
-    int32_t vp_x = wx + BROWSER_BORDER;
-    int32_t vp_y = ab_y + BROWSER_ADDR_H;
-    int32_t vp_w = ww - 2 * BROWSER_BORDER;
-    int32_t vp_h = wh - BROWSER_BORDER - BROWSER_TITLE_H -
-                   BROWSER_ADDR_H - BROWSER_BORDER;
-    for (int32_t row = vp_y; row < vp_y + vp_h && row < (int32_t)h; row++) {
-        if (row < 0) continue;
-        for (int32_t col = vp_x; col < vp_x + vp_w && col < (int32_t)w; col++) {
-            if (col < 0) continue;
-            buf[(uint32_t)row * w + (uint32_t)col] = 0xFFFFFFu;
-        }
-    }
-
-    /* Render page content or default home page */
-    if (brw_page_len > 0) {
-        int pfs = 14;
-        int py = vp_y + 10;
-        int px = vp_x + 12;
-        int line_h = ttf_line_height(pfs);
-        int ci = 0;
-        char line[128];
-        int li = 0;
-        while (ci < brw_page_len && ci < 4096) {
-            if (brw_page_buf[ci] == '\n' || li >= 120) {
-                line[li] = '\0';
-                if (py + pfs < vp_y + vp_h)
-                    ttf_draw_string(buf, (int)w, (int)h, px, py,
-                                    line, 0x000000u, pfs);
-                py += line_h;
-                li = 0;
-                ci++;
-            } else {
-                if (brw_page_buf[ci] >= 0x20 && brw_page_buf[ci] < 0x7F)
-                    line[li++] = (char)brw_page_buf[ci];
-                ci++;
-            }
-        }
-        if (li > 0) {
-            line[li] = '\0';
-            if (py + pfs < vp_y + vp_h)
-                ttf_draw_string(buf, (int)w, (int)h, px, py,
-                                line, 0x000000u, pfs);
-        }
+static void dock_icon_rect(uint32_t scr_w, int idx,
+                           int32_t *ox, int32_t *oy,
+                           int32_t *ow, int32_t *oh) {
+    int32_t rx, ry, rw, rh;
+    dock_bar_rect(scr_w, &rx, &ry, &rw, &rh);
+    int32_t isz = dock_cfg.icon_sz;
+    int32_t cell = isz + 16;
+
+    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
+        *ox = rx + 7 + idx * cell + (cell - isz) / 2;
+        *oy = ry + (rh - isz) / 2;
     } else {
-        /* Default home page: centered title and status */
-        int hfs = 22;
-        const char *htitle = "Socrates BDS 9 Browser";
-        int htlen = 22;
-        int htw = htlen * (hfs * 6 / 10 + hfs / 8);
-        int htx = vp_x + (vp_w - htw) / 2;
-        int hty = vp_y + vp_h / 2 - hfs - 10;
-        ttf_draw_string(buf, (int)w, (int)h, htx, hty,
-                        htitle, 0xD4AF37u, hfs);
+        *ox = rx + (rw - isz) / 2;
+        *oy = ry + 7 + idx * cell + (cell - isz) / 2;
+    }
+    *ow = isz;
+    *oh = isz;
+}
 
-        int sfs = 15;
-        const char *status = "System Status: Online (Local Sandbox Mode)";
-        int slen = 43;
-        int stw = slen * (sfs * 6 / 10 + sfs / 8);
-        int stx = vp_x + (vp_w - stw) / 2;
-        int sty = hty + hfs + 14;
-        ttf_draw_string(buf, (int)w, (int)h, stx, sty,
-                        status, 0xD4AF37u, sfs);
+/* pictogram icons — everything scales off sz */
+static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
+                            int kind, int32_t x, int32_t y, int32_t sz) {
+    int32_t cx = x + sz / 2;
+    int32_t cy = y + sz / 2;
+    int32_t q = sz / 4;
+
+    switch (kind) {
+    case WK_TERM:
+        mono_text(buf, w, h, x + q / 2 + 2, cy - 4, ">_", C_GOLD, 1);
+        break;
+    case WK_BROWSER:
+        gfx_circle_outline(buf, w, h, cx, cy, q + 3, C_TEXT);
+        gfx_rect(buf, w, h, cx - q - 3, cy, 2 * (q + 3) + 1, 1, C_TEXT);
+        gfx_circle_outline(buf, w, h, cx, cy, q + 3, C_TEXT);
+        /* vertical meridian: thin ellipse approximated by lines */
+        gfx_line(buf, w, h, cx, cy - q - 3, cx - q / 2 - 1, cy, 1, C_TEXT);
+        gfx_line(buf, w, h, cx - q / 2 - 1, cy, cx, cy + q + 3, 1, C_TEXT);
+        gfx_line(buf, w, h, cx, cy - q - 3, cx + q / 2 + 1, cy, 1, C_TEXT);
+        gfx_line(buf, w, h, cx + q / 2 + 1, cy, cx, cy + q + 3, 1, C_TEXT);
+        break;
+    case WK_FILES:
+        gfx_rect(buf, w, h, cx - q - 2, cy - q, q + 2, 3, C_GOLD_DIM);
+        gfx_rect(buf, w, h, cx - q - 2, cy - q + 2, 2 * q + 5, q + q - 1,
+                 0xE8CE7Bu);
+        gfx_rect_outline(buf, w, h, cx - q - 2, cy - q + 2, 2 * q + 5,
+                         q + q - 1, C_GOLD_DIM);
+        break;
+    case WK_PAINT:
+        gfx_line(buf, w, h, cx + q, cy - q, cx - q + 2, cy + q - 2, 3, C_TEXT);
+        gfx_tri(buf, w, h, cx - q, cy + q - 4, cx - q + 4, cy + q,
+                cx - q - 2, cy + q + 2, C_GOLD);
+        break;
+    case WK_SYSMON:
+        gfx_rect(buf, w, h, cx - q - 2, cy + q - q / 2, 4, q / 2 + 2, C_TEXT);
+        gfx_rect(buf, w, h, cx - 2, cy - 2, 4, q + 4, C_GOLD);
+        gfx_rect(buf, w, h, cx + q - 2, cy - q, 4, 2 * q + 2, C_TEXT);
+        break;
+    case WK_MATRIX:
+        for (int i = -1; i <= 1; i++) {
+            int32_t colx = cx + i * (q - 1) - 1;
+            int32_t top = cy - q + ((i + 1) * 3);
+            for (int d = 0; d < 3; d++)
+                gfx_rect(buf, w, h, colx, top + d * 5, 2, 3,
+                         d == 0 ? C_GREEN : 0x2E7048u);
+        }
+        break;
+    case WK_HELLO:
+        gfx_circle_outline(buf, w, h, cx, cy, q + 3, C_GOLD);
+        gfx_rect(buf, w, h, cx - q / 2 - 1, cy - 2, 2, 3, C_GOLD);
+        gfx_rect(buf, w, h, cx + q / 2 - 1, cy - 2, 2, 3, C_GOLD);
+        gfx_rect(buf, w, h, cx - q / 2, cy + q / 2, q + 1, 2, C_GOLD);
+        break;
+    case WK_SETTINGS: {
+        int32_t r_out = q + 3;
+        for (int32_t dy = -r_out - 2; dy <= r_out + 2; dy++)
+            for (int32_t dx = -r_out - 2; dx <= r_out + 2; dx++) {
+                int32_t d2 = dx * dx + dy * dy;
+                int32_t px = cx + dx, py = cy + dy;
+                if (px < 0 || px >= (int32_t)w || py < 0 || py >= (int32_t)h)
+                    continue;
+                int32_t adx = dx < 0 ? -dx : dx;
+                int32_t ady = dy < 0 ? -dy : dy;
+                if (d2 <= (q / 2) * (q / 2)) continue;    /* hub hole */
+                if (d2 <= (q + 1) * (q + 1)) {
+                    buf[(uint32_t)py * w + (uint32_t)px] = C_TEXT;
+                    continue;
+                }
+                if (d2 <= (r_out + 2) * (r_out + 2)) {
+                    int tooth = (adx <= 1) || (ady <= 1);
+                    int diff = adx - ady;
+                    if (diff < 0) diff = -diff;
+                    if (diff <= 1 && adx > 1) tooth = 1;
+                    if (tooth)
+                        buf[(uint32_t)py * w + (uint32_t)px] = C_TEXT;
+                }
+            }
+        break;
+    }
+    default:
+        break;
     }
 }
 
-/* ===== MAIN DESKTOP RENDER ===== */
-static uint32_t desktop_tick = 0;
+static void dock_launch(int idx) {
+    int kind = dock_kinds[idx];
+    int32_t ix, iy, iw, ih;
+    dock_icon_rect(scr_w_cache, idx, &ix, &iy, &iw, &ih);
 
-static int prev_terminal_open = 0;
+    if (kind == WK_HELLO && !wins[WK_HELLO].open) {
+        silent_launch = 1;
+        execute_bin_internal("hello", 0);
+        silent_launch = 0;
+    }
+    int was_open = wins[kind].open;
+    wm_open(kind);
+    if (!was_open)
+        spawn_anim_start(kind, ix + iw / 2, iy + ih / 2);
+}
+
+/* returns 1 if the click was consumed by the dock */
+static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
+    int click = (lmb && !prev_lmb);
+    if (!click) return 0;
+
+    int32_t rx, ry, rw, rh;
+    dock_bar_rect(scr_w_cache, &rx, &ry, &rw, &rh);
+    if (mx < rx || mx >= rx + rw || my < ry || my >= ry + rh)
+        return 0;
+
+    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+        int32_t ix, iy, iw, ih;
+        dock_icon_rect(scr_w_cache, i, &ix, &iy, &iw, &ih);
+        if (mx >= ix - 4 && mx < ix + iw + 4 &&
+            my >= iy - 4 && my < iy + ih + 4) {
+            dock_launch(i);
+            return 1;
+        }
+    }
+    return 1;   /* clicks on the bar background are still consumed */
+}
+
+static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                      int32_t mx, int32_t my) {
+    int32_t rx, ry, rw, rh;
+    dock_bar_rect(w, &rx, &ry, &rw, &rh);
+
+    /* translucent plate */
+    gfx_rect_blend(buf, w, h, rx, ry, rw, rh, C_BG_PANEL, 215);
+    gfx_rect_outline(buf, w, h, rx, ry, rw, rh, 0x2E3444u);
+    gfx_rect(buf, w, h, rx, ry, rw, 1, 0x3A4254u);
+
+    int hover = -1;
+    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+        int32_t ix, iy, iw, ih;
+        dock_icon_rect(w, i, &ix, &iy, &iw, &ih);
+        int kind = dock_kinds[i];
+        int hot = (mx >= ix - 4 && mx < ix + iw + 4 &&
+                   my >= iy - 4 && my < iy + ih + 4);
+        if (hot) hover = i;
+
+        /* icon tile */
+        gfx_rect(buf, w, h, ix, iy, iw, ih, hot ? 0x262C3Eu : 0x1C2130u);
+        gfx_rect_outline(buf, w, h, ix, iy, iw, ih,
+                         hot ? C_GOLD_DIM : 0x2A3040u);
+        dock_draw_glyph(buf, w, h, kind, ix, iy, iw);
+
+        /* running indicator */
+        if (wm_is_open(kind)) {
+            if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
+                gfx_circle(buf, w, h, ix + iw / 2, ry + rh - 4, 2, C_GOLD);
+            else if (dock_cfg.edge == DOCK_EDGE_LEFT)
+                gfx_circle(buf, w, h, rx + rw - 4, iy + ih / 2, 2, C_GOLD);
+            else
+                gfx_circle(buf, w, h, rx + 4, iy + ih / 2, 2, C_GOLD);
+        }
+    }
+
+    /* tooltip */
+    if (hover >= 0) {
+        int kind = dock_kinds[hover];
+        const char *name = wk_meta[kind].title;
+        int tw = ttf_text_width(name, 12);
+        int32_t ix, iy, iw, ih;
+        dock_icon_rect(w, hover, &ix, &iy, &iw, &ih);
+
+        int32_t tx, ty;
+        if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
+            tx = ix + iw / 2 - tw / 2 - 8;
+            ty = ry - 26;
+        } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
+            tx = rx + rw + 8;
+            ty = iy + ih / 2 - 11;
+        } else {
+            tx = rx - tw - 24;
+            ty = iy + ih / 2 - 11;
+        }
+        gfx_rect(buf, w, h, tx, ty, tw + 16, 22, 0x1A1E2Au);
+        gfx_rect_outline(buf, w, h, tx, ty, tw + 16, 22, C_GOLD_DIM);
+        ttf_draw_string(buf, (int)w, (int)h, tx + 8, ty + 3, name, C_TEXT, 12);
+    }
+}
+
+/* ===== 10. RENDER GLUE ===== */
+
+static uint8_t desk_prev_lmb = 0;
+
+static int desktop_open_app_by_name(const char *name) {
+    int kind = -1;
+    if (str_eq(name, "terminal") || str_eq(name, "term")) kind = WK_TERM;
+    else if (str_eq(name, "browser") || str_eq(name, "web")) kind = WK_BROWSER;
+    else if (str_eq(name, "files") || str_eq(name, "explorer")) kind = WK_FILES;
+    else if (str_eq(name, "settings")) kind = WK_SETTINGS;
+    else if (str_eq(name, "paint") || str_eq(name, "goldsmith")) kind = WK_PAINT;
+    else if (str_eq(name, "sysmon") || str_eq(name, "monolith")) kind = WK_SYSMON;
+    else if (str_eq(name, "matrix")) kind = WK_MATRIX;
+    else if (str_eq(name, "about")) kind = WK_ABOUT;
+    else if (str_eq(name, "hello")) {
+        silent_launch = 1;
+        execute_bin_internal("hello", 0);
+        silent_launch = 0;
+        wm_open(WK_HELLO);
+        return 1;
+    }
+    if (kind < 0) return 0;
+    wm_open(kind);
+    return 1;
+}
+
+/* Route one keyboard character to the focused window */
+static void desktop_key_input(char ch) {
+    if (menu_open_idx >= 0) {
+        if (ch == 27) menu_open_idx = -1;
+        return;
+    }
+    if (wm_focus == WK_TERM) {
+        if (ch == KEY_PGUP || ch == KEY_PGDN) {
+            int32_t cx, cy, cw, chh;
+            wm_content_rect(WK_TERM, &cx, &cy, &cw, &chh);
+            int rows = (chh - 2 * TERM_PAD) / TERM_LINE_H - 1;
+            term_scroll_key(ch, rows > 4 ? rows - 2 : 4);
+        } else {
+            term_key(ch);
+        }
+        return;
+    }
+    if (wm_focus == WK_BROWSER) {
+        brw_key(ch);
+        return;
+    }
+    if (wm_focus == WK_ABOUT && ch == 27) {
+        wm_close(WK_ABOUT);
+        return;
+    }
+    if (wm_focus == WK_MATRIX && ch == 27) {
+        wm_close(WK_MATRIX);
+        return;
+    }
+}
 
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                            int32_t mx, int32_t my, uint8_t buttons) {
     desktop_tick++;
+    scr_w_cache = w;
+    scr_h_cache = h;
 
-    /* Cache screen dimensions for deferred launches */
-    explorer_scr_w = w;
-    explorer_scr_h = h;
-
-    /* Recalculate dock geometry for current screen size */
     dock_recalc(w, h);
 
-    /* Handle menu clicks and dock clicks */
-    desktop_handle_menu_click(mx, my, buttons & 1);
-    desktop_handle_dock_click(mx, my, buttons & 1, w);
+    if (wall_gen_w != w || wall_gen_h != h)
+        wallpaper_regen(w, h);
 
-    /* Detect terminal just opened — trigger animation */
-    if (is_terminal_open && !prev_terminal_open) {
-        window_init_pos(w, h);
-        open_anim_active = 1;
-        open_anim_tick = 0;
-    }
-    prev_terminal_open = is_terminal_open;
+    /* async engines */
+    term_async_poll();
+    brw_poll();
 
-    /* Only open terminal on first keyboard input if it's open */
-    if (is_terminal_open && !term_ready) {
-        term_init();
-        term_print("Socrates Terminal v1.0\n");
-        term_prompt();
-        term_ready = 1;
-    }
+    /* ---- input ---- */
+    uint8_t lmb = buttons & 1;
+    int consumed = menu_mouse(mx, my, lmb, desk_prev_lmb);
+    if (!consumed)
+        consumed = dock_mouse(mx, my, lmb, desk_prev_lmb);
+    wm_update(mx, my, lmb, desk_prev_lmb, consumed);
+    desk_prev_lmb = lmb;
 
-    /* Handle window drag (only when not animating) */
-    if (is_terminal_open && !open_anim_active)
-        window_handle_drag(mx, my, buttons & 1, w, h);
+    /* ---- draw ---- */
+    for (uint32_t i = 0; i < w * h; i++)
+        buf[i] = wallpaper[i];
 
-    /* Handle app window drag */
-    if (app_window_open)
-        app_window_handle_drag(mx, my, buttons & 1, w, h);
-
-    /* Handle explorer window */
-    if (explorer_open) {
-        explorer_handle_drag(mx, my, buttons & 1, w, h);
-        explorer_handle_click(mx, my, buttons & 1, desktop_tick);
-    }
-
-    /* Handle settings window */
-    if (settings_open) {
-        settings_handle_drag(mx, my, buttons & 1, w, h);
-        settings_handle_click(mx, my, buttons & 1);
-    }
-
-    /* Handle browser window */
-    if (browser_open) {
-        browser_handle_drag(mx, my, buttons & 1, w, h);
-    }
-
-    /* Clear to desktop background color */
-    for (uint32_t i = 0; i < w * h; i++) buf[i] = desktop_bg_color;
-
-    draw_dragon_logo(buf, w, h);
-    desktop_draw_menubar(buf, w, h);
-    desktop_draw_dropdown(buf, w, h);
-    desktop_draw_terminal(buf, w, h, desktop_tick);
-    desktop_draw_app_window(buf, w, h);
-    desktop_draw_explorer(buf, w, h);
-    desktop_draw_settings(buf, w, h);
-    desktop_draw_browser(buf, w, h);
+    wm_draw_all(buf, w, h);
     spawn_anim_draw(buf, w, h);
-    desktop_draw_dock(buf, w, h);
+    menubar_draw(buf, w, h, mx, my);
+    menu_dropdown_draw(buf, w, h, mx, my);
+    dock_draw(buf, w, h, mx, my);
 }
 
 #endif /* DESKTOP_H */
