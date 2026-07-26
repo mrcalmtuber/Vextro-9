@@ -465,6 +465,7 @@ static void term_cmd_help(void) {
     term_print("  run <program>     execute an ELF app\n");
     term_print("  date / uptime / mem / uname          system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
+    term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -838,6 +839,20 @@ static void term_exec(char *cmdline) {
         term_print(host);
         term_print(path);
         term_print(" ...\n");
+    } else if (str_eq(cmd, "img") || str_eq(cmd, "view")) {
+        if (argc < 2) { term_print_c("usage: img <file.sci>\n", 2); return; }
+        char abs[256];
+        term_resolve(argv[1], abs);
+        if (img_open_path(abs) != 0) {
+            term_print_c("img: ", 2);
+            term_print_c(img_status(), 2);
+            term_putc('\n');
+            return;
+        }
+        term_print("  ");
+        term_print_c(img_status(), 4);
+        term_putc('\n');
+        wm_open(WK_IMAGE);
     } else if (str_eq(cmd, "store") || str_eq(cmd, "agora")) {
         store_cmd(argc, argv);
     } else if (str_eq(cmd, "open")) {

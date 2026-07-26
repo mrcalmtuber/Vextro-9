@@ -144,7 +144,17 @@ static void exp_nav_into(const char *dirname) {
     exp_scan();
 }
 
+static int  img_is_sci(const char *name);
+static int  img_open_named(const char *name);
+
 static void exp_open_file(const char *name) {
+    /* pictures go to the viewer, everything else to the browser */
+    if (img_is_sci(name)) {
+        img_open_named(name);
+        wm_open(WK_IMAGE);
+        return;
+    }
+
     /* full ramdisk path for socrates://file/ */
     char url[300];
     str_copy(url, "socrates://file/", sizeof(url));
@@ -803,6 +813,273 @@ static void mtx_draw(uint32_t *buf, uint32_t w, uint32_t h,
             }
             mono_char(buf, w, h, cx + c * 9, cy + row * 11, ch, col, 1);
         }
+    }
+}
+
+/* ===================== PHOTOS (.sci viewer) =====================
+ *
+ * A gallery down the left, the decoded image on the right.  Decoding is
+ * the expensive part — LZMA over the whole plane — so it happens once
+ * when a picture is selected, never per frame.
+ */
+
+#define IMG_MAX_FILES 32
+#define IMG_SIDEBAR_W 150
+#define IMG_INFO_H    26
+
+typedef struct {
+    char name[64];
+    uint32_t size;
+} img_entry_t;
+
+static img_entry_t img_files[IMG_MAX_FILES];
+static int         img_file_count = 0;
+static int         img_sel = -1;
+static int         img_scanned = 0;
+
+static sci_info_t  img_info;
+static int         img_loaded = 0;
+static uint32_t    img_file_size = 0;
+static char        img_name[64] = "";
+static char        img_msg[96] = "";
+static int         img_msg_err = 0;
+static int         img_actual = 0;    /* 1 = 1:1 pixels, 0 = fit to window */
+
+static const char *img_dirs[2] = { "/pics", "/" };
+
+static int img_is_sci(const char *name) {
+    int n = str_len(name);
+    return n > 4 && name[n - 4] == '.' && name[n - 3] == 's' &&
+           name[n - 2] == 'c' && name[n - 1] == 'i';
+}
+
+static void img_scan_cb(const char *name, uint32_t size, int is_dir) {
+    if (is_dir || !img_is_sci(name)) return;
+    if (img_file_count >= IMG_MAX_FILES) return;
+    for (int i = 0; i < img_file_count; i++)
+        if (str_eq(img_files[i].name, name)) return;
+    img_entry_t *e = &img_files[img_file_count++];
+    str_copy(e->name, name, sizeof(e->name));
+    e->size = size;
+}
+
+static char img_scan_dir[32];
+
+static void img_scan(void) {
+    img_file_count = 0;
+    img_scanned = 1;
+    for (int d = 0; d < 2; d++) {
+        str_copy(img_scan_dir, img_dirs[d], sizeof(img_scan_dir));
+        fs_list(img_scan_dir, img_scan_cb);
+    }
+}
+
+/* Build the full path for entry idx by trying each gallery directory. */
+static int img_path_for(const char *name, char *out, int max) {
+    for (int d = 0; d < 2; d++) {
+        str_copy(out, img_dirs[d], max);
+        if (!str_eq(img_dirs[d], "/")) str_append(out, "/", max);
+        str_append(out, name, max);
+        fat_dirent_t e;
+        if (fat_vol.mounted && fat_lookup(out, &e) && !(e.attr & FAT_ATTR_DIR))
+            return 1;
+    }
+    str_copy(out, "/", max);
+    str_append(out, name, max);
+    return 0;
+}
+
+static int img_open_path(const char *path) {
+    uint64_t len = 0;
+    const void *data = fs_read_file(path, &len);
+    if (!data || len == 0) {
+        img_loaded = 0;
+        str_copy(img_msg, "cannot read ", sizeof(img_msg));
+        str_append(img_msg, path, sizeof(img_msg));
+        img_msg_err = 1;
+        return -1;
+    }
+
+    const char *bad = sci_decode((const uint8_t *)data, len, &img_info);
+    if (bad) {
+        img_loaded = 0;
+        str_copy(img_msg, bad, sizeof(img_msg));
+        img_msg_err = 1;
+        return -1;
+    }
+
+    img_loaded = 1;
+    img_file_size = (uint32_t)len;
+    img_msg_err = 0;
+
+    /* remember the leaf name for the title bar */
+    const char *leaf = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') leaf = p + 1;
+    str_copy(img_name, leaf, sizeof(img_name));
+
+    char nb[16];
+    str_copy(img_msg, "", sizeof(img_msg));
+    uint_to_str(img_info.width, nb);  str_append(img_msg, nb, sizeof(img_msg));
+    str_append(img_msg, " x ", sizeof(img_msg));
+    uint_to_str(img_info.height, nb); str_append(img_msg, nb, sizeof(img_msg));
+    str_append(img_msg, "   ", sizeof(img_msg));
+    uint_to_str(img_info.raw_size / 1024, nb);
+    str_append(img_msg, nb, sizeof(img_msg));
+    str_append(img_msg, " KB raw -> ", sizeof(img_msg));
+    uint_to_str(img_file_size / 1024, nb);
+    str_append(img_msg, nb, sizeof(img_msg));
+    str_append(img_msg, " KB on disk  (", sizeof(img_msg));
+    uint_to_str(img_file_size * 100 / (img_info.raw_size ? img_info.raw_size : 1),
+                nb);
+    str_append(img_msg, nb, sizeof(img_msg));
+    str_append(img_msg, "%)", sizeof(img_msg));
+    return 0;
+}
+
+static int img_open_named(const char *name) {
+    char path[160];
+    img_path_for(name, path, sizeof(path));
+    if (!img_scanned) img_scan();
+    for (int i = 0; i < img_file_count; i++)
+        if (str_eq(img_files[i].name, name)) { img_sel = i; break; }
+    return img_open_path(path);
+}
+
+static const char *img_status(void) { return img_msg; }
+
+static void img_select(int idx) {
+    if (idx < 0 || idx >= img_file_count) return;
+    img_sel = idx;
+    char path[160];
+    img_path_for(img_files[idx].name, path, sizeof(path));
+    img_open_path(path);
+}
+
+static void img_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
+                      int32_t cx, int32_t cy, int32_t cw, int32_t chh) {
+    int click = (lmb && !prev_lmb);
+    if (!click) return;
+    if (mx < cx || mx >= cx + cw || my < cy || my >= cy + chh) return;
+
+    if (mx < cx + IMG_SIDEBAR_W) {
+        int idx = (my - cy - 26) / 20;
+        if (idx >= 0 && idx < img_file_count) img_select(idx);
+        return;
+    }
+    /* clicking the picture toggles fit / actual size */
+    if (img_loaded && my < cy + chh - IMG_INFO_H) img_actual = !img_actual;
+}
+
+static void img_key(char ch) {
+    if (ch == KEY_DOWN && img_sel + 1 < img_file_count) img_select(img_sel + 1);
+    else if (ch == KEY_UP && img_sel > 0) img_select(img_sel - 1);
+    else if (ch == ' ') img_actual = !img_actual;
+    else if (ch == 'r' || ch == 'R') { img_scan(); }
+    else if (ch == 27) wm_close(WK_IMAGE);
+}
+
+static void img_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                     int32_t cx, int32_t cy, int32_t cw, int32_t chh,
+                     uint32_t tick, int focused) {
+    (void)focused;
+    if (!img_scanned) img_scan();
+    if (tick % 240 == 0) {
+        int keep = img_sel;
+        img_scan();
+        if (keep < img_file_count) img_sel = keep;
+    }
+
+    /* ---- sidebar ---- */
+    gfx_rect(buf, w, h, cx, cy, IMG_SIDEBAR_W, chh, 0x1A1E2Au);
+    gfx_rect(buf, w, h, cx + IMG_SIDEBAR_W - 1, cy, 1, chh, 0x2E3444u);
+    ttf_draw_string(buf, (int)w, (int)h, cx + 12, cy + 6, "Pictures",
+                    C_GOLD, 13);
+
+    for (int i = 0; i < img_file_count; i++) {
+        int32_t ry = cy + 26 + i * 20;
+        if (ry + 18 > cy + chh) break;
+        if (i == img_sel)
+            gfx_rect(buf, w, h, cx + 2, ry - 2, IMG_SIDEBAR_W - 5, 20,
+                     0x2A2410u);
+        char label[22];
+        store_fit(label, sizeof(label), img_files[i].name,
+                  IMG_SIDEBAR_W - 24, 12);
+        ttf_draw_string(buf, (int)w, (int)h, cx + 12, ry, label,
+                        i == img_sel ? C_GOLD : C_TEXT_DIM, 12);
+    }
+    if (img_file_count == 0)
+        ttf_draw_string(buf, (int)w, (int)h, cx + 12, cy + 30,
+                        "no .sci files", 0x6A7284u, 12);
+
+    /* ---- picture area ---- */
+    int32_t vx = cx + IMG_SIDEBAR_W;
+    int32_t vw = cw - IMG_SIDEBAR_W;
+    int32_t vh = chh - IMG_INFO_H;
+    gfx_rect(buf, w, h, vx, cy, vw, vh, 0x0E1016u);
+
+    if (img_loaded && vw > 8 && vh > 8) {
+        uint32_t iw = img_info.width, ih = img_info.height;
+        int32_t dw, dh;
+
+        if (img_actual) {
+            dw = (int32_t)iw;
+            dh = (int32_t)ih;
+        } else {
+            /* fit, preserving aspect, never upscaling past 1:1 */
+            int32_t sw = (int32_t)((uint64_t)vw * 1024 / iw);
+            int32_t sh = (int32_t)((uint64_t)vh * 1024 / ih);
+            int32_t s = sw < sh ? sw : sh;
+            if (s > 1024) s = 1024;
+            dw = (int32_t)((uint64_t)iw * s / 1024);
+            dh = (int32_t)((uint64_t)ih * s / 1024);
+            if (dw < 1) dw = 1;
+            if (dh < 1) dh = 1;
+        }
+
+        int32_t ox = vx + (vw - dw) / 2;
+        int32_t oy = cy + (vh - dh) / 2;
+
+        for (int32_t y = 0; y < dh; y++) {
+            int32_t dy = oy + y;
+            if (dy < cy || dy >= cy + vh) continue;
+            uint32_t sy = (uint32_t)((uint64_t)y * ih / (uint64_t)dh);
+            if (sy >= ih) sy = ih - 1;
+            const uint32_t *srow = sci_pixels + (uint64_t)sy * iw;
+            for (int32_t x = 0; x < dw; x++) {
+                int32_t dx = ox + x;
+                if (dx < vx || dx >= vx + vw) continue;
+                uint32_t sx = (uint32_t)((uint64_t)x * iw / (uint64_t)dw);
+                if (sx >= iw) sx = iw - 1;
+                buf[(uint32_t)dy * w + (uint32_t)dx] = srow[sx];
+            }
+        }
+    } else if (!img_loaded) {
+        const char *msg = img_msg_err ? img_msg
+                                      : "Select a picture from the list";
+        int tw = ttf_text_width(msg, 13);
+        ttf_draw_string(buf, (int)w, (int)h, vx + (vw - tw) / 2,
+                        cy + vh / 2 - 8, msg,
+                        img_msg_err ? C_RED : 0x6A7284u, 13);
+    }
+
+    /* ---- info bar ---- */
+    gfx_rect(buf, w, h, vx, cy + vh, vw, IMG_INFO_H, C_BG_PANEL);
+    gfx_rect(buf, w, h, vx, cy + vh, vw, 1, 0x2E3444u);
+    if (img_loaded) {
+        ttf_draw_string(buf, (int)w, (int)h, vx + 10, cy + vh + 5, img_name,
+                        C_GOLD, 12);
+        int nw = ttf_text_width(img_name, 12);
+        char fit[96];
+        store_fit(fit, sizeof(fit), img_msg, vw - nw - 90, 12);
+        ttf_draw_string(buf, (int)w, (int)h, vx + 20 + nw, cy + vh + 5, fit,
+                        C_TEXT_DIM, 12);
+        const char *z = img_actual ? "1:1" : "fit";
+        ttf_draw_string(buf, (int)w, (int)h, vx + vw - 30, cy + vh + 5, z,
+                        C_TEXT_DIM, 12);
+    } else if (img_msg_err) {
+        ttf_draw_string(buf, (int)w, (int)h, vx + 10, cy + vh + 5, img_msg,
+                        C_RED, 12);
     }
 }
 

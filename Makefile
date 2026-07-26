@@ -32,22 +32,32 @@ REPO_BINS   := $(addprefix build/store/,$(addsuffix .bsd,$(REPO_APPS)))
 
 BSD_MAKER   := bsdfmt/bsd_maker
 
-.PHONY: all iso run clean cleandisk apps repo bsdtools
+# --- Pictures ---
+# PNG in, .sci out (row filters + LZMA, see src/sci.h).  tools/mkimg.py
+# decodes PNG with Python's own zlib, so there is no image dependency.
+PIC_SRC     := $(wildcard apps/pics/*.png)
+PIC_SCI     := $(patsubst apps/pics/%.png,build/pics/%.sci,$(PIC_SRC))
+PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
+
+.PHONY: all iso run clean cleandisk apps repo bsdtools pics
 
 all: os.iso disk.img
 
 apps: $(REPO_BINS)
+
+pics: $(PIC_SCI)
 
 bsdtools: $(BSD_MAKER) bsdfmt/bsd_run
 
 # --- FAT32 system disk ---
 # Created once and then left alone: it is the OS's writable, persistent
 # filesystem. `make cleandisk` resets it to factory contents.
-disk.img: | build/hello $(STORE_BINS)
+disk.img: | build/hello $(STORE_BINS) $(PIC_SCI)
 	python3 tools/mkfat32.py disk.img 64 \
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
-		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd)
+		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd) \
+		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)
 
 cleandisk:
 	rm -f disk.img
@@ -89,6 +99,11 @@ build/store/%.elf: build/store/%.o bsdfmt/bsd.ld
 
 build/store/%.bsd: build/store/%.elf $(BSD_MAKER)
 	$(BSD_MAKER) -o $@ -e $<
+
+# --- Pictures: PNG -> .sci ---
+build/pics/%.sci: apps/pics/%.png tools/mkimg.py
+	@mkdir -p build/pics
+	python3 tools/mkimg.py -o $@ $<
 
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
 # The store payloads ride along here too, so the storefront still has
