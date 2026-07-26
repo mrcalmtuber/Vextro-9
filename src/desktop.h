@@ -6,6 +6,7 @@
 #include "gfx.h"
 #include "fat32.h"
 #include "bsd_format.h"
+#include "sci.h"
 
 /*
  * Socrates BSD 9 desktop.
@@ -41,7 +42,7 @@ static uint64_t system_total_memory_mb = 0;
 #define DOCK_EDGE_RIGHT  2
 
 /* Built-in launchers, plus one slot per app installed from the store. */
-#define DOCK_BASE_COUNT 9
+#define DOCK_BASE_COUNT 10
 #define DOCK_MAX_ITEMS  25
 
 static int dock_item_count = DOCK_BASE_COUNT;
@@ -80,6 +81,7 @@ enum {
     WK_MATRIX,
     WK_HELLO,
     WK_STORE,
+    WK_IMAGE,
     WK_SETTINGS,
     WK_ABOUT,
     WK_COUNT
@@ -99,6 +101,7 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Matrix",           620, 420 },
     { "hello",            600, 430 },
     { "Agora App Store",  720, 520 },
+    { "Photos",           760, 560 },
     { "Settings",         470, 390 },
     { "About Socrates",   380, 270 },
 };
@@ -181,7 +184,9 @@ static const void *tar_read_file(const char *filename, uint64_t *out_size) {
  * so ISO-only boots (no hard disk attached) still work.
  */
 
-#define FS_FILEBUF_MAX (256 * 1024)
+/* Big enough for a compressed full-colour image; everything else on the
+ * disk is far smaller. */
+#define FS_FILEBUF_MAX (4 * 1024 * 1024)
 static uint8_t fs_filebuf[FS_FILEBUF_MAX];
 static const char *fs_errstr = "";
 
@@ -280,6 +285,10 @@ static int  desktop_open_app_by_name(const char *name);
 static void brw_navigate(const char *url);
 static int  execute_bin(const char *filepath);
 static void store_cmd(int argc, char **argv);
+static void store_fit(char *dst, int dst_max, const char *src,
+                      int budget, int font);
+static int  img_open_path(const char *path);
+static const char *img_status(void);
 
 /* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
 
@@ -753,6 +762,9 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     case WK_STORE:
         store_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
+    case WK_IMAGE:
+        img_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
     case WK_SETTINGS:
         settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
@@ -818,6 +830,9 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
             break;
         case WK_STORE:
             store_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_IMAGE:
+            img_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
             break;
         case WK_PAINT:
             paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
@@ -1031,6 +1046,7 @@ static void menu_rebuild(void) {
     menu_apps[n].label = "Browser";      menu_apps[n++].action = WK_BROWSER;
     menu_apps[n].label = "Files";        menu_apps[n++].action = WK_FILES;
     menu_apps[n].label = "App Store";    menu_apps[n++].action = WK_STORE;
+    menu_apps[n].label = "Photos";       menu_apps[n++].action = WK_IMAGE;
     menu_apps[n].label = "-";            menu_apps[n++].action = -1;
     menu_apps[n].label = "Goldsmith";    menu_apps[n++].action = WK_PAINT;
     menu_apps[n].label = "Monolith";     menu_apps[n++].action = WK_SYSMON;
@@ -1226,7 +1242,7 @@ typedef struct {
 } dock_item_t;
 
 static const int dock_base_kinds[DOCK_BASE_COUNT] = {
-    WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_PAINT,
+    WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_IMAGE, WK_PAINT,
     WK_SYSMON, WK_MATRIX, WK_HELLO, WK_SETTINGS,
 };
 
@@ -1345,6 +1361,16 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect(buf, w, h, cx - q / 2 - 1, cy - 2, 2, 3, C_GOLD);
         gfx_rect(buf, w, h, cx + q / 2 - 1, cy - 2, 2, 3, C_GOLD);
         gfx_rect(buf, w, h, cx - q / 2, cy + q / 2, q + 1, 2, C_GOLD);
+        break;
+    case WK_IMAGE:
+        /* a framed photo: horizon, sun, and a hill */
+        gfx_rect_outline(buf, w, h, cx - q - 3, cy - q - 1, 2 * q + 6,
+                         2 * q + 2, C_TEXT);
+        gfx_circle(buf, w, h, cx + q - 1, cy - q / 2, 2, C_GOLD);
+        gfx_tri(buf, w, h, cx - q - 2, cy + q, cx - 1, cy - q / 2 - 1,
+                cx + q / 2, cy + q, C_GOLD_DIM);
+        gfx_tri(buf, w, h, cx - 2, cy + q, cx + q / 2 + 2, cy - 1,
+                cx + q + 2, cy + q, C_GOLD);
         break;
     case WK_STORE:
         /* a shopping bag with a download arrow in it */
@@ -1543,6 +1569,8 @@ static int desktop_open_app_by_name(const char *name) {
     else if (str_eq(name, "about")) kind = WK_ABOUT;
     else if (str_eq(name, "store") || str_eq(name, "agora") ||
              str_eq(name, "apps")) kind = WK_STORE;
+    else if (str_eq(name, "photos") || str_eq(name, "image") ||
+             str_eq(name, "images")) kind = WK_IMAGE;
     else if (str_eq(name, "hello")) {
         silent_launch = 1;
         execute_bin_internal("hello", 0);
@@ -1578,6 +1606,10 @@ static void desktop_key_input(char ch) {
     }
     if (wm_focus == WK_STORE) {
         store_key(ch);
+        return;
+    }
+    if (wm_focus == WK_IMAGE) {
+        img_key(ch);
         return;
     }
     if (wm_focus == WK_ABOUT && ch == 27) {

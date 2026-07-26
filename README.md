@@ -23,7 +23,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
 - Command history (Up/Down), line editing (Left/Right/Home/End/Del), 240-line scrollback (PgUp/PgDn)
 - Working directory (`cd` / `pwd`, shown in the prompt) and output redirection: `ls > list.txt`, `echo hi >> notes.txt`
-- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `open` `history` `reboot` `shutdown`
+- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `open` `history` `reboot` `shutdown`
 
 ### Networking
 - **Full TCP/IP stack** — IPv4, ICMP (ping), UDP, DNS resolver, polled TCP client, async HTTP/1.0 client with redirects
@@ -38,7 +38,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 
 ### App Store
 - **Agora** — a working package manager with a storefront: browse a catalog, **Install**, **Open**, **Remove**
-- Installing is a real operation — the ELF64 payload is validated, copied to `/apps/<id>.elf` on the FAT32 volume and recorded in the registry at `/apps/apps.db`, so **installed apps survive a reboot**
+- Installing is a real operation — the payload is validated, copied to `/apps/<id>.bsd` on the FAT32 volume and recorded in the registry at `/apps/apps.db`, so **installed apps survive a reboot**
 - Installed apps join the **dock** (after a separator, with their store icon) and the **Apps menu**, and launch straight into their own window
 - Two package sources, one catalog:
   - the repository seeded on disk at `/store/pkg` (also carried in the initrd, so the storefront works on an ISO-only boot)
@@ -60,6 +60,16 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Register/command encodings adapted from the Linux i915 driver; probe-then-bail structure after SerenityOS — display modesetting is deliberately left to firmware
 - If no supported iGPU is present the OS silently stays on the CPU renderer (`gpu` in the terminal shows which path is live; `gpu test` blits to the visible framebuffer on real hardware)
 - **GPU hang capture** (i915 error-state style): when a submission's breadcrumb never lands, the driver latches EIR/ESR, the per-engine IPEHR/IPEIR (the exact command header that broke the pipeline, decoded by name — e.g. a malformed `XY_COLOR_BLT`), ACTHD, INSTDONE, `RING_FAULT_REG` GGTT faults, the HWS page and the ring contents around the parse point — then attempts a `GDRST` blitter-domain engine reset, falling back to CPU rendering after repeated hangs. `gpu error` prints the full report; `gpu decode <hex>` decodes any command dword
+
+### Compressed images — the `.sci` format
+Full-colour pictures that fit on a 64 MB disk, decompressed when opened.
+
+- **`src/lzma.h`** — a complete LZMA / LZMA2 / xz decompressor: range decoder, the full probability model, the LZMA2 chunk layer and enough of the xz container to walk its blocks. It decodes straight into the caller's buffer and uses that buffer as its dictionary window, so there is no separate 32 MB ring
+- **`src/sci.h`** — the container. Each row gets a PNG-style prediction filter (None/Sub/Up/Average/Paeth, chosen per row by lowest absolute sum), and the filtered plane is one LZMA stream. Header carries dimensions, channels, filter mode, codec and both sizes, and is validated before anything is decoded
+- **`tools/mkimg.py`** — PNG or PPM in, `.sci` out. It decodes PNG itself with Python's own `zlib`, so the build needs no Pillow and no opencv
+- **Photos** — a gallery app: `.sci` files found in `/pics` and `/` down the left, the decoded picture on the right, click to toggle fit / 1:1. The status bar shows the real ratio. Double-clicking a `.sci` in Files opens it here, and `img <file>` works from the shell
+
+The two shipped samples land at **623 KB → 12 KB (1%)** for the emblem and **450 KB → 241 KB (53%)** for a deliberately noisy interference field — the latter still smaller than its PNG.
 
 ### The `.bsd` executable format
 A custom x86_64 container that every app store package uses, living in `bsdfmt/`.
@@ -191,6 +201,8 @@ src/            Kernel source
   browser.h     Browser (HTML renderer, navigation, links)
   apps.h        Files / Settings / Goldsmith / Monolith / Matrix / About
   store.h       Agora app store (catalog, installer, registry, storefront)
+  lzma.h        LZMA / LZMA2 / xz decompressor (images + ZIM clusters)
+  sci.h         .sci compressed image format + decoder
   gfx.h         Theme palette + drawing primitives + monospace text
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
   fat32.h       FAT32 driver (read/write)   ata.h  ATA PIO disk driver
@@ -200,13 +212,14 @@ src/            Kernel source
   keyboard.h    PS/2 keyboard           mouse.h  PS/2 mouse
 apps/           Userland app source + seed files for the disk
   store/        App store packages + packages.txt (repository metadata)
+  pics/         Sample PNGs, converted to .sci at build time
 bsdfmt/         The .bsd executable format
   bsd_format.h  Header layout + shared validator
   bsd_maker.c   Builder (raw machine code, or repack an ELF64)
   bsd_run.c     POSIX loader: mmap + mprotect W^X + call
   bsd.ld        Linker script: page-separated text and data segments
 tools/          mkfat32.py (disk formatter), video converter,
-                serve_repo.py (HTTP package repository),
+                mkimg.py (PNG/PPM -> .sci), serve_repo.py (package repo),
                 QEMU test driver (qemu_drive.py)
 limine-binary/  Pre-built Limine bootloader binaries
 Makefile        Top-level build system
