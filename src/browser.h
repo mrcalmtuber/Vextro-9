@@ -639,6 +639,7 @@ static void brw_navigate_no_hist(const char *url) {
     brw_loading = 1;
     brw_set_status("Resolving host...");
     http_get(host, port, path);
+    http_owner = HTTP_OWNER_BROWSER;
 }
 
 static void brw_navigate(const char *url) {

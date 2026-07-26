@@ -245,6 +245,108 @@ static void term_cmd_cat(const char *fname) {
     if (fsize > 0 && text[fsize - 1] != '\n') term_putc('\n');
 }
 
+static void term_print_hex32(uint32_t v) {
+    static const char hx[] = "0123456789ABCDEF";
+    char b[11];
+    b[0] = '0'; b[1] = 'x';
+    for (int i = 0; i < 8; i++)
+        b[2 + i] = hx[(v >> (28 - 4 * i)) & 0xF];
+    b[10] = '\0';
+    term_print(b);
+}
+
+static int term_parse_hex(const char *s, uint32_t *out) {
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    uint32_t v = 0;
+    int n = 0;
+    for (; *s; s++, n++) {
+        char c = *s;
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else return 0;
+        if (n >= 8) return 0;
+        v = (v << 4) | d;
+    }
+    if (n == 0) return 0;
+    *out = v;
+    return 1;
+}
+
+static void term_gpu_reg_row(const char *key, uint32_t val) {
+    term_print("  ");
+    term_print(key);
+    int pad = 18 - str_len(key);
+    for (int i = 0; i < pad; i++) term_putc(' ');
+    term_print_hex32(val);
+    term_putc('\n');
+}
+
+static void term_cmd_gpu_error(void) {
+    if (!igpu_crash.valid) {
+        term_print_c("no GPU errors recorded\n", 4);
+        return;
+    }
+    term_print_c("last GPU hang (BCS blitter)\n", 2);
+    term_print("  parser died in    ");
+    term_print_c(igpu_crash.cmd_name, 2);
+    term_putc('\n');
+    term_gpu_reg_row("IPEHR (bad cmd)", igpu_crash.ipehr);
+    term_gpu_reg_row("IPEIR", igpu_crash.ipeir);
+    term_gpu_reg_row("EIR", igpu_crash.eir);
+    if (igpu_crash.eir & IGPU_ERR_INSTRUCTION)
+        term_print_c("    - invalid instruction error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_PAGE_TABLE)
+        term_print_c("    - page table error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_MEM_REFRESH)
+        term_print_c("    - memory refresh error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_PRIV)
+        term_print_c("    - privilege violation\n", 2);
+    term_gpu_reg_row("ESR", igpu_crash.esr);
+    term_gpu_reg_row("INSTDONE", igpu_crash.instdone);
+    term_gpu_reg_row("ACTHD", igpu_crash.acthd_lo);
+    term_gpu_reg_row("RING_HEAD", igpu_crash.ring_head);
+    term_gpu_reg_row("RING_TAIL", igpu_crash.ring_tail);
+    term_gpu_reg_row("RING_CTL", igpu_crash.ring_ctl);
+    if (igpu_crash.fault_reg & 1) {
+        term_print_c("  GGTT fault at page ", 2);
+        term_print_hex32(igpu_crash.fault_reg & 0xFFFFF000);
+        term_putc('\n');
+        term_gpu_reg_row("RING_FAULT_REG", igpu_crash.fault_reg);
+    }
+    term_gpu_reg_row("HWS[0]", igpu_crash.hws[0]);
+
+    char nb[16];
+    term_print("  breadcrumb        saw ");
+    uint_to_str(igpu_crash.seqno_seen, nb);
+    term_print(nb);
+    term_print(" wanted ");
+    uint_to_str(igpu_crash.seqno_expected, nb);
+    term_print(nb);
+    term_putc('\n');
+
+    term_print("  ring at ACTHD\n");
+    for (int i = 0; i < 8; i += 4) {
+        term_print("    ");
+        for (int j = 0; j < 4; j++) {
+            term_print_hex32(igpu_crash.ring_window[i + j]);
+            term_putc(' ');
+        }
+        term_putc('\n');
+    }
+
+    uint_to_str((uint32_t)igpu_crash.hang_count, nb);
+    term_print("  hang count        ");
+    term_print(nb);
+    term_print("   recovery: ");
+    if (igpu.active)
+        term_print_c(igpu_crash.reset_ok ? "engine reset OK\n"
+                                         : "pending\n", 4);
+    else
+        term_print_c("failed - CPU renderer\n", 2);
+}
+
 static void term_cmd_df(void) {
     if (!fs_writable()) {
         term_print_c("no writable volume (tar ramdisk fallback active)\n", 3);
@@ -363,7 +465,9 @@ static void term_cmd_help(void) {
     term_print("  run <program>     execute an ELF app\n");
     term_print("  date / uptime / mem / uname          system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
-    term_print("  gpu [test]        Intel iGPU blitter status / demo\n");
+    term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
+    term_print("                    the Agora app store\n");
+    term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
     term_print("  open <app>        terminal browser files settings\n");
     term_print("                    paint sysmon matrix about\n");
     term_print("  history / clear / reboot / shutdown\n");
@@ -577,7 +681,26 @@ static void term_exec(char *cmdline) {
     } else if (str_eq(cmd, "df") || str_eq(cmd, "disk")) {
         term_cmd_df();
     } else if (str_eq(cmd, "gpu")) {
-        if (argc >= 2 && str_eq(argv[1], "test")) {
+        if (argc >= 2 && str_eq(argv[1], "error")) {
+            term_cmd_gpu_error();
+        } else if (argc >= 2 && str_eq(argv[1], "decode")) {
+            uint32_t dw;
+            if (argc < 3 || !term_parse_hex(argv[2], &dw)) {
+                term_print_c("usage: gpu decode <hex dword>\n", 2);
+            } else {
+                char name[48];
+                igpu_decode_cmd(dw, name, sizeof(name));
+                term_print("  ");
+                term_print_hex32(dw);
+                term_print("  ->  ");
+                term_print_c(name, 1);
+                char nb[8];
+                term_print_c("  (len field ", 3);
+                uint_to_str(dw & 0xFF, nb);
+                term_print_c(nb, 3);
+                term_print_c(")\n", 3);
+            }
+        } else if (argc >= 2 && str_eq(argv[1], "test")) {
             if (!igpu.active) {
                 term_print_c("gpu test: no active iGPU (CPU renderer)\n", 2);
             } else if (!igpu.fb_blittable) {
@@ -626,6 +749,11 @@ static void term_exec(char *cmdline) {
                 term_print_c("  try 'gpu test' to blit to the screen\n", 3);
             } else {
                 term_print("  renderer  CPU (portable framebuffer path)\n");
+            }
+            if (igpu_crash.valid) {
+                term_print_c("  last hang ", 2);
+                term_print_c(igpu_crash.cmd_name, 2);
+                term_print_c("  ('gpu error' for the full report)\n", 3);
             }
         }
     } else if (str_eq(cmd, "run")) {
@@ -705,10 +833,13 @@ static void term_exec(char *cmdline) {
         term_async = TERM_ASYNC_FETCH;
         term_async_t0 = net_ticks;
         http_get(host, port, path);
+        http_owner = HTTP_OWNER_TERM;
         term_print("fetching http://");
         term_print(host);
         term_print(path);
         term_print(" ...\n");
+    } else if (str_eq(cmd, "store") || str_eq(cmd, "agora")) {
+        store_cmd(argc, argv);
     } else if (str_eq(cmd, "open")) {
         if (argc < 2) { term_print_c("usage: open <app>\n", 2); return; }
         if (!desktop_open_app_by_name(argv[1])) {
