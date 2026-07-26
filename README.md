@@ -43,7 +43,8 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Two package sources, one catalog:
   - the repository seeded on disk at `/store/pkg` (also carried in the initrd, so the storefront works on an ISO-only boot)
   - a **network repository fetched over the in-kernel TCP/IP stack** — `Refresh` pulls an index of `key:value` blocks, and each payload is downloaded with its own HTTP GET
-- Ships five apps, all integer-only userland ELF64 binaries: **Mandelbrot** (16.16 fixed-point fractal), **Orbit** (five-body Newtonian integrator), **Game of Life** (149×100 torus over a heat map), **Plasma** (sine table built at runtime by a magic-circle oscillator) and **Voronoi** (28-site partition, network-only — it exists purely to exercise the download path)
+- Every package is a **`.bsd` executable** (see below), validated field by field before a byte reaches the disk
+- Ships five apps, all integer-only: **Mandelbrot** (16.16 fixed-point fractal), **Orbit** (five-body Newtonian integrator), **Game of Life** (149×100 torus over a heat map), **Plasma** (sine table built at runtime by a magic-circle oscillator) and **Voronoi** (28-site partition, network-only — it exists purely to exercise the download path)
 - Also driveable from the shell: `store list` `store install <id>` `store remove <id>` `store run <id>` `store refresh` `store repo [url]`
 
 ### Apps
@@ -59,6 +60,22 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Register/command encodings adapted from the Linux i915 driver; probe-then-bail structure after SerenityOS — display modesetting is deliberately left to firmware
 - If no supported iGPU is present the OS silently stays on the CPU renderer (`gpu` in the terminal shows which path is live; `gpu test` blits to the visible framebuffer on real hardware)
 - **GPU hang capture** (i915 error-state style): when a submission's breadcrumb never lands, the driver latches EIR/ESR, the per-engine IPEHR/IPEIR (the exact command header that broke the pipeline, decoded by name — e.g. a malformed `XY_COLOR_BLT`), ACTHD, INSTDONE, `RING_FAULT_REG` GGTT faults, the HWS page and the ring contents around the parse point — then attempts a `GDRST` blitter-domain engine reset, falling back to CPU rendering after repeated hangs. `gpu error` prints the full report; `gpu decode <hex>` decodes any command dword
+
+### The `.bsd` executable format
+A custom x86_64 container that every app store package uses, living in `bsdfmt/`.
+
+- **`bsd_format.h`** — an 80-byte header: 4-byte magic `'B' 'S' 'D' 0x64`, a `uint32_t` version that pads the magic to 8 bytes so no `uint64_t` straddles an alignment boundary, then 64-bit entry point, text offset/size, data offset/size, load addresses, bss size and flags. `bsd_validate()` is a freestanding, overflow-safe checker shared verbatim by the host tools, the kernel loader and the store's download path
+- **`bsd_maker.c`** — packs raw x86_64 machine code (`-t code.bin -d data.bin -b bss`), or repacks a linked ELF64's two `PT_LOAD` segments (`-e prog.elf`), which is how the store's packages are built
+- **`bsd_run.c`** — POSIX loader: one anonymous `mmap()` for the image, copy the segments in, then `mprotect()` the text `PROT_READ|PROT_EXEC` and the data `PROT_READ|PROT_WRITE`. Neither is ever writable and executable at once, so **W^X holds** and the NX bit never fires on the entry jump. The entry address is cast to `long (*)(long)` and called
+- Segments are page aligned and never share a page — otherwise `mprotect()`, which works at page granularity, could not give them different protections. `bsd_run` detects hosts with pages coarser than 4 KB (16 KB on Apple silicon) and refuses rather than silently mapping RWX
+- Images carry no relocations, so a loader may place them anywhere as long as it preserves the text↔data distance
+
+```sh
+cd bsdfmt && make demo      # build the tools, pack two examples, run them
+./bsd_run -n prog.bsd       # map and protect without calling (works on any host)
+```
+
+The kernel's loader (`src/desktop.h`) dispatches on magic: `.bsd` for store packages, ELF64 for `hello`, and it rejects anything else.
 
 ### Core
 - **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 4x4 supersampled AA; no floats, no GPU
@@ -107,7 +124,9 @@ make
 ```
 
 This will:
-1. Compile the kernel, the userland `hello` app and the app store packages
+1. Compile the kernel, the userland `hello` app, and the app store
+   packages — each linked to ELF64 and then repacked into a `.bsd` image
+   by `bsdfmt/bsd_maker`
 2. Convert `boot.mp4` to raw RGB565 frames and embed them
 3. Bundle the initrd (ustar tar) and assemble the bootable ISO at `os.iso`
 4. Create `disk.img` — a 64 MB FAT32 system disk seeded with the starter
@@ -181,6 +200,11 @@ src/            Kernel source
   keyboard.h    PS/2 keyboard           mouse.h  PS/2 mouse
 apps/           Userland app source + seed files for the disk
   store/        App store packages + packages.txt (repository metadata)
+bsdfmt/         The .bsd executable format
+  bsd_format.h  Header layout + shared validator
+  bsd_maker.c   Builder (raw machine code, or repack an ELF64)
+  bsd_run.c     POSIX loader: mmap + mprotect W^X + call
+  bsd.ld        Linker script: page-separated text and data segments
 tools/          mkfat32.py (disk formatter), video converter,
                 serve_repo.py (HTTP package repository),
                 QEMU test driver (qemu_drive.py)

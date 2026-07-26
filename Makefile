@@ -5,7 +5,7 @@ HOSTCC  := cc
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
             -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
-            -Isrc -Ikernel/include
+            -Isrc -Ikernel/include -Ibsdfmt
 
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
@@ -20,19 +20,25 @@ LIMINE  := limine-binary
 ISO     := iso_root
 
 # --- App store packages ---
-# Seeded onto the disk under /store/pkg, which is the repository the
-# Agora store installs from.  `voronoi` is deliberately left out so it
-# is only reachable through the network repository (see `make repo`).
+# Every package is a .bsd image (see bsdfmt/): compiled to ELF64, then
+# repacked by bsd_maker into the container the store and the kernel's
+# loader both speak.  Seeded onto the disk under /store/pkg, which is the
+# repository the Agora store installs from.  `voronoi` is deliberately
+# left out so it is only reachable over the network (see `make repo`).
 STORE_APPS  := mandel orbit life plasma
 REPO_APPS   := $(STORE_APPS) voronoi
-STORE_BINS  := $(addprefix build/store/,$(STORE_APPS))
-REPO_BINS   := $(addprefix build/store/,$(REPO_APPS))
+STORE_BINS  := $(addprefix build/store/,$(addsuffix .bsd,$(STORE_APPS)))
+REPO_BINS   := $(addprefix build/store/,$(addsuffix .bsd,$(REPO_APPS)))
 
-.PHONY: all iso run clean cleandisk apps repo
+BSD_MAKER   := bsdfmt/bsd_maker
+
+.PHONY: all iso run clean cleandisk apps repo bsdtools
 
 all: os.iso disk.img
 
 apps: $(REPO_BINS)
+
+bsdtools: $(BSD_MAKER) bsdfmt/bsd_run
 
 # --- FAT32 system disk ---
 # Created once and then left alone: it is the OS's writable, persistent
@@ -41,7 +47,7 @@ disk.img: | build/hello $(STORE_BINS)
 	python3 tools/mkfat32.py disk.img 64 \
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
-		$(foreach a,$(STORE_APPS),build/store/$(a):store/pkg/$(a).elf)
+		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd)
 
 cleandisk:
 	rm -f disk.img
@@ -64,13 +70,25 @@ build/hello.o: apps/hello.c apps/socrates.h
 build/hello: build/hello.o apps/app.ld
 	$(LD) -nostdlib -static -T apps/app.ld build/hello.o -o $@
 
-# --- Store apps: standalone ELF64 canvas apps ---
+# --- .bsd toolchain (host) ---
+$(BSD_MAKER): bsdfmt/bsd_maker.c bsdfmt/bsd_format.h
+	$(HOSTCC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
+
+bsdfmt/bsd_run: bsdfmt/bsd_run.c bsdfmt/bsd_format.h
+	$(HOSTCC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
+
+# --- Store apps: canvas apps compiled to ELF64, repacked as .bsd ---
+# bsd.ld puts .data on its own page so the two segments can carry
+# different protections; -z max-page-size stops ld padding to 2 MB.
 build/store/%.o: apps/store/%.c apps/socrates.h
 	@mkdir -p build/store
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
-build/store/%: build/store/%.o apps/app.ld
-	$(LD) -nostdlib -static -T apps/app.ld $< -o $@
+build/store/%.elf: build/store/%.o bsdfmt/bsd.ld
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T bsdfmt/bsd.ld $< -o $@
+
+build/store/%.bsd: build/store/%.elf $(BSD_MAKER)
+	$(BSD_MAKER) -o $@ -e $<
 
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
 # The store payloads ride along here too, so the storefront still has
@@ -79,7 +97,7 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
 	cp build/hello build/initrd_staging/
-	$(foreach a,$(STORE_APPS),cp build/store/$(a) build/initrd_staging/store/pkg/$(a).elf;)
+	$(foreach a,$(STORE_APPS),cp build/store/$(a).bsd build/initrd_staging/store/pkg/$(a).bsd;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
 
@@ -154,7 +172,11 @@ run: os.iso disk.img
 		-netdev user,id=net0,net=10.0.2.0/24 \
 		-device e1000,netdev=net0
 
+# keep the intermediates make would otherwise delete as chained targets
+.PRECIOUS: build/store/%.o build/store/%.elf
+
 clean:
+	$(MAKE) -C bsdfmt clean
 	rm -rf build os.iso \
 		$(ISO)/boot/kernel \
 		$(ISO)/boot/initrd.tar \
