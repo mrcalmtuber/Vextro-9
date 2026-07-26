@@ -5,6 +5,7 @@
 #include "ttf.h"
 #include "gfx.h"
 #include "fat32.h"
+#include "exfat.h"
 #include "bsd_format.h"
 #include "sci.h"
 
@@ -179,31 +180,111 @@ static const void *tar_read_file(const char *filename, uint64_t *out_size) {
 
 /* ===== 2.5 UNIFIED FILESYSTEM LAYER =====
  *
- * FAT32 on the ATA disk is the real filesystem: writable, persistent,
- * host-mountable.  The tar ramdisk remains only as a read-only fallback
- * so ISO-only boots (no hard disk attached) still work.
+ * exFAT is the system volume: it carries 64-bit sizes, so a file is no
+ * longer capped at FAT32's 4 GB.  FAT32 is still probed as a fallback so
+ * an older disk image keeps working, and the ustar ramdisk remains the
+ * read-only last resort for ISO-only boots with no disk attached.
+ *
+ * Everything above this line talks to fs_* and never to a driver, so
+ * which filesystem is mounted is decided in exactly one place.
  */
 
-/* Big enough for a compressed full-colour image; everything else on the
- * disk is far smaller. */
+#define FS_NONE   0
+#define FS_EXFAT  1
+#define FS_FAT32  2
+
+static int fs_kind = FS_NONE;
+
+/* Big enough for a compressed full-colour image; larger files are read
+ * through fs_read_range() a window at a time. */
 #define FS_FILEBUF_MAX (4 * 1024 * 1024)
 static uint8_t fs_filebuf[FS_FILEBUF_MAX];
 static const char *fs_errstr = "";
 
-static int fs_writable(void) {
-    return fat_vol.mounted;
+static void fs_mount(void) {
+    exfat_mount();
+    if (exf_vol.mounted) { fs_kind = FS_EXFAT; return; }
+    fat32_mount();
+    if (fat_vol.mounted) { fs_kind = FS_FAT32; return; }
+    fs_kind = FS_NONE;
+}
+
+static const char *fs_name(void) {
+    if (fs_kind == FS_EXFAT) return "exFAT";
+    if (fs_kind == FS_FAT32) return "FAT32";
+    return tarfs_base ? "ramdisk (read-only)" : "none";
+}
+
+static int fs_writable(void) { return fs_kind != FS_NONE; }
+
+static uint32_t fs_total_kb(void) {
+    if (fs_kind == FS_EXFAT) return exf_total_kb();
+    if (fs_kind == FS_FAT32) return fat_total_kb();
+    return 0;
+}
+
+static uint32_t fs_free_kb(void) {
+    if (fs_kind == FS_EXFAT) return exf_free_kb();
+    if (fs_kind == FS_FAT32) return fat_free_kb();
+    return 0;
+}
+
+/* Normalise to an absolute path in the caller's buffer. */
+static void fs_abs(const char *in, char *out, int max) {
+    if (in[0] == '/') { str_copy(out, in, max); return; }
+    out[0] = '/';
+    str_copy(out + 1, in, max - 1);
+}
+
+/* Does the path exist, and what is it?  Replaces every direct driver
+ * lookup that used to be scattered through the apps. */
+static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e)) return 0;
+        if (size) *size = e.size;
+        if (is_dir) *is_dir = (e.attr & EXF_ATTR_DIR) ? 1 : 0;
+        return 1;
+    }
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t e;
+        if (!fat_lookup(abs, &e)) return 0;
+        if (size) *size = e.size;
+        if (is_dir) *is_dir = (e.attr & FAT_ATTR_DIR) ? 1 : 0;
+        return 1;
+    }
+    uint64_t n = 0;
+    if (tar_read_file(abs, &n) && n > 0) {
+        if (size) *size = n;
+        if (is_dir) *is_dir = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static const void *fs_read_file(const char *filename, uint64_t *out_size) {
-    if (fat_vol.mounted) {
-        fat_dirent_t e;
-        char abs[256];
-        if (filename[0] != '/') {
-            abs[0] = '/';
-            str_copy(abs + 1, filename, 255);
-        } else {
-            str_copy(abs, filename, 256);
+    char abs[256];
+    fs_abs(filename, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
+            if (out_size) *out_size = 0;
+            return 0;
         }
+        uint32_t got = 0;
+        if (exf_read_file(&e, fs_filebuf, FS_FILEBUF_MAX, &got) != 0) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        if (out_size) *out_size = got;
+        return fs_filebuf;
+    }
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t e;
         if (!fat_lookup(abs, &e) || (e.attr & FAT_ATTR_DIR)) {
             if (out_size) *out_size = 0;
             return 0;
@@ -219,58 +300,111 @@ static const void *fs_read_file(const char *filename, uint64_t *out_size) {
     return tar_read_file(filename, out_size);
 }
 
-static int fs_write_file(const char *path, const void *data, uint32_t len) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+/*
+ * Read a window out of a file.  This is what makes a multi-gigabyte
+ * archive usable: nothing has to fit in a buffer, only the slice being
+ * looked at.  exFAT only — the fallbacks cannot hold such a file anyway.
+ */
+static int fs_read_range(const char *path, uint64_t offset, void *buf,
+                         uint32_t len, uint32_t *got) {
+    *got = 0;
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        if (exf_read_range(&e, offset, (uint8_t *)buf, len, got) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
     }
-    if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
-    }
+
+    uint64_t size = 0;
+    const void *d = fs_read_file(abs, &size);
+    if (!d) { fs_errstr = "not found"; return -1; }
+    if (offset >= size) return 0;
+    uint32_t n = (uint32_t)(size - offset);
+    if (n > len) n = len;
+    const uint8_t *src = (const uint8_t *)d + offset;
+    for (uint32_t i = 0; i < n; i++) ((uint8_t *)buf)[i] = src[i];
+    *got = n;
     return 0;
+}
+
+static int fs_write_file(const char *path, const void *data, uint32_t len) {
+    if (fs_kind == FS_EXFAT) {
+        if (exf_write_file(path, (const uint8_t *)data, len) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    if (fs_kind == FS_FAT32) {
+        if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
+            fs_errstr = fat_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
 static int fs_delete(const char *path) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_delete(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        return 0;
     }
-    if (fat_delete(path) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
+    if (fs_kind == FS_FAT32) {
+        if (fat_delete(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        return 0;
     }
-    return 0;
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
 static int fs_mkdir(const char *path) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_mkdir(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        return 0;
     }
-    if (fat_mkdir(path) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
+    if (fs_kind == FS_FAT32) {
+        if (fat_mkdir(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        return 0;
     }
-    return 0;
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
-/* FAT32-only directory listing (callers fall back to tar walks) */
 typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
 
 static int fs_list(const char *path, fs_list_cb cb) {
-    if (!fat_vol.mounted) return -1;
-    fat_dirent_t d;
-    if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
-        fs_errstr = "no such directory";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_list(path, (exf_list_cb)cb) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
     }
-    fat_iter_t it;
-    fat_iter_init(&it, d.first_clus);
-    fat_dirent_t e;
-    while (fat_iter_next(&it, &e) == 1)
-        cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
-    return 0;
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t d;
+        if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        fat_iter_t it;
+        fat_iter_init(&it, d.first_clus);
+        fat_dirent_t e;
+        while (fat_iter_next(&it, &e) == 1)
+            cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
+        return 0;
+    }
+    return -1;
 }
 
 /* ===== 3. FORWARD DECLARATIONS ===== */

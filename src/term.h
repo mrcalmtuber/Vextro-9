@@ -353,9 +353,12 @@ static void term_cmd_df(void) {
         return;
     }
     char nb[16];
-    uint32_t total = fat_total_kb(), free_kb = fat_free_kb();
-    term_print("  volume    FAT32 on ata0 (");
-    uint_to_str(fat_vol.nclusters, nb);
+    uint32_t total = fs_total_kb(), free_kb = fs_free_kb();
+    term_print("  volume    ");
+    term_print(fs_name());
+    term_print(" on ata0 (");
+    uint_to_str(fs_kind == FS_EXFAT ? exf_vol.cluster_count
+                                    : fat_vol.nclusters, nb);
     term_print(nb);
     term_print(" clusters)\n  total     ");
     uint_to_str(total / 1024, nb);
@@ -466,6 +469,7 @@ static void term_cmd_help(void) {
     term_print("  date / uptime / mem / uname          system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
     term_print("  img <file.sci>    decode and show a compressed image\n");
+    term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -633,8 +637,8 @@ static void term_exec(char *cmdline) {
         if (!fs_writable()) {
             term_print_c("cd: no mounted volume\n", 2);
         } else {
-            fat_dirent_t d;
-            if (fat_lookup(abs, &d) && (d.attr & FAT_ATTR_DIR)) {
+            int is_dir = 0;
+            if (fs_stat(abs, 0, &is_dir) && is_dir) {
                 str_copy(term_cwd, abs, sizeof(term_cwd));
             } else {
                 term_print_c("cd: no such directory: ", 2);
@@ -839,6 +843,47 @@ static void term_exec(char *cmdline) {
         term_print(host);
         term_print(path);
         term_print(" ...\n");
+    } else if (str_eq(cmd, "peek")) {
+        /* Read a window out of a file without loading the whole thing —
+         * the only way to look inside an archive larger than any buffer,
+         * which is what exFAT's 64-bit sizes now allow. */
+        if (argc < 3) {
+            term_print_c("usage: peek <file> <offset> [bytes]\n", 2);
+            return;
+        }
+        char abs[256];
+        term_resolve(argv[1], abs);
+        uint64_t off = 0;
+        for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++)
+            off = off * 10 + (uint64_t)(*q - '0');
+        uint32_t want = 256;
+        if (argc >= 4) {
+            want = 0;
+            for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++)
+                want = want * 10 + (uint32_t)(*q - '0');
+        }
+        if (want > 1024) want = 1024;
+
+        static uint8_t peek_buf[1024];
+        uint32_t got = 0;
+        if (fs_read_range(abs, off, peek_buf, want, &got) != 0) {
+            term_print_c("peek: ", 2);
+            term_print_c(fs_errstr, 2);
+            term_putc('\n');
+            return;
+        }
+        if (got == 0) { term_print_c("(offset is past the end)\n", 3); return; }
+        char nb[16];
+        term_print_c("  ", 3);
+        uint_to_str(got, nb); term_print_c(nb, 3);
+        term_print_c(" bytes at offset ", 3);
+        uint_to_str((uint32_t)off, nb); term_print_c(nb, 3);
+        term_putc('\n');
+        for (uint32_t i = 0; i < got; i++) {
+            char c = (char)peek_buf[i];
+            term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
+        }
+        if (term_cx > 0) term_putc('\n');
     } else if (str_eq(cmd, "img") || str_eq(cmd, "view")) {
         if (argc < 2) { term_print_c("usage: img <file.sci>\n", 2); return; }
         char abs[256];
@@ -1094,11 +1139,12 @@ static void term_banner(void) {
     term_print_c("(x86_64 bare metal)\n", 3);
     if (fs_writable()) {
         char nb[16];
-        term_print_c("FAT32 volume mounted: ", 3);
-        uint_to_str(fat_free_kb() / 1024, nb);
+        term_print_c(fs_name(), 3);
+        term_print_c(" volume mounted: ", 3);
+        uint_to_str(fs_free_kb() / 1024, nb);
         term_print_c(nb, 3);
         term_print_c(" MB free of ", 3);
-        uint_to_str(fat_total_kb() / 1024, nb);
+        uint_to_str(fs_total_kb() / 1024, nb);
         term_print_c(nb, 3);
         term_print_c(" MB (writable, persistent)\n", 3);
     } else {

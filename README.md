@@ -13,17 +13,20 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - **Wallpaper themes** — five gradient themes with the dragon emblem, switchable live from Settings
 
 ### Filesystem
-- **Writable FAT32** on a real ATA disk (`disk.img`) — files survive reboots
-- ATA PIO driver (LBA28) + FAT32 driver: subdirectories, create/write/append, delete, mkdir, long-filename reading, NT case flags, FSInfo upkeep
-- `disk.img` is a standard image: **mount it on your host** (macOS: `hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img`) to exchange files with the OS
+- **Writable exFAT** on a real ATA disk (`disk.img`) — files survive reboots
+- exFAT rather than FAT32 because **FAT32 caps a single file at 4 GB**; exFAT carries 64-bit sizes, so an offline archive of any size fits. The default volume is 8 GB and **sparse**, costing only the few megabytes actually used
+- Full read/write driver: allocation-bitmap free space, contiguous (`NoFatChain`) *and* chained files, checksummed directory entry sets, free-form UTF-16 names — no more 8.3
+- **`fs_read_range()`** reads a window out of a file, so nothing has to fit in a buffer. `peek <file> <offset> [n]` exposes it from the shell
+- ATA PIO driver with **LBA48**, so volumes past 128 GB work; FAT32 and the ustar ramdisk remain as automatic fallbacks, and MBR partitions are probed, so a FAT32 boot partition can sit beside the exFAT system one
+- One `fs_*` layer decides which filesystem is mounted; no app talks to a driver directly
+- `disk.img` is a standard image: **mount it on your host** (macOS: `hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img`) to exchange files with the OS — including dropping in a multi-gigabyte archive
 - Login keycode persists on disk (`keycode.sys`) — delete it to re-register
-- ustar ramdisk remains as a read-only fallback for ISO-only boots
 
 ### Terminal
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
 - Command history (Up/Down), line editing (Left/Right/Home/End/Del), 240-line scrollback (PgUp/PgDn)
 - Working directory (`cd` / `pwd`, shown in the prompt) and output redirection: `ls > list.txt`, `echo hi >> notes.txt`
-- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `open` `history` `reboot` `shutdown`
+- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `peek` `open` `history` `reboot` `shutdown`
 
 ### Networking
 - **Full TCP/IP stack** — IPv4, ICMP (ping), UDP, DNS resolver, polled TCP client, async HTTP/1.0 client with redirects
@@ -38,7 +41,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 
 ### App Store
 - **Agora** — a working package manager with a storefront: browse a catalog, **Install**, **Open**, **Remove**
-- Installing is a real operation — the payload is validated, copied to `/apps/<id>.bsd` on the FAT32 volume and recorded in the registry at `/apps/apps.db`, so **installed apps survive a reboot**
+- Installing is a real operation — the payload is validated, copied to `/apps/<id>.bsd` on the system volume and recorded in the registry at `/apps/apps.db`, so **installed apps survive a reboot**
 - Installed apps join the **dock** (after a separator, with their store icon) and the **Apps menu**, and launch straight into their own window
 - Two package sources, one catalog:
   - the repository seeded on disk at `/store/pkg` (also carried in the initrd, so the storefront works on an ISO-only boot)
@@ -62,7 +65,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - **GPU hang capture** (i915 error-state style): when a submission's breadcrumb never lands, the driver latches EIR/ESR, the per-engine IPEHR/IPEIR (the exact command header that broke the pipeline, decoded by name — e.g. a malformed `XY_COLOR_BLT`), ACTHD, INSTDONE, `RING_FAULT_REG` GGTT faults, the HWS page and the ring contents around the parse point — then attempts a `GDRST` blitter-domain engine reset, falling back to CPU rendering after repeated hangs. `gpu error` prints the full report; `gpu decode <hex>` decodes any command dword
 
 ### Compressed images — the `.sci` format
-Full-colour pictures that fit on a 64 MB disk, decompressed when opened.
+Full-colour pictures stored compressed and decompressed when opened.
 
 - **`src/lzma.h`** — a complete LZMA / LZMA2 / xz decompressor: range decoder, the full probability model, the LZMA2 chunk layer and enough of the xz container to walk its blocks. It decodes straight into the caller's buffer and uses that buffer as its dictionary window, so there is no separate 32 MB ring
 - **`src/sci.h`** — the container. Each row gets a PNG-style prediction filter (None/Sub/Up/Average/Paeth, chosen per row by lowest absolute sum), and the filtered plane is one LZMA stream. Header carries dimensions, channels, filter mode, codec and both sizes, and is validated before anything is decoded
@@ -139,8 +142,10 @@ This will:
    by `bsdfmt/bsd_maker`
 2. Convert `boot.mp4` to raw RGB565 frames and embed them
 3. Bundle the initrd (ustar tar) and assemble the bootable ISO at `os.iso`
-4. Create `disk.img` — a 64 MB FAT32 system disk seeded with the starter
-   files and the store's package repository under `/store/pkg`
+4. Create `disk.img` — an 8 GB sparse exFAT system disk seeded with the
+   starter files, the store's package repository under `/store/pkg` and
+   the sample pictures under `/pics`. Override the size with
+   `make DISK_MB=32768 cleandisk`
 
 `disk.img` is created **once** and then left alone so your files survive
 rebuilds. `make cleandisk` resets it to factory contents — **run this once
@@ -205,7 +210,8 @@ src/            Kernel source
   sci.h         .sci compressed image format + decoder
   gfx.h         Theme palette + drawing primitives + monospace text
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
-  fat32.h       FAT32 driver (read/write)   ata.h  ATA PIO disk driver
+  exfat.h       exFAT driver (read/write, 64-bit sizes, range reads)
+  fat32.h       FAT32 driver (fallback)     ata.h  ATA PIO + LBA48
   pci.h         Generic PCI enumeration + BAR sizing + MMIO mapper
   igpu.h        Intel Gen9 iGPU blitter (GGTT + BCS ring + XY_COLOR_BLT)
   e1000.h       Intel NIC driver        ttf.h  TrueType rasterizer
@@ -218,7 +224,8 @@ bsdfmt/         The .bsd executable format
   bsd_maker.c   Builder (raw machine code, or repack an ELF64)
   bsd_run.c     POSIX loader: mmap + mprotect W^X + call
   bsd.ld        Linker script: page-separated text and data segments
-tools/          mkfat32.py (disk formatter), video converter,
+tools/          mkexfat.py (exFAT formatter), mkfat32.py (FAT32),
+                video converter,
                 mkimg.py (PNG/PPM -> .sci), serve_repo.py (package repo),
                 QEMU test driver (qemu_drive.py)
 limine-binary/  Pre-built Limine bootloader binaries

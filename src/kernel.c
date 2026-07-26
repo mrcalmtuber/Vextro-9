@@ -417,9 +417,10 @@ void kmain(void) {
         tarfs_init(mod->address, mod->size);
     }
 
-    /* Primary filesystem: FAT32 on the ATA disk (writable, persistent) */
+    /* Primary filesystem: exFAT on the ATA disk, with FAT32 and the tar
+     * ramdisk as fallbacks (writable, persistent) */
     ata_init();
-    fat32_mount();
+    fs_mount();
 
     /* App store: load the shipped catalog and the installed-app registry
      * so the dock and the Apps menu already know about installed apps */

@@ -507,6 +507,9 @@ static uint64_t xz_varint(const uint8_t *in, uint64_t size, uint64_t *pos,
     return 0;
 }
 
+/* Used by the ZIM cluster reader; kept here as the container half of the
+ * codec even while the only live consumer is the raw-LZMA image path. */
+__attribute__((unused))
 static int xz_decode(const uint8_t *in, uint64_t in_size,
                      uint8_t *out, uint64_t out_size,
                      uint64_t *out_len, const char **err) {

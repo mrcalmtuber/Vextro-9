@@ -726,19 +726,19 @@ static void sysmon_draw(uint32_t *buf, uint32_t w, uint32_t h,
     gfx_rect(buf, w, h, cx + 16, y + 20, cw - 32, 1, 0x2A3040u);
     y += 28;
 
-    if (fat_vol.mounted) {
-        char v[40];
-        str_copy(v, "FAT32, ", sizeof(v));
-        uint_to_str(fat_free_kb() / 1024, nb);
+    if (fs_writable()) {
+        char v[48];
+        str_copy(v, fs_name(), sizeof(v));
+        str_append(v, ", ", sizeof(v));
+        uint_to_str(fs_free_kb() / 1024, nb);
         str_append(v, nb, sizeof(v));
         str_append(v, " / ", sizeof(v));
-        uint_to_str(fat_total_kb() / 1024, nb);
+        uint_to_str(fs_total_kb() / 1024, nb);
         str_append(v, nb, sizeof(v));
         str_append(v, " MB free", sizeof(v));
         sysmon_row(buf, w, h, cx + 16, y, "disk", v, C_GREEN);
     } else {
-        sysmon_row(buf, w, h, cx + 16, y, "disk",
-                   tarfs_base ? "ramdisk (read-only)" : "none", C_RED);
+        sysmon_row(buf, w, h, cx + 16, y, "disk", fs_name(), C_RED);
     }
     y += 22;
     sysmon_row(buf, w, h, cx + 16, y, "gpu",
@@ -880,8 +880,8 @@ static int img_path_for(const char *name, char *out, int max) {
         str_copy(out, img_dirs[d], max);
         if (!str_eq(img_dirs[d], "/")) str_append(out, "/", max);
         str_append(out, name, max);
-        fat_dirent_t e;
-        if (fat_vol.mounted && fat_lookup(out, &e) && !(e.attr & FAT_ATTR_DIR))
+        int is_dir = 0;
+        if (fs_writable() && fs_stat(out, 0, &is_dir) && !is_dir)
             return 1;
     }
     str_copy(out, "/", max);
