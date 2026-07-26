@@ -49,11 +49,17 @@ pics: $(PIC_SCI)
 
 bsdtools: $(BSD_MAKER) bsdfmt/bsd_run
 
-# --- FAT32 system disk ---
+# --- exFAT system disk ---
+# exFAT rather than FAT32 because FAT32 caps a single file at 4 GB, and
+# an offline encyclopedia is far past that.  The image is sparse, so an
+# 8 GB volume costs only the few megabytes actually used.
+#
 # Created once and then left alone: it is the OS's writable, persistent
 # filesystem. `make cleandisk` resets it to factory contents.
+DISK_MB ?= 8192
+
 disk.img: | build/hello $(STORE_BINS) $(PIC_SCI)
-	python3 tools/mkfat32.py disk.img 64 \
+	python3 tools/mkexfat.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
 		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd) \

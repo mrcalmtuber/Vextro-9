@@ -145,7 +145,7 @@ static void store_app_path(const char *id, char *out /* >= STORE_PATH_MAX */) {
 /* Payload lookup that also sees the ustar ramdisk, so the storefront
  * still works on an ISO-only boot with no hard disk attached. */
 static const void *store_read(const char *path, uint64_t *len) {
-    if (fat_vol.mounted) {
+    if (fs_writable()) {
         const void *d = fs_read_file(path, len);
         if (d) return d;
     }
@@ -153,10 +153,11 @@ static const void *store_read(const char *path, uint64_t *len) {
 }
 
 static int store_stat(const char *path, uint32_t *size) {
-    if (fat_vol.mounted) {
-        fat_dirent_t e;
-        if (fat_lookup(path, &e) && !(e.attr & FAT_ATTR_DIR)) {
-            *size = e.size;
+    if (fs_writable()) {
+        uint64_t sz = 0;
+        int is_dir = 0;
+        if (fs_stat(path, &sz, &is_dir) && !is_dir) {
+            *size = (uint32_t)sz;
             return 1;
         }
     }
@@ -456,8 +457,7 @@ static int store_commit(store_pkg_t *p, const uint8_t *data, uint32_t len) {
         return -1;
     }
 
-    fat_dirent_t d;
-    if (!fat_lookup("/apps", &d) && fs_mkdir("/apps") != 0) {
+    if (!fs_stat("/apps", 0, 0) && fs_mkdir("/apps") != 0) {
         store_say2("cannot create /apps: ", fs_errstr, 2);
         return -1;
     }

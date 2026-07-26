@@ -70,6 +70,9 @@ static struct {
     uint32_t upcase_cluster;
     uint64_t upcase_bytes;
     uint64_t part_lba;          /* where the volume starts on the device */
+    uint32_t free_clusters;     /* kept live: the bitmap is on disk, and
+                                 * rescanning it per frame would be 64
+                                 * PIO reads for an 8 GB volume */
 } exf_vol;
 
 static const char *exf_errstr = "";
@@ -91,11 +94,11 @@ typedef struct {
 /* ---- raw device access, offset by the partition start ---- */
 
 static int exf_read_sec(uint64_t lba, uint32_t count, void *buf) {
-    return ata_read((uint32_t)(exf_vol.part_lba + lba), count, buf);
+    return ata_read(exf_vol.part_lba + lba, count, buf);
 }
 
 static int exf_write_sec(uint64_t lba, uint32_t count, const void *buf) {
-    return ata_write((uint32_t)(exf_vol.part_lba + lba), count, buf);
+    return ata_write(exf_vol.part_lba + lba, count, buf);
 }
 
 static uint16_t exf_rd16(const uint8_t *p) {
@@ -170,9 +173,13 @@ static int exf_bitmap_set(uint32_t clus, int value) {
     uint64_t lba = exf_cluster_lba(exf_vol.bitmap_cluster) + byte / EXF_SECTOR;
     if (exf_read_sec(lba, 1, exf_secbuf) != 0) return -1;
     uint8_t mask = (uint8_t)(1u << (idx & 7));
+    int was = (exf_secbuf[byte % EXF_SECTOR] & mask) ? 1 : 0;
     if (value) exf_secbuf[byte % EXF_SECTOR] |= mask;
     else       exf_secbuf[byte % EXF_SECTOR] &= (uint8_t)~mask;
-    return exf_write_sec(lba, 1, exf_secbuf);
+    if (exf_write_sec(lba, 1, exf_secbuf) != 0) return -1;
+    if (was != (value ? 1 : 0))
+        exf_vol.free_clusters += value ? (uint32_t)-1 : 1;
+    return 0;
 }
 
 static uint32_t exf_alloc_hint = 2;
@@ -886,7 +893,8 @@ static uint32_t exf_total_kb(void) {
 }
 
 static uint32_t exf_free_kb(void) {
-    return (uint32_t)(exf_free_clusters() * exf_vol.cluster_bytes / 1024);
+    return (uint32_t)((uint64_t)exf_vol.free_clusters *
+                      exf_vol.cluster_bytes / 1024);
 }
 
 /* Try to mount an exFAT volume whose VBR is at `lba`. */
@@ -894,7 +902,7 @@ static int exfat_try(uint64_t lba) {
     uint8_t vbr[EXF_SECTOR];
     exf_vol.part_lba = lba;
     exf_vol.mounted = 0;
-    if (ata_read((uint32_t)lba, 1, vbr) != 0) return 0;
+    if (ata_read(lba, 1, vbr) != 0) return 0;
 
     const char *sig = "EXFAT   ";
     for (int i = 0; i < 8; i++)
@@ -943,6 +951,7 @@ static int exfat_try(uint64_t lba) {
         return 0;
     }
     exf_alloc_hint = 2;
+    exf_vol.free_clusters = (uint32_t)exf_free_clusters();   /* one scan */
     return 1;
 }
 
