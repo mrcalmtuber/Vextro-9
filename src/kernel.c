@@ -421,6 +421,10 @@ void kmain(void) {
     ata_init();
     fat32_mount();
 
+    /* App store: load the shipped catalog and the installed-app registry
+     * so the dock and the Apps menu already know about installed apps */
+    store_init();
+
     /* Restore the master keycode saved on a previous boot */
     {
         uint64_t klen = 0;

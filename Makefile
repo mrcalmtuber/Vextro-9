@@ -10,28 +10,46 @@ CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
 
+# -fno-tree-loop-distribute-patterns: without it GCC turns clear loops
+# into memset calls, and there is no libc to link them against.
 APP_CFLAGS := -O2 -Wall -ffreestanding -fno-stack-protector \
               -fno-stack-check -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
-              -mno-red-zone -fPIC
+              -mno-red-zone -fPIC -fno-tree-loop-distribute-patterns
 
 LIMINE  := limine-binary
 ISO     := iso_root
 
-.PHONY: all iso run clean cleandisk
+# --- App store packages ---
+# Seeded onto the disk under /store/pkg, which is the repository the
+# Agora store installs from.  `voronoi` is deliberately left out so it
+# is only reachable through the network repository (see `make repo`).
+STORE_APPS  := mandel orbit life plasma
+REPO_APPS   := $(STORE_APPS) voronoi
+STORE_BINS  := $(addprefix build/store/,$(STORE_APPS))
+REPO_BINS   := $(addprefix build/store/,$(REPO_APPS))
+
+.PHONY: all iso run clean cleandisk apps repo
 
 all: os.iso disk.img
+
+apps: $(REPO_BINS)
 
 # --- FAT32 system disk ---
 # Created once and then left alone: it is the OS's writable, persistent
 # filesystem. `make cleandisk` resets it to factory contents.
-disk.img: | build/hello
+disk.img: | build/hello $(STORE_BINS)
 	python3 tools/mkfat32.py disk.img 64 \
 		apps/about.txt apps/notes.txt build/hello \
-		apps/welcome.txt:docs/welcome.txt
+		apps/welcome.txt:docs/welcome.txt \
+		$(foreach a,$(STORE_APPS),build/store/$(a):store/pkg/$(a).elf)
 
 cleandisk:
 	rm -f disk.img
 	$(MAKE) disk.img
+
+# --- Network package repository (http://10.0.2.2:8000 from the guest) ---
+repo: $(REPO_BINS)
+	python3 tools/serve_repo.py --out build/repo $(REPO_BINS)
 
 # --- Host Limine tool (needed for BIOS boot-sector install) ---
 build/limine-tool: $(LIMINE)/limine.c
@@ -46,11 +64,22 @@ build/hello.o: apps/hello.c apps/socrates.h
 build/hello: build/hello.o apps/app.ld
 	$(LD) -nostdlib -static -T apps/app.ld build/hello.o -o $@
 
+# --- Store apps: standalone ELF64 canvas apps ---
+build/store/%.o: apps/store/%.c apps/socrates.h
+	@mkdir -p build/store
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/store/%: build/store/%.o apps/app.ld
+	$(LD) -nostdlib -static -T apps/app.ld $< -o $@
+
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
-build/initrd.tar: $(wildcard apps/*.txt) build/hello
-	@mkdir -p build/initrd_staging
+# The store payloads ride along here too, so the storefront still has
+# something to install on an ISO-only boot with no disk attached.
+build/initrd.tar: $(wildcard apps/*.txt) build/hello $(STORE_BINS)
+	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
 	cp build/hello build/initrd_staging/
+	$(foreach a,$(STORE_APPS),cp build/store/$(a) build/initrd_staging/store/pkg/$(a).elf;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
 

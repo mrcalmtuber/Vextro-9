@@ -23,7 +23,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
 - Command history (Up/Down), line editing (Left/Right/Home/End/Del), 240-line scrollback (PgUp/PgDn)
 - Working directory (`cd` / `pwd`, shown in the prompt) and output redirection: `ls > list.txt`, `echo hi >> notes.txt`
-- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `open` `history` `reboot` `shutdown`
+- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `open` `history` `reboot` `shutdown`
 
 ### Networking
 - **Full TCP/IP stack** — IPv4, ICMP (ping), UDP, DNS resolver, polled TCP client, async HTTP/1.0 client with redirects
@@ -35,6 +35,16 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - HTML-to-text renderer: headings, paragraphs, lists, `<pre>`, entities, word wrap
 - **Clickable links**, Back/Reload, editable address bar, scrollbar, status bar with load progress
 - Internal pages: `socrates://home`, `socrates://help`, `socrates://about`, `socrates://file/<name>`
+
+### App Store
+- **Agora** — a working package manager with a storefront: browse a catalog, **Install**, **Open**, **Remove**
+- Installing is a real operation — the ELF64 payload is validated, copied to `/apps/<id>.elf` on the FAT32 volume and recorded in the registry at `/apps/apps.db`, so **installed apps survive a reboot**
+- Installed apps join the **dock** (after a separator, with their store icon) and the **Apps menu**, and launch straight into their own window
+- Two package sources, one catalog:
+  - the repository seeded on disk at `/store/pkg` (also carried in the initrd, so the storefront works on an ISO-only boot)
+  - a **network repository fetched over the in-kernel TCP/IP stack** — `Refresh` pulls an index of `key:value` blocks, and each payload is downloaded with its own HTTP GET
+- Ships five apps, all integer-only userland ELF64 binaries: **Mandelbrot** (16.16 fixed-point fractal), **Orbit** (five-body Newtonian integrator), **Game of Life** (149×100 torus over a heat map), **Plasma** (sine table built at runtime by a magic-circle oscillator) and **Voronoi** (28-site partition, network-only — it exists purely to exercise the download path)
+- Also driveable from the shell: `store list` `store install <id>` `store remove <id>` `store run <id>` `store refresh` `store repo [url]`
 
 ### Apps
 - **Files** — ramdisk explorer; double-click text files to view them in the browser
@@ -48,6 +58,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - **Intel Gen9/9.5 iGPU driver** (Skylake → Comet Lake): maps BAR0 GTTMMADR, programs a private GGTT window, brings up the BCS blitter ring in legacy submission mode, and executes `XY_COLOR_BLT` packets — with a CPU-verified self-test at boot
 - Register/command encodings adapted from the Linux i915 driver; probe-then-bail structure after SerenityOS — display modesetting is deliberately left to firmware
 - If no supported iGPU is present the OS silently stays on the CPU renderer (`gpu` in the terminal shows which path is live; `gpu test` blits to the visible framebuffer on real hardware)
+- **GPU hang capture** (i915 error-state style): when a submission's breadcrumb never lands, the driver latches EIR/ESR, the per-engine IPEHR/IPEIR (the exact command header that broke the pipeline, decoded by name — e.g. a malformed `XY_COLOR_BLT`), ACTHD, INSTDONE, `RING_FAULT_REG` GGTT faults, the HWS page and the ring contents around the parse point — then attempts a `GDRST` blitter-domain engine reset, falling back to CPU rendering after repeated hangs. `gpu error` prints the full report; `gpu decode <hex>` decodes any command dword
 
 ### Core
 - **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 4x4 supersampled AA; no floats, no GPU
@@ -96,13 +107,15 @@ make
 ```
 
 This will:
-1. Compile the kernel and userland `hello` app
+1. Compile the kernel, the userland `hello` app and the app store packages
 2. Convert `boot.mp4` to raw RGB565 frames and embed them
 3. Bundle the initrd (ustar tar) and assemble the bootable ISO at `os.iso`
-4. Create `disk.img` — a 64 MB FAT32 system disk seeded with the starter files
+4. Create `disk.img` — a 64 MB FAT32 system disk seeded with the starter
+   files and the store's package repository under `/store/pkg`
 
 `disk.img` is created **once** and then left alone so your files survive
-rebuilds. `make cleandisk` resets it to factory contents.
+rebuilds. `make cleandisk` resets it to factory contents — **run this once
+after pulling the app store** so the packages land on an existing disk.
 
 ---
 
@@ -119,12 +132,33 @@ subsequent boots only ask you to log in. Once on the desktop, try:
 
 ```
 open browser            (or click the globe in the dock)
+open store              (or click the shopping bag in the dock)
+store install mandel    (then look at the dock, and `reboot`)
 ping 10.0.2.2
 fetch http://example.com
 echo hello disk > hi.txt
 mkdir projects && cp hi.txt projects/copy.txt
 cat projects/copy.txt   (still there after `reboot`)
 ```
+
+### Serving the network repository
+
+The store's **Refresh** button queries an HTTP repository. To run one on
+your host, in a second terminal:
+
+```sh
+make repo
+```
+
+That stages `build/repo/{index.sr, pkg/*.elf}` from the compiled packages
+and serves it on port 8000. QEMU user networking maps the host to
+`10.0.2.2`, which is exactly the store's default repository URL
+(`http://10.0.2.2:8000/index.sr`), so **Refresh** just works — it picks up
+`voronoi`, which is not on the disk, and installing it downloads the ELF
+over the kernel's own TCP stack.
+
+Point the store somewhere else with `store repo <url>` (saved to
+`/apps/repo.cfg`). Package metadata lives in `apps/store/packages.txt`.
 
 ---
 
@@ -137,6 +171,7 @@ src/            Kernel source
   term.h        Terminal (commands, history, scrollback)
   browser.h     Browser (HTML renderer, navigation, links)
   apps.h        Files / Settings / Goldsmith / Monolith / Matrix / About
+  store.h       Agora app store (catalog, installer, registry, storefront)
   gfx.h         Theme palette + drawing primitives + monospace text
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
   fat32.h       FAT32 driver (read/write)   ata.h  ATA PIO disk driver
@@ -145,7 +180,9 @@ src/            Kernel source
   e1000.h       Intel NIC driver        ttf.h  TrueType rasterizer
   keyboard.h    PS/2 keyboard           mouse.h  PS/2 mouse
 apps/           Userland app source + seed files for the disk
+  store/        App store packages + packages.txt (repository metadata)
 tools/          mkfat32.py (disk formatter), video converter,
+                serve_repo.py (HTTP package repository),
                 QEMU test driver (qemu_drive.py)
 limine-binary/  Pre-built Limine bootloader binaries
 Makefile        Top-level build system

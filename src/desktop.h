@@ -39,7 +39,11 @@ static uint64_t system_total_memory_mb = 0;
 #define DOCK_EDGE_LEFT   1
 #define DOCK_EDGE_RIGHT  2
 
-#define DOCK_APP_COUNT 8
+/* Built-in launchers, plus one slot per app installed from the store. */
+#define DOCK_BASE_COUNT 9
+#define DOCK_MAX_ITEMS  25
+
+static int dock_item_count = DOCK_BASE_COUNT;
 
 typedef struct {
     int32_t bar_y;      /* bottom edge: top y of bar; sides: top of column */
@@ -57,7 +61,7 @@ static dock_config_t dock_cfg = {
 static void dock_recalc(uint32_t scr_w, uint32_t scr_h) {
     (void)scr_w;
     dock_cfg.bar_h = dock_cfg.icon_sz + 12;
-    dock_cfg.bar_w = DOCK_APP_COUNT * (dock_cfg.icon_sz + 16) + 14;
+    dock_cfg.bar_w = dock_item_count * (dock_cfg.icon_sz + 16) + 14;
     if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
         dock_cfg.bar_y = (int32_t)scr_h - dock_cfg.bar_h - 4;
     else
@@ -74,6 +78,7 @@ enum {
     WK_SYSMON,
     WK_MATRIX,
     WK_HELLO,
+    WK_STORE,
     WK_SETTINGS,
     WK_ABOUT,
     WK_COUNT
@@ -92,6 +97,7 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Monolith",         400, 480 },
     { "Matrix",           620, 420 },
     { "hello",            600, 430 },
+    { "Agora App Store",  720, 520 },
     { "Settings",         470, 390 },
     { "About Socrates",   380, 270 },
 };
@@ -272,6 +278,7 @@ static void wallpaper_set_theme(int idx);
 static int  desktop_open_app_by_name(const char *name);
 static void brw_navigate(const char *url);
 static int  execute_bin(const char *filepath);
+static void store_cmd(int argc, char **argv);
 
 /* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
 
@@ -454,6 +461,7 @@ static int execute_bin(const char *filepath) {
 #include "term.h"
 #include "browser.h"
 #include "apps.h"
+#include "store.h"
 
 /* Canvas app (WK_HELLO) content drawer */
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
@@ -542,6 +550,8 @@ static void wm_open(int kind) {
         brw_navigate_no_hist("socrates://home");
     if (kind == WK_FILES)
         exp_scan();
+    if (kind == WK_STORE)
+        store_restat();
 
     wm_raise(kind);
 }
@@ -660,6 +670,9 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     case WK_HELLO:
         hello_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
+    case WK_STORE:
+        store_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
     case WK_SETTINGS:
         settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
@@ -722,6 +735,9 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
             break;
         case WK_SETTINGS:
             settings_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_STORE:
+            store_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
             break;
         case WK_PAINT:
             paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
@@ -900,34 +916,58 @@ static void wallpaper_set_theme(int idx) {
 
 /* ===== 8. MENUBAR ===== */
 
+/* action codes above the window kinds */
+#define MENU_ACT_REBOOT   100
+#define MENU_ACT_SHUTDOWN 101
+#define MENU_ACT_APP_BASE 200      /* + index into store_inst[] */
+
 typedef struct {
     const char *label;
-    int action;      /* >=0: open window kind; 100 reboot; 101 shutdown; -1 sep */
+    int action;      /* >=0 window kind; 100/101 power; 200+ app; -1 sep */
 } menu_item_t;
 
 static const menu_item_t menu_system[] = {
     { "About Socrates", WK_ABOUT },
     { "Settings",       WK_SETTINGS },
     { "-",              -1 },
-    { "Restart",        100 },
-    { "Shut Down",      101 },
+    { "Restart",        MENU_ACT_REBOOT },
+    { "Shut Down",      MENU_ACT_SHUTDOWN },
 };
 
-static const menu_item_t menu_apps[] = {
-    { "Terminal",  WK_TERM },
-    { "Browser",   WK_BROWSER },
-    { "Files",     WK_FILES },
-    { "-",         -1 },
-    { "Goldsmith", WK_PAINT },
-    { "Monolith",  WK_SYSMON },
-    { "Matrix",    WK_MATRIX },
-    { "hello.elf", WK_HELLO },
-};
+/* The Apps menu is rebuilt each frame so installed packages appear in it. */
+#define MENU_APPS_MAX (10 + STORE_MAX_INST)
+
+static menu_item_t menu_apps[MENU_APPS_MAX];
+static int         menu_apps_n = 0;
 
 #define MENU_COUNT 2
 static const char *menu_labels[MENU_COUNT] = { "Socrates", "Apps" };
 static const menu_item_t *menu_items[MENU_COUNT] = { menu_system, menu_apps };
-static const int menu_item_count[MENU_COUNT] = { 5, 8 };
+static int menu_item_count[MENU_COUNT] = { 5, 0 };
+
+static void menu_rebuild(void) {
+    int n = 0;
+    menu_apps[n].label = "Terminal";     menu_apps[n++].action = WK_TERM;
+    menu_apps[n].label = "Browser";      menu_apps[n++].action = WK_BROWSER;
+    menu_apps[n].label = "Files";        menu_apps[n++].action = WK_FILES;
+    menu_apps[n].label = "App Store";    menu_apps[n++].action = WK_STORE;
+    menu_apps[n].label = "-";            menu_apps[n++].action = -1;
+    menu_apps[n].label = "Goldsmith";    menu_apps[n++].action = WK_PAINT;
+    menu_apps[n].label = "Monolith";     menu_apps[n++].action = WK_SYSMON;
+    menu_apps[n].label = "Matrix";       menu_apps[n++].action = WK_MATRIX;
+    menu_apps[n].label = "hello.elf";    menu_apps[n++].action = WK_HELLO;
+
+    if (store_inst_count > 0) {
+        menu_apps[n].label = "-";        menu_apps[n++].action = -1;
+        for (int i = 0; i < store_inst_count && n < MENU_APPS_MAX; i++) {
+            menu_apps[n].label = store_inst[i].name;
+            menu_apps[n].action = MENU_ACT_APP_BASE + i;
+            n++;
+        }
+    }
+    menu_apps_n = n;
+    menu_item_count[1] = n;
+}
 
 static int menu_open_idx = -1;
 
@@ -950,7 +990,9 @@ static void menu_label_rect(int idx, int32_t *x0, int32_t *x1) {
 }
 
 static void menu_action(int action) {
-    if (action >= 0 && action < WK_COUNT) {
+    if (action >= MENU_ACT_APP_BASE) {
+        store_launch_inst(action - MENU_ACT_APP_BASE);
+    } else if (action >= 0 && action < WK_COUNT) {
         if (action == WK_HELLO) {
             silent_launch = 1;
             execute_bin_internal("hello", 0);
@@ -1096,10 +1138,41 @@ static void menu_dropdown_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* ===== 9. DOCK ===== */
 
-static const int dock_kinds[DOCK_APP_COUNT] = {
-    WK_TERM, WK_BROWSER, WK_FILES, WK_PAINT,
+/* A dock slot is either a built-in window kind or an installed app
+ * (which runs into the shared canvas window, WK_HELLO). */
+typedef struct {
+    int kind;
+    int inst;      /* index into store_inst[], or -1 for a built-in */
+} dock_item_t;
+
+static const int dock_base_kinds[DOCK_BASE_COUNT] = {
+    WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_PAINT,
     WK_SYSMON, WK_MATRIX, WK_HELLO, WK_SETTINGS,
 };
+
+static dock_item_t dock_items[DOCK_MAX_ITEMS];
+
+static void dock_rebuild(void) {
+    int n = 0;
+    for (int i = 0; i < DOCK_BASE_COUNT; i++) {
+        dock_items[n].kind = dock_base_kinds[i];
+        dock_items[n].inst = -1;
+        n++;
+    }
+    for (int i = 0; i < store_inst_count && n < DOCK_MAX_ITEMS; i++) {
+        dock_items[n].kind = WK_HELLO;
+        dock_items[n].inst = i;
+        n++;
+    }
+    dock_item_count = n;
+}
+
+static const char *dock_item_name(int idx) {
+    if (dock_items[idx].inst >= 0)
+        return store_inst[dock_items[idx].inst].name;
+    if (dock_items[idx].kind == WK_HELLO) return "hello";
+    return wk_meta[dock_items[idx].kind].title;
+}
 
 static void dock_bar_rect(uint32_t scr_w, int32_t *rx, int32_t *ry,
                           int32_t *rw, int32_t *rh) {
@@ -1193,6 +1266,22 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect(buf, w, h, cx + q / 2 - 1, cy - 2, 2, 3, C_GOLD);
         gfx_rect(buf, w, h, cx - q / 2, cy + q / 2, q + 1, 2, C_GOLD);
         break;
+    case WK_STORE:
+        /* a shopping bag with a download arrow in it */
+        gfx_rect_outline(buf, w, h, cx - q - 2, cy - q + 2, 2 * q + 4,
+                         2 * q + 1, C_TEXT);
+        gfx_line(buf, w, h, cx - q / 2 - 1, cy - q + 2,
+                 cx - q / 2 - 1, cy - q - 3, 1, C_TEXT);
+        gfx_line(buf, w, h, cx + q / 2 + 1, cy - q + 2,
+                 cx + q / 2 + 1, cy - q - 3, 1, C_TEXT);
+        gfx_line(buf, w, h, cx - q / 2 - 1, cy - q - 3,
+                 cx + q / 2 + 1, cy - q - 3, 1, C_TEXT);
+        gfx_rect(buf, w, h, cx - 1, cy - q + 5, 2, q + q / 2 - 6, C_GOLD);
+        gfx_line(buf, w, h, cx - 4, cy + q / 2 - 3, cx, cy + q / 2 + 1,
+                 1, C_GOLD);
+        gfx_line(buf, w, h, cx + 4, cy + q / 2 - 3, cx, cy + q / 2 + 1,
+                 1, C_GOLD);
+        break;
     case WK_SETTINGS: {
         int32_t r_out = q + 3;
         for (int32_t dy = -r_out - 2; dy <= r_out + 2; dy++)
@@ -1224,11 +1313,31 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/* Draw the pictogram for a dock slot — installed apps borrow the store's
+ * category glyphs so the dock icon matches the storefront card. */
+static void dock_draw_item_glyph(uint32_t *buf, uint32_t w, uint32_t h,
+                                 int idx, int32_t x, int32_t y, int32_t sz) {
+    if (dock_items[idx].inst >= 0) {
+        store_icon_glyph(buf, w, h, x, y, sz,
+                         store_inst[dock_items[idx].inst].icon);
+        return;
+    }
+    dock_draw_glyph(buf, w, h, dock_items[idx].kind, x, y, sz);
+}
+
 static void dock_launch(int idx) {
-    int kind = dock_kinds[idx];
     int32_t ix, iy, iw, ih;
     dock_icon_rect(scr_w_cache, idx, &ix, &iy, &iw, &ih);
 
+    if (dock_items[idx].inst >= 0) {
+        int was_open = wins[WK_HELLO].open;
+        store_launch_inst(dock_items[idx].inst);
+        if (!was_open && wins[WK_HELLO].open)
+            spawn_anim_start(WK_HELLO, ix + iw / 2, iy + ih / 2);
+        return;
+    }
+
+    int kind = dock_items[idx].kind;
     if (kind == WK_HELLO && !wins[WK_HELLO].open) {
         silent_launch = 1;
         execute_bin_internal("hello", 0);
@@ -1250,7 +1359,7 @@ static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
     if (mx < rx || mx >= rx + rw || my < ry || my >= ry + rh)
         return 0;
 
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+    for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(scr_w_cache, i, &ix, &iy, &iw, &ih);
         if (mx >= ix - 4 && mx < ix + iw + 4 &&
@@ -1273,10 +1382,10 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     gfx_rect(buf, w, h, rx, ry, rw, 1, 0x3A4254u);
 
     int hover = -1;
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+    for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, i, &ix, &iy, &iw, &ih);
-        int kind = dock_kinds[i];
+        int kind = dock_items[i].kind;
         int hot = (mx >= ix - 4 && mx < ix + iw + 4 &&
                    my >= iy - 4 && my < iy + ih + 4);
         if (hot) hover = i;
@@ -1285,10 +1394,26 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect(buf, w, h, ix, iy, iw, ih, hot ? 0x262C3Eu : 0x1C2130u);
         gfx_rect_outline(buf, w, h, ix, iy, iw, ih,
                          hot ? C_GOLD_DIM : 0x2A3040u);
-        dock_draw_glyph(buf, w, h, kind, ix, iy, iw);
+        dock_draw_item_glyph(buf, w, h, i, ix, iy, iw);
 
-        /* running indicator */
-        if (wm_is_open(kind)) {
+        /* separator before the installed-app section */
+        if (i == DOCK_BASE_COUNT && dock_item_count > DOCK_BASE_COUNT) {
+            if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
+                gfx_rect(buf, w, h, ix - 9, iy + 2, 1, ih - 4, 0x353C50u);
+            else
+                gfx_rect(buf, w, h, ix + 2, iy - 9, iw - 4, 1, 0x353C50u);
+        }
+
+        /* Running indicator.  Canvas apps all share WK_HELLO, so the one
+         * that is actually loaded is identified by the window title. */
+        int running;
+        if (kind == WK_HELLO)
+            running = wins[WK_HELLO].open &&
+                      str_eq(app_win_title, dock_item_name(i));
+        else
+            running = wm_is_open(kind);
+
+        if (running) {
             if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
                 gfx_circle(buf, w, h, ix + iw / 2, ry + rh - 4, 2, C_GOLD);
             else if (dock_cfg.edge == DOCK_EDGE_LEFT)
@@ -1300,8 +1425,7 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* tooltip */
     if (hover >= 0) {
-        int kind = dock_kinds[hover];
-        const char *name = wk_meta[kind].title;
+        const char *name = dock_item_name(hover);
         int tw = ttf_text_width(name, 12);
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, hover, &ix, &iy, &iw, &ih);
@@ -1337,6 +1461,8 @@ static int desktop_open_app_by_name(const char *name) {
     else if (str_eq(name, "sysmon") || str_eq(name, "monolith")) kind = WK_SYSMON;
     else if (str_eq(name, "matrix")) kind = WK_MATRIX;
     else if (str_eq(name, "about")) kind = WK_ABOUT;
+    else if (str_eq(name, "store") || str_eq(name, "agora") ||
+             str_eq(name, "apps")) kind = WK_STORE;
     else if (str_eq(name, "hello")) {
         silent_launch = 1;
         execute_bin_internal("hello", 0);
@@ -1370,6 +1496,10 @@ static void desktop_key_input(char ch) {
         brw_key(ch);
         return;
     }
+    if (wm_focus == WK_STORE) {
+        store_key(ch);
+        return;
+    }
     if (wm_focus == WK_ABOUT && ch == 27) {
         wm_close(WK_ABOUT);
         return;
@@ -1386,6 +1516,8 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     scr_w_cache = w;
     scr_h_cache = h;
 
+    dock_rebuild();
+    menu_rebuild();
     dock_recalc(w, h);
 
     if (wall_gen_w != w || wall_gen_h != h)
@@ -1394,6 +1526,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     /* async engines */
     term_async_poll();
     brw_poll();
+    store_poll();
 
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;
