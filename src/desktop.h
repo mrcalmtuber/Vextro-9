@@ -5,6 +5,7 @@
 #include "ttf.h"
 #include "gfx.h"
 #include "fat32.h"
+#include "bsd_format.h"
 
 /*
  * Socrates BSD 9 desktop.
@@ -359,35 +360,35 @@ typedef struct {
 static uint8_t app_memory[APP_MEM_SIZE] __attribute__((aligned(4096)));
 static uint8_t app_stack[8192] __attribute__((aligned(16)));
 
-static int execute_bin_internal(const char *filepath, int verbose) {
-    uint64_t fsize = 0;
-    const void *fdata = fs_read_file(filepath, &fsize);
-    if (!fdata || fsize < sizeof(Elf64_Ehdr)) {
-        if (verbose) {
-            term_print_c("run: file not found: ", 2);
-            term_print_c(filepath, 2);
-            term_print("\n");
-        }
-        return -1;
-    }
+/*
+ * Two loaders share one app arena.  Both lay the image out at
+ * app_memory + (vaddr - base_vaddr), so images have to be position
+ * independent — neither loader processes relocations.
+ *
+ * Note that the kernel runs apps in ring 0 out of a static buffer, so it
+ * cannot enforce W^X the way the host-side loader in bsdfmt/bsd_run.c
+ * does; the .bsd page alignment is still honoured, and is what would let
+ * a future paging-aware loader mark the text arena NX-clear and the data
+ * arena NX-set without touching the format.
+ */
 
-    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)fdata;
-    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
-        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-        if (verbose) term_print_c("run: invalid ELF magic\n", 2);
+/* Load an ELF64 image (used by `hello` and `run <elf>`). */
+static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
+                          uint64_t *out_entry) {
+    if (fsize < sizeof(Elf64_Ehdr)) {
+        if (verbose) term_print_c("run: file too small for an ELF64\n", 2);
         return -1;
     }
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)file;
     if (ehdr->e_ident[4] != 2) {
         if (verbose) term_print_c("run: not a 64-bit ELF\n", 2);
         return -1;
     }
 
-    const uint8_t *file_bytes = (const uint8_t *)fdata;
-
     uint64_t base_vaddr = ~(uint64_t)0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
-            (file_bytes + ehdr->e_phoff + i * ehdr->e_phentsize);
+            (file + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type == ELF_PT_LOAD && ph->p_vaddr < base_vaddr)
             base_vaddr = ph->p_vaddr;
     }
@@ -401,28 +402,107 @@ static int execute_bin_internal(const char *filepath, int verbose) {
 
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
-            (file_bytes + ehdr->e_phoff + i * ehdr->e_phentsize);
+            (file + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type != ELF_PT_LOAD) continue;
         uint64_t offset = ph->p_vaddr - base_vaddr;
         if (offset + ph->p_memsz > APP_MEM_SIZE) {
             if (verbose) term_print_c("run: segment too large\n", 2);
             return -1;
         }
-        const uint8_t *src = file_bytes + ph->p_offset;
+        const uint8_t *src = file + ph->p_offset;
         uint8_t *dst = app_memory + offset;
         for (uint64_t j = 0; j < ph->p_filesz; j++)
             dst[j] = src[j];
     }
 
-    uint64_t entry_offset = ehdr->e_entry - base_vaddr;
-    uint64_t entry_addr = (uint64_t)(uintptr_t)(app_memory + entry_offset);
-    uint64_t stack_top  = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
+    if (verbose) term_print_c("loading ELF64: ", 3);
+    *out_entry = (uint64_t)(uintptr_t)(app_memory +
+                                       (ehdr->e_entry - base_vaddr));
+    return 0;
+}
+
+/* Load a .bsd image — the format every app store package uses. */
+static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
+                          uint64_t *out_entry) {
+    /* Copy the header out byte-wise: the filesystem cache hands back a
+     * plain byte buffer and we do not want to assume its alignment. */
+    bsd_header_t h;
+    uint8_t *hp = (uint8_t *)&h;
+    if (fsize < sizeof(h)) {
+        if (verbose) term_print_c("run: file too small for a .bsd header\n", 2);
+        return -1;
+    }
+    for (uint64_t i = 0; i < sizeof(h); i++) hp[i] = file[i];
+
+    const char *bad = bsd_validate(&h, fsize);
+    if (bad) {
+        if (verbose) {
+            term_print_c("run: ", 2);
+            term_print_c(bad, 2);
+            term_print("\n");
+        }
+        return -1;
+    }
+    if (bsd_image_span(&h) > APP_MEM_SIZE) {
+        if (verbose) term_print_c("run: image too large for the app arena\n", 2);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < APP_MEM_SIZE; i++)
+        app_memory[i] = 0;
+
+    uint64_t base = h.text_vaddr;
+    uint8_t *dst = app_memory + (h.text_vaddr - base);
+    for (uint64_t i = 0; i < h.text_size; i++)
+        dst[i] = file[h.text_off + i];
+
+    if (h.data_size) {
+        dst = app_memory + (h.data_vaddr - base);
+        for (uint64_t i = 0; i < h.data_size; i++)
+            dst[i] = file[h.data_off + i];
+    }
+    /* .bss needs no work: the arena was just zeroed. */
+
+    if (verbose) term_print_c("loading .bsd: ", 3);
+    *out_entry = (uint64_t)(uintptr_t)(app_memory + (h.entry - base));
+    return 0;
+}
+
+static int execute_bin_internal(const char *filepath, int verbose) {
+    uint64_t fsize = 0;
+    const void *fdata = fs_read_file(filepath, &fsize);
+    if (!fdata || fsize < 8) {
+        if (verbose) {
+            term_print_c("run: file not found: ", 2);
+            term_print_c(filepath, 2);
+            term_print("\n");
+        }
+        return -1;
+    }
+
+    const uint8_t *file = (const uint8_t *)fdata;
+    uint64_t entry_addr = 0;
+    int rc;
+
+    if (file[0] == (uint8_t)BSD_MAGIC0 && file[1] == (uint8_t)BSD_MAGIC1 &&
+        file[2] == (uint8_t)BSD_MAGIC2 && file[3] == (uint8_t)BSD_MAGIC3) {
+        rc = load_bsd_image(file, fsize, verbose, &entry_addr);
+    } else if (file[0] == 0x7F && file[1] == 'E' && file[2] == 'L' &&
+               file[3] == 'F') {
+        rc = load_elf_image(file, fsize, verbose, &entry_addr);
+    } else {
+        if (verbose)
+            term_print_c("run: not a .bsd or ELF64 executable\n", 2);
+        return -1;
+    }
+    if (rc != 0) return -1;
 
     if (verbose) {
-        term_print_c("loading ELF64: ", 3);
         term_print_c(filepath, 3);
         term_print("\n");
     }
+
+    uint64_t stack_top = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
 
     for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++)
         app_canvas[i] = 0;
