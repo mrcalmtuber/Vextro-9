@@ -410,8 +410,23 @@ static void ttf_draw_string(uint32_t *buf, int bw, int bh,
     }
 }
 
+__attribute__((unused))
 static int ttf_line_height(int size) {
     return size * TTF_LINE_SCALE_NUM / TTF_LINE_SCALE_DEN;
+}
+
+/* Exact pixel width of a string at a given size (matches ttf_draw_string
+ * advance logic) — for centering text and computing hit boxes. */
+static int ttf_text_width(const char *s, int size) {
+    if (!F_ready && !ttf_init()) return 0;
+    int64_t muln = (int64_t)size * TTF_SS;
+    int32_t pen = 0;
+    for (; *s; s++) {
+        int gid = glyph_index((uint8_t)*s);
+        int32_t adv = (int32_t)(((int64_t)advance_width(gid) * muln) / F_upem);
+        pen += adv + adv * TTF_HPAD_NUM / TTF_HPAD_DEN;
+    }
+    return pen / TTF_SS;
 }
 
 #endif /* TTF_H */

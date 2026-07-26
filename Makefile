@@ -17,9 +17,21 @@ APP_CFLAGS := -O2 -Wall -ffreestanding -fno-stack-protector \
 LIMINE  := limine-binary
 ISO     := iso_root
 
-.PHONY: all iso run clean
+.PHONY: all iso run clean cleandisk
 
-all: os.iso
+all: os.iso disk.img
+
+# --- FAT32 system disk ---
+# Created once and then left alone: it is the OS's writable, persistent
+# filesystem. `make cleandisk` resets it to factory contents.
+disk.img: | build/hello
+	python3 tools/mkfat32.py disk.img 64 \
+		apps/about.txt apps/notes.txt build/hello \
+		apps/welcome.txt:docs/welcome.txt
+
+cleandisk:
+	rm -f disk.img
+	$(MAKE) disk.img
 
 # --- Host Limine tool (needed for BIOS boot-sector install) ---
 build/limine-tool: $(LIMINE)/limine.c
@@ -52,7 +64,7 @@ build/boot_animation_data.o: src/boot_animation_data.S build/boot_anim.raw
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- Kernel ---
-build/kernel.o: src/kernel.c src/limine.h src/idt.h src/mouse.h src/keyboard.h src/ttf.h src/comicneue_ttf.h src/sincos_lut.h src/login.h src/desktop.h src/e1000.h src/ac97.h src/netstack.h kernel/include/boot_animation.h
+build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -98,12 +110,13 @@ os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/
 	build/limine-tool bios-install os.iso
 
 # --- Run ---
-run: os.iso
+run: os.iso disk.img
 	@echo ""
 	@echo "  [TIP] Toggle full-screen on/off at any time with: Ctrl + Alt + F"
 	@echo ""
 	qemu-system-x86_64 \
 		-cdrom os.iso \
+		-drive file=disk.img,format=raw,index=0,media=disk \
 		-m 256M \
 		-vga std \
 		-display sdl,show-cursor=off,grab-mod=lshift-lctrl-lalt \

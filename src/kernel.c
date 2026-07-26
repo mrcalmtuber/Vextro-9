@@ -9,6 +9,7 @@
 #include "e1000.h"
 #include "ac97.h"
 #include "netstack.h"
+#include "igpu.h"
 #include "desktop.h"
 #include "boot_animation.h"
 
@@ -227,26 +228,42 @@ static void fill_rect(uint32_t w, uint32_t x, uint32_t y,
 }
 
 /*
- * 8x8 arrow cursor (upper-left hot spot, diagonal handle pointing lower-right)
+ * 12x18 arrow cursor: 'X' = black outline, '.' = white fill, ' ' = clear.
+ * Upper-left hot spot.
  */
-static const uint8_t CURSOR_ARROW[8] = {
-    0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xC0, 0x60, 0x30
+static const char *CURSOR_IMG[18] = {
+    "X           ",
+    "XX          ",
+    "X.X         ",
+    "X..X        ",
+    "X...X       ",
+    "X....X      ",
+    "X.....X     ",
+    "X......X    ",
+    "X.......X   ",
+    "X........X  ",
+    "X.....XXXXX ",
+    "X..X..X     ",
+    "X.X X..X    ",
+    "XX  X..X    ",
+    "X    X..X   ",
+    "     X..X   ",
+    "      X..X  ",
+    "      XXX   ",
 };
 
 static void draw_cursor(uint32_t bw, uint32_t bh) {
     uint32_t cx = (uint32_t)mouse_x;
     uint32_t cy = (uint32_t)mouse_y;
-    for (uint32_t row = 0; row < 8; row++) {
-        uint8_t bits = CURSOR_ARROW[row];
-        for (uint32_t col = 0; col < 8; col++) {
-            if (bits & (uint8_t)(0x80u >> col)) {
-                uint32_t px = cx + col;
-                uint32_t py = cy + row;
-                if (px < bw && py < bh) {
-                    uint32_t bg = backbuf[py * bw + px];
-                    backbuf[py * bw + px] = bg ^ 0xFFFFFFu;
-                }
-            }
+    for (uint32_t row = 0; row < 18; row++) {
+        const char *line = CURSOR_IMG[row];
+        for (uint32_t col = 0; col < 12; col++) {
+            char c = line[col];
+            if (c == ' ') continue;
+            uint32_t px = cx + col;
+            uint32_t py = cy + row;
+            if (px < bw && py < bh)
+                backbuf[py * bw + px] = (c == 'X') ? 0x000000u : 0xFFFFFFu;
         }
     }
 }
@@ -383,11 +400,39 @@ void kmain(void) {
     /* Initialize Layer 2 network stack (Ethernet + ARP) */
     netstack_init();
 
-    /* Initialize Tarfs from Limine boot module (initrd.tar) */
+    /* Intel Gen9 iGPU blitter — optional acceleration; on machines
+     * without a supported iGPU we stay on the portable CPU renderer */
+    if (hhdm_request.response != NULL) {
+        hal_hhdm_offset = hhdm_request.response->offset;
+        uint64_t fb_phys = kern_virt_to_phys((void *)(uintptr_t)vram);
+        if (fb_phys)
+            igpu_init(fb_phys, w, h, pitch_px);
+    }
+
+    /* Initialize Tarfs from Limine boot module (initrd.tar) — read-only
+     * fallback for ISO-only boots without a hard disk */
     if (mod_request.response != NULL &&
         mod_request.response->module_count > 0) {
         struct limine_file *mod = mod_request.response->modules[0];
         tarfs_init(mod->address, mod->size);
+    }
+
+    /* Primary filesystem: FAT32 on the ATA disk (writable, persistent) */
+    ata_init();
+    fat32_mount();
+
+    /* Restore the master keycode saved on a previous boot */
+    {
+        uint64_t klen = 0;
+        const void *kd = fs_read_file("/keycode.sys", &klen);
+        if (kd && klen > 0 && klen < TEXT_BUF_SIZE) {
+            const char *kp = (const char *)kd;
+            for (uint64_t i = 0; i < klen; i++)
+                system_password[i] = kp[i];
+            system_password_len = (uint32_t)klen;
+            system_password[system_password_len] = '\0';
+            is_first_boot = 0;
+        }
     }
 
     /* Compute total system memory from Limine memory map */
@@ -468,12 +513,8 @@ void kmain(void) {
         /* === DESKTOP MODE === */
         if (desktop_mode) {
             char dch;
-            while ((dch = kb_getchar()) != 0) {
-                if (browser_open)
-                    browser_addr_input(dch);
-                else if (is_terminal_open)
-                    term_input(dch);
-            }
+            while ((dch = kb_getchar()) != 0)
+                desktop_key_input(dch);
 
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             draw_cursor(w, h);
@@ -490,7 +531,8 @@ void kmain(void) {
                 enter_pressed = 1;
             } else if (ch == '\b') {
                 if (typed_len > 0) typed_len--;
-            } else if (typed_len < TEXT_BUF_SIZE - 1) {
+            } else if (ch >= 0x20 && ch < 0x7F &&
+                       typed_len < TEXT_BUF_SIZE - 1) {
                 typed_text[typed_len++] = ch;
             }
         }
@@ -507,6 +549,10 @@ void kmain(void) {
                 is_first_boot = 0;
                 typed_len = 0;
                 typed_text[0] = '\0';
+
+                /* persist the keycode so it survives reboots */
+                fs_write_file("/keycode.sys", system_password,
+                              system_password_len);
 
                 confirm_active = 1;
                 confirm_tick = 0;
