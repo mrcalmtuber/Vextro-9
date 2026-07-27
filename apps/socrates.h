@@ -18,7 +18,13 @@
 typedef unsigned int      uint32_t;
 typedef int               int32_t;
 typedef unsigned long     uint64_t;
+typedef long              int64_t;
 typedef unsigned long     uintptr_t;
+
+/* Dimensions of the canvas that sys_draw_pixel writes into.  The kernel
+ * clips anything outside, so these are the app's usable bounds. */
+#define OS_CANVAS_W 598
+#define OS_CANVAS_H 402
 
 /* ---- Syscall 1: sys_print ----
  * Print a null-terminated string to the terminal canvas. */

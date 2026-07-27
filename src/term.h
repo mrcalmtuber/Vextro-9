@@ -245,15 +245,120 @@ static void term_cmd_cat(const char *fname) {
     if (fsize > 0 && text[fsize - 1] != '\n') term_putc('\n');
 }
 
+static void term_print_hex32(uint32_t v) {
+    static const char hx[] = "0123456789ABCDEF";
+    char b[11];
+    b[0] = '0'; b[1] = 'x';
+    for (int i = 0; i < 8; i++)
+        b[2 + i] = hx[(v >> (28 - 4 * i)) & 0xF];
+    b[10] = '\0';
+    term_print(b);
+}
+
+static int term_parse_hex(const char *s, uint32_t *out) {
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    uint32_t v = 0;
+    int n = 0;
+    for (; *s; s++, n++) {
+        char c = *s;
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else return 0;
+        if (n >= 8) return 0;
+        v = (v << 4) | d;
+    }
+    if (n == 0) return 0;
+    *out = v;
+    return 1;
+}
+
+static void term_gpu_reg_row(const char *key, uint32_t val) {
+    term_print("  ");
+    term_print(key);
+    int pad = 18 - str_len(key);
+    for (int i = 0; i < pad; i++) term_putc(' ');
+    term_print_hex32(val);
+    term_putc('\n');
+}
+
+static void term_cmd_gpu_error(void) {
+    if (!igpu_crash.valid) {
+        term_print_c("no GPU errors recorded\n", 4);
+        return;
+    }
+    term_print_c("last GPU hang (BCS blitter)\n", 2);
+    term_print("  parser died in    ");
+    term_print_c(igpu_crash.cmd_name, 2);
+    term_putc('\n');
+    term_gpu_reg_row("IPEHR (bad cmd)", igpu_crash.ipehr);
+    term_gpu_reg_row("IPEIR", igpu_crash.ipeir);
+    term_gpu_reg_row("EIR", igpu_crash.eir);
+    if (igpu_crash.eir & IGPU_ERR_INSTRUCTION)
+        term_print_c("    - invalid instruction error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_PAGE_TABLE)
+        term_print_c("    - page table error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_MEM_REFRESH)
+        term_print_c("    - memory refresh error\n", 2);
+    if (igpu_crash.eir & IGPU_ERR_PRIV)
+        term_print_c("    - privilege violation\n", 2);
+    term_gpu_reg_row("ESR", igpu_crash.esr);
+    term_gpu_reg_row("INSTDONE", igpu_crash.instdone);
+    term_gpu_reg_row("ACTHD", igpu_crash.acthd_lo);
+    term_gpu_reg_row("RING_HEAD", igpu_crash.ring_head);
+    term_gpu_reg_row("RING_TAIL", igpu_crash.ring_tail);
+    term_gpu_reg_row("RING_CTL", igpu_crash.ring_ctl);
+    if (igpu_crash.fault_reg & 1) {
+        term_print_c("  GGTT fault at page ", 2);
+        term_print_hex32(igpu_crash.fault_reg & 0xFFFFF000);
+        term_putc('\n');
+        term_gpu_reg_row("RING_FAULT_REG", igpu_crash.fault_reg);
+    }
+    term_gpu_reg_row("HWS[0]", igpu_crash.hws[0]);
+
+    char nb[16];
+    term_print("  breadcrumb        saw ");
+    uint_to_str(igpu_crash.seqno_seen, nb);
+    term_print(nb);
+    term_print(" wanted ");
+    uint_to_str(igpu_crash.seqno_expected, nb);
+    term_print(nb);
+    term_putc('\n');
+
+    term_print("  ring at ACTHD\n");
+    for (int i = 0; i < 8; i += 4) {
+        term_print("    ");
+        for (int j = 0; j < 4; j++) {
+            term_print_hex32(igpu_crash.ring_window[i + j]);
+            term_putc(' ');
+        }
+        term_putc('\n');
+    }
+
+    uint_to_str((uint32_t)igpu_crash.hang_count, nb);
+    term_print("  hang count        ");
+    term_print(nb);
+    term_print("   recovery: ");
+    if (igpu.active)
+        term_print_c(igpu_crash.reset_ok ? "engine reset OK\n"
+                                         : "pending\n", 4);
+    else
+        term_print_c("failed - CPU renderer\n", 2);
+}
+
 static void term_cmd_df(void) {
     if (!fs_writable()) {
         term_print_c("no writable volume (tar ramdisk fallback active)\n", 3);
         return;
     }
     char nb[16];
-    uint32_t total = fat_total_kb(), free_kb = fat_free_kb();
-    term_print("  volume    FAT32 on ata0 (");
-    uint_to_str(fat_vol.nclusters, nb);
+    uint32_t total = fs_total_kb(), free_kb = fs_free_kb();
+    term_print("  volume    ");
+    term_print(fs_name());
+    term_print(" on ata0 (");
+    uint_to_str(fs_kind == FS_EXFAT ? exf_vol.cluster_count
+                                    : fat_vol.nclusters, nb);
     term_print(nb);
     term_print(" clusters)\n  total     ");
     uint_to_str(total / 1024, nb);
@@ -265,6 +370,34 @@ static void term_cmd_df(void) {
     uint_to_str(free_kb / 1024, nb);
     term_print_c(nb, 4);
     term_print_c(" MB\n", 4);
+}
+
+static void term_cmd_mouse(void) {
+    char nb[16];
+
+    term_print("  pointer   ");
+    if (mouse_absolute)
+        term_print_c("absolute (VMware backdoor) - tracks without a grab\n", 4);
+    else
+        term_print_c("relative (PS/2) - the host must capture the cursor\n", 3);
+
+    term_print("  packets   ");
+    uint_to_str((uint32_t)mouse_pkt_len, nb);
+    term_print(nb);
+    term_print(mouse_pkt_len == 4 ? " bytes, wheel present\n"
+                                  : " bytes, no wheel\n");
+
+    term_print("  position  ");
+    uint_to_str((uint32_t)mouse_x, nb); term_print(nb);
+    term_print(", ");
+    uint_to_str((uint32_t)mouse_y, nb); term_print(nb);
+    term_print("   buttons ");
+    uint_to_str((uint32_t)mouse_buttons, nb); term_print(nb);
+    term_print("\n  screen    ");
+    uint_to_str((uint32_t)(mouse_max_x + 1), nb); term_print(nb);
+    term_print(" x ");
+    uint_to_str((uint32_t)(mouse_max_y + 1), nb); term_print(nb);
+    term_putc('\n');
 }
 
 static void term_cmd_net(void) {
@@ -361,9 +494,15 @@ static void term_cmd_help(void) {
     term_print("  echo <text> > f    write a file  (>> appends)\n");
     term_print("  rm <f>  mkdir <d>  cp <a> <b>  df    manage the disk\n");
     term_print("  run <program>     execute an ELF app\n");
-    term_print("  date / uptime / mem / uname          system info\n");
+    term_print("  date / uptime / mem / uname / mouse   system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
-    term_print("  gpu [test]        Intel iGPU blitter status / demo\n");
+    term_print("  img <file.sci>    decode and show a compressed image\n");
+    term_print("  peek <f> <off> [n]  read a window from a huge file\n");
+    term_print("  zim open <f> | info | main | ls | find/get <path>\n");
+    term_print("  llm load <f> | weights | tok <t> | eval <tok> | probe | gen <t>\n");
+    term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
+    term_print("                    the Agora app store\n");
+    term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
     term_print("  open <app>        terminal browser files settings\n");
     term_print("                    paint sysmon matrix about\n");
     term_print("  history / clear / reboot / shutdown\n");
@@ -390,6 +529,11 @@ static int term_split(char *buf, char **argv, int max) {
         while (*p && *p != ' ') p++;
     }
     return argc;
+}
+
+static int llm_read_thunk(void *ctx, uint64_t off, void *buf,
+                          uint32_t len, uint32_t *got) {
+    return fs_pread((fs_file_t *)ctx, off, buf, len, got);
 }
 
 static void term_exec(char *cmdline);
@@ -528,8 +672,8 @@ static void term_exec(char *cmdline) {
         if (!fs_writable()) {
             term_print_c("cd: no mounted volume\n", 2);
         } else {
-            fat_dirent_t d;
-            if (fat_lookup(abs, &d) && (d.attr & FAT_ATTR_DIR)) {
+            int is_dir = 0;
+            if (fs_stat(abs, 0, &is_dir) && is_dir) {
                 str_copy(term_cwd, abs, sizeof(term_cwd));
             } else {
                 term_print_c("cd: no such directory: ", 2);
@@ -577,7 +721,26 @@ static void term_exec(char *cmdline) {
     } else if (str_eq(cmd, "df") || str_eq(cmd, "disk")) {
         term_cmd_df();
     } else if (str_eq(cmd, "gpu")) {
-        if (argc >= 2 && str_eq(argv[1], "test")) {
+        if (argc >= 2 && str_eq(argv[1], "error")) {
+            term_cmd_gpu_error();
+        } else if (argc >= 2 && str_eq(argv[1], "decode")) {
+            uint32_t dw;
+            if (argc < 3 || !term_parse_hex(argv[2], &dw)) {
+                term_print_c("usage: gpu decode <hex dword>\n", 2);
+            } else {
+                char name[48];
+                igpu_decode_cmd(dw, name, sizeof(name));
+                term_print("  ");
+                term_print_hex32(dw);
+                term_print("  ->  ");
+                term_print_c(name, 1);
+                char nb[8];
+                term_print_c("  (len field ", 3);
+                uint_to_str(dw & 0xFF, nb);
+                term_print_c(nb, 3);
+                term_print_c(")\n", 3);
+            }
+        } else if (argc >= 2 && str_eq(argv[1], "test")) {
             if (!igpu.active) {
                 term_print_c("gpu test: no active iGPU (CPU renderer)\n", 2);
             } else if (!igpu.fb_blittable) {
@@ -627,6 +790,11 @@ static void term_exec(char *cmdline) {
             } else {
                 term_print("  renderer  CPU (portable framebuffer path)\n");
             }
+            if (igpu_crash.valid) {
+                term_print_c("  last hang ", 2);
+                term_print_c(igpu_crash.cmd_name, 2);
+                term_print_c("  ('gpu error' for the full report)\n", 3);
+            }
         }
     } else if (str_eq(cmd, "run")) {
         if (argc < 2) term_print_c("usage: run <program>\n", 2);
@@ -651,6 +819,8 @@ static void term_exec(char *cmdline) {
         term_print("  total system memory: ");
         term_print(buf);
         term_print(" MB\n");
+    } else if (str_eq(cmd, "mouse") || str_eq(cmd, "pointer")) {
+        term_cmd_mouse();
     } else if (str_eq(cmd, "net") || str_eq(cmd, "ifconfig")) {
         term_cmd_net();
     } else if (str_eq(cmd, "arp")) {
@@ -705,10 +875,409 @@ static void term_exec(char *cmdline) {
         term_async = TERM_ASYNC_FETCH;
         term_async_t0 = net_ticks;
         http_get(host, port, path);
+        http_owner = HTTP_OWNER_TERM;
         term_print("fetching http://");
         term_print(host);
         term_print(path);
         term_print(" ...\n");
+    } else if (str_eq(cmd, "peek")) {
+        /* Read a window out of a file without loading the whole thing —
+         * the only way to look inside an archive larger than any buffer,
+         * which is what exFAT's 64-bit sizes now allow. */
+        if (argc < 3) {
+            term_print_c("usage: peek <file> <offset> [bytes]\n", 2);
+            return;
+        }
+        char abs[256];
+        term_resolve(argv[1], abs);
+        uint64_t off = 0;
+        for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++)
+            off = off * 10 + (uint64_t)(*q - '0');
+        uint32_t want = 256;
+        if (argc >= 4) {
+            want = 0;
+            for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++)
+                want = want * 10 + (uint32_t)(*q - '0');
+        }
+        if (want > 1024) want = 1024;
+
+        static uint8_t peek_buf[1024];
+        uint32_t got = 0;
+        if (fs_read_range(abs, off, peek_buf, want, &got) != 0) {
+            term_print_c("peek: ", 2);
+            term_print_c(fs_errstr, 2);
+            term_putc('\n');
+            return;
+        }
+        if (got == 0) { term_print_c("(offset is past the end)\n", 3); return; }
+        char nb[16];
+        term_print_c("  ", 3);
+        uint_to_str(got, nb); term_print_c(nb, 3);
+        term_print_c(" bytes at offset ", 3);
+        uint_to_str((uint32_t)off, nb); term_print_c(nb, 3);
+        term_putc('\n');
+        for (uint32_t i = 0; i < got; i++) {
+            char c = (char)peek_buf[i];
+            term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
+        }
+        if (term_cx > 0) term_putc('\n');
+    } else if (str_eq(cmd, "llm")) {
+        static fs_file_t llm_file;
+        if (argc >= 2 && str_eq(argv[1], "fpu")) {
+            uint32_t v = 0;
+            int ok = llm_fpu_selftest(&v);
+            term_print("  sum 1/n^2 to 20000 = ");
+            /* the integer-only side never touches a float, so the value
+             * arrives pre-scaled and is split by division */
+            uint32_t whole = v / 10000, frac = v % 10000;
+            char nb[16];
+            uint_to_str(whole, nb); term_print(nb);
+            term_putc('.');
+            if (frac < 1000) term_putc('0');
+            if (frac < 100) term_putc('0');
+            if (frac < 10) term_putc('0');
+            uint_to_str(frac, nb); term_print(nb);
+            term_print_c(ok == 0 ? "   FPU OK (expected 1.6449)\n"
+                                 : "   WRONG - SSE is not working\n",
+                         ok == 0 ? 4 : 2);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "weights")) {
+            const char *werr = "?";
+            term_print_c("loading weights (this reads the whole model)...\n", 3);
+            if (llm_load_weights(&werr) != 0) {
+                term_print_c("llm: ", 2); term_print_c(werr, 2); term_putc('\n');
+                return;
+            }
+            term_print_c("weights resident\n", 4);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "eval")) {
+            if (argc < 3) { term_print_c("usage: llm eval <token> [pos]\n", 2); return; }
+            int32_t tk = 0;
+            for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++) tk = tk * 10 + (*q - '0');
+            int pos = 0;
+            if (argc >= 4) { pos = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++) pos = pos * 10 + (*q - '0'); }
+            if (llm_eval(tk, pos) != 0) { term_print_c("eval failed\n", 2); return; }
+            int best = llm_argmax();
+            char piece[64];
+            llm_decode(best, piece, sizeof(piece));
+            char nb[16];
+            term_print("  argmax ");
+            uint_to_str((uint32_t)best, nb); term_print_c(nb, 1);
+            term_print(" [");
+            for (int k = 0; piece[k]; k++) term_putc(piece[k] == ' ' ? '_' : piece[k]);
+            term_print("]\n");
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "probe")) {
+            if (argc < 3) { term_print_c("usage: llm probe <x|xb|q|k|logits> [n]\n", 2); return; }
+            int n = 6;
+            if (argc >= 4) { n = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++) n = n * 10 + (*q - '0');
+                if (n < 1) n = 1;
+                if (n > 12) n = 12;
+            }
+            static int32_t vals[12];
+            if (llm_probe(argv[2], 0, n, vals) < 0) { term_print_c("no such probe\n", 2); return; }
+            char nb[16];
+            for (int i = 0; i < n; i++) {
+                int32_t v = vals[i];
+                term_print("   ");
+                if (v < 0) { term_putc('-'); v = -v; }
+                uint_to_str((uint32_t)(v / 1000000), nb); term_print(nb);
+                term_putc('.');
+                uint32_t fr = (uint32_t)(v % 1000000);
+                for (uint32_t d = 100000; d >= 1; d /= 10) {
+                    term_putc((char)('0' + (fr / d) % 10));
+                    if (d == 1) break;
+                }
+                term_putc('\n');
+            }
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "deq")) {
+            if (argc < 3) { term_print_c("usage: llm deq <tensor> [n]\n", 2); return; }
+            int ti = llm_tensor_find(argv[2]);
+            if (ti < 0) { term_print_c("no such tensor\n", 2); return; }
+            int n = 6;
+            if (argc >= 4) {
+                n = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++)
+                    n = n * 10 + (*q - '0');
+                if (n < 1) n = 1;
+                if (n > 12) n = 12;
+            }
+            static int32_t vals[12];
+            if (llm_tensor_peek(ti, 0, n, vals) < 0) {
+                term_print_c("dequantise failed\n", 2);
+                return;
+            }
+            char nb[16];
+            term_print("  ");
+            term_print_c(llm_tensor_name(ti), 1);
+            term_print("  ");
+            term_print(llm_quant_name(llm_tensor_type(ti)));
+            term_print("  ");
+            uint_to_str((uint32_t)llm_tensor_elems(ti), nb);
+            term_print(nb);
+            term_print(" elems\n");
+            for (int i = 0; i < n; i++) {
+                int32_t v = vals[i];
+                term_print("   ");
+                if (v < 0) { term_putc('-'); v = -v; }
+                uint_to_str((uint32_t)(v / 1000000), nb); term_print(nb);
+                term_putc('.');
+                uint32_t f = (uint32_t)(v % 1000000);
+                for (uint32_t d = 100000; d >= 1; d /= 10) {
+                    term_putc((char)('0' + (f / d) % 10));
+                    if (d == 1) break;
+                }
+                term_putc('\n');
+            }
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "tok")) {
+            if (!llm_tok_ready()) {
+                term_print_c("no tokenizer loaded (llm load <file.gguf>)\n", 2);
+                return;
+            }
+            /* rejoin the argv the splitter took apart */
+            char text[240];
+            text[0] = '\0';
+            for (int i = 2; i < argc; i++) {
+                if (i > 2) str_append(text, " ", sizeof(text));
+                str_append(text, argv[i], sizeof(text));
+            }
+            if (text[0] == '\0') { term_print_c("usage: llm tok <text>\n", 2); return; }
+
+            static int32_t ids[256];
+            int n = llm_encode(text, ids, 256);
+            if (n < 0) { term_print_c("encode failed\n", 2); return; }
+
+            char nb[16];
+            term_print("  ");
+            uint_to_str((uint32_t)n, nb);
+            term_print_c(nb, 1);
+            term_print(" tokens\n");
+            for (int i = 0; i < n; i++) {
+                char piece[64];
+                llm_decode(ids[i], piece, sizeof(piece));
+                term_print("   ");
+                uint_to_str((uint32_t)ids[i], nb);
+                term_print_c(nb, 3);
+                term_print(" ");
+                term_putc('[');
+                for (int k = 0; piece[k]; k++)
+                    term_putc(piece[k] == ' ' ? '_' : piece[k]);
+                term_print("]\n");
+            }
+            /* decode everything back and compare with the input */
+            char round[240];
+            int ro = 0;
+            for (int i = 0; i < n; i++) {
+                char piece[64];
+                llm_decode(ids[i], piece, sizeof(piece));
+                for (int k = 0; piece[k] && ro < (int)sizeof(round) - 1; k++)
+                    round[ro++] = piece[k];
+            }
+            round[ro] = '\0';
+            term_print_c(str_eq(round, text) ? "  round trip OK\n"
+                                             : "  ROUND TRIP MISMATCH\n",
+                         str_eq(round, text) ? 4 : 2);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "load")) {
+            if (argc < 3) { term_print_c("usage: llm load <model.gguf>\n", 2); return; }
+            char abs[256];
+            term_resolve(argv[2], abs);
+            if (fs_open(abs, &llm_file) != 0) {
+                term_print_c("llm: cannot open ", 2);
+                term_print_c(abs, 2);
+                term_putc('\n');
+                return;
+            }
+            const char *lerr = "?";
+            term_print_c("parsing GGUF...\n", 3);
+            if (llm_load(llm_read_thunk, &llm_file, llm_file.size, &lerr) != 0) {
+                term_print_c("llm: ", 2);
+                term_print_c(lerr, 2);
+                term_putc('\n');
+                return;
+            }
+        }
+        const llm_info_t *mi = llm_get_info();
+        if (!mi->loaded) {
+            term_print_c("no model loaded (llm load <file.gguf>)\n", 2);
+            return;
+        }
+        char nb[24];
+        term_print("  arch       "); term_print_c(mi->arch, 1);
+        term_print("  ("); term_print(mi->name); term_print(")\n");
+        term_print("  layers     "); uint_to_str(mi->n_layer, nb); term_print(nb);
+        term_print("   embd "); uint_to_str(mi->n_embd, nb); term_print(nb);
+        term_print("   ff "); uint_to_str(mi->n_ff, nb); term_print(nb); term_putc('\n');
+        term_print("  heads      "); uint_to_str(mi->n_head, nb); term_print(nb);
+        term_print(" q / "); uint_to_str(mi->n_head_kv, nb); term_print(nb);
+        term_print(" kv   vocab "); uint_to_str(mi->n_vocab, nb); term_print(nb);
+        term_putc('\n');
+        term_print("  tensors    "); uint_to_str((uint32_t)mi->n_tensors, nb);
+        term_print(nb); term_print("   weights ");
+        uint_to_str((uint32_t)(mi->weight_bytes / (1024 * 1024)), nb);
+        term_print_c(nb, 1); term_print(" MB of ");
+        uint_to_str((uint32_t)(mi->file_size / (1024 * 1024)), nb);
+        term_print(nb); term_print(" MB file\n");
+        term_print("  quant      ");
+        for (uint32_t t = 0; t < 32; t++) {
+            if (!mi->quant_counts[t]) continue;
+            term_print(llm_quant_name(t));
+            term_putc('*');
+            uint_to_str(mi->quant_counts[t], nb);
+            term_print(nb);
+            term_putc(' ');
+        }
+        term_putc('\n');
+        if (llm_tok_ready()) {
+            term_print("  tokenizer  ");
+            uint_to_str(llm_tok_count(), nb); term_print_c(nb, 1);
+            term_print(" tokens, ");
+            uint_to_str(llm_merge_count(), nb); term_print(nb);
+            term_print(" merges\n");
+        }
+        term_print("  arena      ");
+        uint_to_str((uint32_t)(llm_arena_total() / (1024 * 1024)), nb);
+        term_print_c(nb, 4);
+        term_print(" MB free for weights\n");
+    } else if (str_eq(cmd, "zim")) {
+        if (argc < 2) {
+            term_print_c("usage: zim open <file> | info | main | find <path>"
+                         " | get <path> | ls [prefix]\n", 2);
+            return;
+        }
+        if (str_eq(argv[1], "open")) {
+            if (argc < 3) { term_print_c("usage: zim open <file>\n", 2); return; }
+            char abs[256];
+            term_resolve(argv[2], abs);
+            if (zim_open(abs) != 0) {
+                term_print_c("zim: ", 2);
+                term_print_c(zim_err, 2);
+                term_putc('\n');
+                return;
+            }
+            term_print_c("opened ", 4);
+            term_print_c(abs, 4);
+            term_putc('\n');
+        }
+        if (!zim.open) { term_print_c("no archive open (zim open <file>)\n", 2); return; }
+
+        char nb[24];
+        if (str_eq(argv[1], "open") || str_eq(argv[1], "info")) {
+            term_print("  version    ");
+            uint_to_str(zim.major, nb); term_print(nb);
+            term_print(".");
+            uint_to_str(zim.minor, nb); term_print(nb);
+            term_print("\n  entries    ");
+            uint_to_str(zim.article_count, nb); term_print_c(nb, 1);
+            term_print("\n  clusters   ");
+            uint_to_str(zim.cluster_count, nb); term_print(nb);
+            term_print("\n  size       ");
+            uint_to_str((uint32_t)(zim.f.size / (1024 * 1024)), nb);
+            term_print(nb); term_print(" MB\n  mime types ");
+            uint_to_str((uint32_t)zim.mime_count, nb); term_print(nb);
+            term_putc('\n');
+            if (zim.truncated) {
+                term_print_c("  WARNING: the file is shorter than its header says"
+                             " - incomplete download\n", 2);
+            }
+            return;
+        }
+
+        if (str_eq(argv[1], "main")) {
+            const uint8_t *d; uint32_t n; zim_dirent_t e;
+            if (zim_content(zim.main_page, &d, &n, &e) != 0) {
+                term_print_c("zim: ", 2); term_print_c(zim_err, 2); term_putc('\n');
+                return;
+            }
+            term_print_c("main page: ", 1);
+            term_print_c(e.title, 1);
+            term_print("  (");
+            uint_to_str(n, nb); term_print(nb);
+            term_print(" bytes, ");
+            term_print(zim_mime_name(e.mime));
+            term_print(")\n");
+            return;
+        }
+
+        if (str_eq(argv[1], "find") || str_eq(argv[1], "get")) {
+            if (argc < 3) { term_print_c("usage: zim find|get <path>\n", 2); return; }
+            uint32_t idx;
+            if (!zim_find('C', argv[2], &idx)) {
+                term_print_c("not found: ", 2);
+                term_print_c(argv[2], 2);
+                term_print_c("   (paths are case sensitive, try 'zim ls'"
+                             " to browse)\n", 3);
+                return;
+            }
+            const uint8_t *d; uint32_t n; zim_dirent_t e;
+            if (zim_content(idx, &d, &n, &e) != 0) {
+                term_print_c("zim: ", 2); term_print_c(zim_err, 2); term_putc('\n');
+                return;
+            }
+            term_print_c(e.title, 1);
+            term_print("  [");
+            term_print(zim_mime_name(e.mime));
+            term_print(", ");
+            uint_to_str(n, nb); term_print(nb);
+            term_print(" bytes, cluster ");
+            uint_to_str(e.cluster, nb); term_print(nb);
+            term_print("]\n");
+            if (str_eq(argv[1], "get")) {
+                uint32_t lim = n < 600 ? n : 600;
+                for (uint32_t i = 0; i < lim; i++) {
+                    char c = (char)d[i];
+                    term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
+                }
+                if (term_cx > 0) term_putc('\n');
+            }
+            return;
+        }
+
+        if (str_eq(argv[1], "ls")) {
+            const char *pfx = argc >= 3 ? argv[2] : "";
+            uint32_t i = zim_lower_bound('C', pfx);
+            zim_dirent_t e;
+            int shown = 0;
+            while (i < zim.article_count && shown < 20) {
+                if (zim_dirent(i, &e) != 0) break;
+                if (e.ns != 'C') break;
+                term_print("  ");
+                term_print_c(e.title, e.is_redirect ? 3 : 0);
+                if (e.is_redirect) term_print_c("  ->", 3);
+                term_putc('\n');
+                i++; shown++;
+            }
+            if (shown == 0) term_print_c("  (nothing at that prefix)\n", 3);
+            return;
+        }
+
+        term_print_c("unknown zim subcommand\n", 2);
+    } else if (str_eq(cmd, "img") || str_eq(cmd, "view")) {
+        if (argc < 2) { term_print_c("usage: img <file.sci>\n", 2); return; }
+        char abs[256];
+        term_resolve(argv[1], abs);
+        if (img_open_path(abs) != 0) {
+            term_print_c("img: ", 2);
+            term_print_c(img_status(), 2);
+            term_putc('\n');
+            return;
+        }
+        term_print("  ");
+        term_print_c(img_status(), 4);
+        term_putc('\n');
+        wm_open(WK_IMAGE);
+    } else if (str_eq(cmd, "store") || str_eq(cmd, "agora")) {
+        store_cmd(argc, argv);
     } else if (str_eq(cmd, "open")) {
         if (argc < 2) { term_print_c("usage: open <app>\n", 2); return; }
         if (!desktop_open_app_by_name(argv[1])) {
@@ -948,11 +1517,12 @@ static void term_banner(void) {
     term_print_c("(x86_64 bare metal)\n", 3);
     if (fs_writable()) {
         char nb[16];
-        term_print_c("FAT32 volume mounted: ", 3);
-        uint_to_str(fat_free_kb() / 1024, nb);
+        term_print_c(fs_name(), 3);
+        term_print_c(" volume mounted: ", 3);
+        uint_to_str(fs_free_kb() / 1024, nb);
         term_print_c(nb, 3);
         term_print_c(" MB free of ", 3);
-        uint_to_str(fat_total_kb() / 1024, nb);
+        uint_to_str(fs_total_kb() / 1024, nb);
         term_print_c(nb, 3);
         term_print_c(" MB (writable, persistent)\n", 3);
     } else {

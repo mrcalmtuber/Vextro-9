@@ -797,6 +797,16 @@ static void tcp_tick(void) {
 
 #define HTTP_BUF_MAX  65536
 
+/* There is one TCP connection, so whoever starts a transfer claims it and
+ * the other pollers leave the response alone.  Callers set http_owner
+ * immediately after http_get(). */
+#define HTTP_OWNER_NONE    0
+#define HTTP_OWNER_BROWSER 1
+#define HTTP_OWNER_TERM    2
+#define HTTP_OWNER_STORE   3
+
+static int      http_owner = HTTP_OWNER_NONE;
+
 static int      http_state = HTTP_IDLE;
 static char     http_host[128];
 static char     http_path[256];

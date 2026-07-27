@@ -5,6 +5,9 @@
 #include "ttf.h"
 #include "gfx.h"
 #include "fat32.h"
+#include "exfat.h"
+#include "bsd_format.h"
+#include "sci.h"
 
 /*
  * Socrates BSD 9 desktop.
@@ -39,7 +42,11 @@ static uint64_t system_total_memory_mb = 0;
 #define DOCK_EDGE_LEFT   1
 #define DOCK_EDGE_RIGHT  2
 
-#define DOCK_APP_COUNT 8
+/* Built-in launchers, plus one slot per app installed from the store. */
+#define DOCK_BASE_COUNT 11
+#define DOCK_MAX_ITEMS  25
+
+static int dock_item_count = DOCK_BASE_COUNT;
 
 typedef struct {
     int32_t bar_y;      /* bottom edge: top y of bar; sides: top of column */
@@ -57,7 +64,7 @@ static dock_config_t dock_cfg = {
 static void dock_recalc(uint32_t scr_w, uint32_t scr_h) {
     (void)scr_w;
     dock_cfg.bar_h = dock_cfg.icon_sz + 12;
-    dock_cfg.bar_w = DOCK_APP_COUNT * (dock_cfg.icon_sz + 16) + 14;
+    dock_cfg.bar_w = dock_item_count * (dock_cfg.icon_sz + 16) + 14;
     if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
         dock_cfg.bar_y = (int32_t)scr_h - dock_cfg.bar_h - 4;
     else
@@ -74,6 +81,9 @@ enum {
     WK_SYSMON,
     WK_MATRIX,
     WK_HELLO,
+    WK_STORE,
+    WK_IMAGE,
+    WK_WIKI,
     WK_SETTINGS,
     WK_ABOUT,
     WK_COUNT
@@ -92,6 +102,9 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Monolith",         400, 480 },
     { "Matrix",           620, 420 },
     { "hello",            600, 430 },
+    { "Agora App Store",  720, 520 },
+    { "Photos",           760, 560 },
+    { "Wikipedia",        520, 520 },
     { "Settings",         470, 390 },
     { "About Socrates",   380, 270 },
 };
@@ -169,29 +182,111 @@ static const void *tar_read_file(const char *filename, uint64_t *out_size) {
 
 /* ===== 2.5 UNIFIED FILESYSTEM LAYER =====
  *
- * FAT32 on the ATA disk is the real filesystem: writable, persistent,
- * host-mountable.  The tar ramdisk remains only as a read-only fallback
- * so ISO-only boots (no hard disk attached) still work.
+ * exFAT is the system volume: it carries 64-bit sizes, so a file is no
+ * longer capped at FAT32's 4 GB.  FAT32 is still probed as a fallback so
+ * an older disk image keeps working, and the ustar ramdisk remains the
+ * read-only last resort for ISO-only boots with no disk attached.
+ *
+ * Everything above this line talks to fs_* and never to a driver, so
+ * which filesystem is mounted is decided in exactly one place.
  */
 
-#define FS_FILEBUF_MAX (256 * 1024)
+#define FS_NONE   0
+#define FS_EXFAT  1
+#define FS_FAT32  2
+
+static int fs_kind = FS_NONE;
+
+/* Big enough for a compressed full-colour image; larger files are read
+ * through fs_read_range() a window at a time. */
+#define FS_FILEBUF_MAX (4 * 1024 * 1024)
 static uint8_t fs_filebuf[FS_FILEBUF_MAX];
 static const char *fs_errstr = "";
 
-static int fs_writable(void) {
-    return fat_vol.mounted;
+static void fs_mount(void) {
+    exfat_mount();
+    if (exf_vol.mounted) { fs_kind = FS_EXFAT; return; }
+    fat32_mount();
+    if (fat_vol.mounted) { fs_kind = FS_FAT32; return; }
+    fs_kind = FS_NONE;
+}
+
+static const char *fs_name(void) {
+    if (fs_kind == FS_EXFAT) return "exFAT";
+    if (fs_kind == FS_FAT32) return "FAT32";
+    return tarfs_base ? "ramdisk (read-only)" : "none";
+}
+
+static int fs_writable(void) { return fs_kind != FS_NONE; }
+
+static uint32_t fs_total_kb(void) {
+    if (fs_kind == FS_EXFAT) return exf_total_kb();
+    if (fs_kind == FS_FAT32) return fat_total_kb();
+    return 0;
+}
+
+static uint32_t fs_free_kb(void) {
+    if (fs_kind == FS_EXFAT) return exf_free_kb();
+    if (fs_kind == FS_FAT32) return fat_free_kb();
+    return 0;
+}
+
+/* Normalise to an absolute path in the caller's buffer. */
+static void fs_abs(const char *in, char *out, int max) {
+    if (in[0] == '/') { str_copy(out, in, max); return; }
+    out[0] = '/';
+    str_copy(out + 1, in, max - 1);
+}
+
+/* Does the path exist, and what is it?  Replaces every direct driver
+ * lookup that used to be scattered through the apps. */
+static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e)) return 0;
+        if (size) *size = e.size;
+        if (is_dir) *is_dir = (e.attr & EXF_ATTR_DIR) ? 1 : 0;
+        return 1;
+    }
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t e;
+        if (!fat_lookup(abs, &e)) return 0;
+        if (size) *size = e.size;
+        if (is_dir) *is_dir = (e.attr & FAT_ATTR_DIR) ? 1 : 0;
+        return 1;
+    }
+    uint64_t n = 0;
+    if (tar_read_file(abs, &n) && n > 0) {
+        if (size) *size = n;
+        if (is_dir) *is_dir = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static const void *fs_read_file(const char *filename, uint64_t *out_size) {
-    if (fat_vol.mounted) {
-        fat_dirent_t e;
-        char abs[256];
-        if (filename[0] != '/') {
-            abs[0] = '/';
-            str_copy(abs + 1, filename, 255);
-        } else {
-            str_copy(abs, filename, 256);
+    char abs[256];
+    fs_abs(filename, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
+            if (out_size) *out_size = 0;
+            return 0;
         }
+        uint32_t got = 0;
+        if (exf_read_file(&e, fs_filebuf, FS_FILEBUF_MAX, &got) != 0) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        if (out_size) *out_size = got;
+        return fs_filebuf;
+    }
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t e;
         if (!fat_lookup(abs, &e) || (e.attr & FAT_ATTR_DIR)) {
             if (out_size) *out_size = 0;
             return 0;
@@ -207,59 +302,169 @@ static const void *fs_read_file(const char *filename, uint64_t *out_size) {
     return tar_read_file(filename, out_size);
 }
 
-static int fs_write_file(const char *path, const void *data, uint32_t len) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+/*
+ * Read a window out of a file.  This is what makes a multi-gigabyte
+ * archive usable: nothing has to fit in a buffer, only the slice being
+ * looked at.  exFAT only — the fallbacks cannot hold such a file anyway.
+ */
+static int fs_read_range(const char *path, uint64_t offset, void *buf,
+                         uint32_t len, uint32_t *got) {
+    *got = 0;
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+
+    if (fs_kind == FS_EXFAT) {
+        exf_dirent_t e;
+        if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        if (exf_read_range(&e, offset, (uint8_t *)buf, len, got) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
     }
-    if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
-    }
+
+    uint64_t size = 0;
+    const void *d = fs_read_file(abs, &size);
+    if (!d) { fs_errstr = "not found"; return -1; }
+    if (offset >= size) return 0;
+    uint32_t n = (uint32_t)(size - offset);
+    if (n > len) n = len;
+    const uint8_t *src = (const uint8_t *)d + offset;
+    for (uint32_t i = 0; i < n; i++) ((uint8_t *)buf)[i] = src[i];
+    *got = n;
     return 0;
+}
+
+/*
+ * An open-file handle.  Reading an archive means thousands of small
+ * reads, and resolving the path through the directory tree every time
+ * would dominate the cost, so the located entry is kept.
+ */
+typedef struct {
+    int      kind;
+    int      valid;
+    uint64_t size;
+    exf_dirent_t exf;
+    char     path[160];
+} fs_file_t;
+
+static int fs_open(const char *path, fs_file_t *f) {
+    f->valid = 0;
+    f->kind = fs_kind;
+    str_copy(f->path, path, sizeof(f->path));
+
+    if (fs_kind == FS_EXFAT) {
+        char abs[256];
+        fs_abs(path, abs, sizeof(abs));
+        if (!exf_lookup(abs, &f->exf) || (f->exf.attr & EXF_ATTR_DIR)) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        f->size = f->exf.size;
+        f->valid = 1;
+        return 0;
+    }
+
+    uint64_t sz = 0;
+    int is_dir = 0;
+    if (!fs_stat(path, &sz, &is_dir) || is_dir) {
+        fs_errstr = "not found";
+        return -1;
+    }
+    f->size = sz;
+    f->valid = 1;
+    return 0;
+}
+
+static int fs_pread(fs_file_t *f, uint64_t off, void *buf, uint32_t len,
+                    uint32_t *got) {
+    *got = 0;
+    if (!f->valid) { fs_errstr = "file not open"; return -1; }
+    if (f->kind == FS_EXFAT) {
+        if (exf_read_range(&f->exf, off, (uint8_t *)buf, len, got) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    return fs_read_range(f->path, off, buf, len, got);
+}
+
+static int fs_write_file(const char *path, const void *data, uint32_t len) {
+    if (fs_kind == FS_EXFAT) {
+        if (exf_write_file(path, (const uint8_t *)data, len) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    if (fs_kind == FS_FAT32) {
+        if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
+            fs_errstr = fat_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
 static int fs_delete(const char *path) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_delete(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        return 0;
     }
-    if (fat_delete(path) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
+    if (fs_kind == FS_FAT32) {
+        if (fat_delete(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        return 0;
     }
-    return 0;
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
 static int fs_mkdir(const char *path) {
-    if (!fat_vol.mounted) {
-        fs_errstr = "read-only filesystem (no disk attached)";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_mkdir(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        return 0;
     }
-    if (fat_mkdir(path) != 0) {
-        fs_errstr = fat_errstr;
-        return -1;
+    if (fs_kind == FS_FAT32) {
+        if (fat_mkdir(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        return 0;
     }
-    return 0;
+    fs_errstr = "read-only filesystem (no disk attached)";
+    return -1;
 }
 
-/* FAT32-only directory listing (callers fall back to tar walks) */
 typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
 
 static int fs_list(const char *path, fs_list_cb cb) {
-    if (!fat_vol.mounted) return -1;
-    fat_dirent_t d;
-    if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
-        fs_errstr = "no such directory";
-        return -1;
+    if (fs_kind == FS_EXFAT) {
+        if (exf_list(path, (exf_list_cb)cb) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
     }
-    fat_iter_t it;
-    fat_iter_init(&it, d.first_clus);
-    fat_dirent_t e;
-    while (fat_iter_next(&it, &e) == 1)
-        cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
-    return 0;
+    if (fs_kind == FS_FAT32) {
+        fat_dirent_t d;
+        if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        fat_iter_t it;
+        fat_iter_init(&it, d.first_clus);
+        fat_dirent_t e;
+        while (fat_iter_next(&it, &e) == 1)
+            cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
+        return 0;
+    }
+    return -1;
 }
+
+#include "zim.h"
 
 /* ===== 3. FORWARD DECLARATIONS ===== */
 
@@ -272,6 +477,11 @@ static void wallpaper_set_theme(int idx);
 static int  desktop_open_app_by_name(const char *name);
 static void brw_navigate(const char *url);
 static int  execute_bin(const char *filepath);
+static void store_cmd(int argc, char **argv);
+static void store_fit(char *dst, int dst_max, const char *src,
+                      int budget, int font);
+static int  img_open_path(const char *path);
+static const char *img_status(void);
 
 /* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
 
@@ -352,35 +562,35 @@ typedef struct {
 static uint8_t app_memory[APP_MEM_SIZE] __attribute__((aligned(4096)));
 static uint8_t app_stack[8192] __attribute__((aligned(16)));
 
-static int execute_bin_internal(const char *filepath, int verbose) {
-    uint64_t fsize = 0;
-    const void *fdata = fs_read_file(filepath, &fsize);
-    if (!fdata || fsize < sizeof(Elf64_Ehdr)) {
-        if (verbose) {
-            term_print_c("run: file not found: ", 2);
-            term_print_c(filepath, 2);
-            term_print("\n");
-        }
-        return -1;
-    }
+/*
+ * Two loaders share one app arena.  Both lay the image out at
+ * app_memory + (vaddr - base_vaddr), so images have to be position
+ * independent — neither loader processes relocations.
+ *
+ * Note that the kernel runs apps in ring 0 out of a static buffer, so it
+ * cannot enforce W^X the way the host-side loader in bsdfmt/bsd_run.c
+ * does; the .bsd page alignment is still honoured, and is what would let
+ * a future paging-aware loader mark the text arena NX-clear and the data
+ * arena NX-set without touching the format.
+ */
 
-    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)fdata;
-    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
-        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-        if (verbose) term_print_c("run: invalid ELF magic\n", 2);
+/* Load an ELF64 image (used by `hello` and `run <elf>`). */
+static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
+                          uint64_t *out_entry) {
+    if (fsize < sizeof(Elf64_Ehdr)) {
+        if (verbose) term_print_c("run: file too small for an ELF64\n", 2);
         return -1;
     }
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)file;
     if (ehdr->e_ident[4] != 2) {
         if (verbose) term_print_c("run: not a 64-bit ELF\n", 2);
         return -1;
     }
 
-    const uint8_t *file_bytes = (const uint8_t *)fdata;
-
     uint64_t base_vaddr = ~(uint64_t)0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
-            (file_bytes + ehdr->e_phoff + i * ehdr->e_phentsize);
+            (file + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type == ELF_PT_LOAD && ph->p_vaddr < base_vaddr)
             base_vaddr = ph->p_vaddr;
     }
@@ -394,28 +604,107 @@ static int execute_bin_internal(const char *filepath, int verbose) {
 
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
-            (file_bytes + ehdr->e_phoff + i * ehdr->e_phentsize);
+            (file + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type != ELF_PT_LOAD) continue;
         uint64_t offset = ph->p_vaddr - base_vaddr;
         if (offset + ph->p_memsz > APP_MEM_SIZE) {
             if (verbose) term_print_c("run: segment too large\n", 2);
             return -1;
         }
-        const uint8_t *src = file_bytes + ph->p_offset;
+        const uint8_t *src = file + ph->p_offset;
         uint8_t *dst = app_memory + offset;
         for (uint64_t j = 0; j < ph->p_filesz; j++)
             dst[j] = src[j];
     }
 
-    uint64_t entry_offset = ehdr->e_entry - base_vaddr;
-    uint64_t entry_addr = (uint64_t)(uintptr_t)(app_memory + entry_offset);
-    uint64_t stack_top  = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
+    if (verbose) term_print_c("loading ELF64: ", 3);
+    *out_entry = (uint64_t)(uintptr_t)(app_memory +
+                                       (ehdr->e_entry - base_vaddr));
+    return 0;
+}
+
+/* Load a .bsd image — the format every app store package uses. */
+static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
+                          uint64_t *out_entry) {
+    /* Copy the header out byte-wise: the filesystem cache hands back a
+     * plain byte buffer and we do not want to assume its alignment. */
+    bsd_header_t h;
+    uint8_t *hp = (uint8_t *)&h;
+    if (fsize < sizeof(h)) {
+        if (verbose) term_print_c("run: file too small for a .bsd header\n", 2);
+        return -1;
+    }
+    for (uint64_t i = 0; i < sizeof(h); i++) hp[i] = file[i];
+
+    const char *bad = bsd_validate(&h, fsize);
+    if (bad) {
+        if (verbose) {
+            term_print_c("run: ", 2);
+            term_print_c(bad, 2);
+            term_print("\n");
+        }
+        return -1;
+    }
+    if (bsd_image_span(&h) > APP_MEM_SIZE) {
+        if (verbose) term_print_c("run: image too large for the app arena\n", 2);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < APP_MEM_SIZE; i++)
+        app_memory[i] = 0;
+
+    uint64_t base = h.text_vaddr;
+    uint8_t *dst = app_memory + (h.text_vaddr - base);
+    for (uint64_t i = 0; i < h.text_size; i++)
+        dst[i] = file[h.text_off + i];
+
+    if (h.data_size) {
+        dst = app_memory + (h.data_vaddr - base);
+        for (uint64_t i = 0; i < h.data_size; i++)
+            dst[i] = file[h.data_off + i];
+    }
+    /* .bss needs no work: the arena was just zeroed. */
+
+    if (verbose) term_print_c("loading .bsd: ", 3);
+    *out_entry = (uint64_t)(uintptr_t)(app_memory + (h.entry - base));
+    return 0;
+}
+
+static int execute_bin_internal(const char *filepath, int verbose) {
+    uint64_t fsize = 0;
+    const void *fdata = fs_read_file(filepath, &fsize);
+    if (!fdata || fsize < 8) {
+        if (verbose) {
+            term_print_c("run: file not found: ", 2);
+            term_print_c(filepath, 2);
+            term_print("\n");
+        }
+        return -1;
+    }
+
+    const uint8_t *file = (const uint8_t *)fdata;
+    uint64_t entry_addr = 0;
+    int rc;
+
+    if (file[0] == (uint8_t)BSD_MAGIC0 && file[1] == (uint8_t)BSD_MAGIC1 &&
+        file[2] == (uint8_t)BSD_MAGIC2 && file[3] == (uint8_t)BSD_MAGIC3) {
+        rc = load_bsd_image(file, fsize, verbose, &entry_addr);
+    } else if (file[0] == 0x7F && file[1] == 'E' && file[2] == 'L' &&
+               file[3] == 'F') {
+        rc = load_elf_image(file, fsize, verbose, &entry_addr);
+    } else {
+        if (verbose)
+            term_print_c("run: not a .bsd or ELF64 executable\n", 2);
+        return -1;
+    }
+    if (rc != 0) return -1;
 
     if (verbose) {
-        term_print_c("loading ELF64: ", 3);
         term_print_c(filepath, 3);
         term_print("\n");
     }
+
+    uint64_t stack_top = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
 
     for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++)
         app_canvas[i] = 0;
@@ -454,6 +743,7 @@ static int execute_bin(const char *filepath) {
 #include "term.h"
 #include "browser.h"
 #include "apps.h"
+#include "store.h"
 
 /* Canvas app (WK_HELLO) content drawer */
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
@@ -542,6 +832,8 @@ static void wm_open(int kind) {
         brw_navigate_no_hist("socrates://home");
     if (kind == WK_FILES)
         exp_scan();
+    if (kind == WK_STORE)
+        store_restat();
 
     wm_raise(kind);
 }
@@ -660,6 +952,15 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     case WK_HELLO:
         hello_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
+    case WK_STORE:
+        store_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_IMAGE:
+        img_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
+    case WK_WIKI:
+        wiki_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
+        break;
     case WK_SETTINGS:
         settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
@@ -722,6 +1023,15 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
             break;
         case WK_SETTINGS:
             settings_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_STORE:
+            store_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_IMAGE:
+            img_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_WIKI:
+            wiki_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
             break;
         case WK_PAINT:
             paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
@@ -900,34 +1210,60 @@ static void wallpaper_set_theme(int idx) {
 
 /* ===== 8. MENUBAR ===== */
 
+/* action codes above the window kinds */
+#define MENU_ACT_REBOOT   100
+#define MENU_ACT_SHUTDOWN 101
+#define MENU_ACT_APP_BASE 200      /* + index into store_inst[] */
+
 typedef struct {
     const char *label;
-    int action;      /* >=0: open window kind; 100 reboot; 101 shutdown; -1 sep */
+    int action;      /* >=0 window kind; 100/101 power; 200+ app; -1 sep */
 } menu_item_t;
 
 static const menu_item_t menu_system[] = {
     { "About Socrates", WK_ABOUT },
     { "Settings",       WK_SETTINGS },
     { "-",              -1 },
-    { "Restart",        100 },
-    { "Shut Down",      101 },
+    { "Restart",        MENU_ACT_REBOOT },
+    { "Shut Down",      MENU_ACT_SHUTDOWN },
 };
 
-static const menu_item_t menu_apps[] = {
-    { "Terminal",  WK_TERM },
-    { "Browser",   WK_BROWSER },
-    { "Files",     WK_FILES },
-    { "-",         -1 },
-    { "Goldsmith", WK_PAINT },
-    { "Monolith",  WK_SYSMON },
-    { "Matrix",    WK_MATRIX },
-    { "hello.elf", WK_HELLO },
-};
+/* The Apps menu is rebuilt each frame so installed packages appear in it. */
+#define MENU_APPS_MAX (10 + STORE_MAX_INST)
+
+static menu_item_t menu_apps[MENU_APPS_MAX];
+static int         menu_apps_n = 0;
 
 #define MENU_COUNT 2
 static const char *menu_labels[MENU_COUNT] = { "Socrates", "Apps" };
 static const menu_item_t *menu_items[MENU_COUNT] = { menu_system, menu_apps };
-static const int menu_item_count[MENU_COUNT] = { 5, 8 };
+static int menu_item_count[MENU_COUNT] = { 5, 0 };
+
+static void menu_rebuild(void) {
+    int n = 0;
+    menu_apps[n].label = "Terminal";     menu_apps[n++].action = WK_TERM;
+    menu_apps[n].label = "Browser";      menu_apps[n++].action = WK_BROWSER;
+    menu_apps[n].label = "Files";        menu_apps[n++].action = WK_FILES;
+    menu_apps[n].label = "App Store";    menu_apps[n++].action = WK_STORE;
+    menu_apps[n].label = "Photos";       menu_apps[n++].action = WK_IMAGE;
+    menu_apps[n].label = "Wikipedia";    menu_apps[n++].action = WK_WIKI;
+    menu_apps[n].label = "-";            menu_apps[n++].action = -1;
+    menu_apps[n].label = "Goldsmith";    menu_apps[n++].action = WK_PAINT;
+    menu_apps[n].label = "Monolith";     menu_apps[n++].action = WK_SYSMON;
+    menu_apps[n].label = "Matrix";       menu_apps[n++].action = WK_MATRIX;
+    menu_apps[n].label = "hello.elf";    menu_apps[n++].action = WK_HELLO;
+
+    if (store_inst_count > 0) {
+        menu_apps[n].label = "-";        menu_apps[n++].action = -1;
+        for (int i = 0; i < store_inst_count && n < MENU_APPS_MAX; i++) {
+            menu_apps[n].label = store_inst[i].name;
+            menu_apps[n].action = MENU_ACT_APP_BASE + i;
+            n++;
+        }
+    }
+    menu_apps_n = n;
+    menu_item_count[1] = n;
+}
 
 static int menu_open_idx = -1;
 
@@ -950,7 +1286,9 @@ static void menu_label_rect(int idx, int32_t *x0, int32_t *x1) {
 }
 
 static void menu_action(int action) {
-    if (action >= 0 && action < WK_COUNT) {
+    if (action >= MENU_ACT_APP_BASE) {
+        store_launch_inst(action - MENU_ACT_APP_BASE);
+    } else if (action >= 0 && action < WK_COUNT) {
         if (action == WK_HELLO) {
             silent_launch = 1;
             execute_bin_internal("hello", 0);
@@ -1096,10 +1434,41 @@ static void menu_dropdown_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* ===== 9. DOCK ===== */
 
-static const int dock_kinds[DOCK_APP_COUNT] = {
-    WK_TERM, WK_BROWSER, WK_FILES, WK_PAINT,
+/* A dock slot is either a built-in window kind or an installed app
+ * (which runs into the shared canvas window, WK_HELLO). */
+typedef struct {
+    int kind;
+    int inst;      /* index into store_inst[], or -1 for a built-in */
+} dock_item_t;
+
+static const int dock_base_kinds[DOCK_BASE_COUNT] = {
+    WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_IMAGE, WK_WIKI, WK_PAINT,
     WK_SYSMON, WK_MATRIX, WK_HELLO, WK_SETTINGS,
 };
+
+static dock_item_t dock_items[DOCK_MAX_ITEMS];
+
+static void dock_rebuild(void) {
+    int n = 0;
+    for (int i = 0; i < DOCK_BASE_COUNT; i++) {
+        dock_items[n].kind = dock_base_kinds[i];
+        dock_items[n].inst = -1;
+        n++;
+    }
+    for (int i = 0; i < store_inst_count && n < DOCK_MAX_ITEMS; i++) {
+        dock_items[n].kind = WK_HELLO;
+        dock_items[n].inst = i;
+        n++;
+    }
+    dock_item_count = n;
+}
+
+static const char *dock_item_name(int idx) {
+    if (dock_items[idx].inst >= 0)
+        return store_inst[dock_items[idx].inst].name;
+    if (dock_items[idx].kind == WK_HELLO) return "hello";
+    return wk_meta[dock_items[idx].kind].title;
+}
 
 static void dock_bar_rect(uint32_t scr_w, int32_t *rx, int32_t *ry,
                           int32_t *rw, int32_t *rh) {
@@ -1193,6 +1562,44 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect(buf, w, h, cx + q / 2 - 1, cy - 2, 2, 3, C_GOLD);
         gfx_rect(buf, w, h, cx - q / 2, cy + q / 2, q + 1, 2, C_GOLD);
         break;
+    case WK_IMAGE:
+        /* a framed photo: horizon, sun, and a hill */
+        gfx_rect_outline(buf, w, h, cx - q - 3, cy - q - 1, 2 * q + 6,
+                         2 * q + 2, C_TEXT);
+        gfx_circle(buf, w, h, cx + q - 1, cy - q / 2, 2, C_GOLD);
+        gfx_tri(buf, w, h, cx - q - 2, cy + q, cx - 1, cy - q / 2 - 1,
+                cx + q / 2, cy + q, C_GOLD_DIM);
+        gfx_tri(buf, w, h, cx - 2, cy + q, cx + q / 2 + 2, cy - 1,
+                cx + q + 2, cy + q, C_GOLD);
+        break;
+    case WK_WIKI:
+        /* an open book: two leaves meeting at the spine */
+        gfx_tri(buf, w, h, cx, cy - q, cx - q - 3, cy - q + 2,
+                cx - q - 3, cy + q, C_TEXT);
+        gfx_tri(buf, w, h, cx, cy - q, cx - q - 3, cy + q, cx, cy + q - 1,
+                C_TEXT);
+        gfx_tri(buf, w, h, cx, cy - q, cx + q + 3, cy - q + 2,
+                cx + q + 3, cy + q, C_GOLD_DIM);
+        gfx_tri(buf, w, h, cx, cy - q, cx + q + 3, cy + q, cx, cy + q - 1,
+                C_GOLD_DIM);
+        gfx_rect(buf, w, h, cx - 1, cy - q, 2, 2 * q, C_GOLD);
+        break;
+    case WK_STORE:
+        /* a shopping bag with a download arrow in it */
+        gfx_rect_outline(buf, w, h, cx - q - 2, cy - q + 2, 2 * q + 4,
+                         2 * q + 1, C_TEXT);
+        gfx_line(buf, w, h, cx - q / 2 - 1, cy - q + 2,
+                 cx - q / 2 - 1, cy - q - 3, 1, C_TEXT);
+        gfx_line(buf, w, h, cx + q / 2 + 1, cy - q + 2,
+                 cx + q / 2 + 1, cy - q - 3, 1, C_TEXT);
+        gfx_line(buf, w, h, cx - q / 2 - 1, cy - q - 3,
+                 cx + q / 2 + 1, cy - q - 3, 1, C_TEXT);
+        gfx_rect(buf, w, h, cx - 1, cy - q + 5, 2, q + q / 2 - 6, C_GOLD);
+        gfx_line(buf, w, h, cx - 4, cy + q / 2 - 3, cx, cy + q / 2 + 1,
+                 1, C_GOLD);
+        gfx_line(buf, w, h, cx + 4, cy + q / 2 - 3, cx, cy + q / 2 + 1,
+                 1, C_GOLD);
+        break;
     case WK_SETTINGS: {
         int32_t r_out = q + 3;
         for (int32_t dy = -r_out - 2; dy <= r_out + 2; dy++)
@@ -1224,11 +1631,31 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/* Draw the pictogram for a dock slot — installed apps borrow the store's
+ * category glyphs so the dock icon matches the storefront card. */
+static void dock_draw_item_glyph(uint32_t *buf, uint32_t w, uint32_t h,
+                                 int idx, int32_t x, int32_t y, int32_t sz) {
+    if (dock_items[idx].inst >= 0) {
+        store_icon_glyph(buf, w, h, x, y, sz,
+                         store_inst[dock_items[idx].inst].icon);
+        return;
+    }
+    dock_draw_glyph(buf, w, h, dock_items[idx].kind, x, y, sz);
+}
+
 static void dock_launch(int idx) {
-    int kind = dock_kinds[idx];
     int32_t ix, iy, iw, ih;
     dock_icon_rect(scr_w_cache, idx, &ix, &iy, &iw, &ih);
 
+    if (dock_items[idx].inst >= 0) {
+        int was_open = wins[WK_HELLO].open;
+        store_launch_inst(dock_items[idx].inst);
+        if (!was_open && wins[WK_HELLO].open)
+            spawn_anim_start(WK_HELLO, ix + iw / 2, iy + ih / 2);
+        return;
+    }
+
+    int kind = dock_items[idx].kind;
     if (kind == WK_HELLO && !wins[WK_HELLO].open) {
         silent_launch = 1;
         execute_bin_internal("hello", 0);
@@ -1250,7 +1677,7 @@ static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
     if (mx < rx || mx >= rx + rw || my < ry || my >= ry + rh)
         return 0;
 
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+    for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(scr_w_cache, i, &ix, &iy, &iw, &ih);
         if (mx >= ix - 4 && mx < ix + iw + 4 &&
@@ -1273,10 +1700,10 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     gfx_rect(buf, w, h, rx, ry, rw, 1, 0x3A4254u);
 
     int hover = -1;
-    for (int i = 0; i < DOCK_APP_COUNT; i++) {
+    for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, i, &ix, &iy, &iw, &ih);
-        int kind = dock_kinds[i];
+        int kind = dock_items[i].kind;
         int hot = (mx >= ix - 4 && mx < ix + iw + 4 &&
                    my >= iy - 4 && my < iy + ih + 4);
         if (hot) hover = i;
@@ -1285,10 +1712,26 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect(buf, w, h, ix, iy, iw, ih, hot ? 0x262C3Eu : 0x1C2130u);
         gfx_rect_outline(buf, w, h, ix, iy, iw, ih,
                          hot ? C_GOLD_DIM : 0x2A3040u);
-        dock_draw_glyph(buf, w, h, kind, ix, iy, iw);
+        dock_draw_item_glyph(buf, w, h, i, ix, iy, iw);
 
-        /* running indicator */
-        if (wm_is_open(kind)) {
+        /* separator before the installed-app section */
+        if (i == DOCK_BASE_COUNT && dock_item_count > DOCK_BASE_COUNT) {
+            if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
+                gfx_rect(buf, w, h, ix - 9, iy + 2, 1, ih - 4, 0x353C50u);
+            else
+                gfx_rect(buf, w, h, ix + 2, iy - 9, iw - 4, 1, 0x353C50u);
+        }
+
+        /* Running indicator.  Canvas apps all share WK_HELLO, so the one
+         * that is actually loaded is identified by the window title. */
+        int running;
+        if (kind == WK_HELLO)
+            running = wins[WK_HELLO].open &&
+                      str_eq(app_win_title, dock_item_name(i));
+        else
+            running = wm_is_open(kind);
+
+        if (running) {
             if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
                 gfx_circle(buf, w, h, ix + iw / 2, ry + rh - 4, 2, C_GOLD);
             else if (dock_cfg.edge == DOCK_EDGE_LEFT)
@@ -1300,8 +1743,7 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* tooltip */
     if (hover >= 0) {
-        int kind = dock_kinds[hover];
-        const char *name = wk_meta[kind].title;
+        const char *name = dock_item_name(hover);
         int tw = ttf_text_width(name, 12);
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, hover, &ix, &iy, &iw, &ih);
@@ -1337,6 +1779,12 @@ static int desktop_open_app_by_name(const char *name) {
     else if (str_eq(name, "sysmon") || str_eq(name, "monolith")) kind = WK_SYSMON;
     else if (str_eq(name, "matrix")) kind = WK_MATRIX;
     else if (str_eq(name, "about")) kind = WK_ABOUT;
+    else if (str_eq(name, "store") || str_eq(name, "agora") ||
+             str_eq(name, "apps")) kind = WK_STORE;
+    else if (str_eq(name, "photos") || str_eq(name, "image") ||
+             str_eq(name, "images")) kind = WK_IMAGE;
+    else if (str_eq(name, "wikipedia") || str_eq(name, "wiki") ||
+             str_eq(name, "encyclopedia")) kind = WK_WIKI;
     else if (str_eq(name, "hello")) {
         silent_launch = 1;
         execute_bin_internal("hello", 0);
@@ -1370,6 +1818,18 @@ static void desktop_key_input(char ch) {
         brw_key(ch);
         return;
     }
+    if (wm_focus == WK_STORE) {
+        store_key(ch);
+        return;
+    }
+    if (wm_focus == WK_IMAGE) {
+        img_key(ch);
+        return;
+    }
+    if (wm_focus == WK_WIKI) {
+        wiki_key(ch);
+        return;
+    }
     if (wm_focus == WK_ABOUT && ch == 27) {
         wm_close(WK_ABOUT);
         return;
@@ -1380,12 +1840,53 @@ static void desktop_key_input(char ch) {
     }
 }
 
+/*
+ * Route wheel notches to the focused window, positive towards the top of
+ * the document.  Each window already knows how to scroll itself for the
+ * keyboard, so this is mostly a matter of choosing a step: a notch is
+ * three lines of terminal, or a comfortable fraction of a page elsewhere.
+ */
+static void desktop_wheel_input(int32_t notches) {
+    if (notches == 0 || menu_open_idx >= 0) return;
+
+    int32_t mag = notches < 0 ? -notches : notches;
+    if (mag > 8) mag = 8;                       /* a flick should not hurl */
+    int32_t step = notches > 0 ? mag : -mag;
+
+    switch (wm_focus) {
+    case WK_TERM:
+        term_scroll_key(step > 0 ? KEY_PGUP : KEY_PGDN, (int)(mag * 3));
+        break;
+    case WK_BROWSER:
+        brw_scroll_by((int)(-step * 48), brw_view_h_cache);
+        break;
+    case WK_STORE:
+        store_scroll_by((int)(-step * 48));
+        break;
+    case WK_WIKI:
+        /* the article itself opens in the browser; here the wheel walks
+         * the result list, but not while the chat panel has the window */
+        if (wiki_mode == 0)
+            for (int32_t i = 0; i < mag; i++)
+                wiki_key(step > 0 ? KEY_UP : KEY_DOWN);
+        break;
+    case WK_IMAGE:
+        for (int32_t i = 0; i < mag; i++)
+            img_key(step > 0 ? KEY_UP : KEY_DOWN);
+        break;
+    default:
+        break;
+    }
+}
+
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                            int32_t mx, int32_t my, uint8_t buttons) {
     desktop_tick++;
     scr_w_cache = w;
     scr_h_cache = h;
 
+    dock_rebuild();
+    menu_rebuild();
     dock_recalc(w, h);
 
     if (wall_gen_w != w || wall_gen_h != h)
@@ -1394,6 +1895,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     /* async engines */
     term_async_poll();
     brw_poll();
+    store_poll();
 
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;

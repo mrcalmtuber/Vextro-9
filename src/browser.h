@@ -201,7 +201,57 @@ static int brw_entity(const char *s, int max, char *out) {
 }
 
 /* Resolve href relative to current page host/path → absolute url string */
+/* set while the displayed page came out of a ZIM archive */
+static int brw_zim_mode = 0;
+
+/* ZIM paths are percent-encoded in article markup */
+static void brw_pct_decode(const char *in, char *out, int max) {
+    int o = 0;
+    for (int i = 0; in[i] && o < max - 1; i++) {
+        if (in[i] == '%' && in[i + 1] && in[i + 2]) {
+            int hi = in[i + 1], lo = in[i + 2], v = 0, ok = 1;
+            for (int k = 0; k < 2; k++) {
+                int c = k ? lo : hi, d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else { ok = 0; break; }
+                v = v * 16 + d;
+            }
+            if (ok) { out[o++] = (char)v; i += 2; continue; }
+        }
+        out[o++] = in[i];
+    }
+    out[o] = '\0';
+}
+
 static void brw_resolve_href(const char *href, char *out, int out_max) {
+    if (str_starts_with(href, "zim://")) {
+        str_copy(out, href, out_max);
+        return;
+    }
+    /*
+     * Inside an article every link is relative, and points at a sibling
+     * entry rather than a directory: "../A/Moon" and "Moon" both mean the
+     * entry named Moon.  Strip the walk-ups and the namespace prefix, drop
+     * any fragment, and hand back a zim:// address.
+     */
+    if (brw_zim_mode &&
+        !str_starts_with(href, "http://") && !str_starts_with(href, "https://") &&
+        !str_starts_with(href, "socrates://") && !str_starts_with(href, "//")) {
+        const char *q = href;
+        while (str_starts_with(q, "./")) q += 2;
+        while (str_starts_with(q, "../")) q += 3;
+        if (q[0] && q[1] == '/' &&
+            (q[0] == 'A' || q[0] == 'C' || q[0] == 'I' || q[0] == 'M'))
+            q += 2;
+        char dec[BRW_ADDR_MAX];
+        brw_pct_decode(q, dec, sizeof(dec));
+        for (int i = 0; dec[i]; i++) if (dec[i] == '#') { dec[i] = '\0'; break; }
+        str_copy(out, "zim://", out_max);
+        str_append(out, dec, out_max);
+        return;
+    }
     if (str_starts_with(href, "http://") ||
         str_starts_with(href, "https://") ||
         str_starts_with(href, "socrates://")) {
@@ -555,6 +605,53 @@ static void brw_page_file(const char *name) {
     str_copy(brw_title, name, BRW_TITLE_MAX);
 }
 
+static void brw_page_zim(const char *path) {
+    if (!zim.open) {
+        brw_page_error("No archive is open.  Open the Wikipedia app, or run"
+                       " 'zim open <file>' in the terminal.");
+        return;
+    }
+    if (path[0] == '\0') path = "";
+
+    uint32_t idx;
+    if (!zim_find('C', path, &idx)) {
+        brw_doc_reset();
+        str_copy(brw_title, "Not found", BRW_TITLE_MAX);
+        brw_add_text("No such article", BS_H2, 0);
+        brw_line_flush();
+        brw_add_text(path, BS_DIM, 0);
+        brw_line_flush();
+        brw_line_flush();
+        brw_add_text("Entry names are case sensitive.  Use the Wikipedia app"
+                     " to search.", BS_BODY, 0);
+        brw_doc_finish();
+        return;
+    }
+
+    const uint8_t *data;
+    uint32_t len;
+    zim_dirent_t e;
+    if (zim_content(idx, &data, &len, &e) != 0) {
+        brw_page_error(zim_err);
+        return;
+    }
+
+    int is_html = 0;
+    const char *m = zim_mime_name(e.mime);
+    for (int i = 0; m[i]; i++)
+        if (m[i] == 'h' && m[i+1] == 't' && m[i+2] == 'm' && m[i+3] == 'l') {
+            is_html = 1;
+            break;
+        }
+
+    brw_zim_mode = 1;
+    if (is_html) brw_parse_html(data, (int)len);
+    else         brw_parse_plain(data, (int)len);
+    brw_zim_mode = 0;
+
+    str_copy(brw_title, e.title, BRW_TITLE_MAX);
+}
+
 /* ===== NAVIGATION ===== */
 
 static void brw_set_status(const char *s) {
@@ -582,6 +679,14 @@ static void brw_navigate_no_hist(const char *url) {
 
     char url_buf[BRW_ADDR_MAX];
     str_copy(url_buf, url, BRW_ADDR_MAX);
+
+    if (str_starts_with(url_buf, "zim://")) {
+        brw_set_addr(url_buf);
+        brw_set_status("Reading the archive...");
+        brw_page_zim(url_buf + 6);
+        brw_set_status(zim.open ? "Ready" : "No archive open");
+        return;
+    }
 
     if (str_starts_with(url_buf, "socrates://")) {
         const char *page = url_buf + 11;
@@ -639,6 +744,7 @@ static void brw_navigate_no_hist(const char *url) {
     brw_loading = 1;
     brw_set_status("Resolving host...");
     http_get(host, port, path);
+    http_owner = HTTP_OWNER_BROWSER;
 }
 
 static void brw_navigate(const char *url) {

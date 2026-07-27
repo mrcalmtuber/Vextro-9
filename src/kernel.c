@@ -10,6 +10,7 @@
 #include "ac97.h"
 #include "netstack.h"
 #include "igpu.h"
+#include "llm.h"
 #include "desktop.h"
 #include "boot_animation.h"
 
@@ -205,6 +206,31 @@ static void irq0_handler(interrupt_frame_t *f) {
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/*
+ * Bring up the x87/SSE unit.  The kernel proper is compiled -mno-sse and
+ * never touches these registers; only the inference translation unit
+ * does, and it runs with interrupts enabled but never inside one, so no
+ * ISR can clobber XMM state.
+ *
+ *   CR0.EM clear  - do not trap SSE as "no coprocessor"
+ *   CR0.MP set    - WAIT/FWAIT honours TS
+ *   CR4.OSFXSR    - FXSAVE/FXRSTOR available, SSE instructions legal
+ *   CR4.OSXMMEXCPT- unmasked SSE exceptions raise #XF rather than #UD
+ */
+static void fpu_init(void) {
+    uint64_t cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);          /* EM */
+    cr0 |=  (1ULL << 1);          /* MP */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+
+    __asm__ volatile("fninit");
+}
+
 static void pit_init(uint16_t cs) {
     idt_set_gate(0x20, irq0_handler, cs);
 
@@ -302,6 +328,19 @@ static void boot_frame_delay(void) {
     while (!(inb(0x61) & 0x20)) {} /* spin until OUT2 goes high */
 }
 
+/*
+ * Has someone hit a key?  The animation runs before the IDT is loaded,
+ * so there is no interrupt handler to ask — read the PS/2 controller
+ * directly.  Consuming the press here also means it does not turn up
+ * later as a stray character in the keycode field.
+ */
+static int boot_key_pressed(void) {
+    uint8_t st = inb(0x64);
+    if (st == 0xFF || !(st & 1)) return 0;   /* no controller, or nothing */
+    if (st & 0x20) { (void)inb(0x60); return 0; }  /* mouse byte, discard */
+    return !(inb(0x60) & 0x80);              /* a press, not a release */
+}
+
 static void display_boot_animation(volatile uint32_t *vram,
                                    uint32_t scr_w, uint32_t scr_h,
                                    uint32_t pitch_px) {
@@ -335,6 +374,7 @@ static void display_boot_animation(volatile uint32_t *vram,
             }
         }
         boot_frame_delay();
+        if (boot_key_pressed()) break;   /* any key skips the rest */
     }
 
     /* Clear screen to black after animation finishes */
@@ -349,19 +389,33 @@ void kmain(void) {
         while (1) __asm__ volatile("hlt");
 
     struct limine_framebuffer *fb = fb_request.response->framebuffers[0];
-    uint32_t w        = (uint32_t)fb->width;
-    uint32_t h        = (uint32_t)fb->height;
+    uint32_t panel_w  = (uint32_t)fb->width;
+    uint32_t panel_h  = (uint32_t)fb->height;
     uint32_t pitch_px = (uint32_t)(fb->pitch / (fb->bpp / 8));
     volatile uint32_t *vram = (volatile uint32_t *)fb->address;
 
-    if (w > BUF_MAX_W) w = BUF_MAX_W;
-    if (h > BUF_MAX_H) h = BUF_MAX_H;
+    /*
+     * Everything after this point draws through a fixed back buffer, so
+     * a mode larger than that only ever reaches the panel's top-left
+     * corner.  Blank the whole panel once here, so the margin is black
+     * rather than whatever the firmware left in video memory.
+     */
+    for (uint32_t row = 0; row < panel_h; row++)
+        for (uint32_t col = 0; col < panel_w; col++)
+            vram[row * pitch_px + col] = 0;
 
-    display_boot_animation(vram, w, h, pitch_px);
+    uint32_t w = panel_w > BUF_MAX_W ? BUF_MAX_W : panel_w;
+    uint32_t h = panel_h > BUF_MAX_H ? BUF_MAX_H : panel_h;
+
+    /* The animation is centred on the real panel, not the back buffer */
+    display_boot_animation(vram, panel_w, panel_h, pitch_px);
 
     /* Read the kernel code segment selector */
     uint16_t cs;
     __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+
+    /* Floating point, before anything that might use it */
+    fpu_init();
 
     /* Build IDT: remap PIC, fill all 256 gates with no-op stubs */
     idt_init(cs);
@@ -417,9 +471,14 @@ void kmain(void) {
         tarfs_init(mod->address, mod->size);
     }
 
-    /* Primary filesystem: FAT32 on the ATA disk (writable, persistent) */
+    /* Primary filesystem: exFAT on the ATA disk, with FAT32 and the tar
+     * ramdisk as fallbacks (writable, persistent) */
     ata_init();
-    fat32_mount();
+    fs_mount();
+
+    /* App store: load the shipped catalog and the installed-app registry
+     * so the dock and the Apps menu already know about installed apps */
+    store_init();
 
     /* Restore the master keycode saved on a previous boot */
     {
@@ -446,6 +505,20 @@ void kmain(void) {
                 total_bytes += e->length;
         }
         system_total_memory_mb = total_bytes / (1024 * 1024);
+
+        /* The model is far larger than any static buffer, so give the
+         * inference arena the biggest usable region Limine reports. */
+        if (hhdm_request.response != NULL) {
+            uint64_t best_base = 0, best_len = 0;
+            for (uint64_t i = 0; i < memmap_request.response->entry_count; i++) {
+                struct limine_memmap_entry *e = memmap_request.response->entries[i];
+                if (e->type != LIMINE_MEMMAP_USABLE) continue;
+                if (e->length > best_len) { best_len = e->length; best_base = e->base; }
+            }
+            if (best_len > (16ull << 20))
+                llm_arena_init((void *)(uintptr_t)(hhdm_request.response->offset
+                                                   + best_base), best_len);
+        }
     }
 
     /* Unmask hardware interrupts */
@@ -515,6 +588,15 @@ void kmain(void) {
             char dch;
             while ((dch = kb_getchar()) != 0)
                 desktop_key_input(dch);
+
+            /* Read then subtract, rather than read then zero, so a notch
+             * that lands between the two is carried into the next frame
+             * instead of being dropped. */
+            int32_t wheel = mouse_wheel;
+            if (wheel) {
+                mouse_wheel -= wheel;
+                desktop_wheel_input(wheel);
+            }
 
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             draw_cursor(w, h);

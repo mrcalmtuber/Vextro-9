@@ -23,3 +23,11 @@ limine-12.3.2/
 
 # Generated FAT32 system disk (user data lives here)
 disk.img
+
+# .bsd toolchain binaries and example images
+bsdfmt/bsd_maker
+bsdfmt/bsd_run
+bsdfmt/*.o
+bsdfmt/*.bin
+bsdfmt/*.elf
+bsdfmt/*.bsd

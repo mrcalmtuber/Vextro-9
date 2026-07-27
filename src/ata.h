@@ -31,6 +31,8 @@
 
 #define ATA_CMD_READ     0x20
 #define ATA_CMD_WRITE    0x30
+#define ATA_CMD_READ48   0x24
+#define ATA_CMD_WRITE48  0x34
 #define ATA_CMD_FLUSH    0xE7
 #define ATA_CMD_IDENTIFY 0xEC
 
@@ -45,7 +47,8 @@ static inline void outw(uint16_t port, uint16_t val) {
 }
 
 static int ata_present = 0;
-static uint32_t ata_sectors = 0;      /* LBA28 capacity */
+static int ata_lba48 = 0;             /* device supports 48-bit addressing */
+static uint64_t ata_sectors = 0;      /* capacity in sectors */
 
 /* ~400 ns settle: four reads of the alternate status register */
 static void ata_io_delay(void) {
@@ -101,23 +104,47 @@ static int ata_cmd_ready(void) {
     return -1;
 }
 
-static void ata_select(uint32_t lba) {
+static void ata_select(uint64_t lba) {
     outb(ATA_REG_DRIVE, (uint8_t)(0xE0 | ((lba >> 24) & 0x0F)));
     ata_io_delay();
 }
 
-static int ata_read(uint32_t lba, uint32_t count, void *buf) {
-    if (!ata_present) return -1;
-    uint16_t *p = (uint16_t *)buf;
-    while (count > 0) {
-        uint32_t n = count > 255 ? 255 : count;
-        if (ata_cmd_ready() != 0) return -1;
+/*
+ * Program the task file for one transfer.  LBA28 tops out at 128 GB,
+ * which an encyclopedia volume can exceed, so the 48-bit form is used
+ * whenever the device advertises it: the high bytes are written first,
+ * then the low ones latch over them.
+ */
+static void ata_setup(uint64_t lba, uint32_t n, int write) {
+    if (ata_lba48) {
+        outb(ATA_REG_DRIVE, (uint8_t)0xE0);       /* LBA mode, drive 0 */
+        ata_io_delay();
+        outb(ATA_REG_SECCNT, (uint8_t)(n >> 8));
+        outb(ATA_REG_LBA0, (uint8_t)(lba >> 24));
+        outb(ATA_REG_LBA1, (uint8_t)(lba >> 32));
+        outb(ATA_REG_LBA2, (uint8_t)(lba >> 40));
+        outb(ATA_REG_SECCNT, (uint8_t)n);
+        outb(ATA_REG_LBA0, (uint8_t)lba);
+        outb(ATA_REG_LBA1, (uint8_t)(lba >> 8));
+        outb(ATA_REG_LBA2, (uint8_t)(lba >> 16));
+        outb(ATA_REG_CMD, write ? ATA_CMD_WRITE48 : ATA_CMD_READ48);
+    } else {
         ata_select(lba);
         outb(ATA_REG_SECCNT, (uint8_t)n);
         outb(ATA_REG_LBA0, (uint8_t)lba);
         outb(ATA_REG_LBA1, (uint8_t)(lba >> 8));
         outb(ATA_REG_LBA2, (uint8_t)(lba >> 16));
-        outb(ATA_REG_CMD, ATA_CMD_READ);
+        outb(ATA_REG_CMD, write ? ATA_CMD_WRITE : ATA_CMD_READ);
+    }
+}
+
+static int ata_read(uint64_t lba, uint32_t count, void *buf) {
+    if (!ata_present) return -1;
+    uint16_t *p = (uint16_t *)buf;
+    while (count > 0) {
+        uint32_t n = count > 255 ? 255 : count;
+        if (ata_cmd_ready() != 0) return -1;
+        ata_setup(lba, n, 0);
         for (uint32_t s = 0; s < n; s++) {
             if (ata_wait_drq() != 0) return -1;
             for (int i = 0; i < 256; i++)
@@ -129,18 +156,13 @@ static int ata_read(uint32_t lba, uint32_t count, void *buf) {
     return 0;
 }
 
-static int ata_write(uint32_t lba, uint32_t count, const void *buf) {
+static int ata_write(uint64_t lba, uint32_t count, const void *buf) {
     if (!ata_present) return -1;
     const uint16_t *p = (const uint16_t *)buf;
     while (count > 0) {
         uint32_t n = count > 255 ? 255 : count;
         if (ata_cmd_ready() != 0) return -1;
-        ata_select(lba);
-        outb(ATA_REG_SECCNT, (uint8_t)n);
-        outb(ATA_REG_LBA0, (uint8_t)lba);
-        outb(ATA_REG_LBA1, (uint8_t)(lba >> 8));
-        outb(ATA_REG_LBA2, (uint8_t)(lba >> 16));
-        outb(ATA_REG_CMD, ATA_CMD_WRITE);
+        ata_setup(lba, n, 1);
         for (uint32_t s = 0; s < n; s++) {
             if (ata_wait_drq() != 0) return -1;
             for (int i = 0; i < 256; i++)
@@ -210,12 +232,21 @@ static void ata_init(void) {
     for (int i = 0; i < 256; i++)
         ident[i] = inw(ATA_REG_DATA);
 
-    ata_sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
+    /* word 83 bit 10 announces 48-bit addressing; words 100..103 then
+     * hold the real capacity, which LBA28's 32-bit field cannot express */
+    ata_lba48 = (ident[83] & (1 << 10)) ? 1 : 0;
+    if (ata_lba48) {
+        ata_sectors = (uint64_t)ident[100] | ((uint64_t)ident[101] << 16) |
+                      ((uint64_t)ident[102] << 32) | ((uint64_t)ident[103] << 48);
+        if (ata_sectors == 0) ata_lba48 = 0;
+    }
+    if (!ata_lba48)
+        ata_sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
     ata_present = 1;
 
     serial_puts("[ata] primary master: ");
     serial_put_dec((uint16_t)(ata_sectors / 2048));
-    serial_puts(" MB (LBA28)\n");
+    serial_puts(ata_lba48 ? " MB (LBA48)\n" : " MB (LBA28)\n");
 }
 
 #endif /* ATA_H */
