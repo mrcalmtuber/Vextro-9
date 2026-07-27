@@ -26,7 +26,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
 - Command history (Up/Down), line editing (Left/Right/Home/End/Del), 240-line scrollback (PgUp/PgDn)
 - Working directory (`cd` / `pwd`, shown in the prompt) and output redirection: `ls > list.txt`, `echo hi >> notes.txt`
-- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `peek` `open` `history` `reboot` `shutdown`
+- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `peek` `zim` `open` `history` `reboot` `shutdown`
 
 ### Networking
 - **Full TCP/IP stack** — IPv4, ICMP (ping), UDP, DNS resolver, polled TCP client, async HTTP/1.0 client with redirects
@@ -38,6 +38,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - HTML-to-text renderer: headings, paragraphs, lists, `<pre>`, entities, word wrap
 - **Clickable links**, Back/Reload, editable address bar, scrollbar, status bar with load progress
 - Internal pages: `socrates://home`, `socrates://help`, `socrates://about`, `socrates://file/<name>`
+- Offline encyclopedia articles at `zim://<title>`, with internal links resolved back to archive entries
 
 ### App Store
 - **Agora** — a working package manager with a storefront: browse a catalog, **Install**, **Open**, **Remove**
@@ -63,6 +64,18 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Register/command encodings adapted from the Linux i915 driver; probe-then-bail structure after SerenityOS — display modesetting is deliberately left to firmware
 - If no supported iGPU is present the OS silently stays on the CPU renderer (`gpu` in the terminal shows which path is live; `gpu test` blits to the visible framebuffer on real hardware)
 - **GPU hang capture** (i915 error-state style): when a submission's breadcrumb never lands, the driver latches EIR/ESR, the per-engine IPEHR/IPEIR (the exact command header that broke the pipeline, decoded by name — e.g. a malformed `XY_COLOR_BLT`), ACTHD, INSTDONE, `RING_FAULT_REG` GGTT faults, the HWS page and the ring contents around the parse point — then attempts a `GDRST` blitter-domain engine reset, falling back to CPU rendering after repeated hangs. `gpu error` prints the full report; `gpu decode <hex>` decodes any command dword
+
+### Wikipedia offline — the ZIM reader
+Browse a complete offline encyclopedia on bare metal.
+
+- **`src/zim.h`** — reads Kiwix ZIM archives straight off the exFAT volume, a window at a time. Nothing is loaded whole: only one decompressed cluster is held in memory, and consecutive articles usually share it
+- Lookup is a **binary search over the archive's sorted path list** — about twenty reads across 400k entries, and only about twenty-five across a full dump's 19.7 million. It barely slows as the archive grows
+- **`src/zstd.h`** — a complete Zstandard decompressor (FSE/tANS, Huffman, sequence reconstruction with repeat offsets), written from RFC 8878. ZIM has defaulted to zstd since 2021, so nothing opens without it. xz/LZMA2 clusters work too, via `lzma.h`
+- **Wikipedia app** — type a title, get live prefix results with redirects marked; Enter or a click opens the article
+- Articles render through the existing browser at `zim://<title>`, and **internal links are clickable**: relative hrefs, `../A/` namespace prefixes and percent-encoding are all resolved back to archive entries, so you can browse from article to article with Back working
+- `zim open|info|main|ls|find|get` drive the same reader from the shell
+
+Verified on a real 937 MB Simple English archive (399,853 entries, 3,711 clusters): lookups land on the same clusters and byte counts in the kernel as in a host-side reference run.
 
 ### Compressed images — the `.sci` format
 Full-colour pictures stored compressed and decompressed when opened.
@@ -207,6 +220,8 @@ src/            Kernel source
   apps.h        Files / Settings / Goldsmith / Monolith / Matrix / About
   store.h       Agora app store (catalog, installer, registry, storefront)
   lzma.h        LZMA / LZMA2 / xz decompressor (images + ZIM clusters)
+  zstd.h        Zstandard decompressor (modern ZIM clusters)
+  zim.h         ZIM archive reader (offline Wikipedia)
   sci.h         .sci compressed image format + decoder
   gfx.h         Theme palette + drawing primitives + monospace text
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP

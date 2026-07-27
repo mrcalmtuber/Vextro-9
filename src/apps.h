@@ -1083,6 +1083,213 @@ static void img_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/* ===================== WIKIPEDIA (ZIM browser) =====================
+ *
+ * Type a title, get the entries that start with it.  The archive's path
+ * list is sorted, so a prefix search is one binary search plus a walk —
+ * no index is built and nothing is held in memory.
+ */
+
+#define WIKI_RESULTS   16
+#define WIKI_QUERY_MAX 64
+#define WIKI_ROW_H     22
+
+typedef struct {
+    uint32_t index;
+    char     title[72];
+    int      redirect;
+} wiki_hit_t;
+
+static char       wiki_query[WIKI_QUERY_MAX] = "";
+static int        wiki_qlen = 0;
+static wiki_hit_t wiki_hits[WIKI_RESULTS];
+static int        wiki_hit_count = 0;
+static int        wiki_sel = 0;
+static char       wiki_status[112] = "";
+static int        wiki_status_err = 0;
+static int        wiki_tried_open = 0;
+
+/* Archives people actually leave lying around, tried in order. */
+static const char *wiki_candidates[4] = {
+    "/wiki.zim", "/wikipedia.zim", "/zim/wiki.zim", "/wiki/wiki.zim"
+};
+
+static void wiki_search(void);
+
+static void wiki_autoopen(void) {
+    if (wiki_tried_open) return;
+    wiki_tried_open = 1;
+    if (zim.open) return;
+
+    for (int i = 0; i < 4; i++) {
+        if (!fs_stat(wiki_candidates[i], 0, 0)) continue;
+        if (zim_open(wiki_candidates[i]) == 0) {
+            char nb[16];
+            str_copy(wiki_status, "", sizeof(wiki_status));
+            uint_to_str(zim.article_count, nb);
+            str_append(wiki_status, nb, sizeof(wiki_status));
+            str_append(wiki_status, " entries from ", sizeof(wiki_status));
+            str_append(wiki_status, wiki_candidates[i], sizeof(wiki_status));
+            if (zim.truncated)
+                str_append(wiki_status, "  (WARNING: incomplete download)",
+                           sizeof(wiki_status));
+            wiki_status_err = 0;
+            wiki_search();
+            return;
+        }
+    }
+    str_copy(wiki_status, "No archive found.  Put a .zim on the disk as "
+             "/wiki.zim, or run 'zim open <file>'.", sizeof(wiki_status));
+    wiki_status_err = 1;
+}
+
+static void wiki_search(void) {
+    wiki_hit_count = 0;
+    wiki_sel = 0;
+    if (!zim.open) return;
+
+    uint32_t i = zim_lower_bound('C', wiki_query);
+    zim_dirent_t e;
+    while (i < zim.article_count && wiki_hit_count < WIKI_RESULTS) {
+        if (zim_dirent(i, &e) != 0) break;
+        if (e.ns != 'C') break;
+        /* the walk stops as soon as the prefix stops matching */
+        int k = 0;
+        while (wiki_query[k] && e.url[k] == wiki_query[k]) k++;
+        if (wiki_query[k] != '\0') break;
+
+        wiki_hit_t *h = &wiki_hits[wiki_hit_count++];
+        h->index = i;
+        str_copy(h->title, e.title, sizeof(h->title));
+        h->redirect = e.is_redirect;
+        i++;
+    }
+}
+
+static void wiki_open_hit(int idx) {
+    if (idx < 0 || idx >= wiki_hit_count) return;
+    zim_dirent_t e;
+    if (zim_dirent(wiki_hits[idx].index, &e) != 0) return;
+
+    char url[BRW_ADDR_MAX];
+    str_copy(url, "zim://", sizeof(url));
+    str_append(url, e.url, sizeof(url));
+    brw_navigate(url);
+    wm_open(WK_BROWSER);
+}
+
+static void wiki_key(char ch) {
+    if (ch == 27) { wm_close(WK_WIKI); return; }
+    if (ch == '\n') { wiki_open_hit(wiki_sel); return; }
+    if (ch == KEY_DOWN) {
+        if (wiki_sel + 1 < wiki_hit_count) wiki_sel++;
+        return;
+    }
+    if (ch == KEY_UP) {
+        if (wiki_sel > 0) wiki_sel--;
+        return;
+    }
+    if (ch == '\b') {
+        if (wiki_qlen > 0) {
+            wiki_query[--wiki_qlen] = '\0';
+            wiki_search();
+        }
+        return;
+    }
+    if (ch >= 0x20 && ch < 0x7F && wiki_qlen < WIKI_QUERY_MAX - 1) {
+        wiki_query[wiki_qlen++] = ch;
+        wiki_query[wiki_qlen] = '\0';
+        wiki_search();
+    }
+}
+
+static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
+                       int32_t cx, int32_t cy, int32_t cw, int32_t chh) {
+    int click = (lmb && !prev_lmb);
+    if (!click) return;
+    if (mx < cx || mx >= cx + cw || my < cy || my >= cy + chh) return;
+
+    int32_t list_y = cy + 74;
+    int idx = (my - list_y) / WIKI_ROW_H;
+    if (idx >= 0 && idx < wiki_hit_count) {
+        wiki_sel = idx;
+        wiki_open_hit(idx);
+    }
+}
+
+static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                      int32_t cx, int32_t cy, int32_t cw, int32_t chh,
+                      uint32_t tick, int focused) {
+    wiki_autoopen();
+    gfx_rect(buf, w, h, cx, cy, cw, chh, C_WIN_BG);
+
+    /* header */
+    gfx_vgrad(buf, w, h, cx, cy, cw, 42, 0x1B2030u, 0x11141Cu);
+    gfx_rect(buf, w, h, cx, cy + 41, cw, 1, C_GOLD_DIM);
+    ttf_draw_string(buf, (int)w, (int)h, cx + 16, cy + 10, "Wikipedia",
+                    C_GOLD, 18);
+    {
+        const char *sub = zim.open ? "offline archive" : "no archive";
+        int tw = ttf_text_width(sub, 12);
+        ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 16, cy + 16, sub,
+                        C_TEXT_DIM, 12);
+    }
+
+    /* search box */
+    gfx_rect(buf, w, h, cx + 14, cy + 50, cw - 28, 24, 0xFFFFFFu);
+    gfx_rect_outline(buf, w, h, cx + 14, cy + 50, cw - 28, 24,
+                     focused ? C_GOLD : 0xB8BCC8u);
+    if (wiki_qlen == 0) {
+        ttf_draw_string(buf, (int)w, (int)h, cx + 22, cy + 53,
+                        "Type an article title...", 0xA0A4AEu, 13);
+    } else {
+        ttf_draw_string(buf, (int)w, (int)h, cx + 22, cy + 53, wiki_query,
+                        C_INK, 13);
+    }
+    if (focused && ((tick / 30) & 1) == 0) {
+        int cwid = ttf_text_width(wiki_query, 13);
+        gfx_rect(buf, w, h, cx + 23 + cwid, cy + 54, 1, 17, C_INK);
+    }
+
+    /* results */
+    int32_t ly = cy + 74;
+    for (int i = 0; i < wiki_hit_count; i++) {
+        int32_t ry = ly + i * WIKI_ROW_H;
+        if (ry + WIKI_ROW_H > cy + chh - 22) break;
+        if (i == wiki_sel) {
+            gfx_rect(buf, w, h, cx + 8, ry, cw - 16, WIKI_ROW_H, 0x2A2410u);
+            gfx_rect(buf, w, h, cx + 8, ry, 3, WIKI_ROW_H, C_GOLD);
+        }
+        char fit[72];
+        store_fit(fit, sizeof(fit), wiki_hits[i].title, cw - 60, 13);
+        ttf_draw_string(buf, (int)w, (int)h, cx + 20, ry + 3, fit,
+                        i == wiki_sel ? C_GOLD
+                                      : (wiki_hits[i].redirect ? 0x8A8F9Cu
+                                                               : C_INK), 13);
+        if (wiki_hits[i].redirect)
+            ttf_draw_string(buf, (int)w, (int)h, cx + cw - 74, ry + 4,
+                            "redirect", 0xA0A4AEu, 11);
+    }
+
+    if (zim.open && wiki_hit_count == 0) {
+        const char *msg = wiki_qlen ? "No entry starts with that"
+                                    : "Start typing to search";
+        int tw = ttf_text_width(msg, 13);
+        ttf_draw_string(buf, (int)w, (int)h, cx + (cw - tw) / 2, ly + 30, msg,
+                        0x8A8F9Cu, 13);
+    }
+
+    /* status bar */
+    gfx_rect(buf, w, h, cx, cy + chh - 22, cw, 22, 0xE8E9EEu);
+    gfx_rect(buf, w, h, cx, cy + chh - 22, cw, 1, 0xD5D8E0u);
+    {
+        char fit[112];
+        store_fit(fit, sizeof(fit), wiki_status, cw - 24, 12);
+        ttf_draw_string(buf, (int)w, (int)h, cx + 12, cy + chh - 19, fit,
+                        wiki_status_err ? 0xB0322Eu : 0x50555Fu, 12);
+    }
+}
+
 /* ===================== ABOUT ===================== */
 
 static void about_draw(uint32_t *buf, uint32_t w, uint32_t h,
