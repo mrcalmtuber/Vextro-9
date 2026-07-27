@@ -1840,6 +1840,45 @@ static void desktop_key_input(char ch) {
     }
 }
 
+/*
+ * Route wheel notches to the focused window, positive towards the top of
+ * the document.  Each window already knows how to scroll itself for the
+ * keyboard, so this is mostly a matter of choosing a step: a notch is
+ * three lines of terminal, or a comfortable fraction of a page elsewhere.
+ */
+static void desktop_wheel_input(int32_t notches) {
+    if (notches == 0 || menu_open_idx >= 0) return;
+
+    int32_t mag = notches < 0 ? -notches : notches;
+    if (mag > 8) mag = 8;                       /* a flick should not hurl */
+    int32_t step = notches > 0 ? mag : -mag;
+
+    switch (wm_focus) {
+    case WK_TERM:
+        term_scroll_key(step > 0 ? KEY_PGUP : KEY_PGDN, (int)(mag * 3));
+        break;
+    case WK_BROWSER:
+        brw_scroll_by((int)(-step * 48), brw_view_h_cache);
+        break;
+    case WK_STORE:
+        store_scroll_by((int)(-step * 48));
+        break;
+    case WK_WIKI:
+        /* the article itself opens in the browser; here the wheel walks
+         * the result list, but not while the chat panel has the window */
+        if (wiki_mode == 0)
+            for (int32_t i = 0; i < mag; i++)
+                wiki_key(step > 0 ? KEY_UP : KEY_DOWN);
+        break;
+    case WK_IMAGE:
+        for (int32_t i = 0; i < mag; i++)
+            img_key(step > 0 ? KEY_UP : KEY_DOWN);
+        break;
+    default:
+        break;
+    }
+}
+
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                            int32_t mx, int32_t my, uint8_t buttons) {
     desktop_tick++;
