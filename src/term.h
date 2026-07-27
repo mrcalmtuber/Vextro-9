@@ -471,7 +471,7 @@ static void term_cmd_help(void) {
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
-    term_print("  llm load <model.gguf> | info | fpu | tok <text>\n");
+    term_print("  llm load <model.gguf> | info | fpu | tok <t> | deq <tensor>\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -910,6 +910,47 @@ static void term_exec(char *cmdline) {
             term_print_c(ok == 0 ? "   FPU OK (expected 1.6449)\n"
                                  : "   WRONG - SSE is not working\n",
                          ok == 0 ? 4 : 2);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "deq")) {
+            if (argc < 3) { term_print_c("usage: llm deq <tensor> [n]\n", 2); return; }
+            int ti = llm_tensor_find(argv[2]);
+            if (ti < 0) { term_print_c("no such tensor\n", 2); return; }
+            int n = 6;
+            if (argc >= 4) {
+                n = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++)
+                    n = n * 10 + (*q - '0');
+                if (n < 1) n = 1;
+                if (n > 12) n = 12;
+            }
+            static int32_t vals[12];
+            if (llm_tensor_peek(ti, 0, n, vals) < 0) {
+                term_print_c("dequantise failed\n", 2);
+                return;
+            }
+            char nb[16];
+            term_print("  ");
+            term_print_c(llm_tensor_name(ti), 1);
+            term_print("  ");
+            term_print(llm_quant_name(llm_tensor_type(ti)));
+            term_print("  ");
+            uint_to_str((uint32_t)llm_tensor_elems(ti), nb);
+            term_print(nb);
+            term_print(" elems\n");
+            for (int i = 0; i < n; i++) {
+                int32_t v = vals[i];
+                term_print("   ");
+                if (v < 0) { term_putc('-'); v = -v; }
+                uint_to_str((uint32_t)(v / 1000000), nb); term_print(nb);
+                term_putc('.');
+                uint32_t f = (uint32_t)(v % 1000000);
+                for (uint32_t d = 100000; d >= 1; d /= 10) {
+                    term_putc((char)('0' + (f / d) % 10));
+                    if (d == 1) break;
+                }
+                term_putc('\n');
+            }
             return;
         }
         if (argc >= 2 && str_eq(argv[1], "tok")) {

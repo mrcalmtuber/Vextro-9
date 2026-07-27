@@ -60,6 +60,20 @@ int          llm_load(llm_read_fn rd, void *ctx, uint64_t file_size,
 const llm_info_t *llm_get_info(void);
 const char  *llm_quant_name(uint32_t type);
 
+/* ---- tensors ---- */
+int          llm_tensor_count(void);
+/* Find a tensor by name; returns its index or -1. */
+int          llm_tensor_find(const char *name);
+const char  *llm_tensor_name(int idx);
+uint32_t     llm_tensor_type(int idx);
+uint64_t     llm_tensor_elems(int idx);
+/*
+ * Dequantise `n` elements of a tensor starting at `first`, returning
+ * them scaled by 1e6 as integers — the caller lives in the integer-only
+ * translation unit and cannot hold a float.
+ */
+int          llm_tensor_peek(int idx, uint64_t first, int n, int32_t *out);
+
 /* ---- tokenizer ---- */
 #define LLM_TOK_MAX 4096          /* tokens per encode call */
 
