@@ -90,6 +90,41 @@ static void tok_hash_put(uint32_t id);
 static int  tok_find(const char *s, int len);
 static void mrg_put(uint32_t a, uint32_t b, uint32_t rank);
 
+#define LLM_TENSOR_MAX 512
+
+typedef struct {
+    char     name[LLM_NAME_MAX];
+    uint32_t type;
+    uint64_t offset;        /* relative to the data section */
+    uint64_t elems;
+} tensor_t;
+
+static tensor_t tensors[LLM_TENSOR_MAX];
+static int      tensor_n;
+static uint64_t data_start;      /* file offset of the tensor payload */
+static llm_read_fn model_rd;
+static void       *model_ctx;
+
+/* half-precision to float; GGUF stores every scale this way */
+static float fp16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t man  = h & 0x3FF;
+    union { uint32_t u; float f; } o;
+    if (exp == 0) {
+        if (man == 0) { o.u = sign; return o.f; }
+        /* subnormal: renormalise */
+        exp = 127 - 15 + 1;
+        while (!(man & 0x400)) { man <<= 1; exp--; }
+        man &= 0x3FF;
+        o.u = sign | (exp << 23) | (man << 13);
+        return o.f;
+    }
+    if (exp == 31) { o.u = sign | 0x7F800000u | (man << 13); return o.f; }
+    o.u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+    return o.f;
+}
+
 static llm_info_t info;
 
 const llm_info_t *llm_get_info(void) { return &info; }
@@ -205,6 +240,7 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
 
     for (uint32_t i = 0; i < sizeof(info); i++) ((uint8_t *)&info)[i] = 0;
     info.file_size = file_size;
+    tensor_n = 0;
     tok_blob = 0; tok_off = 0; tok_hash = 0; tok_n = 0;
     mrg_key = 0; mrg_rank = 0; mrg_n = 0;
     build_byte_map();
@@ -337,7 +373,17 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
         uint64_t elems = 1;
         for (uint32_t d = 0; d < ndim; d++) elems *= g_u64(&g);
         uint32_t qt = g_u32(&g);
-        (void)g_u64(&g);                       /* offset within the blob */
+        uint64_t toff = g_u64(&g);             /* offset within the blob */
+
+        if (tensor_n < LLM_TENSOR_MAX) {
+            tensor_t *te = &tensors[tensor_n++];
+            int c = 0;
+            while (tname[c] && c < LLM_NAME_MAX - 1) { te->name[c] = tname[c]; c++; }
+            te->name[c] = '\0';
+            te->type = qt;
+            te->offset = toff;
+            te->elems = elems;
+        }
 
         uint32_t be, bb;
         if (quant_block(qt, &be, &bb) != 0) {
@@ -351,6 +397,13 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
     if (g.failed) { *err = "truncated tensor table"; return -1; }
 
     info.weight_bytes = total_bytes;
+
+    /* the payload starts after the table, rounded up to the alignment
+     * GGUF defaults to when it does not say otherwise */
+    data_start = (g.pos + 31) & ~(uint64_t)31;
+    model_rd = rd;
+    model_ctx = ctx;
+
     info.loaded = 1;
     return 0;
 }
@@ -622,4 +675,152 @@ int llm_encode(const char *text, int32_t *out, int max_out) {
         }
     }
     return n_out;
+}
+
+/* =====================================================================
+ * Dequantisation
+ *
+ * The K-quants pack a 256-element super-block: one fp16 scale for the
+ * whole block, a second for the minimums, then per-sub-block scales at
+ * six bits each, crammed two-to-a-byte-and-a-bit.  Getting the packing
+ * wrong produces weights that are the right order of magnitude and
+ * completely wrong, which is why this is checked against a reference
+ * rather than eyeballed.
+ * ===================================================================== */
+
+int llm_tensor_count(void) { return tensor_n; }
+const char *llm_tensor_name(int i) {
+    return (i >= 0 && i < tensor_n) ? tensors[i].name : "";
+}
+uint32_t llm_tensor_type(int i)  { return (i >= 0 && i < tensor_n) ? tensors[i].type : 0; }
+uint64_t llm_tensor_elems(int i) { return (i >= 0 && i < tensor_n) ? tensors[i].elems : 0; }
+
+int llm_tensor_find(const char *name) {
+    for (int i = 0; i < tensor_n; i++)
+        if (str_same(tensors[i].name, name)) return i;
+    return -1;
+}
+
+/* six-bit scale and minimum for sub-block j, out of the packed twelve */
+static void k4_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+/* Expand one block into `out`; returns elements written, or -1. */
+static int dequant_block(uint32_t type, const uint8_t *b, float *out) {
+    switch (type) {
+    case 0: {                                   /* F32 */
+        union { uint32_t u; float f; } c;
+        c.u = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+              ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        out[0] = c.f;
+        return 1;
+    }
+    case 1:                                     /* F16 */
+        out[0] = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        return 1;
+
+    case 6: {                                   /* Q5_0: 32 elements */
+        float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        uint32_t qh = (uint32_t)b[2] | ((uint32_t)b[3] << 8) |
+                      ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24);
+        const uint8_t *qs = b + 6;
+        for (int j = 0; j < 16; j++) {
+            uint8_t h0 = (uint8_t)(((qh >> (j + 0)) << 4) & 0x10);
+            uint8_t h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
+            out[j]      = (float)(((qs[j] & 0x0F) | h0) - 16) * d;
+            out[j + 16] = (float)(((qs[j] >> 4)   | h1) - 16) * d;
+        }
+        return 32;
+    }
+    case 8: {                                   /* Q8_0: 32 elements */
+        float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        const int8_t *qs = (const int8_t *)(b + 2);
+        for (int j = 0; j < 32; j++) out[j] = (float)qs[j] * d;
+        return 32;
+    }
+
+    case 12: {                                  /* Q4_K: 256 elements */
+        float d    = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        float dmin = fp16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+        const uint8_t *sc = b + 4;
+        const uint8_t *q  = b + 16;
+        int is = 0;
+        float *y = out;
+        for (int n = 0; n < 256; n += 64) {
+            uint8_t s1, m1, s2, m2;
+            k4_scale_min(is + 0, sc, &s1, &m1);
+            k4_scale_min(is + 1, sc, &s2, &m2);
+            float d1 = d * (float)s1, off1 = dmin * (float)m1;
+            float d2 = d * (float)s2, off2 = dmin * (float)m2;
+            for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - off1;
+            for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4)  - off2;
+            q += 32;
+            is += 2;
+        }
+        return 256;
+    }
+
+    case 14: {                                  /* Q6_K: 256 elements */
+        const uint8_t *ql = b;
+        const uint8_t *qh = b + 128;
+        const int8_t  *sc = (const int8_t *)(b + 192);
+        float d = fp16_to_f32((uint16_t)(b[208] | (b[209] << 8)));
+        float *y = out;
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int q1 = (int)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * (float)sc[is + 0] * (float)q1;
+                y[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                y[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                y[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+        return 256;
+    }
+    default:
+        return -1;
+    }
+}
+
+int llm_tensor_peek(int idx, uint64_t first, int n, int32_t *out) {
+    if (idx < 0 || idx >= tensor_n || !model_rd) return -1;
+    tensor_t *t = &tensors[idx];
+    uint32_t be, bb;
+    if (quant_block(t->type, &be, &bb) != 0) return -1;
+    if (first + (uint64_t)n > t->elems) return -1;
+
+    static float block[256];
+    static uint8_t raw[256];
+    int done = 0;
+    while (done < n) {
+        uint64_t e = first + (uint64_t)done;
+        uint64_t bi = e / be;                 /* which block */
+        uint32_t within = (uint32_t)(e % be);
+
+        uint32_t got = 0;
+        if (model_rd(model_ctx, data_start + t->offset + bi * bb,
+                     raw, bb, &got) != 0 || got < bb) return -1;
+        if (dequant_block(t->type, raw, block) < 0) return -1;
+
+        while (within < be && done < n) {
+            float v = block[within++];
+            out[done++] = (int32_t)(v * 1000000.0f);
+        }
+    }
+    return done;
 }
