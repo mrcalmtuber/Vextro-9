@@ -471,7 +471,7 @@ static void term_cmd_help(void) {
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
-    term_print("  llm load <model.gguf> | info | fpu | tok <t> | deq <tensor>\n");
+    term_print("  llm load <f> | weights | tok <t> | eval <tok> | probe | gen <t>\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -910,6 +910,61 @@ static void term_exec(char *cmdline) {
             term_print_c(ok == 0 ? "   FPU OK (expected 1.6449)\n"
                                  : "   WRONG - SSE is not working\n",
                          ok == 0 ? 4 : 2);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "weights")) {
+            const char *werr = "?";
+            term_print_c("loading weights (this reads the whole model)...\n", 3);
+            if (llm_load_weights(&werr) != 0) {
+                term_print_c("llm: ", 2); term_print_c(werr, 2); term_putc('\n');
+                return;
+            }
+            term_print_c("weights resident\n", 4);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "eval")) {
+            if (argc < 3) { term_print_c("usage: llm eval <token> [pos]\n", 2); return; }
+            int32_t tk = 0;
+            for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++) tk = tk * 10 + (*q - '0');
+            int pos = 0;
+            if (argc >= 4) { pos = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++) pos = pos * 10 + (*q - '0'); }
+            if (llm_eval(tk, pos) != 0) { term_print_c("eval failed\n", 2); return; }
+            int best = llm_argmax();
+            char piece[64];
+            llm_decode(best, piece, sizeof(piece));
+            char nb[16];
+            term_print("  argmax ");
+            uint_to_str((uint32_t)best, nb); term_print_c(nb, 1);
+            term_print(" [");
+            for (int k = 0; piece[k]; k++) term_putc(piece[k] == ' ' ? '_' : piece[k]);
+            term_print("]\n");
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "probe")) {
+            if (argc < 3) { term_print_c("usage: llm probe <x|xb|q|k|logits> [n]\n", 2); return; }
+            int n = 6;
+            if (argc >= 4) { n = 0;
+                for (const char *q = argv[3]; *q >= '0' && *q <= '9'; q++) n = n * 10 + (*q - '0');
+                if (n < 1) n = 1;
+                if (n > 12) n = 12;
+            }
+            static int32_t vals[12];
+            if (llm_probe(argv[2], 0, n, vals) < 0) { term_print_c("no such probe\n", 2); return; }
+            char nb[16];
+            for (int i = 0; i < n; i++) {
+                int32_t v = vals[i];
+                term_print("   ");
+                if (v < 0) { term_putc('-'); v = -v; }
+                uint_to_str((uint32_t)(v / 1000000), nb); term_print(nb);
+                term_putc('.');
+                uint32_t fr = (uint32_t)(v % 1000000);
+                for (uint32_t d = 100000; d >= 1; d /= 10) {
+                    term_putc((char)('0' + (fr / d) % 10));
+                    if (d == 1) break;
+                }
+                term_putc('\n');
+            }
             return;
         }
         if (argc >= 2 && str_eq(argv[1], "deq")) {

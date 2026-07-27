@@ -97,6 +97,7 @@ typedef struct {
     uint32_t type;
     uint64_t offset;        /* relative to the data section */
     uint64_t elems;
+    uint32_t ne0, ne1;      /* ne0 is the contiguous (input) dimension */
 } tensor_t;
 
 static tensor_t tensors[LLM_TENSOR_MAX];
@@ -370,8 +371,9 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
         g_str(&g, tname, sizeof(tname));
         uint32_t ndim = g_u32(&g);
         if (ndim == 0 || ndim > 4) { *err = "bad tensor rank"; return -1; }
+        uint64_t dims[4] = { 1, 1, 1, 1 };
         uint64_t elems = 1;
-        for (uint32_t d = 0; d < ndim; d++) elems *= g_u64(&g);
+        for (uint32_t d = 0; d < ndim; d++) { dims[d] = g_u64(&g); elems *= dims[d]; }
         uint32_t qt = g_u32(&g);
         uint64_t toff = g_u64(&g);             /* offset within the blob */
 
@@ -383,6 +385,8 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
             te->type = qt;
             te->offset = toff;
             te->elems = elems;
+            te->ne0 = (uint32_t)dims[0];
+            te->ne1 = (uint32_t)dims[1];
         }
 
         uint32_t be, bb;
@@ -824,4 +828,389 @@ int llm_tensor_peek(int idx, uint64_t first, int n, int32_t *out) {
         }
     }
     return done;
+}
+
+/* =====================================================================
+ * Inference
+ *
+ * No libm here either, so the transcendentals are written out below.
+ * They only need to be good to float32, which a short polynomial after
+ * range reduction manages comfortably.
+ * ===================================================================== */
+
+#define K_PI      3.14159265358979f
+#define K_TWO_PI  6.28318530717959f
+#define K_LN2     0.693147180559945f
+
+static float k_exp(float x) {
+    if (x > 88.0f)  return 3.0e38f;
+    if (x < -88.0f) return 0.0f;
+    float n = x * (1.0f / K_LN2);
+    int ni = (int)(n >= 0.0f ? n + 0.5f : n - 0.5f);
+    float r = x - (float)ni * K_LN2;          /* |r| <= ln2/2 */
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (1.0f / 6.0f +
+              r * (1.0f / 24.0f + r * (1.0f / 120.0f + r * (1.0f / 720.0f))))));
+    int e = 127 + ni;
+    if (e <= 0) return 0.0f;
+    if (e >= 255) return 3.0e38f;
+    union { uint32_t u; float f; } s;
+    s.u = (uint32_t)e << 23;
+    return p * s.f;
+}
+
+static float k_log(float x) {
+    if (x <= 0.0f) return -1.0e30f;
+    union { uint32_t u; float f; } v;
+    v.f = x;
+    int e = (int)((v.u >> 23) & 0xFF) - 127;
+    v.u = (v.u & 0x007FFFFFu) | (127u << 23);  /* mantissa into [1,2) */
+    float m = v.f;
+    float t = (m - 1.0f) / (m + 1.0f);         /* atanh series converges fast */
+    float t2 = t * t;
+    float lm = 2.0f * t * (1.0f + t2 * (1.0f / 3.0f + t2 * (1.0f / 5.0f +
+               t2 * (1.0f / 7.0f + t2 * (1.0f / 9.0f)))));
+    return (float)e * K_LN2 + lm;
+}
+
+static float k_sin(float x) {
+    /* fold into [-pi, pi], then into [-pi/2, pi/2] by symmetry */
+    float k = x * (1.0f / K_TWO_PI);
+    int ki = (int)(k >= 0.0f ? k + 0.5f : k - 0.5f);
+    x -= (float)ki * K_TWO_PI;
+    if (x >  K_PI * 0.5f) x =  K_PI - x;
+    else if (x < -K_PI * 0.5f) x = -K_PI - x;
+    float x2 = x * x;
+    return x * (1.0f + x2 * (-1.0f / 6.0f + x2 * (1.0f / 120.0f +
+           x2 * (-1.0f / 5040.0f + x2 * (1.0f / 362880.0f -
+           x2 * (1.0f / 39916800.0f))))));
+}
+
+static float k_cos(float x) { return k_sin(x + K_PI * 0.5f); }
+
+static float k_sqrt(float x) {
+    if (x <= 0.0f) return 0.0f;
+    float r;
+    __asm__ volatile("sqrtss %1, %0" : "=x"(r) : "x"(x));
+    return r;
+}
+
+/* ---- weights in memory ---- */
+
+typedef struct {
+    const uint8_t *data;
+    uint32_t type;
+    uint32_t ne0, ne1;
+} wt_t;
+
+typedef struct {
+    wt_t attn_norm, wq, bq, wk, bk, wv, bv, wo;
+    wt_t ffn_norm, w_gate, w_up, w_down;
+} layer_t;
+
+static uint8_t *weights_blob;
+static uint64_t weights_len;
+static int      weights_ok;
+
+static wt_t     w_tok_embd, w_out_norm;
+static layer_t  w_layers[32];
+
+static int      head_dim, kv_dim, n_ctx;
+
+/* activations */
+static float *a_x, *a_xb, *a_xb2, *a_q, *a_k, *a_v, *a_att, *a_hb, *a_hb2;
+static float *a_logits, *kv_k, *kv_v;
+
+/* snapshots of the first layer, kept only so a reference forward pass
+ * can be compared against step by step */
+static float *p_embd, *p_xb0, *p_q0;
+
+int llm_weights_loaded(void) { return weights_ok; }
+
+/* name building without a printf */
+static void mkname(char *out, const char *pre, int idx, const char *post) {
+    int o = 0;
+    while (*pre) out[o++] = *pre++;
+    if (idx >= 0) {
+        char d[8];
+        int n = 0;
+        int v = idx;
+        if (v == 0) d[n++] = '0';
+        while (v > 0) { d[n++] = (char)('0' + v % 10); v /= 10; }
+        while (n > 0) out[o++] = d[--n];
+    }
+    while (*post) out[o++] = *post++;
+    out[o] = '\0';
+}
+
+static int bind_tensor(wt_t *w, const char *name, const char **err) {
+    int i = llm_tensor_find(name);
+    if (i < 0) { *err = "a tensor the model needs is missing"; return -1; }
+    w->data = weights_blob + tensors[i].offset;
+    w->type = tensors[i].type;
+    w->ne0  = tensors[i].ne0;
+    w->ne1  = tensors[i].ne1 ? tensors[i].ne1 : 1;
+    return 0;
+}
+
+int llm_load_weights(const char **err) {
+    if (!info.loaded) { *err = "no model loaded"; return -1; }
+    weights_ok = 0;
+
+    head_dim = (int)(info.n_embd / info.n_head);
+    kv_dim   = (int)(info.n_head_kv * (uint32_t)head_dim);
+    n_ctx    = LLM_CTX_MAX;
+
+    /* the payload runs from the data section to the end of the file */
+    weights_len = info.file_size - data_start;
+    weights_blob = (uint8_t *)arena_alloc(weights_len + 64);
+    if (!weights_blob) { *err = "arena too small for the weights"; return -1; }
+
+    uint64_t done = 0;
+    while (done < weights_len) {
+        uint32_t chunk = 1u << 20;
+        if (done + chunk > weights_len) chunk = (uint32_t)(weights_len - done);
+        uint32_t got = 0;
+        if (model_rd(model_ctx, data_start + done, weights_blob + done,
+                     chunk, &got) != 0 || got == 0) {
+            *err = "read error while loading weights";
+            return -1;
+        }
+        done += got;
+    }
+
+    if (bind_tensor(&w_tok_embd, "token_embd.weight", err) != 0) return -1;
+    if (bind_tensor(&w_out_norm, "output_norm.weight", err) != 0) return -1;
+
+    char nm[LLM_NAME_MAX];
+    for (uint32_t l = 0; l < info.n_layer; l++) {
+        layer_t *L = &w_layers[l];
+        mkname(nm, "blk.", (int)l, ".attn_norm.weight");   if (bind_tensor(&L->attn_norm, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_q.weight");      if (bind_tensor(&L->wq, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_q.bias");        if (bind_tensor(&L->bq, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_k.weight");      if (bind_tensor(&L->wk, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_k.bias");        if (bind_tensor(&L->bk, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_v.weight");      if (bind_tensor(&L->wv, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_v.bias");        if (bind_tensor(&L->bv, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_output.weight"); if (bind_tensor(&L->wo, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".ffn_norm.weight");    if (bind_tensor(&L->ffn_norm, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".ffn_gate.weight");    if (bind_tensor(&L->w_gate, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".ffn_up.weight");      if (bind_tensor(&L->w_up, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".ffn_down.weight");    if (bind_tensor(&L->w_down, nm, err)) return -1;
+    }
+
+    uint32_t E = info.n_embd, F = info.n_ff;
+    a_x      = (float *)arena_alloc(E * 4);
+    a_xb     = (float *)arena_alloc(E * 4);
+    a_xb2    = (float *)arena_alloc(E * 4);
+    a_q      = (float *)arena_alloc(E * 4);
+    a_k      = (float *)arena_alloc((uint64_t)kv_dim * 4);
+    a_v      = (float *)arena_alloc((uint64_t)kv_dim * 4);
+    a_att    = (float *)arena_alloc((uint64_t)info.n_head * n_ctx * 4);
+    a_hb     = (float *)arena_alloc(F * 4);
+    a_hb2    = (float *)arena_alloc(F * 4);
+    a_logits = (float *)arena_alloc((uint64_t)info.n_vocab * 4);
+    kv_k = (float *)arena_alloc((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
+    kv_v = (float *)arena_alloc((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
+    p_embd = (float *)arena_alloc(E * 4);
+    p_xb0  = (float *)arena_alloc(E * 4);
+    p_q0   = (float *)arena_alloc(E * 4);
+    if (!p_q0) { *err = "arena too small for the KV cache"; return -1; }
+
+    weights_ok = 1;
+    return 0;
+}
+
+/* ---- kernels ---- */
+
+/* Expand row `row` of a weight tensor into `out` (ne0 elements). */
+static void deq_row(const wt_t *w, uint32_t row, float *out) {
+    uint32_t be, bb;
+    quant_block(w->type, &be, &bb);
+    uint64_t first = (uint64_t)row * w->ne0;
+    const uint8_t *p = w->data + (first / be) * bb;
+    static float blk[256];
+    uint32_t n = 0;
+    while (n < w->ne0) {
+        int got = dequant_block(w->type, p, blk);
+        if (got <= 0) return;
+        for (int i = 0; i < got && n < w->ne0; i++) out[n++] = blk[i];
+        p += bb;
+    }
+}
+
+/* out[j] = dot(row j, x) for every output row */
+static void matmul(float *out, const float *x, const wt_t *w) {
+    static float row[8192];
+    for (uint32_t j = 0; j < w->ne1; j++) {
+        deq_row(w, j, row);
+        float s = 0.0f;
+        for (uint32_t i = 0; i < w->ne0; i++) s += row[i] * x[i];
+        out[j] = s;
+    }
+}
+
+static void rmsnorm(float *out, const float *x, const wt_t *w, uint32_t n) {
+    static float g[8192];
+    deq_row(w, 0, g);
+    float ss = 0.0f;
+    for (uint32_t i = 0; i < n; i++) ss += x[i] * x[i];
+    ss = ss / (float)n + info.rms_eps;
+    float scale = 1.0f / k_sqrt(ss);
+    for (uint32_t i = 0; i < n; i++) out[i] = x[i] * scale * g[i];
+}
+
+static void softmax(float *x, int n) {
+    float mx = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = k_exp(x[i] - mx); sum += x[i]; }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
+/*
+ * Rotary embeddings, NeoX style: the pair for index i is (i, i + d/2),
+ * not (2i, 2i+1).  Qwen2 uses that convention, and mixing the two up
+ * yields fluent-looking output that is subtly wrong, so it is worth
+ * being explicit about.
+ */
+static void rope(float *vec, int n_heads, int pos) {
+    float base_log = k_log(info.rope_freq_base);
+    int half = head_dim / 2;
+    for (int h = 0; h < n_heads; h++) {
+        float *p = vec + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float freq = k_exp(-base_log * (2.0f * (float)i) / (float)head_dim);
+            float th = (float)pos * freq;
+            float c = k_cos(th), s = k_sin(th);
+            float x0 = p[i], x1 = p[i + half];
+            p[i]        = x0 * c - x1 * s;
+            p[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
+int llm_eval(int32_t token, int pos) {
+    if (!weights_ok) return -1;
+    if (pos < 0 || pos >= n_ctx) return -1;
+    if (token < 0 || (uint32_t)token >= info.n_vocab) return -1;
+
+    uint32_t E = info.n_embd, H = info.n_head, KVH = info.n_head_kv;
+
+    deq_row(&w_tok_embd, (uint32_t)token, a_x);
+    for (uint32_t i = 0; i < E; i++) p_embd[i] = a_x[i];
+
+    for (uint32_t l = 0; l < info.n_layer; l++) {
+        layer_t *L = &w_layers[l];
+
+        rmsnorm(a_xb, a_x, &L->attn_norm, E);
+
+        matmul(a_q, a_xb, &L->wq);
+        matmul(a_k, a_xb, &L->wk);
+        matmul(a_v, a_xb, &L->wv);
+
+        /* Qwen2 puts a bias on the q, k and v projections */
+        static float bias[8192];
+        deq_row(&L->bq, 0, bias);
+        for (uint32_t i = 0; i < E; i++) a_q[i] += bias[i];
+        deq_row(&L->bk, 0, bias);
+        for (int i = 0; i < kv_dim; i++) a_k[i] += bias[i];
+        deq_row(&L->bv, 0, bias);
+        for (int i = 0; i < kv_dim; i++) a_v[i] += bias[i];
+
+        if (l == 0) {
+            for (uint32_t i = 0; i < E; i++) { p_xb0[i] = a_xb[i]; p_q0[i] = a_q[i]; }
+        }
+
+        rope(a_q, (int)H, pos);
+        rope(a_k, (int)KVH, pos);
+
+        /* stash this position's keys and values */
+        float *krow = kv_k + ((uint64_t)l * n_ctx + pos) * kv_dim;
+        float *vrow = kv_v + ((uint64_t)l * n_ctx + pos) * kv_dim;
+        for (int i = 0; i < kv_dim; i++) { krow[i] = a_k[i]; vrow[i] = a_v[i]; }
+
+        /* grouped-query attention: several query heads share a kv head */
+        int group = (int)(H / KVH);
+        float inv_sqrt = 1.0f / k_sqrt((float)head_dim);
+
+        for (uint32_t h = 0; h < H; h++) {
+            const float *qh = a_q + h * head_dim;
+            int kvh = (int)h / group;
+            float *sc = a_att + (uint64_t)h * n_ctx;
+
+            for (int t = 0; t <= pos; t++) {
+                const float *kt = kv_k + ((uint64_t)l * n_ctx + t) * kv_dim
+                                       + kvh * head_dim;
+                float s = 0.0f;
+                for (int i = 0; i < head_dim; i++) s += qh[i] * kt[i];
+                sc[t] = s * inv_sqrt;
+            }
+            softmax(sc, pos + 1);
+
+            float *ob = a_xb + h * head_dim;
+            for (int i = 0; i < head_dim; i++) ob[i] = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                const float *vt = kv_v + ((uint64_t)l * n_ctx + t) * kv_dim
+                                       + kvh * head_dim;
+                float a = sc[t];
+                for (int i = 0; i < head_dim; i++) ob[i] += a * vt[i];
+            }
+        }
+
+        matmul(a_xb2, a_xb, &L->wo);
+        for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
+
+        rmsnorm(a_xb, a_x, &L->ffn_norm, E);
+        matmul(a_hb,  a_xb, &L->w_gate);
+        matmul(a_hb2, a_xb, &L->w_up);
+
+        /* SwiGLU */
+        for (uint32_t i = 0; i < info.n_ff; i++) {
+            float g = a_hb[i];
+            g = g / (1.0f + k_exp(-g));
+            a_hb[i] = g * a_hb2[i];
+        }
+
+        matmul(a_xb2, a_hb, &L->w_down);
+        for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
+    }
+
+    rmsnorm(a_x, a_x, &w_out_norm, E);
+    /* embeddings are tied, so the vocabulary matrix is the logit head */
+    matmul(a_logits, a_x, &w_tok_embd);
+    return 0;
+}
+
+int llm_argmax(void) {
+    if (!weights_ok) return -1;
+    int best = 0;
+    float bv = a_logits[0];
+    for (uint32_t i = 1; i < info.n_vocab; i++)
+        if (a_logits[i] > bv) { bv = a_logits[i]; best = (int)i; }
+    return best;
+}
+
+int llm_logit(int32_t token, int32_t *scaled) {
+    if (!weights_ok || token < 0 || (uint32_t)token >= info.n_vocab) return -1;
+    *scaled = (int32_t)(a_logits[token] * 1000.0f);
+    return 0;
+}
+
+/* Intermediate values, for checking against a reference forward pass. */
+int llm_probe(const char *what, int layer, int n, int32_t *out) {
+    if (!weights_ok) return -1;
+    const float *src = 0;
+    if (str_same(what, "embd")) src = p_embd;
+    else if (str_same(what, "norm0")) src = p_xb0;
+    else if (str_same(what, "q0")) src = p_q0;
+    else if (str_same(what, "x")) src = a_x;
+    else if (str_same(what, "xb")) src = a_xb;
+    else if (str_same(what, "q")) src = a_q;
+    else if (str_same(what, "k")) src = a_k;
+    else if (str_same(what, "logits")) src = a_logits;
+    else return -1;
+    (void)layer;
+    for (int i = 0; i < n; i++) out[i] = (int32_t)(src[i] * 1000000.0f);
+    return n;
 }
