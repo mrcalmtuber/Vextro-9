@@ -178,16 +178,33 @@ os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/
 	build/limine-tool bios-install os.iso
 
 # --- Run ---
+# Not every QEMU is built with the same display backends: Homebrew's
+# macOS build ships Cocoa and no SDL, most Linux builds have GTK and SDL.
+# Ask this one what it has rather than hard-coding a backend, and only
+# pass sub-options the chosen backend actually accepts (grab-mod is
+# SDL-only, and QEMU rejects the whole option if it does not know it).
+QEMU ?= qemu-system-x86_64
+
+QEMU_DISPLAY := $(shell d=$$($(QEMU) -display help 2>/dev/null); \
+  if   echo "$$d" | grep -qx sdl;   then echo 'sdl,show-cursor=off,grab-mod=lshift-lctrl-lalt'; \
+  elif echo "$$d" | grep -qx gtk;   then echo 'gtk,show-cursor=off,grab-on-hover=on'; \
+  elif echo "$$d" | grep -qx cocoa; then echo 'cocoa,show-cursor=off'; \
+  else echo none; fi)
+
+# (a shell `case` cannot be used here: the ")" in its patterns would
+# close make's own $(shell ...) expansion early)
+QEMU_FSKEY := $(if $(findstring cocoa,$(QEMU_DISPLAY)),Ctrl + Cmd + F,Ctrl + Alt + F)
+
 run: os.iso disk.img
 	@echo ""
-	@echo "  [TIP] Toggle full-screen on/off at any time with: Ctrl + Alt + F"
+	@echo "  [TIP] Toggle full-screen on/off at any time with: $(QEMU_FSKEY)"
 	@echo ""
-	qemu-system-x86_64 \
+	$(QEMU) \
 		-cdrom os.iso \
 		-drive file=disk.img,format=raw,index=0,media=disk \
 		-m 256M \
 		-vga std \
-		-display sdl,show-cursor=off,grab-mod=lshift-lctrl-lalt \
+		-display $(QEMU_DISPLAY) \
 		-full-screen \
 		-boot d \
 		-netdev user,id=net0,net=10.0.2.0/24 \
