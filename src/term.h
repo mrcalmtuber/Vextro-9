@@ -471,7 +471,7 @@ static void term_cmd_help(void) {
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
-    term_print("  llm load <model.gguf> | info | fpu\n");
+    term_print("  llm load <model.gguf> | info | fpu | tok <text>\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -912,6 +912,56 @@ static void term_exec(char *cmdline) {
                          ok == 0 ? 4 : 2);
             return;
         }
+        if (argc >= 2 && str_eq(argv[1], "tok")) {
+            if (!llm_tok_ready()) {
+                term_print_c("no tokenizer loaded (llm load <file.gguf>)\n", 2);
+                return;
+            }
+            /* rejoin the argv the splitter took apart */
+            char text[240];
+            text[0] = '\0';
+            for (int i = 2; i < argc; i++) {
+                if (i > 2) str_append(text, " ", sizeof(text));
+                str_append(text, argv[i], sizeof(text));
+            }
+            if (text[0] == '\0') { term_print_c("usage: llm tok <text>\n", 2); return; }
+
+            static int32_t ids[256];
+            int n = llm_encode(text, ids, 256);
+            if (n < 0) { term_print_c("encode failed\n", 2); return; }
+
+            char nb[16];
+            term_print("  ");
+            uint_to_str((uint32_t)n, nb);
+            term_print_c(nb, 1);
+            term_print(" tokens\n");
+            for (int i = 0; i < n; i++) {
+                char piece[64];
+                llm_decode(ids[i], piece, sizeof(piece));
+                term_print("   ");
+                uint_to_str((uint32_t)ids[i], nb);
+                term_print_c(nb, 3);
+                term_print(" ");
+                term_putc('[');
+                for (int k = 0; piece[k]; k++)
+                    term_putc(piece[k] == ' ' ? '_' : piece[k]);
+                term_print("]\n");
+            }
+            /* decode everything back and compare with the input */
+            char round[240];
+            int ro = 0;
+            for (int i = 0; i < n; i++) {
+                char piece[64];
+                llm_decode(ids[i], piece, sizeof(piece));
+                for (int k = 0; piece[k] && ro < (int)sizeof(round) - 1; k++)
+                    round[ro++] = piece[k];
+            }
+            round[ro] = '\0';
+            term_print_c(str_eq(round, text) ? "  round trip OK\n"
+                                             : "  ROUND TRIP MISMATCH\n",
+                         str_eq(round, text) ? 4 : 2);
+            return;
+        }
         if (argc >= 2 && str_eq(argv[1], "load")) {
             if (argc < 3) { term_print_c("usage: llm load <model.gguf>\n", 2); return; }
             char abs[256];
@@ -962,6 +1012,13 @@ static void term_exec(char *cmdline) {
             term_putc(' ');
         }
         term_putc('\n');
+        if (llm_tok_ready()) {
+            term_print("  tokenizer  ");
+            uint_to_str(llm_tok_count(), nb); term_print_c(nb, 1);
+            term_print(" tokens, ");
+            uint_to_str(llm_merge_count(), nb); term_print(nb);
+            term_print(" merges\n");
+        }
         term_print("  arena      ");
         uint_to_str((uint32_t)(llm_arena_total() / (1024 * 1024)), nb);
         term_print_c(nb, 4);
