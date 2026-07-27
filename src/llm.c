@@ -685,7 +685,8 @@ int llm_encode(const char *text, int32_t *out, int max_out) {
  * six bits each, crammed two-to-a-byte-and-a-bit.  Getting the packing
  * wrong produces weights that are the right order of magnitude and
  * completely wrong, which is why this is checked against a reference
- * rather than eyeballed.
+ * rather than eyeballed.  All four types the model uses (Q4_K, Q5_0,
+ * Q6_K and F32) have been verified that way, element for element.
  * ===================================================================== */
 
 int llm_tensor_count(void) { return tensor_n; }
