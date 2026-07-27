@@ -136,8 +136,18 @@ build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build/kernel: build/kernel.o build/boot_animation_data.o linker.ld
-	$(LD) $(LDFLAGS) build/kernel.o build/boot_animation_data.o -o $@
+# The inference unit is the one place floats are allowed: a transformer
+# is float maths end to end, while the rest of the kernel stays integer
+# only so no interrupt handler can grow an FPU dependency.
+LLM_CFLAGS := $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) \
+              -msse -msse2 -mfpmath=sse
+
+build/llm.o: src/llm.c src/llm.h
+	@mkdir -p build
+	$(CC) $(LLM_CFLAGS) -c $< -o $@
+
+build/kernel: build/kernel.o build/llm.o build/boot_animation_data.o linker.ld
+	$(LD) $(LDFLAGS) build/kernel.o build/llm.o build/boot_animation_data.o -o $@
 
 # --- ISO root population ---
 $(ISO)/boot/kernel: build/kernel
@@ -202,7 +212,7 @@ run: os.iso disk.img
 	$(QEMU) \
 		-cdrom os.iso \
 		-drive file=disk.img,format=raw,index=0,media=disk \
-		-m 256M \
+		-m 2048M \
 		-vga std \
 		-display $(QEMU_DISPLAY) \
 		-full-screen \
