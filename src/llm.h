@@ -100,8 +100,12 @@ int          llm_fpu_selftest(uint32_t *scaled_by_10000);
 int      llm_weights_loaded(void);
 /* Pull every tensor into the arena; slow, once per boot. */
 int      llm_load_weights(const char **err);
-/* Run one token through the model at position pos. */
+/* Run one token through the model at position pos, start to finish. */
 int      llm_eval(int32_t token, int pos);
+/* The same, handed out a layer at a time so a UI can redraw between. */
+int      llm_eval_begin(int32_t token, int pos);
+int      llm_eval_step(void);        /* 1 when the logits are ready */
+int      llm_eval_progress(void);    /* 0..100 */
 /* Greedy pick from the last eval's logits. */
 int      llm_argmax(void);
 /* A logit, scaled by 1000, for inspection from the integer-only side. */

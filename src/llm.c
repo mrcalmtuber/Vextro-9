@@ -1090,95 +1090,156 @@ static void rope(float *vec, int n_heads, int pos) {
     }
 }
 
-int llm_eval(int32_t token, int pos) {
+/*
+ * Evaluation is resumable.  One forward pass takes about a minute under
+ * emulation, and a UI that called it straight through would freeze the
+ * whole desktop for that long, so the work is handed out a layer at a
+ * time and the caller redraws in between.
+ */
+static int32_t  ev_token;
+static int      ev_pos;
+static uint32_t ev_layer;
+static int      ev_stage;      /* 0 layers, 1 logits, 2 done */
+static uint32_t ev_logit_row;
+static int      ev_active;
+
+#define EV_LOGIT_CHUNK 8192
+
+static void eval_layer(uint32_t l, int pos) {
+    uint32_t E = info.n_embd, H = info.n_head, KVH = info.n_head_kv;
+    layer_t *L = &w_layers[l];
+
+    rmsnorm(a_xb, a_x, &L->attn_norm, E);
+
+    matmul(a_q, a_xb, &L->wq);
+    matmul(a_k, a_xb, &L->wk);
+    matmul(a_v, a_xb, &L->wv);
+
+    /* Qwen2 puts a bias on the q, k and v projections */
+    static float bias[8192];
+    deq_row(&L->bq, 0, bias);
+    for (uint32_t i = 0; i < E; i++) a_q[i] += bias[i];
+    deq_row(&L->bk, 0, bias);
+    for (int i = 0; i < kv_dim; i++) a_k[i] += bias[i];
+    deq_row(&L->bv, 0, bias);
+    for (int i = 0; i < kv_dim; i++) a_v[i] += bias[i];
+
+    if (l == 0) {
+        for (uint32_t i = 0; i < E; i++) { p_xb0[i] = a_xb[i]; p_q0[i] = a_q[i]; }
+    }
+
+    rope(a_q, (int)H, pos);
+    rope(a_k, (int)KVH, pos);
+
+    float *krow = kv_k + ((uint64_t)l * n_ctx + pos) * kv_dim;
+    float *vrow = kv_v + ((uint64_t)l * n_ctx + pos) * kv_dim;
+    for (int i = 0; i < kv_dim; i++) { krow[i] = a_k[i]; vrow[i] = a_v[i]; }
+
+    int group = (int)(H / KVH);
+    float inv_sqrt = 1.0f / k_sqrt((float)head_dim);
+
+    for (uint32_t h = 0; h < H; h++) {
+        const float *qh = a_q + h * head_dim;
+        int kvh = (int)h / group;
+        float *sc = a_att + (uint64_t)h * n_ctx;
+
+        for (int t = 0; t <= pos; t++) {
+            const float *kt = kv_k + ((uint64_t)l * n_ctx + t) * kv_dim
+                                   + kvh * head_dim;
+            float sdot = 0.0f;
+            for (int i = 0; i < head_dim; i++) sdot += qh[i] * kt[i];
+            sc[t] = sdot * inv_sqrt;
+        }
+        softmax(sc, pos + 1);
+
+        float *ob = a_xb + h * head_dim;
+        for (int i = 0; i < head_dim; i++) ob[i] = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            const float *vt = kv_v + ((uint64_t)l * n_ctx + t) * kv_dim
+                                   + kvh * head_dim;
+            float a = sc[t];
+            for (int i = 0; i < head_dim; i++) ob[i] += a * vt[i];
+        }
+    }
+
+    matmul(a_xb2, a_xb, &L->wo);
+    for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
+
+    rmsnorm(a_xb, a_x, &L->ffn_norm, E);
+    matmul(a_hb,  a_xb, &L->w_gate);
+    matmul(a_hb2, a_xb, &L->w_up);
+
+    for (uint32_t i = 0; i < info.n_ff; i++) {
+        float g = a_hb[i];
+        g = g / (1.0f + k_exp(-g));          /* SiLU */
+        a_hb[i] = g * a_hb2[i];
+    }
+
+    matmul(a_xb2, a_hb, &L->w_down);
+    for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
+}
+
+int llm_eval_begin(int32_t token, int pos) {
     if (!weights_ok) return -1;
     if (pos < 0 || pos >= n_ctx) return -1;
     if (token < 0 || (uint32_t)token >= info.n_vocab) return -1;
 
-    uint32_t E = info.n_embd, H = info.n_head, KVH = info.n_head_kv;
-
     deq_row(&w_tok_embd, (uint32_t)token, a_x);
-    for (uint32_t i = 0; i < E; i++) p_embd[i] = a_x[i];
+    for (uint32_t i = 0; i < info.n_embd; i++) p_embd[i] = a_x[i];
 
-    for (uint32_t l = 0; l < info.n_layer; l++) {
-        layer_t *L = &w_layers[l];
+    ev_token = token;
+    ev_pos = pos;
+    ev_layer = 0;
+    ev_stage = 0;
+    ev_logit_row = 0;
+    ev_active = 1;
+    return 0;
+}
 
-        rmsnorm(a_xb, a_x, &L->attn_norm, E);
+/* Returns 1 once the logits are ready, 0 while there is more to do. */
+int llm_eval_step(void) {
+    if (!ev_active) return 1;
 
-        matmul(a_q, a_xb, &L->wq);
-        matmul(a_k, a_xb, &L->wk);
-        matmul(a_v, a_xb, &L->wv);
-
-        /* Qwen2 puts a bias on the q, k and v projections */
-        static float bias[8192];
-        deq_row(&L->bq, 0, bias);
-        for (uint32_t i = 0; i < E; i++) a_q[i] += bias[i];
-        deq_row(&L->bk, 0, bias);
-        for (int i = 0; i < kv_dim; i++) a_k[i] += bias[i];
-        deq_row(&L->bv, 0, bias);
-        for (int i = 0; i < kv_dim; i++) a_v[i] += bias[i];
-
-        if (l == 0) {
-            for (uint32_t i = 0; i < E; i++) { p_xb0[i] = a_xb[i]; p_q0[i] = a_q[i]; }
+    if (ev_stage == 0) {
+        eval_layer(ev_layer, ev_pos);
+        if (++ev_layer >= info.n_layer) {
+            rmsnorm(a_x, a_x, &w_out_norm, info.n_embd);
+            ev_stage = 1;
         }
-
-        rope(a_q, (int)H, pos);
-        rope(a_k, (int)KVH, pos);
-
-        /* stash this position's keys and values */
-        float *krow = kv_k + ((uint64_t)l * n_ctx + pos) * kv_dim;
-        float *vrow = kv_v + ((uint64_t)l * n_ctx + pos) * kv_dim;
-        for (int i = 0; i < kv_dim; i++) { krow[i] = a_k[i]; vrow[i] = a_v[i]; }
-
-        /* grouped-query attention: several query heads share a kv head */
-        int group = (int)(H / KVH);
-        float inv_sqrt = 1.0f / k_sqrt((float)head_dim);
-
-        for (uint32_t h = 0; h < H; h++) {
-            const float *qh = a_q + h * head_dim;
-            int kvh = (int)h / group;
-            float *sc = a_att + (uint64_t)h * n_ctx;
-
-            for (int t = 0; t <= pos; t++) {
-                const float *kt = kv_k + ((uint64_t)l * n_ctx + t) * kv_dim
-                                       + kvh * head_dim;
-                float s = 0.0f;
-                for (int i = 0; i < head_dim; i++) s += qh[i] * kt[i];
-                sc[t] = s * inv_sqrt;
-            }
-            softmax(sc, pos + 1);
-
-            float *ob = a_xb + h * head_dim;
-            for (int i = 0; i < head_dim; i++) ob[i] = 0.0f;
-            for (int t = 0; t <= pos; t++) {
-                const float *vt = kv_v + ((uint64_t)l * n_ctx + t) * kv_dim
-                                       + kvh * head_dim;
-                float a = sc[t];
-                for (int i = 0; i < head_dim; i++) ob[i] += a * vt[i];
-            }
-        }
-
-        matmul(a_xb2, a_xb, &L->wo);
-        for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
-
-        rmsnorm(a_xb, a_x, &L->ffn_norm, E);
-        matmul(a_hb,  a_xb, &L->w_gate);
-        matmul(a_hb2, a_xb, &L->w_up);
-
-        /* SwiGLU */
-        for (uint32_t i = 0; i < info.n_ff; i++) {
-            float g = a_hb[i];
-            g = g / (1.0f + k_exp(-g));
-            a_hb[i] = g * a_hb2[i];
-        }
-
-        matmul(a_xb2, a_hb, &L->w_down);
-        for (uint32_t i = 0; i < E; i++) a_x[i] += a_xb2[i];
+        return 0;
     }
 
-    rmsnorm(a_x, a_x, &w_out_norm, E);
-    /* embeddings are tied, so the vocabulary matrix is the logit head */
-    matmul(a_logits, a_x, &w_tok_embd);
+    /* the logit head is a quarter of the work on its own, so it is
+     * handed out in chunks too */
+    uint32_t end = ev_logit_row + EV_LOGIT_CHUNK;
+    if (end > info.n_vocab) end = info.n_vocab;
+    static float row[8192];
+    for (uint32_t j = ev_logit_row; j < end; j++) {
+        deq_row(&w_tok_embd, j, row);
+        float sdot = 0.0f;
+        for (uint32_t i = 0; i < info.n_embd; i++) sdot += row[i] * a_x[i];
+        a_logits[j] = sdot;
+    }
+    ev_logit_row = end;
+    if (ev_logit_row >= info.n_vocab) {
+        ev_active = 0;
+        ev_stage = 2;
+        return 1;
+    }
+    return 0;
+}
+
+int llm_eval_progress(void) {
+    if (!ev_active && ev_stage == 2) return 100;
+    if (!ev_active) return 0;
+    /* the layers are about three quarters of the cost */
+    if (ev_stage == 0) return (int)(ev_layer * 75 / info.n_layer);
+    return 75 + (int)((uint64_t)ev_logit_row * 25 / info.n_vocab);
+}
+
+int llm_eval(int32_t token, int pos) {
+    if (llm_eval_begin(token, pos) != 0) return -1;
+    while (llm_eval_step() == 0) { }
     return 0;
 }
 
