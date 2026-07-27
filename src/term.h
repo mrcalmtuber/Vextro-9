@@ -470,6 +470,7 @@ static void term_cmd_help(void) {
     term_print("  net / arp / ping / dns / fetch       networking\n");
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
+    term_print("  zim open <f> | info | main | ls | find/get <path>\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -884,6 +885,119 @@ static void term_exec(char *cmdline) {
             term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
         }
         if (term_cx > 0) term_putc('\n');
+    } else if (str_eq(cmd, "zim")) {
+        if (argc < 2) {
+            term_print_c("usage: zim open <file> | info | main | find <path>"
+                         " | get <path> | ls [prefix]\n", 2);
+            return;
+        }
+        if (str_eq(argv[1], "open")) {
+            if (argc < 3) { term_print_c("usage: zim open <file>\n", 2); return; }
+            char abs[256];
+            term_resolve(argv[2], abs);
+            if (zim_open(abs) != 0) {
+                term_print_c("zim: ", 2);
+                term_print_c(zim_err, 2);
+                term_putc('\n');
+                return;
+            }
+            term_print_c("opened ", 4);
+            term_print_c(abs, 4);
+            term_putc('\n');
+        }
+        if (!zim.open) { term_print_c("no archive open (zim open <file>)\n", 2); return; }
+
+        char nb[24];
+        if (str_eq(argv[1], "open") || str_eq(argv[1], "info")) {
+            term_print("  version    ");
+            uint_to_str(zim.major, nb); term_print(nb);
+            term_print(".");
+            uint_to_str(zim.minor, nb); term_print(nb);
+            term_print("\n  entries    ");
+            uint_to_str(zim.article_count, nb); term_print_c(nb, 1);
+            term_print("\n  clusters   ");
+            uint_to_str(zim.cluster_count, nb); term_print(nb);
+            term_print("\n  size       ");
+            uint_to_str((uint32_t)(zim.f.size / (1024 * 1024)), nb);
+            term_print(nb); term_print(" MB\n  mime types ");
+            uint_to_str((uint32_t)zim.mime_count, nb); term_print(nb);
+            term_putc('\n');
+            if (zim.truncated) {
+                term_print_c("  WARNING: the file is shorter than its header says"
+                             " - incomplete download\n", 2);
+            }
+            return;
+        }
+
+        if (str_eq(argv[1], "main")) {
+            const uint8_t *d; uint32_t n; zim_dirent_t e;
+            if (zim_content(zim.main_page, &d, &n, &e) != 0) {
+                term_print_c("zim: ", 2); term_print_c(zim_err, 2); term_putc('\n');
+                return;
+            }
+            term_print_c("main page: ", 1);
+            term_print_c(e.title, 1);
+            term_print("  (");
+            uint_to_str(n, nb); term_print(nb);
+            term_print(" bytes, ");
+            term_print(zim_mime_name(e.mime));
+            term_print(")\n");
+            return;
+        }
+
+        if (str_eq(argv[1], "find") || str_eq(argv[1], "get")) {
+            if (argc < 3) { term_print_c("usage: zim find|get <path>\n", 2); return; }
+            uint32_t idx;
+            if (!zim_find('C', argv[2], &idx)) {
+                term_print_c("not found: ", 2);
+                term_print_c(argv[2], 2);
+                term_print_c("   (paths are case sensitive, try 'zim ls'"
+                             " to browse)\n", 3);
+                return;
+            }
+            const uint8_t *d; uint32_t n; zim_dirent_t e;
+            if (zim_content(idx, &d, &n, &e) != 0) {
+                term_print_c("zim: ", 2); term_print_c(zim_err, 2); term_putc('\n');
+                return;
+            }
+            term_print_c(e.title, 1);
+            term_print("  [");
+            term_print(zim_mime_name(e.mime));
+            term_print(", ");
+            uint_to_str(n, nb); term_print(nb);
+            term_print(" bytes, cluster ");
+            uint_to_str(e.cluster, nb); term_print(nb);
+            term_print("]\n");
+            if (str_eq(argv[1], "get")) {
+                uint32_t lim = n < 600 ? n : 600;
+                for (uint32_t i = 0; i < lim; i++) {
+                    char c = (char)d[i];
+                    term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
+                }
+                if (term_cx > 0) term_putc('\n');
+            }
+            return;
+        }
+
+        if (str_eq(argv[1], "ls")) {
+            const char *pfx = argc >= 3 ? argv[2] : "";
+            uint32_t i = zim_lower_bound('C', pfx);
+            zim_dirent_t e;
+            int shown = 0;
+            while (i < zim.article_count && shown < 20) {
+                if (zim_dirent(i, &e) != 0) break;
+                if (e.ns != 'C') break;
+                term_print("  ");
+                term_print_c(e.title, e.is_redirect ? 3 : 0);
+                if (e.is_redirect) term_print_c("  ->", 3);
+                term_putc('\n');
+                i++; shown++;
+            }
+            if (shown == 0) term_print_c("  (nothing at that prefix)\n", 3);
+            return;
+        }
+
+        term_print_c("unknown zim subcommand\n", 2);
     } else if (str_eq(cmd, "img") || str_eq(cmd, "view")) {
         if (argc < 2) { term_print_c("usage: img <file.sci>\n", 2); return; }
         char abs[256];

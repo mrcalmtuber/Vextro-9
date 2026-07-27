@@ -336,6 +336,61 @@ static int fs_read_range(const char *path, uint64_t offset, void *buf,
     return 0;
 }
 
+/*
+ * An open-file handle.  Reading an archive means thousands of small
+ * reads, and resolving the path through the directory tree every time
+ * would dominate the cost, so the located entry is kept.
+ */
+typedef struct {
+    int      kind;
+    int      valid;
+    uint64_t size;
+    exf_dirent_t exf;
+    char     path[160];
+} fs_file_t;
+
+static int fs_open(const char *path, fs_file_t *f) {
+    f->valid = 0;
+    f->kind = fs_kind;
+    str_copy(f->path, path, sizeof(f->path));
+
+    if (fs_kind == FS_EXFAT) {
+        char abs[256];
+        fs_abs(path, abs, sizeof(abs));
+        if (!exf_lookup(abs, &f->exf) || (f->exf.attr & EXF_ATTR_DIR)) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        f->size = f->exf.size;
+        f->valid = 1;
+        return 0;
+    }
+
+    uint64_t sz = 0;
+    int is_dir = 0;
+    if (!fs_stat(path, &sz, &is_dir) || is_dir) {
+        fs_errstr = "not found";
+        return -1;
+    }
+    f->size = sz;
+    f->valid = 1;
+    return 0;
+}
+
+static int fs_pread(fs_file_t *f, uint64_t off, void *buf, uint32_t len,
+                    uint32_t *got) {
+    *got = 0;
+    if (!f->valid) { fs_errstr = "file not open"; return -1; }
+    if (f->kind == FS_EXFAT) {
+        if (exf_read_range(&f->exf, off, (uint8_t *)buf, len, got) != 0) {
+            fs_errstr = exf_errstr;
+            return -1;
+        }
+        return 0;
+    }
+    return fs_read_range(f->path, off, buf, len, got);
+}
+
 static int fs_write_file(const char *path, const void *data, uint32_t len) {
     if (fs_kind == FS_EXFAT) {
         if (exf_write_file(path, (const uint8_t *)data, len) != 0) {
@@ -406,6 +461,8 @@ static int fs_list(const char *path, fs_list_cb cb) {
     }
     return -1;
 }
+
+#include "zim.h"
 
 /* ===== 3. FORWARD DECLARATIONS ===== */
 
