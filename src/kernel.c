@@ -328,6 +328,19 @@ static void boot_frame_delay(void) {
     while (!(inb(0x61) & 0x20)) {} /* spin until OUT2 goes high */
 }
 
+/*
+ * Has someone hit a key?  The animation runs before the IDT is loaded,
+ * so there is no interrupt handler to ask — read the PS/2 controller
+ * directly.  Consuming the press here also means it does not turn up
+ * later as a stray character in the keycode field.
+ */
+static int boot_key_pressed(void) {
+    uint8_t st = inb(0x64);
+    if (st == 0xFF || !(st & 1)) return 0;   /* no controller, or nothing */
+    if (st & 0x20) { (void)inb(0x60); return 0; }  /* mouse byte, discard */
+    return !(inb(0x60) & 0x80);              /* a press, not a release */
+}
+
 static void display_boot_animation(volatile uint32_t *vram,
                                    uint32_t scr_w, uint32_t scr_h,
                                    uint32_t pitch_px) {
@@ -361,6 +374,7 @@ static void display_boot_animation(volatile uint32_t *vram,
             }
         }
         boot_frame_delay();
+        if (boot_key_pressed()) break;   /* any key skips the rest */
     }
 
     /* Clear screen to black after animation finishes */
@@ -375,15 +389,26 @@ void kmain(void) {
         while (1) __asm__ volatile("hlt");
 
     struct limine_framebuffer *fb = fb_request.response->framebuffers[0];
-    uint32_t w        = (uint32_t)fb->width;
-    uint32_t h        = (uint32_t)fb->height;
+    uint32_t panel_w  = (uint32_t)fb->width;
+    uint32_t panel_h  = (uint32_t)fb->height;
     uint32_t pitch_px = (uint32_t)(fb->pitch / (fb->bpp / 8));
     volatile uint32_t *vram = (volatile uint32_t *)fb->address;
 
-    if (w > BUF_MAX_W) w = BUF_MAX_W;
-    if (h > BUF_MAX_H) h = BUF_MAX_H;
+    /*
+     * Everything after this point draws through a fixed back buffer, so
+     * a mode larger than that only ever reaches the panel's top-left
+     * corner.  Blank the whole panel once here, so the margin is black
+     * rather than whatever the firmware left in video memory.
+     */
+    for (uint32_t row = 0; row < panel_h; row++)
+        for (uint32_t col = 0; col < panel_w; col++)
+            vram[row * pitch_px + col] = 0;
 
-    display_boot_animation(vram, w, h, pitch_px);
+    uint32_t w = panel_w > BUF_MAX_W ? BUF_MAX_W : panel_w;
+    uint32_t h = panel_h > BUF_MAX_H ? BUF_MAX_H : panel_h;
+
+    /* The animation is centred on the real panel, not the back buffer */
+    display_boot_animation(vram, panel_w, panel_h, pitch_px);
 
     /* Read the kernel code segment selector */
     uint16_t cs;
@@ -563,6 +588,15 @@ void kmain(void) {
             char dch;
             while ((dch = kb_getchar()) != 0)
                 desktop_key_input(dch);
+
+            /* Read then subtract, rather than read then zero, so a notch
+             * that lands between the two is carried into the next frame
+             * instead of being dropped. */
+            int32_t wheel = mouse_wheel;
+            if (wheel) {
+                mouse_wheel -= wheel;
+                desktop_wheel_input(wheel);
+            }
 
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             draw_cursor(w, h);

@@ -11,6 +11,9 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - **Menubar** — working Socrates / Apps menus (About, Restart, Shut Down, app launchers), live clock + date, network status indicator
 - **Dock** — pictogram icons with hover tooltips, running indicators, bottom/left/right placement, adjustable size
 - **Wallpaper themes** — five gradient themes with the dragon emblem, switchable live from Settings
+- **Absolute pointer** — the cursor tracks the host's straight away, with no click-to-grab and no capture to escape from. A PS/2 mouse can only report *relative* motion, which a host cannot turn into a position without capturing the real cursor first, so the guest asks for the VMware backdoor pointer and falls back to PS/2 only when there is no hypervisor to ask
+- **Scroll wheel** — negotiated through the IntelliMouse sample-rate knock, and routed to whichever window has focus: terminal scrollback, browser pages, store shelves, article lists
+- **Resolution independent** — the desktop lays itself out around whatever mode the bootloader hands over, from 1024x768 up to 1920x1080
 
 ### Filesystem
 - **Writable exFAT** on a real ATA disk (`disk.img`) — files survive reboots
@@ -26,7 +29,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
 - Command history (Up/Down), line editing (Left/Right/Home/End/Del), 240-line scrollback (PgUp/PgDn)
 - Working directory (`cd` / `pwd`, shown in the prompt) and output redirection: `ls > list.txt`, `echo hi >> notes.txt`
-- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `net` `arp` `ping` `dns` `fetch` `store` `img` `peek` `zim` `open` `history` `reboot` `shutdown`
+- Commands: `help` `clear` `ls` `cat` `cd` `pwd` `rm` `mkdir` `cp` `df` `run` `echo` `date` `uptime` `mem` `mouse` `net` `arp` `ping` `dns` `fetch` `store` `img` `peek` `zim` `open` `history` `reboot` `shutdown`
 
 ### Networking
 - **Full TCP/IP stack** — IPv4, ICMP (ping), UDP, DNS resolver, polled TCP client, async HTTP/1.0 client with redirects
@@ -105,9 +108,9 @@ The kernel's loader (`src/desktop.h`) dispatches on magic: `.bsd` for store pack
 
 ### Core
 - **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 4x4 supersampled AA; no floats, no GPU
-- **Boot animation** — full-color video playback via raw RGB565 frames embedded at link time
+- **Boot animation** — full-color video playback via raw RGB565 frames embedded at link time; any key skips it
 - **Login screen** — first-boot keycode registration (persisted to disk) with melt animation on bad passwords
-- **HAL** — IDT, PIT, PS/2 mouse + keyboard (incl. extended scancodes), ATA PIO, AC97 audio
+- **HAL** — IDT, PIT, PS/2 keyboard (incl. extended scancodes), PS/2 + VMware-backdoor pointer with wheel, ATA PIO, AC97 audio
 - **Generic PCI layer** — full bus/device/function enumeration (multifunction aware), class-code lookup, BAR sizing incl. 64-bit BARs, shared page-table MMIO mapper
 - **Syscall interface** — `int 0x80` gateway with a minimal userland ABI
 - **Limine bootloader** — BIOS + UEFI dual-boot, El Torito ISO
@@ -172,7 +175,23 @@ after pulling the app store** so the packages land on an existing disk.
 make run
 ```
 
-Launches in QEMU with SDL display, E1000 networking, and 256 MB RAM. Toggle full-screen with **Ctrl+Alt+F** (left-side modifiers).
+Launches in QEMU full-screen with E1000 networking and 2 GB of RAM.
+
+Not every QEMU build ships the same display backends — Homebrew's macOS
+build has Cocoa and no SDL — so `make run` asks the binary what it has and
+picks one, printing the full-screen shortcut for that backend as it
+starts (**Ctrl+Cmd+F** on macOS, **Ctrl+Alt+F** elsewhere).
+
+**Just move the mouse** — the pointer is absolute, so there is no window
+to click into first and no capture to break out of. Any key skips the
+boot animation.
+
+The mode is 1280x800 by default; override it per run, up to the
+`BUF_MAX_W`/`BUF_MAX_H` back buffer in `src/kernel.c`:
+
+```sh
+make run RES=1920x1080x32
+```
 
 First boot asks you to choose a master keycode; it is saved to disk, so
 subsequent boots only ask you to log in. Once on the desktop, try:
@@ -217,7 +236,8 @@ src/            Kernel source
   desktop.h     Window manager, menubar, dock, wallpaper, ELF loader
   term.h        Terminal (commands, history, scrollback)
   browser.h     Browser (HTML renderer, navigation, links)
-  apps.h        Files / Settings / Goldsmith / Monolith / Matrix / About
+  apps.h        Files / Settings / Photos / Wikipedia + RAG chat / About
+  llm.h llm.c   Local transformer inference (the one SSE translation unit)
   store.h       Agora app store (catalog, installer, registry, storefront)
   lzma.h        LZMA / LZMA2 / xz decompressor (images + ZIM clusters)
   zstd.h        Zstandard decompressor (modern ZIM clusters)
@@ -230,7 +250,8 @@ src/            Kernel source
   pci.h         Generic PCI enumeration + BAR sizing + MMIO mapper
   igpu.h        Intel Gen9 iGPU blitter (GGTT + BCS ring + XY_COLOR_BLT)
   e1000.h       Intel NIC driver        ttf.h  TrueType rasterizer
-  keyboard.h    PS/2 keyboard           mouse.h  PS/2 mouse
+  keyboard.h    PS/2 keyboard           mouse.h  pointer + wheel
+  vmmouse.h     VMware backdoor protocol (absolute pointer, no grab)
 apps/           Userland app source + seed files for the disk
   store/        App store packages + packages.txt (repository metadata)
   pics/         Sample PNGs, converted to .sci at build time

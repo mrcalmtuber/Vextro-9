@@ -39,7 +39,9 @@ PIC_SRC     := $(wildcard apps/pics/*.png)
 PIC_SCI     := $(patsubst apps/pics/%.png,build/pics/%.sci,$(PIC_SRC))
 PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
 
-.PHONY: all iso run clean cleandisk apps repo bsdtools pics
+.PHONY: all iso run clean cleandisk apps repo bsdtools pics FORCE
+
+FORCE:
 
 all: os.iso disk.img
 
@@ -158,9 +160,24 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 	@mkdir -p $(ISO)/boot
 	cp $< $@
 
-$(ISO)/boot/limine/limine.conf: limine.conf
+# Framebuffer mode.  `resolution` is the key Limine actually reads; the
+# framebuffer_width/height/bpp trio that used to live in limine.conf is
+# not part of the config format at all, so it was quietly ignored and the
+# mode came from whatever the display's EDID preferred.  Any size up to
+# the BUF_MAX_W x BUF_MAX_H back buffer in src/kernel.c works:
+#     make run RES=1920x1080x32
+RES ?= 1280x800x32
+
+# make compares timestamps, and a variable has none — without recording
+# RES somewhere on disk, changing it would leave the previous mode baked
+# into an ISO that looks up to date.
+build/res.stamp: FORCE
+	@mkdir -p build
+	@echo '$(RES)' | cmp -s - $@ || echo '$(RES)' > $@
+
+$(ISO)/boot/limine/limine.conf: limine.conf build/res.stamp
 	@mkdir -p $(ISO)/boot/limine
-	cp limine.conf                     $(ISO)/boot/limine/limine.conf
+	sed 's|^\( *resolution:\).*|\1 $(RES)|' limine.conf > $@
 	cp $(LIMINE)/limine-bios.sys       $(ISO)/boot/limine/
 	cp $(LIMINE)/limine-bios-cd.bin    $(ISO)/boot/limine/
 	cp $(LIMINE)/limine-uefi-cd.bin    $(ISO)/boot/limine/
@@ -193,12 +210,16 @@ os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/
 # Ask this one what it has rather than hard-coding a backend, and only
 # pass sub-options the chosen backend actually accepts (grab-mod is
 # SDL-only, and QEMU rejects the whole option if it does not know it).
+#
+# zoom-to-fit matters more than it sounds: without it, Cocoa and GTK draw
+# the guest at 1:1 in the middle of the full-screen window and surround it
+# with black, which looks exactly like a desktop that refuses to resize.
 QEMU ?= qemu-system-x86_64
 
 QEMU_DISPLAY := $(shell d=$$($(QEMU) -display help 2>/dev/null); \
   if   echo "$$d" | grep -qx sdl;   then echo 'sdl,show-cursor=off,grab-mod=lshift-lctrl-lalt'; \
-  elif echo "$$d" | grep -qx gtk;   then echo 'gtk,show-cursor=off,grab-on-hover=on'; \
-  elif echo "$$d" | grep -qx cocoa; then echo 'cocoa,show-cursor=off'; \
+  elif echo "$$d" | grep -qx gtk;   then echo 'gtk,show-cursor=off,grab-on-hover=on,zoom-to-fit=on'; \
+  elif echo "$$d" | grep -qx cocoa; then echo 'cocoa,show-cursor=off,zoom-to-fit=on'; \
   else echo none; fi)
 
 # (a shell `case` cannot be used here: the ")" in its patterns would
@@ -208,6 +229,7 @@ QEMU_FSKEY := $(if $(findstring cocoa,$(QEMU_DISPLAY)),Ctrl + Cmd + F,Ctrl + Alt
 run: os.iso disk.img
 	@echo ""
 	@echo "  [TIP] Toggle full-screen on/off at any time with: $(QEMU_FSKEY)"
+	@echo "  [TIP] The pointer is absolute — just move it, no click to grab."
 	@echo ""
 	$(QEMU) \
 		-cdrom os.iso \

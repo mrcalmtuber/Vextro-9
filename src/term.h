@@ -372,6 +372,34 @@ static void term_cmd_df(void) {
     term_print_c(" MB\n", 4);
 }
 
+static void term_cmd_mouse(void) {
+    char nb[16];
+
+    term_print("  pointer   ");
+    if (mouse_absolute)
+        term_print_c("absolute (VMware backdoor) - tracks without a grab\n", 4);
+    else
+        term_print_c("relative (PS/2) - the host must capture the cursor\n", 3);
+
+    term_print("  packets   ");
+    uint_to_str((uint32_t)mouse_pkt_len, nb);
+    term_print(nb);
+    term_print(mouse_pkt_len == 4 ? " bytes, wheel present\n"
+                                  : " bytes, no wheel\n");
+
+    term_print("  position  ");
+    uint_to_str((uint32_t)mouse_x, nb); term_print(nb);
+    term_print(", ");
+    uint_to_str((uint32_t)mouse_y, nb); term_print(nb);
+    term_print("   buttons ");
+    uint_to_str((uint32_t)mouse_buttons, nb); term_print(nb);
+    term_print("\n  screen    ");
+    uint_to_str((uint32_t)(mouse_max_x + 1), nb); term_print(nb);
+    term_print(" x ");
+    uint_to_str((uint32_t)(mouse_max_y + 1), nb); term_print(nb);
+    term_putc('\n');
+}
+
 static void term_cmd_net(void) {
     char buf[24];
     if (!e1000_found) {
@@ -466,7 +494,7 @@ static void term_cmd_help(void) {
     term_print("  echo <text> > f    write a file  (>> appends)\n");
     term_print("  rm <f>  mkdir <d>  cp <a> <b>  df    manage the disk\n");
     term_print("  run <program>     execute an ELF app\n");
-    term_print("  date / uptime / mem / uname          system info\n");
+    term_print("  date / uptime / mem / uname / mouse   system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
@@ -791,6 +819,8 @@ static void term_exec(char *cmdline) {
         term_print("  total system memory: ");
         term_print(buf);
         term_print(" MB\n");
+    } else if (str_eq(cmd, "mouse") || str_eq(cmd, "pointer")) {
+        term_cmd_mouse();
     } else if (str_eq(cmd, "net") || str_eq(cmd, "ifconfig")) {
         term_cmd_net();
     } else if (str_eq(cmd, "arp")) {
