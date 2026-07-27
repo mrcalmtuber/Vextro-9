@@ -1106,6 +1106,8 @@ static wiki_hit_t wiki_hits[WIKI_RESULTS];
 static int        wiki_hit_count = 0;
 static int        wiki_sel = 0;
 static char       wiki_status[112] = "";
+static int        wiki_mode;            /* 0 search, 1 chat */
+static void       wiki_chat_key(char ch);
 static int        wiki_status_err = 0;
 static int        wiki_tried_open = 0;
 
@@ -1179,6 +1181,7 @@ static void wiki_open_hit(int idx) {
 }
 
 static void wiki_key(char ch) {
+    if (wiki_mode == 1) { wiki_chat_key(ch); return; }
     if (ch == 27) { wm_close(WK_WIKI); return; }
     if (ch == '\n') { wiki_open_hit(wiki_sel); return; }
     if (ch == KEY_DOWN) {
@@ -1209,6 +1212,13 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
     if (!click) return;
     if (mx < cx || mx >= cx + cw || my < cy || my >= cy + chh) return;
 
+    /* the bubble in the header toggles between searching and asking */
+    if (mx >= cx + cw - 42 && mx < cx + cw - 8 && my >= cy + 8 && my < cy + 36) {
+        wiki_mode = !wiki_mode;
+        return;
+    }
+    if (wiki_mode) return;
+
     int32_t list_y = cy + 74;
     int idx = (my - list_y) / WIKI_ROW_H;
     if (idx >= 0 && idx < wiki_hit_count) {
@@ -1217,10 +1227,300 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
     }
 }
 
+/* ===== the chat side of the Wikipedia app =====
+ *
+ * Retrieval is lexical rather than vector-based: the archive's path list
+ * is already sorted, so the question's most distinctive word finds an
+ * article by prefix in a couple of dozen reads.  That article's opening
+ * text becomes the context the model is asked to answer from.
+ *
+ * Generation is driven a step at a time from the draw loop.  A forward
+ * pass takes about a minute under emulation, and calling it straight
+ * through would freeze the desktop, so each frame advances it a little
+ * and redraws.
+ */
+
+#define WIKI_CTX_CHARS 480
+#define WIKI_ANS_MAX   512
+#define WIKI_LOG_MAX   1600
+
+static char  wiki_input[160];
+static int   wiki_input_len;
+static char  wiki_log[WIKI_LOG_MAX];
+static char  wiki_context[WIKI_CTX_CHARS + 8];
+static char  wiki_source[96];
+static char  wiki_answer[WIKI_ANS_MAX];
+static int   wiki_answer_len;
+
+static int32_t wiki_toks[512];
+static int   wiki_ntok, wiki_tokidx;
+static int   wiki_pos, wiki_gen_n;
+static int   wiki_busy;            /* 0 idle, 1 prefill, 2 generating */
+static int   wiki_im_end;
+
+static void wiki_log_add(const char *s) {
+    int n = str_len(wiki_log);
+    int i = 0;
+    while (s[i] && n < WIKI_LOG_MAX - 2) wiki_log[n++] = s[i++];
+    wiki_log[n] = '\0';
+}
+
+/* strip tags and entities out of an article, keeping the readable text */
+static void wiki_html_text(const uint8_t *src, uint32_t len, char *out, int max) {
+    int o = 0, in_tag = 0, space = 1, skip = 0;
+    for (uint32_t i = 0; i < len && o < max - 1; i++) {
+        char c = (char)src[i];
+        if (c == '<') {
+            /* drop the contents of script and style outright */
+            if (i + 7 < len && (src[i+1] == 's' || src[i+1] == 'S')) skip = 1;
+            in_tag = 1;
+            continue;
+        }
+        if (c == '>') { in_tag = 0; continue; }
+        if (in_tag) continue;
+        if (skip && c != ' ') { skip = 0; }
+        if (c == '&') {
+            while (i < len && src[i] != ';' && src[i] != ' ') i++;
+            continue;
+        }
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (c == ' ') {
+            if (space) continue;
+            space = 1;
+        } else {
+            if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) continue;
+            space = 0;
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+}
+
+/* the longest word in the question, which is the most selective one */
+static void wiki_keyword(const char *q, char *out, int max) {
+    int best_len = 0, best_at = 0, i = 0;
+    while (q[i]) {
+        while (q[i] == ' ') i++;
+        int st = i;
+        while (q[i] && q[i] != ' ' && q[i] != '?') i++;
+        int ln = i - st;
+        if (ln > best_len) { best_len = ln; best_at = st; }
+    }
+    int o = 0;
+    for (int k = 0; k < best_len && o < max - 1; k++) out[o++] = q[best_at + k];
+    out[o] = '\0';
+    /* article titles are capitalised */
+    if (out[0] >= 'a' && out[0] <= 'z') out[0] = (char)(out[0] - 32);
+}
+
+/* Find an article for the question and load its opening text. */
+static int wiki_retrieve(const char *question) {
+    wiki_context[0] = '\0';
+    wiki_source[0] = '\0';
+    if (!zim.open) return 0;
+
+    char key[64];
+    wiki_keyword(question, key, sizeof(key));
+    if (key[0] == '\0') return 0;
+
+    uint32_t idx = zim_lower_bound('C', key);
+    zim_dirent_t e;
+    if (idx >= zim.article_count || zim_dirent(idx, &e) != 0) return 0;
+    if (e.ns != 'C') return 0;
+
+    const uint8_t *d;
+    uint32_t n;
+    zim_dirent_t got;
+    if (zim_content(idx, &d, &n, &got) != 0) return 0;
+
+    wiki_html_text(d, n < 20000 ? n : 20000, wiki_context, WIKI_CTX_CHARS);
+    str_copy(wiki_source, got.title, sizeof(wiki_source));
+    return 1;
+}
+
+static void wiki_submit(void) {
+    if (wiki_busy) return;
+    if (wiki_input_len == 0) return;
+    if (!llm_weights_loaded()) {
+        wiki_log_add("\nModel not loaded.  Run 'llm load /qwen2.gguf' then"
+                     " 'llm weights' in the terminal.\n");
+        return;
+    }
+
+    wiki_log_add("\nYou: ");
+    wiki_log_add(wiki_input);
+    wiki_log_add("\n");
+
+    wiki_retrieve(wiki_input);
+    if (wiki_source[0]) {
+        wiki_log_add("[context: ");
+        wiki_log_add(wiki_source);
+        wiki_log_add("]\n");
+    }
+
+    /* Qwen2's chat format, with the retrieved passage as the grounding */
+    static char prompt[1400];
+    prompt[0] = '\0';
+    str_append(prompt, "<|im_start|>system\nAnswer the question using the"
+                       " context. Be brief.<|im_end|>\n<|im_start|>user\n",
+               sizeof(prompt));
+    if (wiki_context[0]) {
+        str_append(prompt, "Context: ", sizeof(prompt));
+        str_append(prompt, wiki_context, sizeof(prompt));
+        str_append(prompt, "\n", sizeof(prompt));
+    }
+    str_append(prompt, "Question: ", sizeof(prompt));
+    str_append(prompt, wiki_input, sizeof(prompt));
+    str_append(prompt, "<|im_end|>\n<|im_start|>assistant\n", sizeof(prompt));
+
+    wiki_ntok = llm_encode(prompt, wiki_toks, 512);
+    if (wiki_ntok <= 0) { wiki_log_add("(could not tokenize)\n"); return; }
+
+    wiki_im_end = llm_token_id("<|im_end|>");
+    wiki_tokidx = 0;
+    wiki_pos = 0;
+    wiki_gen_n = 0;
+    wiki_answer[0] = '\0';
+    wiki_answer_len = 0;
+    wiki_busy = 1;
+    llm_eval_begin(wiki_toks[0], 0);
+
+    wiki_input[0] = '\0';
+    wiki_input_len = 0;
+}
+
+/* advance generation; called once per frame */
+static void wiki_gen_poll(void) {
+    if (!wiki_busy) return;
+
+    /* a few layers per frame keeps the desktop responsive */
+    for (int k = 0; k < 2; k++) {
+        if (llm_eval_step() != 1) return;
+
+        if (wiki_busy == 1) {
+            /* still feeding the prompt in */
+            wiki_tokidx++;
+            wiki_pos++;
+            if (wiki_tokidx < wiki_ntok) {
+                llm_eval_begin(wiki_toks[wiki_tokidx], wiki_pos);
+                continue;
+            }
+            wiki_busy = 2;                    /* prompt consumed */
+        }
+
+        int next = llm_argmax();
+        if (next == wiki_im_end || wiki_gen_n >= 48 || wiki_pos + 1 >= LLM_CTX_MAX) {
+            wiki_log_add("AI: ");
+            wiki_log_add(wiki_answer);
+            wiki_log_add("\n");
+            wiki_busy = 0;
+            return;
+        }
+
+        char piece[64];
+        llm_decode(next, piece, sizeof(piece));
+        for (int i = 0; piece[i] && wiki_answer_len < WIKI_ANS_MAX - 2; i++)
+            wiki_answer[wiki_answer_len++] = piece[i];
+        wiki_answer[wiki_answer_len] = '\0';
+
+        wiki_gen_n++;
+        wiki_pos++;
+        llm_eval_begin(next, wiki_pos);
+    }
+}
+
+static void wiki_chat_key(char ch) {
+    if (ch == 27) { wiki_mode = 0; return; }
+    if (wiki_busy) return;
+    if (ch == '\n') { wiki_submit(); return; }
+    if (ch == '\b') {
+        if (wiki_input_len > 0) wiki_input[--wiki_input_len] = '\0';
+        return;
+    }
+    if (ch >= 0x20 && ch < 0x7F && wiki_input_len < (int)sizeof(wiki_input) - 1) {
+        wiki_input[wiki_input_len++] = ch;
+        wiki_input[wiki_input_len] = '\0';
+    }
+}
+
+static void wiki_chat_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                           int32_t cx, int32_t cy, int32_t cw, int32_t chh,
+                           uint32_t tick, int focused) {
+    gfx_rect(buf, w, h, cx, cy + 42, cw, chh - 42, C_WIN_BG);
+
+    /* transcript */
+    int32_t y = cy + 52;
+    const char *p = wiki_log;
+    char line[96];
+    int li = 0;
+    while (*p && y < cy + chh - 62) {
+        if (*p == '\n' || li >= 88) {
+            line[li] = '\0';
+            if (li) {
+                int is_you = (line[0] == 'Y' && line[1] == 'o' && line[2] == 'u');
+                int is_ctx = (line[0] == '[');
+                ttf_draw_string(buf, (int)w, (int)h, cx + 14, y, line,
+                                is_you ? 0x1A1E28u : (is_ctx ? 0x8A8F9Cu : C_LINK), 12);
+            }
+            y += 17;
+            li = 0;
+            if (*p == '\n') p++;
+            continue;
+        }
+        line[li++] = *p++;
+    }
+    if (li && y < cy + chh - 62) {
+        line[li] = '\0';
+        ttf_draw_string(buf, (int)w, (int)h, cx + 14, y, line, C_LINK, 12);
+    }
+
+    /* the answer as it arrives */
+    if (wiki_busy) {
+        int pct = llm_eval_progress();
+        char st[64], nb[12];
+        str_copy(st, wiki_busy == 1 ? "reading the question " : "thinking ", sizeof(st));
+        uint_to_str((uint32_t)(wiki_busy == 1
+                    ? wiki_tokidx * 100 / (wiki_ntok ? wiki_ntok : 1) : pct), nb);
+        str_append(st, nb, sizeof(st));
+        str_append(st, "%", sizeof(st));
+        ttf_draw_string(buf, (int)w, (int)h, cx + 14, cy + chh - 56, st,
+                        C_LINK, 12);
+        int32_t bw = cw - 28;
+        gfx_rect(buf, w, h, cx + 14, cy + chh - 38, bw, 4, 0xD5D8E0u);
+        gfx_rect(buf, w, h, cx + 14, cy + chh - 38, bw * pct / 100, 4, C_GOLD);
+        if (wiki_answer_len) {
+            char fit[96];
+            store_fit(fit, sizeof(fit), wiki_answer, cw - 28, 12);
+            ttf_draw_string(buf, (int)w, (int)h, cx + 14, cy + chh - 74, fit,
+                            0x2E7D4Fu, 12);
+        }
+    }
+
+    /* input box */
+    gfx_rect(buf, w, h, cx + 12, cy + chh - 30, cw - 24, 24, 0xFFFFFFu);
+    gfx_rect_outline(buf, w, h, cx + 12, cy + chh - 30, cw - 24, 24,
+                     wiki_busy ? 0xD0D3DAu : (focused ? C_GOLD : 0xB8BCC8u));
+    if (wiki_input_len == 0) {
+        ttf_draw_string(buf, (int)w, (int)h, cx + 20, cy + chh - 27,
+                        wiki_busy ? "working..." : "Ask about an article...",
+                        0xA0A4AEu, 12);
+    } else {
+        char fit[96];
+        store_fit(fit, sizeof(fit), wiki_input, cw - 40, 12);
+        ttf_draw_string(buf, (int)w, (int)h, cx + 20, cy + chh - 27, fit,
+                        C_INK, 12);
+    }
+    if (focused && !wiki_busy && ((tick / 30) & 1) == 0) {
+        int cwid = ttf_text_width(wiki_input, 12);
+        gfx_rect(buf, w, h, cx + 21 + cwid, cy + chh - 26, 1, 17, C_INK);
+    }
+}
+
 static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
                       int32_t cx, int32_t cy, int32_t cw, int32_t chh,
                       uint32_t tick, int focused) {
     wiki_autoopen();
+    wiki_gen_poll();
     gfx_rect(buf, w, h, cx, cy, cw, chh, C_WIN_BG);
 
     /* header */
@@ -1229,10 +1529,31 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
     ttf_draw_string(buf, (int)w, (int)h, cx + 16, cy + 10, "Wikipedia",
                     C_GOLD, 18);
     {
-        const char *sub = zim.open ? "offline archive" : "no archive";
+        const char *sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
+                                                        : "no archive");
         int tw = ttf_text_width(sub, 12);
-        ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 16, cy + 16, sub,
+        ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 52, cy + 16, sub,
                         C_TEXT_DIM, 12);
+    }
+
+    /* the chat bubble, top right */
+    {
+        int32_t bx = cx + cw - 40, by = cy + 10;
+        uint32_t fill = wiki_mode ? C_GOLD : 0x2A3040u;
+        uint32_t ink  = wiki_mode ? 0x11141Cu : C_TEXT;
+        gfx_rect(buf, w, h, bx, by, 30, 18, fill);
+        gfx_rect(buf, w, h, bx + 1, by - 1, 28, 1, fill);
+        gfx_rect(buf, w, h, bx + 1, by + 18, 28, 1, fill);
+        /* tail */
+        gfx_tri(buf, w, h, bx + 6, by + 18, bx + 6, by + 24, bx + 14, by + 18,
+                fill);
+        for (int d = 0; d < 3; d++)
+            gfx_rect(buf, w, h, bx + 7 + d * 8, by + 8, 3, 3, ink);
+    }
+
+    if (wiki_mode) {
+        wiki_chat_draw(buf, w, h, cx, cy, cw, chh, tick, focused);
+        return;
     }
 
     /* search box */
