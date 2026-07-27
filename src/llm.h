@@ -60,6 +60,18 @@ int          llm_load(llm_read_fn rd, void *ctx, uint64_t file_size,
 const llm_info_t *llm_get_info(void);
 const char  *llm_quant_name(uint32_t type);
 
+/* ---- tokenizer ---- */
+#define LLM_TOK_MAX 4096          /* tokens per encode call */
+
+int          llm_tok_ready(void);
+uint32_t     llm_tok_count(void);
+uint32_t     llm_merge_count(void);
+/* Encode text into ids; returns how many were produced, or -1. */
+int          llm_encode(const char *text, int32_t *out, int max_out);
+/* Append token id's text to out (UTF-8), NUL-terminated. */
+int          llm_decode(int32_t id, char *out, int max);
+int          llm_token_id(const char *piece);   /* -1 if absent */
+
 /* Proof that the floating-point unit is actually usable in the kernel.
  * The result comes back scaled by 10000 as an integer, because the
  * caller lives in the integer-only translation unit and cannot so much

@@ -24,8 +24,6 @@ void llm_arena_init(void *base, uint64_t size) {
 uint64_t llm_arena_total(void) { return arena_size; }
 uint64_t llm_arena_used(void)  { return arena_head; }
 
-/* used once weight loading lands; the arena itself is already live */
-__attribute__((unused))
 static void *arena_alloc(uint64_t n) {
     uint64_t aligned = (arena_head + 63) & ~(uint64_t)63;   /* cache line */
     if (!arena_base || aligned + n > arena_size) return 0;
@@ -76,6 +74,21 @@ static int quant_block(uint32_t t, uint32_t *elems, uint32_t *bytes) {
     default: return -1;
     }
 }
+
+static char     *tok_blob;         /* all token text, NUL separated */
+static uint32_t *tok_off;          /* id -> offset into tok_blob    */
+static uint32_t  tok_n;
+static int32_t  *tok_hash;         /* hash -> id, -1 empty          */
+static uint32_t  tok_hash_mask;
+static uint64_t *mrg_key;          /* (a<<32)|b, +1 so 0 means empty */
+static uint32_t *mrg_rank;
+static uint32_t  mrg_hash_mask;
+static uint32_t  mrg_n;
+
+static void build_byte_map(void);
+static void tok_hash_put(uint32_t id);
+static int  tok_find(const char *s, int len);
+static void mrg_put(uint32_t a, uint32_t b, uint32_t rank);
 
 static llm_info_t info;
 
@@ -192,6 +205,9 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
 
     for (uint32_t i = 0; i < sizeof(info); i++) ((uint8_t *)&info)[i] = 0;
     info.file_size = file_size;
+    tok_blob = 0; tok_off = 0; tok_hash = 0; tok_n = 0;
+    mrg_key = 0; mrg_rank = 0; mrg_n = 0;
+    build_byte_map();
 
     if (g_u32(&g) != GGUF_MAGIC) { *err = "not a GGUF file"; return -1; }
     uint32_t version = g_u32(&g);
@@ -229,12 +245,73 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
             if      (str_same(key, "qwen2.rope.freq_base"))                 info.rope_freq_base = v;
             else if (str_same(key, "qwen2.attention.layer_norm_rms_epsilon")) info.rms_eps = v;
         } else if (type == GT_ARRAY) {
-            /* the tokenizer arrays are the only big ones; note the vocab
-             * size and skip the payload for now */
             uint32_t et = g_u32(&g);
             uint64_t n = g_u64(&g);
-            if (str_same(key, "tokenizer.ggml.tokens")) info.n_vocab = (uint32_t)n;
-            for (uint64_t k = 0; k < n && !g.failed; k++) g_skip_one(&g, et);
+
+            if (str_same(key, "tokenizer.ggml.tokens") && et == GT_STRING) {
+                /* the vocabulary, concatenated into one blob */
+                info.n_vocab = (uint32_t)n;
+                tok_n = (uint32_t)n;
+                uint64_t cap = n * 24 + 256;
+                tok_blob = (char *)arena_alloc(cap);
+                tok_off  = (uint32_t *)arena_alloc(n * 4);
+                if (!tok_blob || !tok_off) { *err = "arena too small for the vocabulary"; return -1; }
+
+                uint64_t used = 0;
+                for (uint64_t k = 0; k < n && !g.failed; k++) {
+                    uint64_t slen = g_u64(&g);
+                    tok_off[k] = (uint32_t)used;
+                    for (uint64_t j = 0; j < slen; j++) {
+                        uint8_t c = g_u8(&g);
+                        if (used < cap - 1) tok_blob[used++] = (char)c;
+                    }
+                    if (used < cap) tok_blob[used++] = '\0';
+                }
+
+                /* an open-addressed index over the vocabulary */
+                uint32_t hs = 1;
+                while (hs < tok_n * 2) hs <<= 1;
+                tok_hash_mask = hs - 1;
+                tok_hash = (int32_t *)arena_alloc((uint64_t)hs * 4);
+                if (!tok_hash) { *err = "arena too small for the token index"; return -1; }
+                for (uint32_t k = 0; k < hs; k++) tok_hash[k] = -1;
+                for (uint32_t k = 0; k < tok_n; k++) tok_hash_put(k);
+
+            } else if (str_same(key, "tokenizer.ggml.merges") && et == GT_STRING) {
+                /* each merge is "A B": the two pieces that fuse, in rank
+                 * order, so the index is the rank */
+                if (!tok_blob) { *err = "merges arrived before the vocabulary"; return -1; }
+                mrg_n = (uint32_t)n;
+                uint32_t hs = 1;
+                while (hs < mrg_n * 2) hs <<= 1;
+                mrg_hash_mask = hs - 1;
+                mrg_key  = (uint64_t *)arena_alloc((uint64_t)hs * 8);
+                mrg_rank = (uint32_t *)arena_alloc((uint64_t)hs * 4);
+                if (!mrg_key || !mrg_rank) { *err = "arena too small for the merge table"; return -1; }
+                for (uint32_t k = 0; k < hs; k++) { mrg_key[k] = 0; mrg_rank[k] = 0; }
+
+                char line[256];
+                for (uint64_t k = 0; k < n && !g.failed; k++) {
+                    uint64_t slen = g_u64(&g);
+                    uint32_t o = 0;
+                    for (uint64_t j = 0; j < slen; j++) {
+                        uint8_t c = g_u8(&g);
+                        if (o < sizeof(line) - 1) line[o++] = (char)c;
+                    }
+                    line[o] = '\0';
+                    int sp = -1;
+                    for (uint32_t j = 0; j < o; j++)
+                        if (line[j] == ' ') { sp = (int)j; break; }
+                    if (sp <= 0) continue;
+                    line[sp] = '\0';
+                    int a = tok_find(line, sp);
+                    int b = tok_find(line + sp + 1, (int)o - sp - 1);
+                    if (a >= 0 && b >= 0)
+                        mrg_put((uint32_t)a, (uint32_t)b, (uint32_t)k);
+                }
+            } else {
+                for (uint64_t k = 0; k < n && !g.failed; k++) g_skip_one(&g, et);
+            }
         } else {
             g_skip_value(&g, type);
         }
@@ -292,4 +369,257 @@ int llm_fpu_selftest(uint32_t *scaled) {
     *scaled = (uint32_t)(acc * 10000.0f);
     /* expect ~1.6449; allow slack for float32 accumulation order */
     return (acc > 1.6f && acc < 1.7f) ? 0 : -1;
+}
+
+/* =====================================================================
+ * Byte-level BPE tokenizer
+ *
+ * Qwen2 tokenizes the way GPT-2 does: text is first reversibly mapped
+ * from raw bytes onto printable codepoints, so that no token can ever
+ * contain a control byte or a raw space, and the merge table then works
+ * on that mapped text.  A space becomes U+0120, which is why vocabulary
+ * dumps are full of leading 'Ġ'.
+ *
+ * Three tables come out of the GGUF and live in the arena:
+ *   - the vocabulary, concatenated and NUL-separated
+ *   - an open-addressed hash from token text to id
+ *   - an open-addressed hash from a merged pair to its rank
+ *
+ * Encoding splits the text into pieces roughly the way the reference
+ * pre-tokenizer does, then repeatedly applies the lowest-ranked merge
+ * within each piece, which is the definition of BPE.
+ * ===================================================================== */
+
+/* byte <-> printable codepoint, the GPT-2 mapping */
+static uint16_t byte_to_uni[256];
+static int16_t  uni_to_byte[512];
+
+static void build_byte_map(void) {
+    for (int i = 0; i < 512; i++) uni_to_byte[i] = -1;
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        int printable = (b >= '!' && b <= '~') ||
+                        (b >= 0xA1 && b <= 0xAC) ||
+                        (b >= 0xAE && b <= 0xFF);
+        byte_to_uni[b] = printable ? (uint16_t)b : (uint16_t)(256 + n++);
+    }
+    for (int b = 0; b < 256; b++) {
+        uint16_t u = byte_to_uni[b];
+        if (u < 512) uni_to_byte[u] = (int16_t)b;
+    }
+}
+
+/* one codepoint as UTF-8; the mapping never exceeds U+02FF so 2 bytes do */
+static int uni_to_utf8(uint16_t cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+}
+
+static uint32_t str_hash(const char *s, int len) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int tok_len(uint32_t id) {
+    const char *s = tok_blob + tok_off[id];
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static void tok_hash_put(uint32_t id) {
+    const char *s = tok_blob + tok_off[id];
+    uint32_t h = str_hash(s, tok_len(id)) & tok_hash_mask;
+    while (tok_hash[h] >= 0) h = (h + 1) & tok_hash_mask;
+    tok_hash[h] = (int32_t)id;
+}
+
+static int tok_find(const char *s, int len) {
+    if (!tok_hash) return -1;
+    uint32_t h = str_hash(s, len) & tok_hash_mask;
+    while (tok_hash[h] >= 0) {
+        const char *c = tok_blob + tok_off[tok_hash[h]];
+        int i = 0;
+        while (i < len && c[i] && c[i] == s[i]) i++;
+        if (i == len && c[i] == '\0') return tok_hash[h];
+        h = (h + 1) & tok_hash_mask;
+    }
+    return -1;
+}
+
+int llm_token_id(const char *piece) {
+    int n = 0;
+    while (piece[n]) n++;
+    return tok_find(piece, n);
+}
+
+static void mrg_put(uint32_t a, uint32_t b, uint32_t rank) {
+    uint64_t key = (((uint64_t)a << 32) | b) + 1;
+    uint32_t h = (uint32_t)((key * 1099511628211ull) >> 32) & mrg_hash_mask;
+    while (mrg_key[h] && mrg_key[h] != key) h = (h + 1) & mrg_hash_mask;
+    if (!mrg_key[h]) { mrg_key[h] = key; mrg_rank[h] = rank; }
+}
+
+static uint32_t mrg_get(uint32_t a, uint32_t b) {
+    if (!mrg_key) return 0xFFFFFFFFu;
+    uint64_t key = (((uint64_t)a << 32) | b) + 1;
+    uint32_t h = (uint32_t)((key * 1099511628211ull) >> 32) & mrg_hash_mask;
+    while (mrg_key[h]) {
+        if (mrg_key[h] == key) return mrg_rank[h];
+        h = (h + 1) & mrg_hash_mask;
+    }
+    return 0xFFFFFFFFu;                       /* not a mergeable pair */
+}
+
+int llm_tok_ready(void)     { return tok_blob && tok_n > 0 && mrg_n > 0; }
+uint32_t llm_tok_count(void)   { return tok_n; }
+uint32_t llm_merge_count(void) { return mrg_n; }
+
+int llm_decode(int32_t id, char *out, int max) {
+    if (id < 0 || (uint32_t)id >= tok_n || !tok_blob) return -1;
+    const char *s = tok_blob + tok_off[id];
+    int o = 0;
+    /* walk the mapped codepoints back to the bytes they stand for */
+    for (int i = 0; s[i];) {
+        uint16_t cp;
+        if ((uint8_t)s[i] < 0x80) { cp = (uint8_t)s[i]; i += 1; }
+        else if (((uint8_t)s[i] & 0xE0) == 0xC0 && s[i + 1]) {
+            cp = (uint16_t)(((s[i] & 0x1F) << 6) | (s[i + 1] & 0x3F));
+            i += 2;
+        } else { i += 1; continue; }
+        int16_t b = cp < 512 ? uni_to_byte[cp] : -1;
+        if (b >= 0 && o < max - 1) out[o++] = (char)b;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/*
+ * Split like the reference pre-tokenizer: contractions, runs of letters,
+ * short runs of digits, punctuation, and whitespace each become their own
+ * piece.  Letter and digit classes are approximated over ASCII, with any
+ * byte above 0x7F treated as a letter, which is right for the Latin text
+ * these articles are made of.
+ */
+static int is_letter(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80;
+}
+static int is_digit_c(uint8_t c) { return c >= '0' && c <= '9'; }
+static int is_space_c(uint8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+/* how many bytes of text[] belong to the next piece */
+static int next_piece(const char *t, int len) {
+    if (len <= 0) return 0;
+    uint8_t c0 = (uint8_t)t[0];
+
+    /* 's 't 're 've 'm 'll 'd */
+    if (c0 == '\'' && len > 1) {
+        uint8_t a = (uint8_t)t[1] | 0x20;
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+        if (len > 2) {
+            uint8_t b = (uint8_t)t[2] | 0x20;
+            if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
+                (a == 'l' && b == 'l')) return 3;
+        }
+    }
+
+    int i = 0;
+    /* an optional single leading space joins the following word */
+    if (c0 == ' ' && len > 1 &&
+        (is_letter((uint8_t)t[1]) || is_digit_c((uint8_t)t[1]))) i = 1;
+
+    if (i < len && is_letter((uint8_t)t[i])) {
+        while (i < len && is_letter((uint8_t)t[i])) i++;
+        return i;
+    }
+    if (i < len && is_digit_c((uint8_t)t[i])) {
+        int d = 0;
+        while (i < len && is_digit_c((uint8_t)t[i]) && d < 3) { i++; d++; }
+        return i;
+    }
+
+    i = 0;
+    if (c0 == ' ' && len > 1 && !is_space_c((uint8_t)t[1])) i = 1;
+    if (i < len && !is_space_c((uint8_t)t[i]) &&
+        !is_letter((uint8_t)t[i]) && !is_digit_c((uint8_t)t[i])) {
+        while (i < len && !is_space_c((uint8_t)t[i]) &&
+               !is_letter((uint8_t)t[i]) && !is_digit_c((uint8_t)t[i])) i++;
+        return i;
+    }
+
+    i = 0;
+    while (i < len && is_space_c((uint8_t)t[i])) i++;
+    return i > 0 ? i : 1;
+}
+
+#define PIECE_MAX 512
+
+int llm_encode(const char *text, int32_t *out, int max_out) {
+    if (!llm_tok_ready()) return -1;
+
+    int n_out = 0;
+    int len = 0;
+    while (text[len]) len++;
+
+    int pos = 0;
+    while (pos < len) {
+        int plen = next_piece(text + pos, len - pos);
+        if (plen <= 0) break;
+
+        /* map the piece's bytes onto their printable codepoints, and
+         * seed BPE with one token per mapped character */
+        static int32_t sym[PIECE_MAX];
+        static char    cbuf[PIECE_MAX * 2];
+        int nsym = 0, cused = 0;
+
+        for (int i = 0; i < plen && nsym < PIECE_MAX; i++) {
+            char enc[4];
+            int n = uni_to_utf8(byte_to_uni[(uint8_t)text[pos + i]], enc);
+            if (cused + n + 1 > (int)sizeof(cbuf)) break;
+            int id = tok_find(enc, n);
+            for (int k = 0; k < n; k++) cbuf[cused + k] = enc[k];
+            cused += n;
+            sym[nsym++] = id;             /* -1 if the byte has no token */
+        }
+        pos += plen;
+
+        /* repeatedly fuse the neighbouring pair with the lowest rank */
+        for (;;) {
+            uint32_t best = 0xFFFFFFFFu;
+            int at = -1;
+            for (int i = 0; i + 1 < nsym; i++) {
+                if (sym[i] < 0 || sym[i + 1] < 0) continue;
+                uint32_t r = mrg_get((uint32_t)sym[i], (uint32_t)sym[i + 1]);
+                if (r < best) { best = r; at = i; }
+            }
+            if (at < 0) break;
+
+            /* the merged text has to exist as a token to fuse into */
+            char joined[PIECE_MAX * 2];
+            int jl = 0;
+            const char *a = tok_blob + tok_off[sym[at]];
+            const char *b = tok_blob + tok_off[sym[at + 1]];
+            while (*a && jl < (int)sizeof(joined) - 1) joined[jl++] = *a++;
+            while (*b && jl < (int)sizeof(joined) - 1) joined[jl++] = *b++;
+            joined[jl] = '\0';
+            int merged = tok_find(joined, jl);
+            if (merged < 0) break;
+
+            sym[at] = merged;
+            for (int i = at + 1; i + 1 < nsym; i++) sym[i] = sym[i + 1];
+            nsym--;
+        }
+
+        for (int i = 0; i < nsym; i++) {
+            if (n_out >= max_out) return n_out;
+            if (sym[i] >= 0) out[n_out++] = sym[i];
+        }
+    }
+    return n_out;
 }
