@@ -10,6 +10,7 @@
 #include "ac97.h"
 #include "netstack.h"
 #include "igpu.h"
+#include "llm.h"
 #include "desktop.h"
 #include "boot_animation.h"
 
@@ -205,6 +206,31 @@ static void irq0_handler(interrupt_frame_t *f) {
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/*
+ * Bring up the x87/SSE unit.  The kernel proper is compiled -mno-sse and
+ * never touches these registers; only the inference translation unit
+ * does, and it runs with interrupts enabled but never inside one, so no
+ * ISR can clobber XMM state.
+ *
+ *   CR0.EM clear  - do not trap SSE as "no coprocessor"
+ *   CR0.MP set    - WAIT/FWAIT honours TS
+ *   CR4.OSFXSR    - FXSAVE/FXRSTOR available, SSE instructions legal
+ *   CR4.OSXMMEXCPT- unmasked SSE exceptions raise #XF rather than #UD
+ */
+static void fpu_init(void) {
+    uint64_t cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);          /* EM */
+    cr0 |=  (1ULL << 1);          /* MP */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+
+    __asm__ volatile("fninit");
+}
+
 static void pit_init(uint16_t cs) {
     idt_set_gate(0x20, irq0_handler, cs);
 
@@ -363,6 +389,9 @@ void kmain(void) {
     uint16_t cs;
     __asm__ volatile("mov %%cs, %0" : "=r"(cs));
 
+    /* Floating point, before anything that might use it */
+    fpu_init();
+
     /* Build IDT: remap PIC, fill all 256 gates with no-op stubs */
     idt_init(cs);
 
@@ -451,6 +480,20 @@ void kmain(void) {
                 total_bytes += e->length;
         }
         system_total_memory_mb = total_bytes / (1024 * 1024);
+
+        /* The model is far larger than any static buffer, so give the
+         * inference arena the biggest usable region Limine reports. */
+        if (hhdm_request.response != NULL) {
+            uint64_t best_base = 0, best_len = 0;
+            for (uint64_t i = 0; i < memmap_request.response->entry_count; i++) {
+                struct limine_memmap_entry *e = memmap_request.response->entries[i];
+                if (e->type != LIMINE_MEMMAP_USABLE) continue;
+                if (e->length > best_len) { best_len = e->length; best_base = e->base; }
+            }
+            if (best_len > (16ull << 20))
+                llm_arena_init((void *)(uintptr_t)(hhdm_request.response->offset
+                                                   + best_base), best_len);
+        }
     }
 
     /* Unmask hardware interrupts */

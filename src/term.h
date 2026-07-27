@@ -471,6 +471,7 @@ static void term_cmd_help(void) {
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
+    term_print("  llm load <model.gguf> | info | fpu\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -500,6 +501,11 @@ static int term_split(char *buf, char **argv, int max) {
         while (*p && *p != ' ') p++;
     }
     return argc;
+}
+
+static int llm_read_thunk(void *ctx, uint64_t off, void *buf,
+                          uint32_t len, uint32_t *got) {
+    return fs_pread((fs_file_t *)ctx, off, buf, len, got);
 }
 
 static void term_exec(char *cmdline);
@@ -885,6 +891,81 @@ static void term_exec(char *cmdline) {
             term_putc((c >= 0x20 && c < 0x7F) || c == '\n' ? c : '.');
         }
         if (term_cx > 0) term_putc('\n');
+    } else if (str_eq(cmd, "llm")) {
+        static fs_file_t llm_file;
+        if (argc >= 2 && str_eq(argv[1], "fpu")) {
+            uint32_t v = 0;
+            int ok = llm_fpu_selftest(&v);
+            term_print("  sum 1/n^2 to 20000 = ");
+            /* the integer-only side never touches a float, so the value
+             * arrives pre-scaled and is split by division */
+            uint32_t whole = v / 10000, frac = v % 10000;
+            char nb[16];
+            uint_to_str(whole, nb); term_print(nb);
+            term_putc('.');
+            if (frac < 1000) term_putc('0');
+            if (frac < 100) term_putc('0');
+            if (frac < 10) term_putc('0');
+            uint_to_str(frac, nb); term_print(nb);
+            term_print_c(ok == 0 ? "   FPU OK (expected 1.6449)\n"
+                                 : "   WRONG - SSE is not working\n",
+                         ok == 0 ? 4 : 2);
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "load")) {
+            if (argc < 3) { term_print_c("usage: llm load <model.gguf>\n", 2); return; }
+            char abs[256];
+            term_resolve(argv[2], abs);
+            if (fs_open(abs, &llm_file) != 0) {
+                term_print_c("llm: cannot open ", 2);
+                term_print_c(abs, 2);
+                term_putc('\n');
+                return;
+            }
+            const char *lerr = "?";
+            term_print_c("parsing GGUF...\n", 3);
+            if (llm_load(llm_read_thunk, &llm_file, llm_file.size, &lerr) != 0) {
+                term_print_c("llm: ", 2);
+                term_print_c(lerr, 2);
+                term_putc('\n');
+                return;
+            }
+        }
+        const llm_info_t *mi = llm_get_info();
+        if (!mi->loaded) {
+            term_print_c("no model loaded (llm load <file.gguf>)\n", 2);
+            return;
+        }
+        char nb[24];
+        term_print("  arch       "); term_print_c(mi->arch, 1);
+        term_print("  ("); term_print(mi->name); term_print(")\n");
+        term_print("  layers     "); uint_to_str(mi->n_layer, nb); term_print(nb);
+        term_print("   embd "); uint_to_str(mi->n_embd, nb); term_print(nb);
+        term_print("   ff "); uint_to_str(mi->n_ff, nb); term_print(nb); term_putc('\n');
+        term_print("  heads      "); uint_to_str(mi->n_head, nb); term_print(nb);
+        term_print(" q / "); uint_to_str(mi->n_head_kv, nb); term_print(nb);
+        term_print(" kv   vocab "); uint_to_str(mi->n_vocab, nb); term_print(nb);
+        term_putc('\n');
+        term_print("  tensors    "); uint_to_str((uint32_t)mi->n_tensors, nb);
+        term_print(nb); term_print("   weights ");
+        uint_to_str((uint32_t)(mi->weight_bytes / (1024 * 1024)), nb);
+        term_print_c(nb, 1); term_print(" MB of ");
+        uint_to_str((uint32_t)(mi->file_size / (1024 * 1024)), nb);
+        term_print(nb); term_print(" MB file\n");
+        term_print("  quant      ");
+        for (uint32_t t = 0; t < 32; t++) {
+            if (!mi->quant_counts[t]) continue;
+            term_print(llm_quant_name(t));
+            term_putc('*');
+            uint_to_str(mi->quant_counts[t], nb);
+            term_print(nb);
+            term_putc(' ');
+        }
+        term_putc('\n');
+        term_print("  arena      ");
+        uint_to_str((uint32_t)(llm_arena_total() / (1024 * 1024)), nb);
+        term_print_c(nb, 4);
+        term_print(" MB free for weights\n");
     } else if (str_eq(cmd, "zim")) {
         if (argc < 2) {
             term_print_c("usage: zim open <file> | info | main | find <path>"
