@@ -93,3 +93,18 @@ int          llm_token_id(const char *piece);   /* -1 if absent */
 int          llm_fpu_selftest(uint32_t *scaled_by_10000);
 
 #endif /* LLM_H */
+
+/* ---- inference ---- */
+#define LLM_CTX_MAX 1024
+
+int      llm_weights_loaded(void);
+/* Pull every tensor into the arena; slow, once per boot. */
+int      llm_load_weights(const char **err);
+/* Run one token through the model at position pos. */
+int      llm_eval(int32_t token, int pos);
+/* Greedy pick from the last eval's logits. */
+int      llm_argmax(void);
+/* A logit, scaled by 1000, for inspection from the integer-only side. */
+int      llm_logit(int32_t token, int32_t *scaled_by_1000);
+/* Intermediate values for verification, also scaled by 1e6. */
+int      llm_probe(const char *what, int layer, int n, int32_t *out);
