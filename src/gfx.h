@@ -315,6 +315,15 @@ static void date_string(char *out /* >= 16 */) {
     out[p] = '\0';
 }
 
+/*
+ * Set by anything that writes to the panel behind the compositor's back
+ * — the iGPU blit test is the only one today.  The flip skips rows that
+ * match the previously presented frame, and a direct write leaves it
+ * believing a row is still on screen when something else has overwritten
+ * it, so such a writer has to say so.
+ */
+static int gfx_force_full_flip = 0;
+
 /* ===== TINY PSEUDO-RNG (for matrix rain etc.) ===== */
 
 static uint32_t gfx_rng_state = 0x53525431u;

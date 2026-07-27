@@ -17,18 +17,38 @@
 #include "comicneue_ttf.h"
 
 /* ----- tunables ----- */
-#define TTF_SS        4        /* supersample factor per axis (4x4 = 16 samples) */
+/*
+ * 8x8 = 64 samples per pixel, so coverage lands on one of 65 levels
+ * rather than 17.  That would be far too slow to do per frame, but every
+ * glyph is rasterized once per size and then kept as a coverage mask,
+ * so the cost is paid once and never again.
+ */
+#define TTF_SS        8        /* supersample factor per axis (8x8 = 64 samples) */
 #define TTF_MAXPTS    2048     /* max points per simple glyph                    */
 #define TTF_MAXEDGES  4096     /* max device-space edges per glyph               */
 #define TTF_COVMAX    256      /* max glyph box side (pixels) for coverage buffer*/
 #define TTF_MAXCROSS  128      /* max edge crossings per scanline                */
 #define TTF_FLATTEN   8        /* line segments per quadratic Bezier             */
 
-/* ----- high-density rendering: character padding and line-height ----- */
-#define TTF_HPAD_NUM   1       /* horizontal inter-char padding: HPAD_NUM/HPAD_DEN of advance */
+/*
+ * Letter tracking, as a fraction of each advance.
+ *
+ * This used to be 1/8, inflating every advance 12.5% past the metrics
+ * the designer chose.  Words came apart into strings of separate
+ * letters, which costs more legibility than the extra air buys back —
+ * word shape is most of what makes text readable at a glance.  Zero
+ * means "use the font's own spacing".
+ */
+#define TTF_HPAD_NUM   0
 #define TTF_HPAD_DEN   8
 #define TTF_LINE_SCALE_NUM  5  /* line-height multiplier: 5/4 = 1.25x             */
 #define TTF_LINE_SCALE_DEN  4
+
+/* Cached glyph masks: 95 printable ASCII across the ~13 sizes the UI
+ * uses, at a few hundred bytes each. */
+#define TTF_CACHE_SLOTS  2048
+#define TTF_CACHE_BYTES  (1536 * 1024)
+#define TTF_CACHE_MAXPX  64     /* do not cache anything larger than this */
 
 /* ----- font blob + big-endian readers ----- */
 static const uint8_t *FT;
@@ -64,6 +84,55 @@ static int32_t  C_x[TTF_MAXCROSS];
 static int      C_d[TTF_MAXCROSS];
 
 static uint8_t  COV[TTF_COVMAX * TTF_COVMAX];
+
+/* box the last rasterize produced, in whole pixels relative to the
+ * canonical origin (pen on the baseline) */
+static int      COV_w, COV_h, COV_ox, COV_oy;
+
+/*
+ * Coverage curve — the cheap stand-in for hinting.
+ *
+ * A lowercase stem in this face is 63/1000 em, which at 13 px is 0.82 of
+ * a pixel: it physically cannot fill one, so the darkest pixel in an 'l'
+ * comes out mid-grey and the whole UI reads as smudged.  A real hinting
+ * engine would snap the stem onto the pixel grid so it lands solid.
+ * Lifting partial coverage is the approximation of that, and it is what
+ * makes small text look like ink instead of a smear.
+ *
+ * The curve is the midpoint between leaving coverage alone and the
+ * aggressive a(2-a) lift, which darkens the mid-tones where stems live
+ * without crushing the soft edges of curves into hard steps.
+ */
+static uint8_t  COVCURVE[256];
+
+static void build_cov_curve(void) {
+    for (int a = 0; a < 256; a++) {
+        int inv = 255 - a;
+        int strong = 255 - (inv * inv) / 255;
+        COVCURVE[a] = (uint8_t)((a + strong) / 2);
+    }
+}
+
+/*
+ * Glyph mask cache.
+ *
+ * Every string in the UI is re-rasterized on every frame — outline
+ * decode, Bezier flattening and a full scanline fill per character, tens
+ * of thousands of edge tests for a single 13 px glyph.  Since glyphs are
+ * now placed on whole pixels, the coverage mask for a given glyph at a
+ * given size is always identical, so it can be computed once and then
+ * simply blitted.  That is what pays for the finer supersampling above.
+ */
+typedef struct {
+    uint32_t key;        /* (gid << 8) | size, never 0 for a live slot */
+    int16_t  ox, oy;     /* mask corner relative to pen / baseline, px */
+    uint16_t w, h;
+    uint32_t off;        /* into G_pool */
+} glyph_slot_t;
+
+static glyph_slot_t G_slot[TTF_CACHE_SLOTS];
+static uint8_t      G_pool[TTF_CACHE_BYTES];
+static uint32_t     G_pool_used = 0;
 
 /* ----- transform: font units -> subpixel device coordinates ----- */
 static inline int32_t TX(int fu) { return PENX + (int32_t)(((int64_t)fu * MULN) / F_upem); }
@@ -119,6 +188,7 @@ static int ttf_init(void) {
     }
     if (!T_cmap4) return 0;
 
+    build_cov_curve();
     F_ready = 1;
     return 1;
 }
@@ -308,9 +378,12 @@ static inline uint32_t blend(uint32_t fg, uint32_t bg, uint32_t a) {
     return (r << 16) | (g << 8) | b;
 }
 
-/* ----- rasterize current edge list into buf ----- */
-static void rasterize_glyph(uint32_t *buf, int bw, int bh, uint32_t color) {
-    if (nedges == 0) return;
+/* ----- rasterize the current edge list into COV -----
+ * Returns 1 if anything was covered, and leaves the box in
+ * COV_w/COV_h/COV_ox/COV_oy. */
+static int rasterize_glyph(void) {
+    COV_w = COV_h = 0;
+    if (nedges == 0) return 0;
 
     int32_t minx = 0x7FFFFFFF, maxx = -0x7FFFFFFF;
     int32_t miny = 0x7FFFFFFF, maxy = -0x7FFFFFFF;
@@ -331,7 +404,7 @@ static void rasterize_glyph(uint32_t *buf, int bw, int bh, uint32_t color) {
     int boxMinPy = floordiv(miny, TTF_SS), boxMaxPy = floordiv(maxy, TTF_SS);
     int boxW = boxMaxPx - boxMinPx + 1;
     int boxH = boxMaxPy - boxMinPy + 1;
-    if (boxW <= 0 || boxH <= 0) return;
+    if (boxW <= 0 || boxH <= 0) return 0;
     if (boxW > TTF_COVMAX) boxW = TTF_COVMAX;
     if (boxH > TTF_COVMAX) boxH = TTF_COVMAX;
 
@@ -375,19 +448,77 @@ static void rasterize_glyph(uint32_t *buf, int bw, int bh, uint32_t color) {
         }
     }
 
-    /* blend coverage (0..SS*SS) into the framebuffer with smooth AA */
+    /* Normalise the sample counts to 0..255 in place, then apply the
+     * coverage curve, so a cached mask is ready to blend as it stands. */
     int maxc = TTF_SS * TTF_SS;
-    for (int py = 0; py < boxH; py++) {
-        for (int px = 0; px < boxW; px++) {
-            int c = COV[py * boxW + px];
-            if (!c) continue;
-            if (c > maxc) c = maxc;
-            uint32_t a = (uint32_t)c * 255 / (uint32_t)maxc;
-            int X = boxMinPx + px, Y = boxMinPy + py;
-            if (X < 0 || Y < 0 || X >= bw || Y >= bh) continue;
-            buf[Y * bw + X] = blend(color, buf[Y * bw + X], a);
+    for (int k = 0; k < boxW * boxH; k++) {
+        int c = COV[k];
+        if (c > maxc) c = maxc;
+        COV[k] = COVCURVE[(uint32_t)c * 255 / (uint32_t)maxc];
+    }
+
+    COV_w = boxW; COV_h = boxH;
+    COV_ox = boxMinPx; COV_oy = boxMinPy;
+    return 1;
+}
+
+/* ----- blend a coverage mask into the framebuffer ----- */
+static void blit_mask(uint32_t *buf, int bw, int bh,
+                      const uint8_t *mask, int mw, int mh,
+                      int x0, int y0, uint32_t color) {
+    for (int py = 0; py < mh; py++) {
+        int Y = y0 + py;
+        if (Y < 0 || Y >= bh) continue;
+        const uint8_t *row = mask + py * mw;
+        uint32_t *dst = buf + Y * bw;
+        for (int px = 0; px < mw; px++) {
+            uint32_t a = row[px];
+            if (!a) continue;
+            int X = x0 + px;
+            if (X < 0 || X >= bw) continue;
+            dst[X] = (a == 255) ? color : blend(color, dst[X], a);
         }
     }
+}
+
+/* ----- cache lookup, rasterizing on a miss ----- */
+static const glyph_slot_t *glyph_mask(int gid, int size) {
+    /* Clear first: the caller falls back to whatever this leaves in COV,
+     * and must never be handed a mask left over from a previous glyph. */
+    COV_w = COV_h = 0;
+
+    uint32_t key = ((uint32_t)gid << 8) | (uint32_t)(size & 0xFF);
+    uint32_t h = (key * 2654435761u) % TTF_CACHE_SLOTS;
+
+    for (uint32_t probe = 0; probe < 64; probe++) {
+        glyph_slot_t *s = &G_slot[(h + probe) % TTF_CACHE_SLOTS];
+        if (s->key == key) return s->w ? s : 0;
+        if (s->key != 0) continue;              /* occupied by someone else */
+
+        /* miss: rasterize once, at the canonical origin */
+        PENX = 0;
+        BASEY = 0;
+        nedges = 0;
+        decode_glyph(gid, 0, 0, 0);
+        if (!rasterize_glyph()) {               /* blank, e.g. a space */
+            s->key = key; s->w = s->h = 0;
+            return 0;
+        }
+        uint32_t need = (uint32_t)COV_w * (uint32_t)COV_h;
+        if (COV_w > TTF_CACHE_MAXPX || COV_h > TTF_CACHE_MAXPX ||
+            G_pool_used + need > TTF_CACHE_BYTES)
+            return 0;                           /* too big, or pool full */
+
+        uint8_t *dst = G_pool + G_pool_used;
+        for (uint32_t k = 0; k < need; k++) dst[k] = COV[k];
+        s->key = key;
+        s->ox = (int16_t)COV_ox; s->oy = (int16_t)COV_oy;
+        s->w  = (uint16_t)COV_w; s->h  = (uint16_t)COV_h;
+        s->off = G_pool_used;
+        G_pool_used += need;
+        return s;
+    }
+    return 0;
 }
 
 /* ----- public: draw a string with its top-left at (topX,topY) ----- */
@@ -396,17 +527,40 @@ static void ttf_draw_string(uint32_t *buf, int bw, int bh,
                             uint32_t color, int size) {
     if (!F_ready && !ttf_init()) return;
 
-    MULN  = (int64_t)size * TTF_SS;
-    PENX  = topX * TTF_SS;
-    BASEY = topY * TTF_SS + (int32_t)(((int64_t)F_ascent * MULN) / F_upem);
+    MULN = (int64_t)size * TTF_SS;
+
+    /*
+     * Grid-fit the baseline.  Left fractional it lands on an exact half
+     * pixel at 13 and 14 px — the two sizes most of this UI is set in —
+     * which splits the flat bottom of every letter across two rows and
+     * puts a grey fringe under the whole interface.
+     */
+    int base_px = topY + (int)(((int64_t)F_ascent * size + F_upem / 2) / F_upem);
+
+    int64_t pen = 0;          /* exact subpixel pen, so spacing never drifts */
 
     for (; *s; s++) {
         int gid = glyph_index((uint8_t)*s);
-        nedges = 0;
-        decode_glyph(gid, 0, 0, 0);
-        rasterize_glyph(buf, bw, bh, color);
+
+        /*
+         * The pen advances exactly, but each glyph is *placed* on a whole
+         * pixel.  Left on a quarter-pixel phase, the same letter picks up
+         * a different number of sample columns depending on where in the
+         * word it falls, so identical letters render at visibly different
+         * weights — and no two placements of a glyph can share a mask.
+         */
+        int pen_px = topX + (int)((pen + TTF_SS / 2) / TTF_SS);
+
+        const glyph_slot_t *g = glyph_mask(gid, size);
+        if (g)
+            blit_mask(buf, bw, bh, G_pool + g->off, g->w, g->h,
+                      pen_px + g->ox, base_px + g->oy, color);
+        else if (COV_w)       /* did not fit the cache; mask is still in COV */
+            blit_mask(buf, bw, bh, COV, COV_w, COV_h,
+                      pen_px + COV_ox, base_px + COV_oy, color);
+
         int32_t adv = (int32_t)(((int64_t)advance_width(gid) * MULN) / F_upem);
-        PENX += adv + adv * TTF_HPAD_NUM / TTF_HPAD_DEN;
+        pen += adv + adv * TTF_HPAD_NUM / TTF_HPAD_DEN;
     }
 }
 
@@ -426,7 +580,9 @@ static int ttf_text_width(const char *s, int size) {
         int32_t adv = (int32_t)(((int64_t)advance_width(gid) * muln) / F_upem);
         pen += adv + adv * TTF_HPAD_NUM / TTF_HPAD_DEN;
     }
-    return pen / TTF_SS;
+    /* Round to match where ttf_draw_string actually puts the pen, so
+     * centring and hit boxes agree with the glyphs on screen. */
+    return (pen + TTF_SS / 2) / TTF_SS;
 }
 
 #endif /* TTF_H */

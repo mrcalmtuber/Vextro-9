@@ -32,6 +32,24 @@ static void *arena_alloc(uint64_t n) {
     return p;
 }
 
+/*
+ * The same, but sticky about failure.
+ *
+ * A request that does not fit is refused without advancing the head, so
+ * a *later*, smaller request can still succeed.  Checking only the last
+ * pointer of a run of allocations would therefore miss a hole in the
+ * middle and leave a null behind — which surfaces much later as a page
+ * fault mid-inference, and this kernel's fault handler halts forever.
+ * Better to notice here and say so.
+ */
+static int arena_failed = 0;
+
+static void *arena_need(uint64_t n) {
+    void *p = arena_alloc(n);
+    if (!p) arena_failed = 1;
+    return p;
+}
+
 /* ---- GGUF ---- */
 
 #define GGUF_MAGIC 0x46554747u      /* "GGUF" little-endian */
@@ -952,9 +970,25 @@ static int bind_tensor(wt_t *w, const char *name, const char **err) {
     return 0;
 }
 
-int llm_load_weights(const char **err) {
+/*
+ * Weight loading, handed out a chunk at a time.
+ *
+ * Reading ~370 MB off an emulated PIO disk takes the better part of a
+ * minute, and doing it in one call means the render loop does not run
+ * for that whole time: no cursor, no clock, nothing — which is
+ * indistinguishable from a hung machine.  Split the same work into
+ * begin/step so a caller can advance it from its frame loop and stay
+ * alive, exactly as evaluation already does.
+ */
+static uint64_t load_done = 0;
+static int      load_active = 0;
+
+static int llm_bind_all(const char **err);
+
+int llm_load_begin(const char **err) {
     if (!info.loaded) { *err = "no model loaded"; return -1; }
     weights_ok = 0;
+    load_active = 0;
 
     head_dim = (int)(info.n_embd / info.n_head);
     kv_dim   = (int)(info.n_head_kv * (uint32_t)head_dim);
@@ -965,19 +999,54 @@ int llm_load_weights(const char **err) {
     weights_blob = (uint8_t *)arena_alloc(weights_len + 64);
     if (!weights_blob) { *err = "arena too small for the weights"; return -1; }
 
-    uint64_t done = 0;
-    while (done < weights_len) {
+    load_done = 0;
+    load_active = 1;
+    return 0;
+}
+
+int llm_load_progress(void) {
+    if (!weights_len) return 0;
+    if (weights_ok) return 100;
+    return (int)(load_done * 100 / weights_len);
+}
+
+int llm_load_active(void) { return load_active; }
+
+/* One chunk per call: 1 when the model is fully resident, 0 for more to
+ * do, -1 on failure with *err set. */
+int llm_load_step(const char **err) {
+    if (!load_active) { *err = "no load in progress"; return -1; }
+
+    if (load_done < weights_len) {
         uint32_t chunk = 1u << 20;
-        if (done + chunk > weights_len) chunk = (uint32_t)(weights_len - done);
+        if (load_done + chunk > weights_len)
+            chunk = (uint32_t)(weights_len - load_done);
         uint32_t got = 0;
-        if (model_rd(model_ctx, data_start + done, weights_blob + done,
-                     chunk, &got) != 0 || got == 0) {
+        if (model_rd(model_ctx, data_start + load_done,
+                     weights_blob + load_done, chunk, &got) != 0 || got == 0) {
             *err = "read error while loading weights";
+            load_active = 0;
             return -1;
         }
-        done += got;
+        load_done += got;
+        if (load_done < weights_len) return 0;
     }
 
+    load_active = 0;
+    return llm_bind_all(err) == 0 ? 1 : -1;
+}
+
+int llm_load_weights(const char **err) {
+    if (llm_load_begin(err) != 0) return -1;
+    for (;;) {
+        int r = llm_load_step(err);
+        if (r < 0) return -1;
+        if (r == 1) return 0;
+    }
+}
+
+/* Resolve every tensor and carve out the activation buffers. */
+static int llm_bind_all(const char **err) {
     if (bind_tensor(&w_tok_embd, "token_embd.weight", err) != 0) return -1;
     if (bind_tensor(&w_out_norm, "output_norm.weight", err) != 0) return -1;
 
@@ -999,22 +1068,23 @@ int llm_load_weights(const char **err) {
     }
 
     uint32_t E = info.n_embd, F = info.n_ff;
-    a_x      = (float *)arena_alloc(E * 4);
-    a_xb     = (float *)arena_alloc(E * 4);
-    a_xb2    = (float *)arena_alloc(E * 4);
-    a_q      = (float *)arena_alloc(E * 4);
-    a_k      = (float *)arena_alloc((uint64_t)kv_dim * 4);
-    a_v      = (float *)arena_alloc((uint64_t)kv_dim * 4);
-    a_att    = (float *)arena_alloc((uint64_t)info.n_head * n_ctx * 4);
-    a_hb     = (float *)arena_alloc(F * 4);
-    a_hb2    = (float *)arena_alloc(F * 4);
-    a_logits = (float *)arena_alloc((uint64_t)info.n_vocab * 4);
-    kv_k = (float *)arena_alloc((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
-    kv_v = (float *)arena_alloc((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
-    p_embd = (float *)arena_alloc(E * 4);
-    p_xb0  = (float *)arena_alloc(E * 4);
-    p_q0   = (float *)arena_alloc(E * 4);
-    if (!p_q0) { *err = "arena too small for the KV cache"; return -1; }
+    arena_failed = 0;
+    a_x      = (float *)arena_need(E * 4);
+    a_xb     = (float *)arena_need(E * 4);
+    a_xb2    = (float *)arena_need(E * 4);
+    a_q      = (float *)arena_need(E * 4);
+    a_k      = (float *)arena_need((uint64_t)kv_dim * 4);
+    a_v      = (float *)arena_need((uint64_t)kv_dim * 4);
+    a_att    = (float *)arena_need((uint64_t)info.n_head * n_ctx * 4);
+    a_hb     = (float *)arena_need(F * 4);
+    a_hb2    = (float *)arena_need(F * 4);
+    a_logits = (float *)arena_need((uint64_t)info.n_vocab * 4);
+    kv_k = (float *)arena_need((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
+    kv_v = (float *)arena_need((uint64_t)info.n_layer * n_ctx * kv_dim * 4);
+    p_embd = (float *)arena_need(E * 4);
+    p_xb0  = (float *)arena_need(E * 4);
+    p_q0   = (float *)arena_need(E * 4);
+    if (arena_failed) { *err = "arena too small for the KV cache"; return -1; }
 
     weights_ok = 1;
     return 0;

@@ -1342,8 +1342,20 @@ static void wiki_submit(void) {
     if (wiki_busy) return;
     if (wiki_input_len == 0) return;
     if (!llm_weights_loaded()) {
-        wiki_log_add("\nModel not loaded.  Run 'llm load /qwen2.gguf' then"
-                     " 'llm weights' in the terminal.\n");
+        if (ai_busy()) {
+            char nb[8];
+            uint_to_str((uint32_t)ai_progress(), nb);
+            wiki_log_add("\nStill loading the model - ");
+            wiki_log_add(nb);
+            wiki_log_add("%.  Ask again in a moment.\n");
+        } else if (ai_state == AI_FAILED) {
+            wiki_log_add("\nThe model could not be loaded: ");
+            wiki_log_add(ai_err);
+            wiki_log_add("\n");
+        } else {
+            wiki_log_add("\nNo model on this volume.  Copy a Qwen2 GGUF to "
+                         AI_MODEL_PATH " and reboot.\n");
+        }
         return;
     }
 
@@ -1529,8 +1541,21 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
     ttf_draw_string(buf, (int)w, (int)h, cx + 16, cy + 10, "Wikipedia",
                     C_GOLD, 18);
     {
-        const char *sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
-                                                        : "no archive");
+        /* While the model streams in, say so where the subtitle goes —
+         * it is the one place someone waiting to ask a question looks. */
+        static char ai_sub[32];
+        const char *sub;
+        if (wiki_mode && ai_busy()) {
+            char nb[8];
+            uint_to_str((uint32_t)ai_progress(), nb);
+            str_copy(ai_sub, "loading the model ", sizeof(ai_sub));
+            str_append(ai_sub, nb, sizeof(ai_sub));
+            str_append(ai_sub, "%", sizeof(ai_sub));
+            sub = ai_sub;
+        } else {
+            sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
+                                                : "no archive");
+        }
         int tw = ttf_text_width(sub, 12);
         ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 52, cy + 16, sub,
                         C_TEXT_DIM, 12);

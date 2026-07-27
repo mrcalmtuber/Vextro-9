@@ -164,9 +164,18 @@ static volatile struct limine_memmap_request memmap_request = {
 __attribute__((used, section(".limine_reqs_end")))
 static volatile uint64_t end_marker[] = LIMINE_REQUESTS_END_MARKER;
 
-/* Software double-buffer (1024x768 = 786432 pixels) */
+/*
+ * Software double-buffer.  The bound is a build option because it costs
+ * static memory three times over — back buffer, previous frame, and the
+ * wallpaper cache — so a machine that only ever runs 1280x800 should not
+ * pay for a 2560x1600 panel it does not have.
+ */
+#ifndef BUF_MAX_W
 #define BUF_MAX_W 1920
+#endif
+#ifndef BUF_MAX_H
 #define BUF_MAX_H 1080
+#endif
 static uint32_t backbuf[BUF_MAX_W * BUF_MAX_H];
 
 #define COLOR_BLACK  0x000000u
@@ -294,11 +303,51 @@ static void draw_cursor(uint32_t bw, uint32_t bh) {
     }
 }
 
+/*
+ * Previously presented frame, so a row that did not change can be left
+ * alone.  Comparing two rows in RAM is far cheaper than writing one to
+ * the panel, and on a desktop that is mostly still, almost every row is
+ * unchanged.
+ */
+static uint32_t prevbuf[BUF_MAX_W * BUF_MAX_H];
+static int      prev_valid = 0;
+
+static int row_same(const uint32_t *a, const uint32_t *b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+/*
+ * Copy the back buffer to the panel.
+ *
+ * This writes straight into live scanout with nothing to synchronise
+ * against, so the host can sample a row that has already been updated
+ * next to one that has not — the seam that shows up as tearing.  There
+ * is no vblank to wait for here, but skipping unchanged rows shrinks
+ * that window to whatever actually moved, and when the screen is
+ * completely still it writes nothing at all.
+ */
 static void vga_flip(volatile uint32_t *vram,
                      uint32_t w, uint32_t h, uint32_t pitch_px) {
-    for (uint32_t row = 0; row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            vram[row * pitch_px + col] = backbuf[row * w + col];
+    if (gfx_force_full_flip) {          /* someone else wrote the panel */
+        gfx_force_full_flip = 0;
+        prev_valid = 0;
+    }
+
+    for (uint32_t row = 0; row < h; row++) {
+        const uint32_t *src = backbuf + row * w;
+        uint32_t       *cmp = prevbuf + row * w;
+
+        if (prev_valid && row_same(src, cmp, w)) continue;
+
+        volatile uint32_t *dst = vram + row * pitch_px;
+        for (uint32_t col = 0; col < w; col++) {
+            dst[col] = src[col];
+            cmp[col] = src[col];
+        }
+    }
+    prev_valid = 1;
 }
 
 /* HAL initialization: probe PS/2 controller safely */
@@ -479,6 +528,11 @@ void kmain(void) {
     /* App store: load the shipped catalog and the installed-app registry
      * so the dock and the Apps menu already know about installed apps */
     store_init();
+
+    /* If a model is sitting on the volume, start pulling it in.  The
+     * work itself happens in the render loop, so this only opens the
+     * file — the desktop comes up while the weights are still arriving. */
+    ai_autoload_start();
 
     /* Restore the master keycode saved on a previous boot */
     {

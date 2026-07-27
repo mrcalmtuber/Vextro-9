@@ -97,8 +97,54 @@ static int exf_read_sec(uint64_t lba, uint32_t count, void *buf) {
     return ata_read(exf_vol.part_lba + lba, count, buf);
 }
 
+/*
+ * Read-ahead window.
+ *
+ * Some workloads are made almost entirely of tiny reads: parsing a
+ * language model's metadata walks a few hundred thousand strings of a
+ * handful of bytes each, marching forward through several megabytes.
+ * Served a sector at a time that is one command to the drive per 512
+ * bytes, and on emulated PIO the per-command cost dominates completely.
+ *
+ * Fetching a window instead turns that into one command per 16 KB.  It
+ * is read-ahead rather than a cache: the win comes from the sectors
+ * nobody has asked for yet, not from re-reading the one that was.
+ */
+#define EXF_RA_SECTORS 32
+
+static uint8_t  exf_ra[EXF_RA_SECTORS * EXF_SECTOR];
+static uint64_t exf_ra_lba = 0;
+static uint32_t exf_ra_count = 0;      /* 0 = nothing valid */
+
 static int exf_write_sec(uint64_t lba, uint32_t count, const void *buf) {
+    exf_ra_count = 0;            /* the device no longer matches the window */
     return ata_write(exf_vol.part_lba + lba, count, buf);
+}
+
+/* One sector, through the window, copied into `out`. */
+static int exf_read_sec1(uint64_t lba, uint8_t *out) {
+    if (!(exf_ra_count && lba >= exf_ra_lba &&
+          lba < exf_ra_lba + exf_ra_count)) {
+        uint32_t want = EXF_RA_SECTORS;
+        if (exf_vol.total_sectors && lba + want > exf_vol.total_sectors) {
+            want = (uint32_t)(exf_vol.total_sectors - lba);
+            if (want == 0) want = 1;
+        }
+        if (exf_read_sec(lba, want, exf_ra) != 0) {
+            /* the window may run past something the drive will not
+             * serve; the single sector asked for still has to work */
+            if (exf_read_sec(lba, 1, exf_ra) != 0) {
+                exf_ra_count = 0;
+                return -1;
+            }
+            want = 1;
+        }
+        exf_ra_lba   = lba;
+        exf_ra_count = want;
+    }
+    const uint8_t *src = exf_ra + (lba - exf_ra_lba) * EXF_SECTOR;
+    for (int i = 0; i < EXF_SECTOR; i++) out[i] = src[i];
+    return 0;
 }
 
 static uint16_t exf_rd16(const uint8_t *p) {
@@ -128,21 +174,76 @@ static uint64_t exf_cluster_lba(uint32_t clus) {
 
 /* ---- FAT ---- */
 
+/*
+ * One cached FAT sector.
+ *
+ * A cluster chain is walked one entry at a time, and 128 consecutive
+ * entries share a 512-byte sector — so fetching the FAT from the device
+ * on every step turns a sequential walk into one disk transaction per
+ * cluster.  Holding on to the last sector read collapses that to one per
+ * 128 clusters.  For a 400 MB file that is the difference between a read
+ * that finishes and one that looks like the machine has died.
+ *
+ * This deliberately does not share exf_secbuf: the callers of that
+ * buffer interleave with chain walks and would evict the cache on every
+ * step, which is the same as having no cache at all.
+ */
+static uint8_t  exf_fatbuf[EXF_SECTOR];
+static uint64_t exf_fatbuf_lba = 0;
+static int      exf_fatbuf_valid = 0;
+
+/*
+ * Where the last chain walk finished.
+ *
+ * exf_read_range is handed an absolute offset rather than a position, so
+ * by itself it must start from the file's first cluster every time — and
+ * reading a large file in chunks costs O(n^2) FAT steps.  Remembering
+ * the end of the previous walk lets the overwhelmingly common case, the
+ * next read continuing where the last one stopped, resume instead.
+ *
+ * Keyed by first cluster, which is never 0 for a real file, so 0 doubles
+ * as "no cursor".
+ */
+static uint32_t exf_walk_first = 0;
+static uint64_t exf_walk_index = 0;
+static uint32_t exf_walk_clus  = 0;
+
+static void exf_fat_forget(void) {
+    exf_fatbuf_valid = 0;
+    exf_ra_count     = 0;
+    exf_walk_first   = 0;
+}
+
+static int exf_fat_load(uint64_t lba) {
+    if (exf_fatbuf_valid && exf_fatbuf_lba == lba) return 0;
+    if (exf_read_sec(lba, 1, exf_fatbuf) != 0) {
+        exf_fatbuf_valid = 0;
+        return -1;
+    }
+    exf_fatbuf_lba   = lba;
+    exf_fatbuf_valid = 1;
+    return 0;
+}
+
 static uint32_t exf_fat_get(uint32_t clus) {
     if (clus < 2 || clus >= exf_vol.cluster_count + 2) return EXF_EOC;
     uint64_t byte = (uint64_t)clus * 4;
     uint64_t lba = exf_vol.fat_offset + byte / EXF_SECTOR;
-    if (exf_read_sec(lba, 1, exf_secbuf) != 0) return EXF_EOC;
-    return exf_rd32(exf_secbuf + (byte % EXF_SECTOR));
+    if (exf_fat_load(lba) != 0) return EXF_EOC;
+    return exf_rd32(exf_fatbuf + (byte % EXF_SECTOR));
 }
 
 static int exf_fat_set(uint32_t clus, uint32_t val) {
     if (clus < 2 || clus >= exf_vol.cluster_count + 2) return -1;
     uint64_t byte = (uint64_t)clus * 4;
     uint64_t lba = exf_vol.fat_offset + byte / EXF_SECTOR;
-    if (exf_read_sec(lba, 1, exf_secbuf) != 0) return -1;
-    exf_wr32(exf_secbuf + (byte % EXF_SECTOR), val);
-    return exf_write_sec(lba, 1, exf_secbuf);
+    if (exf_fat_load(lba) != 0) return -1;
+    exf_wr32(exf_fatbuf + (byte % EXF_SECTOR), val);
+    /* The cached sector still matches the device after this write, so it
+     * stays valid — but any chain it described may have just changed
+     * shape, which the read cursor must not be allowed to believe. */
+    exf_walk_first = 0;
+    return exf_write_sec(lba, 1, exf_fatbuf);
 }
 
 /* Cluster that follows `clus` in a file's allocation. */
@@ -161,7 +262,7 @@ static int exf_bitmap_test(uint32_t clus, int *out) {
     uint64_t byte = idx / 8;
     if (byte >= exf_vol.bitmap_bytes) return -1;
     uint64_t lba = exf_cluster_lba(exf_vol.bitmap_cluster) + byte / EXF_SECTOR;
-    if (exf_read_sec(lba, 1, exf_secbuf) != 0) return -1;
+    if (exf_read_sec1(lba, exf_secbuf) != 0) return -1;
     *out = (exf_secbuf[byte % EXF_SECTOR] >> (idx & 7)) & 1;
     return 0;
 }
@@ -441,10 +542,22 @@ static int exf_read_range(const exf_dirent_t *f, uint64_t offset,
     if (f->contiguous) {
         clus += (uint32_t)skip_clusters;
     } else {
-        for (uint64_t i = 0; i < skip_clusters; i++) {
+        /* Resume the previous walk of this chain when this read starts at
+         * or beyond where that one ended — which is what sequential
+         * reading always does. */
+        uint64_t i = 0;
+        if (exf_walk_first == f->first_clus && exf_walk_clus >= 2 &&
+            exf_walk_index <= skip_clusters) {
+            i    = exf_walk_index;
+            clus = exf_walk_clus;
+        }
+        for (; i < skip_clusters; i++) {
             clus = exf_fat_get(clus);
             if (clus < 2 || clus >= EXF_EOC) { exf_errstr = "short chain"; return -1; }
         }
+        exf_walk_first = f->first_clus;
+        exf_walk_index = skip_clusters;
+        exf_walk_clus  = clus;
     }
 
     while (len > 0) {
@@ -471,7 +584,7 @@ static int exf_read_range(const exf_dirent_t *f, uint64_t offset,
                 continue;
             }
 
-            if (exf_read_sec(lba, 1, exf_secbuf) != 0) {
+            if (exf_read_sec1(lba, exf_secbuf) != 0) {
                 exf_errstr = "read error";
                 return -1;
             }
@@ -902,6 +1015,7 @@ static int exfat_try(uint64_t lba) {
     uint8_t vbr[EXF_SECTOR];
     exf_vol.part_lba = lba;
     exf_vol.mounted = 0;
+    exf_fat_forget();          /* nothing cached describes this volume yet */
     if (ata_read(lba, 1, vbr) != 0) return 0;
 
     const char *sig = "EXFAT   ";

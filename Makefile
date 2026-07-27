@@ -7,6 +7,37 @@ CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
             -Isrc -Ikernel/include -Ibsdfmt
 
+# --- Display mode ---
+# `resolution` is the key Limine actually reads, and it matches the card's
+# advertised VBE mode list *exactly* — ask for a mode the card does not
+# list and it silently lands on 1024x768.  (1280x832, the exact half of a
+# 2560x1664 Retina panel, is one such mode: verified unavailable even
+# with EDID hints, which is why it is not offered here.)
+#
+# NATIVE=1 renders at the panel's own resolution so the host never
+# resamples the guest at all — a 1:1 image with a thin letterbox rather
+# than a 1280x800 one filtered up. It costs four times the software fill
+# and more VGA memory than QEMU's 16 MB default, so it is opt-in:
+#     make run NATIVE=1
+NATIVE ?= 0
+
+ifeq ($(NATIVE),1)
+RES      ?= 2560x1600x32
+FB_MAX_W ?= 2560
+FB_MAX_H ?= 1600
+QEMU_VGA := -device VGA,vgamem_mb=32,edid=on,xres=2560,yres=1600
+else
+RES      ?= 1280x800x32
+FB_MAX_W ?= 1920
+FB_MAX_H ?= 1080
+QEMU_VGA := -vga std
+endif
+
+# The back buffer, the previous frame and the wallpaper cache are all
+# statically sized, so the bound is a build option rather than a constant.
+CFLAGS  += -DBUF_MAX_W=$(FB_MAX_W)  -DBUF_MAX_H=$(FB_MAX_H) \
+           -DWALL_MAX_W=$(FB_MAX_W) -DWALL_MAX_H=$(FB_MAX_H)
+
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
 
@@ -134,7 +165,7 @@ build/boot_animation_data.o: src/boot_animation_data.S build/boot_anim.raw
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- Kernel ---
-build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h
+build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h build/res.stamp
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -166,14 +197,14 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 # mode came from whatever the display's EDID preferred.  Any size up to
 # the BUF_MAX_W x BUF_MAX_H back buffer in src/kernel.c works:
 #     make run RES=1920x1080x32
-RES ?= 1280x800x32
 
 # make compares timestamps, and a variable has none — without recording
 # RES somewhere on disk, changing it would leave the previous mode baked
 # into an ISO that looks up to date.
 build/res.stamp: FORCE
 	@mkdir -p build
-	@echo '$(RES)' | cmp -s - $@ || echo '$(RES)' > $@
+	@echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H)' | cmp -s - $@ || \
+	  echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H)' > $@
 
 $(ISO)/boot/limine/limine.conf: limine.conf build/res.stamp
 	@mkdir -p $(ISO)/boot/limine
@@ -235,7 +266,7 @@ run: os.iso disk.img
 		-cdrom os.iso \
 		-drive file=disk.img,format=raw,index=0,media=disk \
 		-m 2048M \
-		-vga std \
+		$(QEMU_VGA) \
 		-display $(QEMU_DISPLAY) \
 		-full-screen \
 		-boot d \

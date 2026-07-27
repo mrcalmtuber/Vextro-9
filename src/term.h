@@ -536,6 +536,81 @@ static int llm_read_thunk(void *ctx, uint64_t off, void *buf,
     return fs_pread((fs_file_t *)ctx, off, buf, len, got);
 }
 
+/*
+ * ===== Background model loading =====
+ *
+ * The chat panel used to tell people to go and type two commands in the
+ * terminal before it would answer anything, and the second of those
+ * commands read ~370 MB in a single call, so the whole machine sat
+ * frozen while it ran.  Instead: notice the model on the volume at boot
+ * and stream it in from the frame loop, a megabyte at a time, so the
+ * desktop stays live and nothing needs typing.
+ */
+#define AI_IDLE     0
+#define AI_PARSE    1      /* read the GGUF header, metadata and tensor table */
+#define AI_WEIGHTS  2      /* stream the payload into the arena               */
+#define AI_READY    3
+#define AI_FAILED   4
+
+#define AI_MODEL_PATH "/qwen2.gguf"
+
+static int         ai_state = AI_IDLE;
+static const char *ai_err   = "";
+static fs_file_t   ai_file;
+
+/* Begin, if the model is actually there.  Missing is not a failure — a
+ * machine without one simply has no chat. */
+static void ai_autoload_start(void) {
+    if (ai_state != AI_IDLE) return;
+    if (fs_open(AI_MODEL_PATH, &ai_file) != 0) return;
+    ai_state = AI_PARSE;
+}
+
+static void ai_poll(void) {
+    const char *err = "?";
+
+    switch (ai_state) {
+    case AI_PARSE:
+        /* One shot: the tensor table has to be whole before anything
+         * can be bound, and it is a small fraction of the file. */
+        if (llm_load(llm_read_thunk, &ai_file, ai_file.size, &err) != 0 ||
+            llm_load_begin(&err) != 0) {
+            ai_err = err;
+            ai_state = AI_FAILED;
+            return;
+        }
+        ai_state = AI_WEIGHTS;
+        return;
+
+    case AI_WEIGHTS: {
+        /* A few chunks per frame: enough to finish in reasonable time,
+         * few enough that the desktop still redraws smoothly. */
+        for (int i = 0; i < 4; i++) {
+            int r = llm_load_step(&err);
+            if (r < 0) { ai_err = err; ai_state = AI_FAILED; return; }
+            if (r == 1) { ai_state = AI_READY; return; }
+        }
+        return;
+    }
+
+    default:
+        return;
+    }
+}
+
+static int ai_busy(void) {
+    return ai_state == AI_PARSE || ai_state == AI_WEIGHTS;
+}
+
+/* 0..100 across both phases; the parse counts as the first slice */
+static int ai_progress(void) {
+    if (ai_state == AI_READY) return 100;
+    if (ai_state == AI_PARSE) return 0;
+    if (ai_state != AI_WEIGHTS) return 0;
+    int p = llm_load_progress();
+    return p > 99 ? 99 : p;
+}
+
 static void term_exec(char *cmdline);
 
 static void term_build_prompt(char *out, int max) {
@@ -748,6 +823,7 @@ static void term_exec(char *cmdline) {
             } else {
                 /* blit a tile onto the live framebuffer, verify by CPU */
                 int tx = 40, ty = 60, tw = 120, th = 80;
+                gfx_force_full_flip = 1;   /* the GPU writes the panel directly */
                 if (igpu_screen_fill(tx, ty, tw, th, 0x00D4AF37) != 0) {
                     term_print_c("gpu test: blit submission failed\n", 2);
                 } else {
@@ -1088,6 +1164,19 @@ static void term_exec(char *cmdline) {
                          str_eq(round, text) ? 4 : 2);
             return;
         }
+        /* The background loader owns the arena while it runs; letting a
+         * manual load re-parse underneath it would leave the streaming
+         * step filling a buffer nothing points at any more. */
+        if (ai_busy() && argc >= 2 &&
+            (str_eq(argv[1], "load") || str_eq(argv[1], "weights"))) {
+            char nb[8];
+            uint_to_str((uint32_t)ai_progress(), nb);
+            term_print_c("the model is already loading in the background - ", 3);
+            term_print_c(nb, 3);
+            term_print_c("%\n", 3);
+            return;
+        }
+
         if (argc >= 2 && str_eq(argv[1], "load")) {
             if (argc < 3) { term_print_c("usage: llm load <model.gguf>\n", 2); return; }
             char abs[256];

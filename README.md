@@ -24,6 +24,7 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - One `fs_*` layer decides which filesystem is mounted; no app talks to a driver directly
 - `disk.img` is a standard image: **mount it on your host** (macOS: `hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img`) to exchange files with the OS — including dropping in a multi-gigabyte archive
 - Login keycode persists on disk (`keycode.sys`) — delete it to re-register
+- A 16 KB read-ahead window and a cached FAT sector: small sequential reads used to cost one drive command per 512 bytes, and walking a fragmented file's cluster chain re-started from its first cluster on every call
 
 ### Terminal
 - Crisp monospace grid rendering (8x8 bitmap font) with a blinking block cursor
@@ -75,6 +76,7 @@ Browse a complete offline encyclopedia on bare metal.
 - Lookup is a **binary search over the archive's sorted path list** — about twenty reads across 400k entries, and only about twenty-five across a full dump's 19.7 million. It barely slows as the archive grows
 - **`src/zstd.h`** — a complete Zstandard decompressor (FSE/tANS, Huffman, sequence reconstruction with repeat offsets), written from RFC 8878. ZIM has defaulted to zstd since 2021, so nothing opens without it. xz/LZMA2 clusters work too, via `lzma.h`
 - **Wikipedia app** — type a title, get live prefix results with redirects marked; Enter or a click opens the article
+- **Ask it questions** — the bubble in the header switches to a chat panel that retrieves an article and answers from it. The model loads by itself: drop a Qwen2 GGUF at `/qwen2.gguf` and it streams into memory in the background while the desktop stays live, with progress in the header. Nothing to type
 - Articles render through the existing browser at `zim://<title>`, and **internal links are clickable**: relative hrefs, `../A/` namespace prefixes and percent-encoding are all resolved back to archive entries, so you can browse from article to article with Back working
 - `zim open|info|main|ls|find|get` drive the same reader from the shell
 
@@ -107,7 +109,7 @@ cd bsdfmt && make demo      # build the tools, pack two examples, run them
 The kernel's loader (`src/desktop.h`) dispatches on magic: `.bsd` for store packages, ELF64 for `hello`, and it rejects anything else.
 
 ### Core
-- **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 4x4 supersampled AA; no floats, no GPU
+- **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 8x8 supersampled AA; no floats, no GPU. Baselines and glyph origins are snapped to whole pixels (left fractional, a 13px baseline lands on an exact half-pixel and fringes every letter), and each glyph's coverage mask is cached per size rather than re-rasterized on every frame — which is what makes the finer sampling affordable
 - **Boot animation** — full-color video playback via raw RGB565 frames embedded at link time; any key skips it
 - **Login screen** — first-boot keycode registration (persisted to disk) with melt animation on bad passwords
 - **HAL** — IDT, PIT, PS/2 keyboard (incl. extended scancodes), PS/2 + VMware-backdoor pointer with wheel, ATA PIO, AC97 audio
