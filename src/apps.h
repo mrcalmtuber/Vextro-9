@@ -1118,6 +1118,53 @@ static const char *wiki_candidates[4] = {
 
 static void wiki_search(void);
 
+/*
+ * Open whatever the archive nominates as its front door.
+ *
+ * Without this an empty query lists from the very first entry, which in
+ * path order is punctuation — `!`, `!!`, `"` — and reads as garbage.  Every
+ * Kiwix archive carries a main page; this is what Kiwix itself opens.
+ *
+ * Prefer the W/mainPage entry: the header's main_page field is an index
+ * whose meaning changed between archive versions, so it is the fallback
+ * rather than the first choice.
+ */
+static int wiki_want_main = 0;   /* set during draw, acted on from the poll */
+
+static void wiki_open_main_page(void) {
+    if (!zim.open) return;
+
+    uint32_t idx;
+    zim_dirent_t e;
+    if (zim_find('W', "mainPage", &idx) &&
+        zim_resolve(idx, &e) == 0 && e.ns == 'C') {
+        /* resolved past the redirect, so this is the real article */
+    } else if (zim.main_page < zim.article_count &&
+               zim_dirent(zim.main_page, &e) == 0 && e.ns == 'C') {
+        /* older layout: the header index is a path index */
+    } else {
+        return;                       /* no front door; the list stands */
+    }
+
+    char url[BRW_ADDR_MAX];
+    str_copy(url, "zim://", sizeof(url));
+    str_append(url, e.url, sizeof(url));
+    brw_navigate(url);
+    wm_open(WK_BROWSER);
+}
+
+/*
+ * Runs from the frame loop's poll phase, not from drawing.  The archive is
+ * opened lazily on the first draw of the window, but wm_open() reorders the
+ * z-stack that wm_draw_all() is walking at that moment, so the landing page
+ * has to be raised a step later.
+ */
+static void wiki_poll(void) {
+    if (!wiki_want_main) return;
+    wiki_want_main = 0;
+    wiki_open_main_page();
+}
+
 static void wiki_autoopen(void) {
     if (wiki_tried_open) return;
     wiki_tried_open = 1;
@@ -1137,6 +1184,7 @@ static void wiki_autoopen(void) {
                            sizeof(wiki_status));
             wiki_status_err = 0;
             wiki_search();
+            wiki_want_main = 1;       /* raised next poll, not mid-draw */
             return;
         }
     }
@@ -1145,27 +1193,115 @@ static void wiki_autoopen(void) {
     wiki_status_err = 1;
 }
 
+/* Is this entry something a reader would want listed? */
+static int wiki_listable(const zim_dirent_t *e) {
+    if (e->ns != 'C') return 0;
+    if (e->is_redirect) return 0;      /* an alias, not an article */
+    /* namespace C also holds stylesheets, scripts and images; opening one
+     * would dump raw bytes into the browser */
+    const char *m = zim_mime_name(e->mime);
+    for (int i = 0; m[i] && m[i + 1] && m[i + 2] && m[i + 3]; i++)
+        if (m[i] == 'h' && m[i + 1] == 't' && m[i + 2] == 'm' && m[i + 3] == 'l')
+            return 1;
+    return 0;
+}
+
+/*
+ * Walk the title-ordered listing from `start`, collecting listable
+ * entries whose title still has `q` as a prefix.  Case-insensitive on the
+ * comparison, but the index itself is ordered case-sensitively, which is
+ * why the caller probes more than one starting point.
+ */
+static void wiki_collect(uint32_t start, const char *q) {
+    zim_dirent_t e;
+    for (uint32_t r = start;
+         r < zim.title_count && wiki_hit_count < WIKI_RESULTS; r++) {
+        uint32_t idx = zim_title_at(r);
+        if (zim_dirent(idx, &e) != 0) break;
+
+        int k = 0;
+        while (q[k] && e.title[k] &&
+               chr_lower(q[k]) == chr_lower(e.title[k])) k++;
+        if (q[k] != '\0') break;       /* past the prefix run */
+
+        if (!wiki_listable(&e)) continue;
+
+        for (int d = 0; d < wiki_hit_count; d++)      /* no duplicates */
+            if (wiki_hits[d].index == idx) goto next;
+
+        {
+            wiki_hit_t *h = &wiki_hits[wiki_hit_count++];
+            h->index = idx;
+            str_copy(h->title, e.title, sizeof(h->title));
+            h->redirect = 0;
+        }
+    next: ;
+    }
+}
+
+/* Lower bound over the title listing, comparing titles bytewise. */
+static uint32_t wiki_title_lower_bound(const char *q) {
+    uint32_t lo = 0, hi = zim.title_count;
+    zim_dirent_t e;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (zim_dirent(zim_title_at(mid), &e) != 0) break;
+        if (str_cmp_bytes(e.title, q) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 static void wiki_search(void) {
     wiki_hit_count = 0;
     wiki_sel = 0;
     if (!zim.open) return;
 
-    uint32_t i = zim_lower_bound('C', wiki_query);
-    zim_dirent_t e;
-    while (i < zim.article_count && wiki_hit_count < WIKI_RESULTS) {
-        if (zim_dirent(i, &e) != 0) break;
-        if (e.ns != 'C') break;
-        /* the walk stops as soon as the prefix stops matching */
-        int k = 0;
-        while (wiki_query[k] && e.url[k] == wiki_query[k]) k++;
-        if (wiki_query[k] != '\0') break;
-
-        wiki_hit_t *h = &wiki_hits[wiki_hit_count++];
-        h->index = i;
-        str_copy(h->title, e.title, sizeof(h->title));
-        h->redirect = e.is_redirect;
-        i++;
+    /* Without the listing (older archives) fall back to path order. */
+    if (zim.title_count == 0) {
+        uint32_t i = zim_lower_bound('C', wiki_query);
+        zim_dirent_t e;
+        while (i < zim.article_count && wiki_hit_count < WIKI_RESULTS) {
+            if (zim_dirent(i, &e) != 0) break;
+            if (e.ns != 'C') break;
+            int k = 0;
+            while (wiki_query[k] && e.url[k] == wiki_query[k]) k++;
+            if (wiki_query[k] != '\0') break;
+            if (wiki_listable(&e)) {
+                wiki_hit_t *h = &wiki_hits[wiki_hit_count++];
+                h->index = i;
+                str_copy(h->title, e.title, sizeof(h->title));
+                h->redirect = 0;
+            }
+            i++;
+        }
+        return;
     }
+
+    /*
+     * The index is sorted bytewise, so uppercase sorts before lowercase
+     * and a single probe cannot be case-insensitive: typed "new york"
+     * lands nowhere near "New York".  Rather than pretend otherwise,
+     * probe the spellings people actually type — as given, with the
+     * first letter capitalised, and title-cased — and merge the results.
+     * wiki_collect already rejects duplicates.
+     */
+    char v[3][WIKI_QUERY_MAX];
+    int nv = 1;
+    str_copy(v[0], wiki_query, WIKI_QUERY_MAX);
+
+    str_copy(v[nv], wiki_query, WIKI_QUERY_MAX);
+    v[nv][0] = chr_upper(v[nv][0]);
+    if (!str_eq(v[nv], v[0])) nv++;
+
+    str_copy(v[nv], wiki_query, WIKI_QUERY_MAX);
+    for (int i = 0; v[nv][i]; i++)
+        if (i == 0 || v[nv][i - 1] == ' ')
+            v[nv][i] = chr_upper(v[nv][i]);
+    if (!str_eq(v[nv], v[0]) && (nv < 2 || !str_eq(v[nv], v[1]))) nv++;
+
+    for (int i = 0; i < nv && wiki_hit_count < WIKI_RESULTS; i++)
+        wiki_collect(wiki_title_lower_bound(v[i]), v[i]);
 }
 
 static void wiki_open_hit(int idx) {
@@ -1342,8 +1478,20 @@ static void wiki_submit(void) {
     if (wiki_busy) return;
     if (wiki_input_len == 0) return;
     if (!llm_weights_loaded()) {
-        wiki_log_add("\nModel not loaded.  Run 'llm load /qwen2.gguf' then"
-                     " 'llm weights' in the terminal.\n");
+        if (ai_busy()) {
+            char nb[8];
+            uint_to_str((uint32_t)ai_progress(), nb);
+            wiki_log_add("\nStill loading the model - ");
+            wiki_log_add(nb);
+            wiki_log_add("%.  Ask again in a moment.\n");
+        } else if (ai_state == AI_FAILED) {
+            wiki_log_add("\nThe model could not be loaded: ");
+            wiki_log_add(ai_err);
+            wiki_log_add("\n");
+        } else {
+            wiki_log_add("\nNo model on this volume.  Copy a Qwen2 GGUF to "
+                         AI_MODEL_PATH " and reboot.\n");
+        }
         return;
     }
 
@@ -1529,8 +1677,21 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
     ttf_draw_string(buf, (int)w, (int)h, cx + 16, cy + 10, "Wikipedia",
                     C_GOLD, 18);
     {
-        const char *sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
-                                                        : "no archive");
+        /* While the model streams in, say so where the subtitle goes —
+         * it is the one place someone waiting to ask a question looks. */
+        static char ai_sub[32];
+        const char *sub;
+        if (wiki_mode && ai_busy()) {
+            char nb[8];
+            uint_to_str((uint32_t)ai_progress(), nb);
+            str_copy(ai_sub, "loading the model ", sizeof(ai_sub));
+            str_append(ai_sub, nb, sizeof(ai_sub));
+            str_append(ai_sub, "%", sizeof(ai_sub));
+            sub = ai_sub;
+        } else {
+            sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
+                                                : "no archive");
+        }
         int tw = ttf_text_width(sub, 12);
         ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 52, cy + 16, sub,
                         C_TEXT_DIM, 12);

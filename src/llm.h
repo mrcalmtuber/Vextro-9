@@ -100,6 +100,12 @@ int          llm_fpu_selftest(uint32_t *scaled_by_10000);
 int      llm_weights_loaded(void);
 /* Pull every tensor into the arena; slow, once per boot. */
 int      llm_load_weights(const char **err);
+/* The same, a chunk at a time, so a UI can keep drawing while it runs.
+ * llm_load_step returns 1 when the model is resident, 0 for more to do. */
+int      llm_load_begin(const char **err);
+int      llm_load_step(const char **err);
+int      llm_load_progress(void);      /* 0..100 */
+int      llm_load_active(void);
 /* Run one token through the model at position pos, start to finish. */
 int      llm_eval(int32_t token, int pos);
 /* The same, handed out a layer at a time so a UI can redraw between. */

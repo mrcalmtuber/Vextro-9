@@ -280,6 +280,51 @@ static void brw_resolve_href(const char *href, char *out, int out_max) {
     str_append(out, href, out_max);
 }
 
+/*
+ * The nearest ASCII for a Unicode codepoint, or 0 to drop it.
+ *
+ * The font is indexed by byte, so anything above 0x7E cannot be drawn.
+ * Encyclopedia text is full of accented names, typographic quotes and
+ * dashes; silently deleting them corrupts words, while folding keeps them
+ * readable.  '?' is the honest answer for anything genuinely foreign —
+ * it shows something is there rather than pretending otherwise.
+ */
+static char brw_fold_cp(uint32_t cp) {
+    if (cp < 0x80) return (char)cp;
+
+    /* Latin-1 and Latin Extended-A, in codepoint order */
+    static const char lat1[] =
+        "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYPs"      /* 0xC0..0xDF */
+        "aaaaaaaceeeeiiii" "dnooooo/ouuuuypy";     /* 0xE0..0xFF */
+    if (cp >= 0xC0 && cp <= 0xFF) return lat1[cp - 0xC0];
+
+    switch (cp) {
+    case 0x2018: case 0x2019: case 0x201B: return '\'';  /* curly single */
+    case 0x201C: case 0x201D: case 0x201F: return '"';   /* curly double */
+    case 0x2010: case 0x2011: case 0x2012:
+    case 0x2013: case 0x2014: case 0x2015: return '-';   /* dashes */
+    case 0x2026: return '.';                             /* ellipsis */
+    case 0x00A0: case 0x2007: case 0x202F: return ' ';   /* hard spaces */
+    case 0x00B7: case 0x2022: return '*';                /* bullets */
+    case 0x00D7: return 'x';
+    case 0x2032: return '\'';
+    case 0x2033: return '"';
+    case 0x00AB: case 0x00BB: return '"';
+    case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: return 0;  /* zero width */
+    default: break;
+    }
+    /* Latin Extended-A is mostly accented ASCII in pairs */
+    if (cp >= 0x0100 && cp <= 0x017F) {
+        static const char lex[] = "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGg"
+                                  "HhHhIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnn"
+                                  "NnOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUu"
+                                  "UuUuWwYyYZzZzZzs";
+        uint32_t k = cp - 0x0100;
+        if (k < sizeof(lex) - 1) return lex[k];
+    }
+    return '?';
+}
+
 static void brw_parse_html(const uint8_t *src, int len) {
     brw_doc_reset();
 
@@ -477,6 +522,30 @@ static void brw_parse_html(const uint8_t *src, int len) {
         } else if (out >= 0x20 && out < 0x7F) {
             if (wlen < 63) word[wlen++] = out;
             else { BRW_FLUSH_WORD(); word[wlen++] = out; }
+        } else if ((uint8_t)out >= 0xC0) {
+            /*
+             * UTF-8 lead byte.  Archive text is UTF-8 and this renderer
+             * draws bytes, so dropping what it cannot show deletes
+             * letters from the middle of words — "Zoë" became "Zo".
+             * Fold to the nearest ASCII instead and step over the
+             * continuation bytes.
+             */
+            uint32_t cp = 0;
+            int extra = 0;
+            uint8_t b = (uint8_t)out;
+            if      ((b & 0xE0) == 0xC0) { cp = b & 0x1Fu; extra = 1; }
+            else if ((b & 0xF0) == 0xE0) { cp = b & 0x0Fu; extra = 2; }
+            else                         { cp = b & 0x07u; extra = 3; }
+            for (int k = 0; k < extra && i + 1 < len; k++) {
+                uint8_t c2 = src[++i];
+                if ((c2 & 0xC0) != 0x80) break;
+                cp = (cp << 6) | (uint32_t)(c2 & 0x3F);
+            }
+            char f = brw_fold_cp(cp);
+            if (f) {
+                if (wlen < 63) word[wlen++] = f;
+                else { BRW_FLUSH_WORD(); word[wlen++] = f; }
+            }
         }
         i++;
     }

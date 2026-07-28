@@ -1093,8 +1093,13 @@ static void spawn_anim_draw(uint32_t *buf, uint32_t w, uint32_t h) {
 
 /* ===== 7. WALLPAPER (cached, regenerated on theme/size change) ===== */
 
+/* Tracks the back buffer's bound — see BUF_MAX_W in kernel.c */
+#ifndef WALL_MAX_W
 #define WALL_MAX_W 1920
+#endif
+#ifndef WALL_MAX_H
 #define WALL_MAX_H 1080
+#endif
 
 static uint32_t wallpaper[WALL_MAX_W * WALL_MAX_H];
 static int      wall_cur_theme = 0;
@@ -1373,14 +1378,28 @@ static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* right side: net indicator + date + clock */
     {
-        char clk[10];
-        clock_string(clk);
+        /*
+         * The clock and date come off the CMOS, which is slow enough
+         * that reading it on every frame is a waste — almost every read
+         * returns what the last one did.  Sample twice a second instead.
+         *
+         * Keyed to PIT ticks, not frames: frames are not a unit of time,
+         * and under a heavy background load the desktop drops to a few a
+         * second, which would leave the clock visibly stopped.
+         */
+        static char clk[10] = "";
+        static char dt[16]  = "";
+        static uint32_t clock_stamp = 0;
+        if (clk[0] == '\0' || sys_ticks - clock_stamp >= 30) {
+            clock_stamp = sys_ticks;
+            clock_string(clk);
+            date_string(dt);
+        }
+
         int cw2 = ttf_text_width(clk, 14);
         int32_t x = (int32_t)w - cw2 - 16;
         ttf_draw_string(buf, (int)w, (int)h, x, 6, clk, C_TEXT, 14);
 
-        char dt[16];
-        date_string(dt);
         int dw = ttf_text_width(dt, 13);
         x -= dw + 18;
         ttf_draw_string(buf, (int)w, (int)h, x, 7, dt, C_TEXT_DIM, 13);
@@ -1896,6 +1915,8 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     term_async_poll();
     brw_poll();
     store_poll();
+    ai_poll();
+    wiki_poll();
 
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;

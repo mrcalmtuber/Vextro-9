@@ -138,6 +138,29 @@ static void ata_setup(uint64_t lba, uint32_t n, int write) {
     }
 }
 
+/*
+ * A whole sector in one string instruction.
+ *
+ * The obvious loop is 256 separate `in` instructions per sector, and on an
+ * emulated machine each one is a trap out to the host's device model — the
+ * per-access overhead dwarfs the 512 bytes being moved.  `rep insw` is a
+ * single instruction the emulator can service as one block, which is worth
+ * far more here than it would be on real hardware.
+ */
+static inline void ata_insw(uint16_t *dst, uint32_t words) {
+    __asm__ volatile("cld; rep insw"
+                     : "+D"(dst), "+c"(words)
+                     : "d"(ATA_REG_DATA)
+                     : "memory");
+}
+
+static inline void ata_outsw(const uint16_t *src, uint32_t words) {
+    __asm__ volatile("cld; rep outsw"
+                     : "+S"(src), "+c"(words)
+                     : "d"(ATA_REG_DATA)
+                     : "memory");
+}
+
 static int ata_read(uint64_t lba, uint32_t count, void *buf) {
     if (!ata_present) return -1;
     uint16_t *p = (uint16_t *)buf;
@@ -147,8 +170,8 @@ static int ata_read(uint64_t lba, uint32_t count, void *buf) {
         ata_setup(lba, n, 0);
         for (uint32_t s = 0; s < n; s++) {
             if (ata_wait_drq() != 0) return -1;
-            for (int i = 0; i < 256; i++)
-                *p++ = inw(ATA_REG_DATA);
+            ata_insw(p, 256);
+            p += 256;
         }
         lba += n;
         count -= n;
@@ -165,8 +188,8 @@ static int ata_write(uint64_t lba, uint32_t count, const void *buf) {
         ata_setup(lba, n, 1);
         for (uint32_t s = 0; s < n; s++) {
             if (ata_wait_drq() != 0) return -1;
-            for (int i = 0; i < 256; i++)
-                outw(ATA_REG_DATA, *p++);
+            ata_outsw(p, 256);
+            p += 256;
             /* the device goes busy while it commits the sector — wait it
              * out, or the next command gets silently swallowed */
             ata_io_delay();
