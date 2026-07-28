@@ -156,7 +156,17 @@ typedef struct {
     uint64_t    pos;
     uint64_t    size;
     int         failed;
-    uint8_t     buf[4096];
+    /*
+     * The window this reader pulls the file through.
+     *
+     * 4 KB was the whole cost of loading a model.  Metadata is ~24 MB of
+     * vocabulary and merges, and at 4 KB a piece that is ~6,000 requests,
+     * each of which the filesystem splits into a partial sector, a run of
+     * whole ones and another partial — more commands to the drive than
+     * reading the entire 373 MB of weights, which streams in 1 MB chunks.
+     * The parse was never the slow part; the request size was.
+     */
+    uint8_t     buf[256 * 1024];
     uint64_t    buf_off;
     uint32_t    buf_len;
 } greader_t;
@@ -189,9 +199,8 @@ static int g_bytes(greader_t *g, void *out, uint32_t n) {
     return 0;
 }
 
-static uint8_t  g_u8(greader_t *g)  { uint8_t v = 0;  g_bytes(g, &v, 1); return v; }
-static uint16_t g_u16(greader_t *g) { uint8_t b[2]; g_bytes(g, b, 2);
-    return (uint16_t)(b[0] | (b[1] << 8)); }
+/* g_u8/g_u16 are gone: every field is now read or stepped over in bulk,
+ * and a per-byte accessor is exactly what made this parse slow. */
 static uint32_t g_u32(greader_t *g) { uint8_t b[4]; g_bytes(g, b, 4);
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
            ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24); }
@@ -210,30 +219,47 @@ static int str_same(const char *a, const char *b) {
     return *a == *b;
 }
 
+/*
+ * Move the cursor forward without copying anything.
+ *
+ * The reader had no seek at all, so skipping a field meant *reading* every
+ * byte of it and throwing the result away.  A refill only happens when the
+ * cursor leaves the buffer, so a short skip stays in memory and a long one
+ * costs exactly one refill.
+ */
+static void g_advance(greader_t *g, uint64_t n) {
+    if (g->pos + n > g->size) { g->failed = 1; return; }
+    g->pos += n;
+}
+
 /* Read a length-prefixed string into out (truncating), always consuming
  * the whole field. */
 static void g_str(greader_t *g, char *out, int max) {
     uint64_t n = g_u64(g);
-    uint64_t i = 0;
-    int o = 0;
-    while (i < n) {
-        uint8_t c = g_u8(g);
-        if (o < max - 1) out[o++] = (char)c;
-        i++;
-        if (g->failed) break;
+    if (g->failed) { if (out && max > 0) out[0] = '\0'; return; }
+
+    /* Take what fits in one bulk copy, then step over the rest — this used
+     * to run a function call per byte, over megabytes of vocabulary. */
+    uint32_t take = 0;
+    if (out && max > 1) {
+        take = (n < (uint64_t)(max - 1)) ? (uint32_t)n : (uint32_t)(max - 1);
+        g_bytes(g, out, take);
+        out[take] = '\0';
+    } else if (out && max > 0) {
+        out[0] = '\0';
     }
-    if (out && max > 0) out[o] = '\0';
+    if (n > take) g_advance(g, n - take);
 }
 
 static void g_skip_value(greader_t *g, uint32_t type);
 
 static void g_skip_one(greader_t *g, uint32_t type) {
     switch (type) {
-    case GT_U8: case GT_I8: case GT_BOOL: g_u8(g);  break;
-    case GT_U16: case GT_I16:             g_u16(g); break;
-    case GT_U32: case GT_I32: case GT_F32: g_u32(g); break;
-    case GT_U64: case GT_I64: case GT_F64: g_u64(g); break;
-    case GT_STRING: { char tmp[2]; g_str(g, tmp, 2); break; }
+    case GT_U8: case GT_I8: case GT_BOOL: g_advance(g, 1); break;
+    case GT_U16: case GT_I16:             g_advance(g, 2); break;
+    case GT_U32: case GT_I32: case GT_F32: g_advance(g, 4); break;
+    case GT_U64: case GT_I64: case GT_F64: g_advance(g, 8); break;
+    case GT_STRING: { uint64_t n = g_u64(g); g_advance(g, n); break; }
     default: g->failed = 1; break;
     }
 }
@@ -242,6 +268,17 @@ static void g_skip_value(greader_t *g, uint32_t type) {
     if (type == GT_ARRAY) {
         uint32_t et = g_u32(g);
         uint64_t n = g_u64(g);
+        /* Fixed-width elements are one arithmetic step, not n of them —
+         * this array is 151,936 entries in the model we care about. */
+        uint32_t w = 0;
+        switch (et) {
+        case GT_U8: case GT_I8: case GT_BOOL:  w = 1; break;
+        case GT_U16: case GT_I16:              w = 2; break;
+        case GT_U32: case GT_I32: case GT_F32: w = 4; break;
+        case GT_U64: case GT_I64: case GT_F64: w = 8; break;
+        default: break;
+        }
+        if (w) { g_advance(g, n * w); return; }
         for (uint64_t i = 0; i < n && !g->failed; i++) g_skip_one(g, et);
         return;
     }
@@ -316,10 +353,13 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
                 for (uint64_t k = 0; k < n && !g.failed; k++) {
                     uint64_t slen = g_u64(&g);
                     tok_off[k] = (uint32_t)used;
-                    for (uint64_t j = 0; j < slen; j++) {
-                        uint8_t c = g_u8(&g);
-                        if (used < cap - 1) tok_blob[used++] = (char)c;
-                    }
+                    /* straight into the blob in one copy */
+                    uint64_t room = (used + 1 < cap) ? (cap - 1 - used) : 0;
+                    uint32_t take = (slen < room) ? (uint32_t)slen
+                                                  : (uint32_t)room;
+                    if (take) g_bytes(&g, tok_blob + used, take);
+                    used += take;
+                    if (slen > take) g_advance(&g, slen - take);
                     if (used < cap) tok_blob[used++] = '\0';
                 }
 
@@ -348,11 +388,10 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
                 char line[256];
                 for (uint64_t k = 0; k < n && !g.failed; k++) {
                     uint64_t slen = g_u64(&g);
-                    uint32_t o = 0;
-                    for (uint64_t j = 0; j < slen; j++) {
-                        uint8_t c = g_u8(&g);
-                        if (o < sizeof(line) - 1) line[o++] = (char)c;
-                    }
+                    uint32_t o = (slen < sizeof(line) - 1)
+                               ? (uint32_t)slen : (uint32_t)(sizeof(line) - 1);
+                    if (o) g_bytes(&g, line, o);
+                    if (slen > o) g_advance(&g, slen - o);
                     line[o] = '\0';
                     int sp = -1;
                     for (uint32_t j = 0; j < o; j++)
@@ -365,7 +404,20 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
                         mrg_put((uint32_t)a, (uint32_t)b, (uint32_t)k);
                 }
             } else {
-                for (uint64_t k = 0; k < n && !g.failed; k++) g_skip_one(&g, et);
+                /* an array we do not care about — step over it whole
+                 * rather than reading every element (token_type alone is
+                 * 151,936 of them) */
+                uint32_t w = 0;
+                switch (et) {
+                case GT_U8: case GT_I8: case GT_BOOL:  w = 1; break;
+                case GT_U16: case GT_I16:              w = 2; break;
+                case GT_U32: case GT_I32: case GT_F32: w = 4; break;
+                case GT_U64: case GT_I64: case GT_F64: w = 8; break;
+                default: break;
+                }
+                if (w) g_advance(&g, n * w);
+                else for (uint64_t k = 0; k < n && !g.failed; k++)
+                         g_skip_one(&g, et);
             }
         } else {
             g_skip_value(&g, type);

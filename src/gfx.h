@@ -219,6 +219,33 @@ static int str_starts_with(const char *str, const char *prefix) {
     return 1;
 }
 
+/*
+ * Real time, counted by the PIT at ~60 Hz.
+ *
+ * Anything that wants "twice a second" has to key off this rather than a
+ * frame counter: a frame is not a fixed amount of time, and during a
+ * heavy background load the desktop drops to a few frames a second — at
+ * which point a 30-frame interval is ten seconds, and the clock visibly
+ * stops.
+ */
+static volatile uint32_t sys_ticks = 0;
+
+static char chr_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static char chr_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+}
+
+/* Bytewise compare, unsigned — the order archives are sorted in. */
+static int str_cmp_bytes(const char *a, const char *b) {
+    const unsigned char *x = (const unsigned char *)a;
+    const unsigned char *y = (const unsigned char *)b;
+    while (*x && *x == *y) { x++; y++; }
+    return (int)*x - (int)*y;
+}
+
 static int str_len(const char *s) {
     int n = 0;
     while (s[n]) n++;

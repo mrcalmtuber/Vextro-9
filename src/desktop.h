@@ -1380,15 +1380,18 @@ static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
     {
         /*
          * The clock and date come off the CMOS, which is slow enough
-         * that reading it on every frame is a waste — and the frame rate
-         * is well above one per second, so almost every read returns
-         * what the last one did.  Sample twice a second and keep it.
+         * that reading it on every frame is a waste — almost every read
+         * returns what the last one did.  Sample twice a second instead.
+         *
+         * Keyed to PIT ticks, not frames: frames are not a unit of time,
+         * and under a heavy background load the desktop drops to a few a
+         * second, which would leave the clock visibly stopped.
          */
         static char clk[10] = "";
         static char dt[16]  = "";
         static uint32_t clock_stamp = 0;
-        if (clk[0] == '\0' || desktop_tick - clock_stamp >= 30) {
-            clock_stamp = desktop_tick;
+        if (clk[0] == '\0' || sys_ticks - clock_stamp >= 30) {
+            clock_stamp = sys_ticks;
             clock_string(clk);
             date_string(dt);
         }
@@ -1913,6 +1916,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     brw_poll();
     store_poll();
     ai_poll();
+    wiki_poll();
 
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;

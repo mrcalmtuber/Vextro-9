@@ -212,6 +212,7 @@ static int hal_ps2_present = 1;
 __attribute__((interrupt))
 static void irq0_handler(interrupt_frame_t *f) {
     (void)f;
+    sys_ticks++;
     outb(PIC1_CMD, PIC_EOI);
 }
 

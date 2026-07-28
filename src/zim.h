@@ -77,7 +77,25 @@ static struct {
     int      truncated;          /* the file is shorter than it claims */
     char     mimes[ZIM_MIME_MAX][48];
     int      mime_count;
+    uint32_t title_count;        /* entries in the title-ordered listing */
 } zim;
+
+/*
+ * The title-ordered listing.
+ *
+ * Entries are stored sorted by *path*, and a path is a URL — underscores
+ * for spaces, punctuation sorting before letters.  Browsing that order
+ * shows `!`, `!!`, `!!!`, `"` before anything a reader wants, and typing
+ * a title with spaces in it never matches.
+ *
+ * Modern archives ship the answer: an entry holding the article indices
+ * in *title* order.  The header's own titlePtrPos is retired in version 6
+ * (it reads as all-ones), so this listing is where it lives now.
+ */
+#define ZIM_TITLE_MAX 500000
+static uint32_t zim_title_idx[ZIM_TITLE_MAX];
+
+static int zim_load_title_listing(void);   /* defined below zim_content */
 
 static const char *zim_err = "";
 
@@ -168,6 +186,7 @@ static int zim_open(const char *path) {
     }
 
     zim.open = 1;
+    zim_load_title_listing();     /* optional: absent on older archives */
     return 0;
 }
 
@@ -395,5 +414,84 @@ static const char *zim_mime_name(uint16_t m) {
     if (m < (uint16_t)zim.mime_count) return zim.mimes[m];
     return "?";
 }
+
+/*
+ * Read the title-ordered listing into memory.
+ *
+ * This deliberately does not go through zim_content().  The listing lives
+ * in an *uncompressed* cluster, and in a Simple English dump that cluster
+ * is 24 MB — four times the cluster read buffer, so the normal path
+ * refuses it.  But an uncompressed cluster is just bytes sitting in the
+ * file, so the blob can be read straight out at its own offset: no
+ * decompression, no staging, one read of exactly the wanted range.
+ *
+ * Absence is not an error.  Older archives have no such entry, and the
+ * caller falls back to path order.
+ */
+static int zim_load_title_listing(void) {
+    zim.title_count = 0;
+
+    uint32_t e;
+    /* note zim_find is 1-on-success, unlike its neighbours */
+    if (!zim_find('X', "listing/titleOrdered/v1", &e)) return -1;
+
+    zim_dirent_t d;
+    if (zim_dirent(e, &d) != 0 || d.is_redirect) return -1;
+
+    uint64_t coff, cend;
+    if (zim_cluster_range(d.cluster, &coff, &cend) != 0) return -1;
+
+    uint8_t info;
+    if (zim_read(coff, &info, 1) != 0) return -1;
+    int comp = info & 0x0F;
+    int ext  = (info & 0x10) ? 1 : 0;
+
+    const uint8_t *blob = 0;
+    uint32_t blen = 0;
+
+    if (comp == ZIM_COMP_NONE || comp == ZIM_COMP_NONE1) {
+        /* offsets are relative to the byte after the info byte */
+        uint64_t base = coff + 1;
+        uint32_t w = ext ? 8 : 4;
+        uint8_t ob[16];
+        if (zim_read(base + (uint64_t)d.blob * w, ob, 2 * w) != 0) return -1;
+        uint64_t o0 = ext ? zim_r64(ob)     : zim_r32(ob);
+        uint64_t o1 = ext ? zim_r64(ob + w) : zim_r32(ob + w);
+        if (o1 <= o0) return -1;
+
+        uint64_t n = (o1 - o0) / 4;
+        if (n > ZIM_TITLE_MAX) n = ZIM_TITLE_MAX;
+
+        /* straight into the index array, then byte-swapped in place */
+        uint8_t *dst = (uint8_t *)zim_title_idx;
+        if (zim_read(base + o0, dst, (uint32_t)(n * 4)) != 0) return -1;
+        for (uint64_t i = 0; i < n; i++)
+            zim_title_idx[i] = zim_r32(dst + i * 4);
+        zim.title_count = (uint32_t)n;
+        return 0;
+    }
+
+    /* compressed listing: only workable if the cluster fits the buffers */
+    if (zim_content(e, &blob, &blen, 0) != 0) return -1;
+    uint32_t n = blen / 4;
+    if (n > ZIM_TITLE_MAX) n = ZIM_TITLE_MAX;
+    for (uint32_t i = 0; i < n; i++)
+        zim_title_idx[i] = zim_r32(blob + i * 4);
+    zim.title_count = n;
+    return 0;
+}
+
+/* Path-list index of the article at `rank` in title order. */
+static uint32_t zim_title_at(uint32_t rank) {
+    return rank < zim.title_count ? zim_title_idx[rank] : 0;
+}
+
+/*
+ * Note on sorting: the listing is ordered bytewise on the title *after*
+ * the empty-title fallback in zim_dirent_at_offset — an empty title field
+ * means "same as the path", not "no title".  That fallback is what makes
+ * the order exact; without it a search for "New York" lands on "Noynoy
+ * Aquino".  e.title is therefore always safe to compare directly.
+ */
 
 #endif /* ZIM_H */
