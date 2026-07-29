@@ -377,6 +377,16 @@ static int hal_init_devices(uint16_t cs, int32_t w, int32_t h) {
      * the desktop above cannot tell.
      */
 #ifdef ENABLE_XHCI
+    /*
+     * The MMIO mapper walks the page tables through Limine's direct map,
+     * so it needs the HHDM offset before it can resolve anything. That
+     * used to be set as a side effect of e1000_init(), which runs much
+     * later — so every walk here used offset zero, dereferenced a
+     * physical address that is not mapped, and faulted into a handler
+     * that halts without a word. Setting it explicitly makes the
+     * dependency visible instead of incidental.
+     */
+    if (hhdm_request.response) hal_hhdm_offset = hhdm_request.response->offset;
     if (xhci_init()) xhci_enumerate();
 #endif
     return 0;

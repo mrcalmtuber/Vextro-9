@@ -176,7 +176,26 @@ static int pci_bar(const pci_dev_t *d, int bar_idx,
                                     (uint8_t)(off + 4)) : 0;
     uint64_t base = (((uint64_t)hi << 32) | lo) & ~0xFULL;
 
-    /* sizing: write all-ones, read mask, restore */
+    /*
+     * Sizing: write all-ones, read the mask back, restore.
+     *
+     * Decode is turned off first, and that is not a nicety. While
+     * 0xFFFFFFFF is latched in the BAR the device advertises the largest
+     * region it can express and claims every address in it — which can
+     * overlap the framebuffer, a RAM alias, or the MMIO the CPU is
+     * currently executing out of. The window is only a few PCI
+     * transactions wide, but a machine that dies inside it dies with the
+     * screen blank and nothing on the serial line.
+     *
+     * The e1000 tolerated this and an xHCI controller did not, which is
+     * how it was found: the driver hung here with no output, on a
+     * function that had worked for every previous caller. Clearing the
+     * command register's I/O and memory bits for the duration is what the
+     * specification asks for, and costs two config writes.
+     */
+    uint32_t cmd = pci_read32(d->bus, d->slot, d->func, 0x04);
+    pci_write32(d->bus, d->slot, d->func, 0x04, cmd & ~0x3u);
+
     pci_write32(d->bus, d->slot, d->func, off, 0xFFFFFFFF);
     uint32_t mask_lo = pci_read32(d->bus, d->slot, d->func, off);
     pci_write32(d->bus, d->slot, d->func, off, lo);
@@ -186,6 +205,8 @@ static int pci_bar(const pci_dev_t *d, int bar_idx,
         mask_hi = pci_read32(d->bus, d->slot, d->func, (uint8_t)(off + 4));
         pci_write32(d->bus, d->slot, d->func, (uint8_t)(off + 4), hi);
     }
+
+    pci_write32(d->bus, d->slot, d->func, 0x04, cmd);
     uint64_t mask = (((uint64_t)mask_hi << 32) | mask_lo) & ~0xFULL;
     if (mask == 0) return -1;
 

@@ -28,34 +28,34 @@
  * the PCI device is found and its BAR mapped.
  *
  * ============================ STATUS ============================
- * INCOMPLETE. Compiles, finds the controller, and then hangs — so it is
- * behind -DENABLE_XHCI and OFF by default. The shipped ISO does not
- * contain it, which matters because every modern machine has an xHCI
- * controller and a hang here would brick the boot on exactly the
- * hardware this is meant to rescue.
+ * PARTIAL, and behind -DENABLE_XHCI (off by default).
  *
- * Where it stops, and the next thing to try:
+ * WORKING: the controller comes up. It is found on the PCI bus, its BAR
+ * is mapped, it halts and resets cleanly, the device context array,
+ * scratchpad buffers, command ring and event ring are all accepted, and
+ * it reaches the run state — reporting 8 ports and 64 slots under qemu.
+ * The kernel boots normally with this enabled.
  *
- *   Stage logging shows "found controller" never prints, and that marker
- *   sits immediately after pci_bar(). So the hang is inside pci_bar's
- *   BAR-sizing step, which writes 0xFFFFFFFF to BAR0, reads the mask
- *   back, and restores the original value.
+ * NOT WORKING: enumeration finds no devices. xhci_enumerate() walks the
+ * ports looking for PORTSC.CCS and reports "no HID devices found" even
+ * with usb-kbd and usb-mouse attached to the controller.
  *
- *   pci_bar does that *without first disabling the device's memory
- *   decode*. While all-ones is latched, the device claims an enormous
- *   region — potentially overlapping the framebuffer, RAM aliases, or
- *   the very MMIO the CPU is executing from. The e1000 survives it; the
- *   xHCI apparently does not.
+ * The likely reason, for whoever picks this up: on a USB 3 capable
+ * controller the port set is split. Ports appear twice — once as USB 2
+ * and once as USB 3 — and which half a device shows up on depends on its
+ * speed. Which register index corresponds to which protocol is not
+ * implied by the port number; it comes from the Supported Protocol
+ * extended capabilities, walked from HCCPARAMS1's xECP field, and this
+ * driver does not read them yet. A full-speed HID device attached to
+ * qemu-xhci will sit on a port this code is not looking at.
  *
- *   The fix is the standard sequence: clear the memory-space bit in the
- *   PCI command register, size the BAR, restore the BAR, then re-enable
- *   decode. That belongs in pci.h's pci_bar() rather than here, since
- *   every caller has the same exposure — the e1000 is getting away with
- *   it rather than being correct.
+ * So the next step is the xECP walk: read HCCPARAMS1 >> 16 for the
+ * capability list offset, follow it to the Supported Protocol entries
+ * (capability ID 2), and use their port offset/count fields to know
+ * which PORTSC indices are USB 2 and which are USB 3.
  *
- * Untested beyond that point: everything after the BAR is mapped. The
- * ring setup, slot enumeration, control transfers and report decoding
- * are written but have never run.
+ * Everything past enumeration — slot setup, control transfers, report
+ * decoding — is written but has still never executed.
  * ================================================================
  *
  * Structure of the thing, since the register names alone do not convey
@@ -378,8 +378,20 @@ static int xhci_init(void) {
     }
     xhci_log("found controller");
     pci_enable(&dev, 0x0006);        /* memory space + bus master */
+    xhci_log("decode enabled");
 
-    xhci_mmio = mmio_map(bar_phys, bar_len ? bar_len : 0x10000);
+    /*
+     * Cap what gets mapped. Only the capability, operational, runtime and
+     * doorbell register blocks are touched here, which fit in 64 KB on
+     * every controller — while a BAR may legitimately be far larger, and
+     * mmio_map walks it a page at a time out of a 32-page table pool.
+     * Asking for the whole BAR is how a driver that only needs the first
+     * few pages exhausts the pool and returns nothing, or spends a very
+     * long time not saying so.
+     */
+    uint64_t map_len = bar_len ? bar_len : 0x10000;
+    if (map_len > 0x10000) map_len = 0x10000;
+    xhci_mmio = mmio_map(bar_phys, map_len);
     xhci_log("mapped BAR0");
     if (!xhci_mmio) { xhci_log("cannot map BAR0"); return 0; }
 

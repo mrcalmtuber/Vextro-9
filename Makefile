@@ -5,7 +5,7 @@ HOSTCC  := cc
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
             -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
-            -Isrc -Ikernel/include -Ibsdfmt
+            -Isrc -Ikernel/include -Ibsdfmt $(EXTRA)
 
 # --- Display mode ---
 # `resolution` is the key Limine actually reads, and it matches the card's
