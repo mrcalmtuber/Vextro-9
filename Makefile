@@ -38,6 +38,26 @@ endif
 CFLAGS  += -DBUF_MAX_W=$(FB_MAX_W)  -DBUF_MAX_H=$(FB_MAX_H) \
            -DWALL_MAX_W=$(FB_MAX_W) -DWALL_MAX_H=$(FB_MAX_H)
 
+# --- Rebuild when the compiler flags change ---
+#
+# make compares timestamps, and a flag has none. Without this,
+# `make iso EXTRA=-DSTORAGE_SELFTEST` after an ordinary build leaves
+# kernel.o untouched and produces an ISO that does not contain the thing
+# that was asked for — silently, so the tests then "pass" by not running.
+#
+# It happens at parse time, before any rule runs, and that placement is
+# the load-bearing part. A recipe that deletes the objects is too late:
+# macOS ships GNU Make 3.81, which stats every target while building its
+# dependency graph and does not look again. It also compares
+# modification times to the whole second, so a stamp rewritten in the
+# same second as the previous build is not "newer" and changes nothing.
+# Deleting before the graph exists sidesteps both.
+BUILD_FLAGS := $(CFLAGS)
+$(shell mkdir -p build; \
+        [ "`cat build/.flags 2>/dev/null`" = "$(BUILD_FLAGS)" ] || \
+        { printf '%s\n' "$(BUILD_FLAGS)" > build/.flags; \
+          rm -f build/kernel.o build/llm.o; })
+
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
 
@@ -201,6 +221,12 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 # make compares timestamps, and a variable has none — without recording
 # RES somewhere on disk, changing it would leave the previous mode baked
 # into an ISO that looks up to date.
+#
+# EXTRA is recorded for the same reason and it bites harder, because the
+# symptom is silence: `make iso EXTRA=-DSTORAGE_SELFTEST` after an
+# ordinary build leaves kernel.o untouched, produces an ISO with no
+# self-test in it, and says nothing at all. The tests then "pass" by not
+# running.
 build/res.stamp: FORCE
 	@mkdir -p build
 	@echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H)' | cmp -s - $@ || \

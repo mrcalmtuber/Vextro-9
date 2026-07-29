@@ -385,10 +385,11 @@ static int nvme_init(void) {
     }
     pci_enable(&dev, PCI_CMD_MEM | PCI_CMD_MASTER);
 
-    /* Registers end at 0x1000; the doorbells follow.  Two queue pairs at
-     * the largest legal stride still fit inside 8 KB. */
-    if (size > 0x2000) size = 0x2000;
-    nvme_regs = mmio_map(bar, size);
+    /* Registers end at 0x1000 and the doorbells follow.  Mapping the
+     * whole BAR would burn page-table pool on space nothing here reads,
+     * so this takes 8 KB and checks below that the doorbells fit. */
+    uint64_t mapped = size > 0x2000 ? 0x2000 : size;
+    nvme_regs = mmio_map(bar, mapped);
     if (!nvme_regs) { nvme_log("could not map BAR0"); return 0; }
 
     uint64_t cap = nvme_rd64(NVME_CAP);
@@ -396,6 +397,19 @@ static int nvme_init(void) {
     uint32_t dstrd  = (uint32_t)((cap >> 32) & 0xF);
     uint32_t mpsmin = (uint32_t)((cap >> 48) & 0xF);
     nvme_db_stride  = 4u << dstrd;
+
+    /*
+     * The doorbell spacing is the controller's to choose, and the field
+     * allows up to 4 MB between them. Every real controller uses the
+     * minimum, but "every real one" is not a bound — and the write that
+     * would go past the mapping is a store to an unmapped page in the
+     * middle of a disk transfer, which is a fault with no useful
+     * explanation attached. Checking costs one comparison at boot.
+     */
+    if (nvme_doorbell(NVME_IOQ_ID, 1) + 4 > mapped) {
+        nvme_log("doorbells are spaced further apart than the mapped window");
+        return 0;
+    }
 
     /*
      * The host page size the controller is told to use is fixed at 4 KB

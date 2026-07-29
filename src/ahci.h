@@ -227,7 +227,11 @@ static int ahci_exec(int disk, const uint8_t *fis, void *buf,
 
     int nprd = 0;
     if (buf && bytes) {
-        dma_run_t runs[AHCI_PRDT_MAX];
+        /* Static, not automatic: 168 runs is 2.7 KB, and this is reached
+         * from deep inside the filesystem code on a kernel stack that
+         * Limine sized, not this driver. One command is ever in flight,
+         * so there is nothing to share it with. */
+        static dma_run_t runs[AHCI_PRDT_MAX];
         nprd = dma_split(buf, bytes, runs, AHCI_PRDT_MAX);
         if (nprd <= 0) { ahci_log("buffer too fragmented for one command"); return -1; }
         for (int r = 0; r < nprd; r++) {
