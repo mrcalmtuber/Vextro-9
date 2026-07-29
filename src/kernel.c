@@ -4,6 +4,7 @@
 #include "idt.h"
 #include "mouse.h"
 #include "keyboard.h"
+#include "xhci.h"
 #include "ttf.h"
 #include "login.h"
 #include "e1000.h"
@@ -363,6 +364,21 @@ static int hal_init_devices(uint16_t cs, int32_t w, int32_t h) {
     /* PS/2 controller exists — init mouse and keyboard */
     mouse_init(cs, w - 1, h - 1);
     keyboard_init(cs);
+
+    /*
+     * USB input, for machines that have no PS/2 controller to emulate one.
+     *
+     * Brought up after the PS/2 path rather than instead of it. Under a
+     * hypervisor the emulated PS/2 devices and the VMware backdoor are
+     * present and better — the backdoor pointer is absolute, which a USB
+     * boot-protocol mouse cannot be. On real hardware there is usually no
+     * PS/2 controller at all and this is the only way in. Both feed the
+     * same ring and the same pointer variables, so whichever answers,
+     * the desktop above cannot tell.
+     */
+#ifdef ENABLE_XHCI
+    if (xhci_init()) xhci_enumerate();
+#endif
     return 0;
 }
 
@@ -582,6 +598,9 @@ void kmain(void) {
     /* Render loop — wakes on each interrupt, redraws, sleeps again */
     while (1) {
         net_poll();
+#ifdef ENABLE_XHCI
+        xhci_poll();
+#endif
 
         /* --- Confirmation message overlay --- */
         if (confirm_active) {
