@@ -42,6 +42,18 @@ static void serial_put_hex32(uint32_t v) {
         serial_putc(hx[(v >> i) & 0xF]);
 }
 
+/* Lives here rather than in netstack.h, where it used to, because the
+ * storage drivers print capacities long before the network exists and
+ * the single-translation-unit build made the order it happened to work
+ * in look like a rule. */
+static void serial_put_dec(uint32_t val) {
+    char buf[12];
+    int i = 0;
+    if (val == 0) { serial_putc('0'); return; }
+    while (val > 0) { buf[i++] = (char)('0' + (val % 10)); val /= 10; }
+    while (i > 0) serial_putc(buf[--i]);
+}
+
 /* ===== 32-BIT PORT I/O ===== */
 
 static inline void outl(uint16_t port, uint32_t val) {
@@ -270,6 +282,53 @@ static uint64_t kern_virt_to_phys(void *virt) {
     uint64_t pti = (vaddr >> 12) & 0x1FF;
     if (!(pt[pti] & PTE_PRESENT)) return 0;
     return (pt[pti] & PTE_ADDR_MASK) | (vaddr & 0xFFF);
+}
+
+/*
+ * Split a kernel buffer into physically contiguous runs.
+ *
+ * A bus-mastering device is handed physical addresses, and a buffer that
+ * looks like one array to C is only one array to the DMA engine if its
+ * pages happen to be contiguous in physical memory.  Limine loads the
+ * kernel image contiguously today, so in practice they are — but "in
+ * practice" is how a driver works on the machine it was written on and
+ * corrupts memory on the next one, and the failure would be silent data
+ * loss on a real disk rather than a clean fault.
+ *
+ * So the address is resolved a page at a time and adjacent pages are
+ * coalesced.  On a contiguous buffer this returns a single run and costs
+ * one page-table walk per 4 KB, which is nothing next to the transfer.
+ * Returns the number of runs, or -1 if the buffer needs more than `max`.
+ */
+typedef struct {
+    uint64_t phys;
+    uint32_t len;
+} dma_run_t;
+
+static int dma_split(const void *buf, uint32_t len, dma_run_t *runs, int max) {
+    if (len == 0) return 0;
+    uint64_t va = (uint64_t)(uintptr_t)buf;
+    int n = 0;
+
+    while (len > 0) {
+        uint64_t pa = kern_virt_to_phys((void *)(uintptr_t)va);
+        if (!pa) return -1;
+
+        uint32_t chunk = 4096u - (uint32_t)(va & 0xFFF);
+        if (chunk > len) chunk = len;
+
+        if (n > 0 && runs[n - 1].phys + runs[n - 1].len == pa)
+            runs[n - 1].len += chunk;          /* extends the previous run */
+        else {
+            if (n >= max) return -1;
+            runs[n].phys = pa;
+            runs[n].len  = chunk;
+            n++;
+        }
+        va  += chunk;
+        len -= chunk;
+    }
+    return n;
 }
 
 /* ===== MMIO MAPPER =====

@@ -2,7 +2,7 @@
 #define EXFAT_H
 
 #include <stdint.h>
-#include "ata.h"
+#include "blk.h"
 
 /*
  * exFAT driver — read and write.
@@ -94,7 +94,7 @@ typedef struct {
 /* ---- raw device access, offset by the partition start ---- */
 
 static int exf_read_sec(uint64_t lba, uint32_t count, void *buf) {
-    return ata_read(exf_vol.part_lba + lba, count, buf);
+    return blk_read(exf_vol.part_lba + lba, count, buf);
 }
 
 /*
@@ -118,7 +118,7 @@ static uint32_t exf_ra_count = 0;      /* 0 = nothing valid */
 
 static int exf_write_sec(uint64_t lba, uint32_t count, const void *buf) {
     exf_ra_count = 0;            /* the device no longer matches the window */
-    return ata_write(exf_vol.part_lba + lba, count, buf);
+    return blk_write(exf_vol.part_lba + lba, count, buf);
 }
 
 /* One sector, through the window, copied into `out`. */
@@ -1016,7 +1016,7 @@ static int exfat_try(uint64_t lba) {
     exf_vol.part_lba = lba;
     exf_vol.mounted = 0;
     exf_fat_forget();          /* nothing cached describes this volume yet */
-    if (ata_read(lba, 1, vbr) != 0) return 0;
+    if (blk_read(lba, 1, vbr) != 0) return 0;
 
     const char *sig = "EXFAT   ";
     for (int i = 0; i < 8; i++)
@@ -1076,12 +1076,12 @@ static int exfat_try(uint64_t lba) {
  */
 static void exfat_mount(void) {
     exf_vol.mounted = 0;
-    if (!ata_present) return;
+    if (!blk_present()) return;
 
     if (exfat_try(0)) return;
 
     uint8_t mbr[EXF_SECTOR];
-    if (ata_read(0, 1, mbr) != 0) return;
+    if (blk_read(0, 1, mbr) != 0) return;
     if (mbr[510] != 0x55 || mbr[511] != 0xAA) return;
 
     for (int i = 0; i < 4; i++) {

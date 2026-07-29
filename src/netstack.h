@@ -22,14 +22,6 @@ static void net_log(const char *msg) {
     serial_putc('\n');
 }
 
-static void serial_put_dec(uint16_t val) {
-    char buf[6];
-    int i = 0;
-    if (val == 0) { serial_putc('0'); return; }
-    while (val > 0) { buf[i++] = (char)('0' + (val % 10)); val /= 10; }
-    while (i > 0) serial_putc(buf[--i]);
-}
-
 /* ===== BYTE ORDER ===== */
 
 static inline uint16_t ntohs(uint16_t net) {

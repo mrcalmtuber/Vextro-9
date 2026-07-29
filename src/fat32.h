@@ -2,7 +2,7 @@
 #define FAT32_H
 
 #include <stdint.h>
-#include "ata.h"
+#include "blk.h"
 #include "gfx.h"
 
 /*
@@ -84,7 +84,7 @@ static int fat_flush(void) {
         for (uint32_t n = 0; n < fat_vol.nfats; n++) {
             uint32_t lba = fat_vol.part_lba + fat_vol.resvd +
                            n * fat_vol.fatsz + sec;
-            if (ata_write(lba, 1, fat_table + sec * 512) != 0)
+            if (blk_write(lba, 1, fat_table + sec * 512) != 0)
                 return -1;
         }
         fat_dirty_bm[sec >> 3] &= (uint8_t)~(1 << (sec & 7));
@@ -93,7 +93,7 @@ static int fat_flush(void) {
 
     /* keep FSInfo honest for host mounts */
     if (fat_vol.fsinfo_lba) {
-        if (ata_read(fat_vol.fsinfo_lba, 1, fat_secbuf) == 0) {
+        if (blk_read(fat_vol.fsinfo_lba, 1, fat_secbuf) == 0) {
             uint32_t free_n = fat_count_free();
             fat_secbuf[488] = (uint8_t)free_n;
             fat_secbuf[489] = (uint8_t)(free_n >> 8);
@@ -103,10 +103,10 @@ static int fat_flush(void) {
             fat_secbuf[493] = (uint8_t)(fat_free_hint >> 8);
             fat_secbuf[494] = (uint8_t)(fat_free_hint >> 16);
             fat_secbuf[495] = (uint8_t)(fat_free_hint >> 24);
-            ata_write(fat_vol.fsinfo_lba, 1, fat_secbuf);
+            blk_write(fat_vol.fsinfo_lba, 1, fat_secbuf);
         }
     }
-    ata_flush();
+    blk_flush();
     return 0;
 }
 
@@ -231,7 +231,7 @@ static int fat_iter_next(fat_iter_t *it, fat_dirent_t *out) {
 
         if (!it->sec_loaded) {
             it->sec_lba = fat_cluster_lba(it->clus) + it->sec_in_clus;
-            if (ata_read(it->sec_lba, 1, it->sec) != 0)
+            if (blk_read(it->sec_lba, 1, it->sec) != 0)
                 return -1;
             it->sec_loaded = 1;
         }
@@ -425,7 +425,7 @@ static int fat_read_file(const fat_dirent_t *f, uint8_t *buf,
            guard++ < fat_vol.nclusters + 2) {
         uint32_t lba = fat_cluster_lba(c);
         for (uint32_t s = 0; s < fat_vol.spc && remaining > 0; s++) {
-            if (ata_read(lba + s, 1, fat_secbuf) != 0) return -1;
+            if (blk_read(lba + s, 1, fat_secbuf) != 0) return -1;
             uint32_t n = remaining < 512 ? remaining : 512;
             for (uint32_t i = 0; i < n; i++)
                 buf[got + i] = fat_secbuf[i];
@@ -495,7 +495,7 @@ static int fat_find_slot(uint32_t dir_clus, uint32_t *out_lba, int *out_idx) {
     while (c >= 2 && c < FAT_EOC && guard++ < fat_vol.nclusters + 2) {
         for (uint32_t s = 0; s < fat_vol.spc; s++) {
             uint32_t lba = fat_cluster_lba(c) + s;
-            if (ata_read(lba, 1, fat_secbuf) != 0) {
+            if (blk_read(lba, 1, fat_secbuf) != 0) {
                 fat_errstr = "dir read error";
                 return -1;
             }
@@ -518,7 +518,7 @@ static int fat_find_slot(uint32_t dir_clus, uint32_t *out_lba, int *out_idx) {
     fat_set(prev, nc);
     for (int i = 0; i < 512; i++) fat_secbuf[i] = 0;
     for (uint32_t s = 0; s < fat_vol.spc; s++)
-        if (ata_write(fat_cluster_lba(nc) + s, 1, fat_secbuf) != 0) {
+        if (blk_write(fat_cluster_lba(nc) + s, 1, fat_secbuf) != 0) {
             fat_errstr = "dir grow error";
             return -1;
         }
@@ -531,7 +531,7 @@ static int fat_find_slot(uint32_t dir_clus, uint32_t *out_lba, int *out_idx) {
 static int fat_write_entry(uint32_t lba, int idx, const uint8_t *field,
                            uint8_t nt, uint8_t attr, uint32_t first,
                            uint32_t size) {
-    if (ata_read(lba, 1, fat_secbuf) != 0) return -1;
+    if (blk_read(lba, 1, fat_secbuf) != 0) return -1;
     uint8_t *ent = fat_secbuf + idx * 32;
     for (int i = 0; i < 32; i++) ent[i] = 0;
     for (int i = 0; i < 11; i++) ent[i] = field[i];
@@ -548,13 +548,13 @@ static int fat_write_entry(uint32_t lba, int idx, const uint8_t *field,
     ent[26] = (uint8_t)first; ent[27] = (uint8_t)(first >> 8);
     ent[28] = (uint8_t)size;        ent[29] = (uint8_t)(size >> 8);
     ent[30] = (uint8_t)(size >> 16); ent[31] = (uint8_t)(size >> 24);
-    return ata_write(lba, 1, fat_secbuf);
+    return blk_write(lba, 1, fat_secbuf);
 }
 
 /* patch first-cluster + size + mtime of an existing short entry */
 static int fat_update_entry(uint32_t lba, int idx, uint32_t first,
                             uint32_t size) {
-    if (ata_read(lba, 1, fat_secbuf) != 0) return -1;
+    if (blk_read(lba, 1, fat_secbuf) != 0) return -1;
     uint8_t *ent = fat_secbuf + idx * 32;
     uint16_t date, tim;
     fat_now(&date, &tim);
@@ -564,7 +564,7 @@ static int fat_update_entry(uint32_t lba, int idx, uint32_t first,
     ent[26] = (uint8_t)first; ent[27] = (uint8_t)(first >> 8);
     ent[28] = (uint8_t)size;        ent[29] = (uint8_t)(size >> 8);
     ent[30] = (uint8_t)(size >> 16); ent[31] = (uint8_t)(size >> 24);
-    return ata_write(lba, 1, fat_secbuf);
+    return blk_write(lba, 1, fat_secbuf);
 }
 
 /* ===== PUBLIC OPERATIONS ===== */
@@ -620,7 +620,7 @@ static int fat_write_file(const char *path, const uint8_t *data,
         for (uint32_t s = 0; s < fat_vol.spc; s++) {
             uint32_t left = len - written;
             if (left >= 512) {
-                if (ata_write(lba + s, 1, data + written) != 0) {
+                if (blk_write(lba + s, 1, data + written) != 0) {
                     fat_errstr = "io error";
                     return -1;
                 }
@@ -628,7 +628,7 @@ static int fat_write_file(const char *path, const uint8_t *data,
             } else {
                 for (int b = 0; b < 512; b++)
                     fat_secbuf[b] = (uint32_t)b < left ? data[written + b] : 0;
-                if (ata_write(lba + s, 1, fat_secbuf) != 0) {
+                if (blk_write(lba + s, 1, fat_secbuf) != 0) {
                     fat_errstr = "io error";
                     return -1;
                 }
@@ -677,7 +677,7 @@ static int fat_mkdir(const char *path) {
     /* zero the cluster, then write . and .. */
     for (int i = 0; i < 512; i++) fat_secbuf[i] = 0;
     for (uint32_t s = 1; s < fat_vol.spc; s++)
-        if (ata_write(fat_cluster_lba(clus) + s, 1, fat_secbuf) != 0) {
+        if (blk_write(fat_cluster_lba(clus) + s, 1, fat_secbuf) != 0) {
             fat_errstr = "dir zero error";
             return -1;
         }
@@ -697,7 +697,7 @@ static int fat_mkdir(const char *path) {
         ent[20] = (uint8_t)(fc >> 16); ent[21] = (uint8_t)(fc >> 24);
         ent[26] = (uint8_t)fc;         ent[27] = (uint8_t)(fc >> 8);
     }
-    if (ata_write(fat_cluster_lba(clus), 1, fat_secbuf) != 0) {
+    if (blk_write(fat_cluster_lba(clus), 1, fat_secbuf) != 0) {
         fat_errstr = "io error";
         return -1;
     }
@@ -744,12 +744,12 @@ static int fat_delete(const char *path) {
 
     /* mark the whole record (LFN parts + short entry) deleted */
     for (int i = 0; i < it.rec_n; i++) {
-        if (ata_read(it.rec_lba[i], 1, fat_secbuf) != 0) {
+        if (blk_read(it.rec_lba[i], 1, fat_secbuf) != 0) {
             fat_errstr = "io error";
             return -1;
         }
         fat_secbuf[it.rec_idx[i] * 32] = 0xE5;
-        if (ata_write(it.rec_lba[i], 1, fat_secbuf) != 0) {
+        if (blk_write(it.rec_lba[i], 1, fat_secbuf) != 0) {
             fat_errstr = "io error";
             return -1;
         }
@@ -764,7 +764,7 @@ static int fat_delete(const char *path) {
 /* ===== MOUNT ===== */
 
 static int fat32_try_vbr(uint32_t lba) {
-    if (ata_read(lba, 1, fat_secbuf) != 0) return 0;
+    if (blk_read(lba, 1, fat_secbuf) != 0) return 0;
     if (fat_secbuf[510] != 0x55 || fat_secbuf[511] != 0xAA) return 0;
     if (fat_secbuf[0] != 0xEB && fat_secbuf[0] != 0xE9) return 0;
 
@@ -809,7 +809,7 @@ static int fat32_try_vbr(uint32_t lba) {
     if (fat_vol.nclusters > map_max) fat_vol.nclusters = map_max;
     fat_vol.fsinfo_lba = fsinfo ? lba + fsinfo : 0;
 
-    if (ata_read(lba + resvd, fatsz32, fat_table) != 0)
+    if (blk_read(lba + resvd, fatsz32, fat_table) != 0)
         return 0;
     for (uint32_t i = 0; i < sizeof(fat_dirty_bm); i++)
         fat_dirty_bm[i] = 0;
@@ -821,7 +821,7 @@ static int fat32_try_vbr(uint32_t lba) {
 
 static void fat32_mount(void) {
     fat_vol.mounted = 0;
-    if (!ata_present) return;
+    if (!blk_present()) return;
 
     if (fat32_try_vbr(0)) {
         serial_puts("[fat32] mounted superfloppy volume\n");
@@ -829,7 +829,7 @@ static void fat32_mount(void) {
     }
 
     /* try MBR partitions */
-    if (ata_read(0, 1, fat_secbuf) != 0) return;
+    if (blk_read(0, 1, fat_secbuf) != 0) return;
     if (fat_secbuf[510] != 0x55 || fat_secbuf[511] != 0xAA) return;
     uint32_t starts[4];
     uint8_t types[4];

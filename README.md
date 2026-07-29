@@ -16,11 +16,14 @@ A bare-metal x86_64 operating system built from scratch — custom kernel, TrueT
 - **Resolution independent** — the desktop lays itself out around whatever mode the bootloader hands over, from 1024x768 up to 1920x1080
 
 ### Filesystem
-- **Writable exFAT** on a real ATA disk (`disk.img`) — files survive reboots
+- **Writable exFAT** on a real disk (`disk.img`) — files survive reboots
 - exFAT rather than FAT32 because **FAT32 caps a single file at 4 GB**; exFAT carries 64-bit sizes, so an offline archive of any size fits. The default volume is 8 GB and **sparse**, costing only the few megabytes actually used
 - Full read/write driver: allocation-bitmap free space, contiguous (`NoFatChain`) *and* chained files, checksummed directory entry sets, free-form UTF-16 names — no more 8.3
 - **`fs_read_range()`** reads a window out of a file, so nothing has to fit in a buffer. `peek <file> <offset> [n]` exposes it from the shell
-- ATA PIO driver with **LBA48**, so volumes past 128 GB work; FAT32 and the ustar ramdisk remain as automatic fallbacks, and MBR partitions are probed, so a FAT32 boot partition can sit beside the exFAT system one
+- **Three storage buses**, probed newest first: **NVMe**, **AHCI/SATA**, and legacy **ATA PIO** with LBA48. A machine built in the last decade has no IDE controller at all, so without the first two the OS finds no disk on real hardware — and NVMe and AHCI move data by bus-master DMA rather than a port read per 16 bits
+- Every disk found is enumerated, and the volume is mounted from **whichever one actually carries it** — an NVMe system drive next to a SATA data drive is ordinary, and bus position says nothing about what is stored where
+- Everything above the block layer is addressed in **512-byte sectors regardless of hardware block size**; NVMe namespaces with 4 KB blocks are translated, read-modify-write included, so a partial-sector write does not destroy its seven neighbours
+- FAT32 and the ustar ramdisk remain as automatic fallbacks, and MBR partitions are probed, so a FAT32 boot partition can sit beside the exFAT system one
 - One `fs_*` layer decides which filesystem is mounted; no app talks to a driver directly
 - `disk.img` is a standard image: **mount it on your host** (macOS: `hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img`) to exchange files with the OS — including dropping in a multi-gigabyte archive
 - Login keycode persists on disk (`keycode.sys`) — delete it to re-register
@@ -112,7 +115,7 @@ The kernel's loader (`src/desktop.h`) dispatches on magic: `.bsd` for store pack
 - **Custom TrueType rasterizer** — integer-only engine rendering Comic Neue (OFL) with 8x8 supersampled AA; no floats, no GPU. Baselines and glyph origins are snapped to whole pixels (left fractional, a 13px baseline lands on an exact half-pixel and fringes every letter), and each glyph's coverage mask is cached per size rather than re-rasterized on every frame — which is what makes the finer sampling affordable
 - **Boot animation** — full-color video playback via raw RGB565 frames embedded at link time; any key skips it
 - **Login screen** — first-boot keycode registration (persisted to disk) with melt animation on bad passwords
-- **HAL** — IDT, PIT, PS/2 keyboard (incl. extended scancodes), PS/2 + VMware-backdoor pointer with wheel, ATA PIO, AC97 audio
+- **HAL** — IDT, PIT, PS/2 keyboard (incl. extended scancodes), PS/2 + VMware-backdoor pointer with wheel, NVMe / AHCI / ATA PIO storage, AC97 audio
 - **Generic PCI layer** — full bus/device/function enumeration (multifunction aware), class-code lookup, BAR sizing incl. 64-bit BARs, shared page-table MMIO mapper
 - **Syscall interface** — `int 0x80` gateway with a minimal userland ABI
 - **Limine bootloader** — BIOS + UEFI dual-boot, El Torito ISO
@@ -248,7 +251,11 @@ src/            Kernel source
   gfx.h         Theme palette + drawing primitives + monospace text
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
   exfat.h       exFAT driver (read/write, 64-bit sizes, range reads)
-  fat32.h       FAT32 driver (fallback)     ata.h  ATA PIO + LBA48
+  fat32.h       FAT32 driver (fallback)
+  blk.h         Block layer: one 512-byte sector view over three buses
+  nvme.h        NVMe driver (admin + I/O queues, PRP lists, 4K blocks)
+  ahci.h        AHCI/SATA driver (command lists, PRDT scatter/gather)
+  ata.h         ATA PIO + LBA48 (legacy fallback)
   pci.h         Generic PCI enumeration + BAR sizing + MMIO mapper
   igpu.h        Intel Gen9 iGPU blitter (GGTT + BCS ring + XY_COLOR_BLT)
   e1000.h       Intel NIC driver        ttf.h  TrueType rasterizer

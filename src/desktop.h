@@ -203,11 +203,38 @@ static int fs_kind = FS_NONE;
 static uint8_t fs_filebuf[FS_FILEBUF_MAX];
 static const char *fs_errstr = "";
 
+/*
+ * Try every disk the block layer found, in its order, and stop at the
+ * first one carrying a volume we can read.
+ *
+ * On the machine this was developed against there is one disk and the
+ * loop runs once.  On a real one there may be an NVMe system drive, a
+ * SATA disk and a USB stick, and only one of them has the OS on it —
+ * scanning is the only way to know which, since a bus position says
+ * nothing about what is stored there.
+ */
 static void fs_mount(void) {
-    exfat_mount();
-    if (exf_vol.mounted) { fs_kind = FS_EXFAT; return; }
-    fat32_mount();
-    if (fat_vol.mounted) { fs_kind = FS_FAT32; return; }
+    for (int i = 0; i < blk_count; i++) {
+        if (blk_select(i) != 0) continue;
+        exfat_mount();
+        if (exf_vol.mounted) fs_kind = FS_EXFAT;
+        else {
+            fat32_mount();
+            if (fat_vol.mounted) fs_kind = FS_FAT32;
+        }
+        if (fs_kind != FS_NONE) {
+            serial_puts("[fs] mounted ");
+            serial_puts(fs_kind == FS_EXFAT ? "exFAT" : "FAT32");
+            serial_puts(" on ");
+            serial_puts(blk_bus_name());
+            serial_puts(" disk ");
+            serial_put_dec((uint32_t)i);
+            serial_putc('\n');
+            return;
+        }
+    }
+    if (blk_count > 0) blk_select(0);
+    serial_puts("[fs] no volume found on any disk\n");
     fs_kind = FS_NONE;
 }
 

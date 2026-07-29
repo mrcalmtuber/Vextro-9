@@ -547,9 +547,16 @@ void kmain(void) {
         tarfs_init(mod->address, mod->size);
     }
 
-    /* Primary filesystem: exFAT on the ATA disk, with FAT32 and the tar
-     * ramdisk as fallbacks (writable, persistent) */
-    ata_init();
+    /* Storage: probe NVMe, then SATA, then the legacy IDE ports, and
+     * mount the first volume any of them turns out to be carrying.  The
+     * tar ramdisk stays as the read-only fallback for a machine where
+     * none of the three finds a disk. */
+    if (hhdm_request.response != NULL)
+        hal_hhdm_offset = hhdm_request.response->offset;
+    blk_init();
+#ifdef STORAGE_SELFTEST
+    blk_selftest();
+#endif
     fs_mount();
 
     /* App store: load the shipped catalog and the installed-app registry

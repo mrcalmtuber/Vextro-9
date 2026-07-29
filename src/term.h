@@ -356,11 +356,17 @@ static void term_cmd_df(void) {
     uint32_t total = fs_total_kb(), free_kb = fs_free_kb();
     term_print("  volume    ");
     term_print(fs_name());
-    term_print(" on ata0 (");
+    term_print(" on ");
+    term_print(blk_bus_name());          /* NVMe, SATA or IDE — whichever
+                                          * bus the volume was found on */
+    term_print(" (");
     uint_to_str(fs_kind == FS_EXFAT ? exf_vol.cluster_count
                                     : fat_vol.nclusters, nb);
     term_print(nb);
-    term_print(" clusters)\n  total     ");
+    term_print(" clusters)\n  device    ");
+    uint_to_str((uint32_t)(blk_sectors() / 2048), nb);
+    term_print(nb);
+    term_print(" MB raw\n  total     ");
     uint_to_str(total / 1024, nb);
     term_print(nb);
     term_print(" MB\n  used      ");

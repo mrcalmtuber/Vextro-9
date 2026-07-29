@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "idt.h"
+#include "pci.h"    /* serial_* helpers */
 
 /*
  * ATA PIO driver — primary bus master drive, LBA28, polling only.
