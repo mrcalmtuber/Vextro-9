@@ -178,6 +178,9 @@ static volatile uint64_t end_marker[] = LIMINE_REQUESTS_END_MARKER;
 #define BUF_MAX_H 1080
 #endif
 static uint32_t backbuf[BUF_MAX_W * BUF_MAX_H];
+/* The previous frame, so a flip can tell what actually changed. */
+static uint32_t prevbuf[BUF_MAX_W * BUF_MAX_H];
+static int      prev_valid = 0;
 
 #define COLOR_BLACK  0x000000u
 #define COLOR_WHITE  0xFFFFFFu
@@ -396,20 +399,6 @@ static void draw_cursor(uint32_t bw, uint32_t bh) {
     }
 }
 
-/*
- * Previously presented frame, so a row that did not change can be left
- * alone.  Comparing two rows in RAM is far cheaper than writing one to
- * the panel, and on a desktop that is mostly still, almost every row is
- * unchanged.
- */
-static uint32_t prevbuf[BUF_MAX_W * BUF_MAX_H];
-static int      prev_valid = 0;
-
-static int row_same(const uint32_t *a, const uint32_t *b, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++)
-        if (a[i] != b[i]) return 0;
-    return 1;
-}
 
 /*
  * Copy the back buffer to the panel.
@@ -420,6 +409,24 @@ static int row_same(const uint32_t *a, const uint32_t *b, uint32_t n) {
  * is no vblank to wait for here, but skipping unchanged rows shrinks
  * that window to whatever actually moved, and when the screen is
  * completely still it writes nothing at all.
+ */
+/*
+ * Push the back buffer at the panel, touching as little as possible.
+ *
+ * Three things happen in one pass, and folding them together is the
+ * point: finding what changed, copying it, and recording where it was.
+ *
+ * The row scan used to answer only "is this row identical?" and then
+ * copy the whole row if not. A moving pointer changes twelve pixels of a
+ * 1280-wide row, so that copied a hundred times more than it needed to —
+ * and, worse, it learned nothing it could pass on. Scanning inward from
+ * both ends of the row costs the same comparisons, copies only the span
+ * between them, and yields a bounding box for free.
+ *
+ * That box is what makes the difference on virtio-gpu, where presenting
+ * is an explicit transfer of guest pixels into the host's copy of the
+ * resource followed by a flush. Handing it the whole screen every frame
+ * means moving four megabytes to show a cursor that moved four pixels.
  */
 static void vga_flip(volatile uint32_t *vram,
                      uint32_t w, uint32_t h, uint32_t pitch_px) {
@@ -432,10 +439,15 @@ static void vga_flip(volatile uint32_t *vram,
         const uint32_t *src = backbuf + row * w;
         uint32_t       *cmp = prevbuf + row * w;
 
-        if (prev_valid && row_same(src, cmp, w)) continue;
+        uint32_t c0 = 0, c1 = w;
+        if (prev_valid) {
+            while (c0 < w && src[c0] == cmp[c0]) c0++;
+            if (c0 == w) continue;                  /* row unchanged */
+            while (c1 > c0 && src[c1 - 1] == cmp[c1 - 1]) c1--;
+        }
 
         volatile uint32_t *dst = vram + row * pitch_px;
-        for (uint32_t col = 0; col < w; col++) {
+        for (uint32_t col = c0; col < c1; col++) {
             dst[col] = src[col];
             cmp[col] = src[col];
         }

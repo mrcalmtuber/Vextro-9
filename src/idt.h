@@ -61,6 +61,12 @@ static inline int budget_expired_ms(uint64_t start, uint32_t ms) {
     return (cycle_now() - start) >= (uint64_t)ms * cycles_per_ms;
 }
 
+/* Microseconds, for spans a millisecond cannot resolve. */
+static inline uint32_t cycles_to_us(uint64_t cycles) {
+    uint64_t per_us = cycles_per_ms / 1000;
+    return per_us ? (uint32_t)(cycles / per_us) : 0;
+}
+
 /* For reporting an elapsed span; 0 if the counter was never calibrated. */
 static inline uint32_t cycles_to_ms(uint64_t cycles) {
     return cycles_per_ms ? (uint32_t)(cycles / cycles_per_ms) : 0;

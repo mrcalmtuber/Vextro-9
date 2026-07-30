@@ -1053,13 +1053,13 @@ static void term_exec(char *cmdline) {
             llm_bench(&d, &o, &b);
             if (!b) { term_print_c("load a model first\n", 2); return; }
             char nb[16];
-            term_print("  one 896x4864 matmul, the model's largest\n");
+            term_print("  one ffn_up matmul (Q5_0, 51% of the weights)\n");
             term_print("  dequantise only   ");
-            uint_to_str(cycles_to_ms(d), nb); term_print(nb); term_print(" ms\n");
+            uint_to_str(cycles_to_us(d), nb); term_print(nb); term_print(" us\n");
             term_print("  arithmetic only   ");
-            uint_to_str(cycles_to_ms(o), nb); term_print(nb); term_print(" ms\n");
+            uint_to_str(cycles_to_us(o), nb); term_print(nb); term_print(" us\n");
             term_print("  as the model runs ");
-            uint_to_str(cycles_to_ms(b), nb); term_print(nb); term_print(" ms\n");
+            uint_to_str(cycles_to_us(b), nb); term_print(nb); term_print(" us\n");
             return;
         }
         if (argc >= 2 && str_eq(argv[1], "weights")) {

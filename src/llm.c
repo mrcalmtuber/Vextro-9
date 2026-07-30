@@ -1683,7 +1683,10 @@ void llm_bench(uint64_t *deq_cy, uint64_t *dot_cy, uint64_t *both_cy) {
     if (both_cy) *both_cy = 0;
     if (!weights_ok) return;
 
-    const wt_t *w = &w_layers[0].w_down;
+    /* ffn_up, not ffn_down: this model stores it Q5_0, which is 51% of
+     * all its weights and the type the vector path actually covers.
+     * Benchmarking a Q6_K tensor would measure the scalar fallback. */
+    const wt_t *w = &w_layers[0].w_up;
     static float x[8192];
     static float out[8192];
     static float row[8192];
