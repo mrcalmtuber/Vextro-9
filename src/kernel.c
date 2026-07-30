@@ -289,6 +289,18 @@ static uint32_t frame_n = 0;
 static uint64_t frame_render_cy = 0, frame_flip_cy = 0, frame_idle_cy = 0;
 static uint32_t frame_t0_ticks = 0;
 
+/*
+ * Pixels actually pushed into live scanout per frame.
+ *
+ * Cycles are the wrong instrument for the tearing near the pointer: the
+ * flip spends nearly all of its time *comparing* a million pixels and
+ * almost none writing the handful that changed, so the cycle count barely
+ * moves however much the written area shrinks. What is visible on the
+ * panel is the writing, because it races the host's sampling of it.
+ */
+static uint64_t frame_wr_px = 0;      /* written by the flip    */
+static uint64_t frame_cur_px = 0;     /* written by the overlay */
+
 static void frame_report(void) {
     if (++frame_n < 120) return;
 
@@ -304,10 +316,15 @@ static void frame_report(void) {
     serial_put_dec((uint32_t)(frame_flip_cy / 120 / 1000));
     serial_puts("k cyc  idle ");
     serial_put_dec((uint32_t)(frame_idle_cy / 120 / 1000));
-    serial_puts("k cyc\n");
+    serial_puts("k cyc  scanout ");
+    serial_put_dec((uint32_t)(frame_wr_px / 120));
+    serial_puts(" px + cursor ");
+    serial_put_dec((uint32_t)(frame_cur_px / 120));
+    serial_puts(" px\n");
 
     frame_n = 0;
     frame_render_cy = frame_flip_cy = frame_idle_cy = 0;
+    frame_wr_px = frame_cur_px = 0;
     frame_t0_ticks = sys_ticks;
 }
 
@@ -383,20 +400,88 @@ static const char *CURSOR_IMG[18] = {
     "      XXX   ",
 };
 
-static void draw_cursor(uint32_t bw, uint32_t bh) {
-    uint32_t cx = (uint32_t)mouse_x;
-    uint32_t cy = (uint32_t)mouse_y;
-    for (uint32_t row = 0; row < 18; row++) {
-        const char *line = CURSOR_IMG[row];
-        for (uint32_t col = 0; col < 12; col++) {
-            char c = line[col];
-            if (c == ' ') continue;
-            uint32_t px = cx + col;
-            uint32_t py = cy + row;
-            if (px < bw && py < bh)
-                backbuf[py * bw + px] = (c == 'X') ? 0x000000u : 0xFFFFFFu;
+#define CURSOR_W 12
+#define CURSOR_H 18
+
+/*
+ * The pointer is an overlay, not part of the picture.
+ *
+ * It used to be stamped into the back buffer along with everything else,
+ * which meant moving it *changed the frame*. The flip compares against
+ * the previous frame and writes the span from the leftmost change to the
+ * rightmost, so a pointer crossing the screen dirtied the rectangle it
+ * left, the one it arrived at, and everything between — and those writes
+ * go straight into live scanout with no vblank to hide behind. On an
+ * otherwise still desktop that band was the only thing being rewritten,
+ * every frame, which is exactly the shimmer that follows the cursor.
+ *
+ * Keeping it out of `backbuf` means cursor motion dirties nothing at all:
+ * the flip no longer sees the pointer, so `desktop_render`'s output is
+ * identical whether the mouse moved or not.
+ *
+ * There is no hardware cursor plane to hand this to. QEMU's `-vga std`
+ * has none, and igpu.h is deliberately blitter-only, so the sprite is
+ * composited into scanout directly, after the flip.
+ *
+ * Nothing needs saving from underneath. `backbuf` *is* the clean desktop
+ * — by construction it never contains the pointer — so erasing means
+ * copying those pixels back out of it.
+ */
+static int32_t cur_prev_x = 0, cur_prev_y = 0;
+static int     cur_drawn  = 0;
+
+/* Repaint a rectangle of the true desktop over whatever is in scanout. */
+static void cursor_restore(volatile uint32_t *vram, uint32_t w, uint32_t h,
+                           uint32_t pitch_px, int32_t rx, int32_t ry) {
+    if (rx < 0) rx = 0;
+    if (ry < 0) ry = 0;
+    for (uint32_t row = 0; row < CURSOR_H; row++) {
+        uint32_t py = (uint32_t)ry + row;
+        if (py >= h) break;
+        const uint32_t   *src = backbuf + py * w;
+        volatile uint32_t *dst = vram + py * pitch_px;
+        for (uint32_t col = 0; col < CURSOR_W; col++) {
+            uint32_t px = (uint32_t)rx + col;
+            if (px >= w) break;
+            dst[px] = src[px];
+            frame_cur_px++;
         }
     }
+}
+
+/*
+ * Erase the pointer where it was, draw it where it is.
+ *
+ * Called after the flip. The redraw is unconditional because the flip may
+ * have just written desktop content over part of the sprite; the erase is
+ * not, because when the pointer has not moved there is nothing stale to
+ * clean up.
+ */
+static void cursor_overlay_flush(volatile uint32_t *vram, uint32_t w,
+                                 uint32_t h, uint32_t pitch_px) {
+    int32_t cx = mouse_x, cy = mouse_y;
+
+    if (cur_drawn && (cur_prev_x != cx || cur_prev_y != cy))
+        cursor_restore(vram, w, h, pitch_px, cur_prev_x, cur_prev_y);
+
+    for (uint32_t row = 0; row < CURSOR_H; row++) {
+        uint32_t py = (uint32_t)(cy + (int32_t)row);
+        if (py >= h) break;
+        const char        *line = CURSOR_IMG[row];
+        volatile uint32_t *dst  = vram + py * pitch_px;
+        for (uint32_t col = 0; col < CURSOR_W; col++) {
+            char c = line[col];
+            if (c == ' ') continue;
+            uint32_t px = (uint32_t)(cx + (int32_t)col);
+            if (px >= w) continue;
+            dst[px] = (c == 'X') ? 0x000000u : 0xFFFFFFu;
+            frame_cur_px++;
+        }
+    }
+
+    cur_prev_x = cx;
+    cur_prev_y = cy;
+    cur_drawn  = 1;
 }
 
 
@@ -433,6 +518,10 @@ static void vga_flip(volatile uint32_t *vram,
     if (gfx_force_full_flip) {          /* someone else wrote the panel */
         gfx_force_full_flip = 0;
         prev_valid = 0;
+        /* Whatever was on the panel is gone, pointer included, so there
+         * is no stale sprite to erase — and erasing would write the
+         * desktop over a rectangle the full flip is about to repaint. */
+        cur_drawn = 0;
     }
 
     for (uint32_t row = 0; row < h; row++) {
@@ -451,6 +540,7 @@ static void vga_flip(volatile uint32_t *vram,
             dst[col] = src[col];
             cmp[col] = src[col];
         }
+        frame_wr_px += c1 - c0;
     }
     prev_valid = 1;
 }
@@ -813,8 +903,8 @@ void kmain(void) {
             uint64_t t0 = cycle_now();
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             uint64_t t1 = cycle_now();
-            draw_cursor(w, h);
             vga_flip(vram, w, h, pitch_px);
+            cursor_overlay_flush(vram, w, h, pitch_px);
             uint64_t t2 = cycle_now();
             frame_render_cy += t1 - t0;
             frame_flip_cy   += t2 - t1;
@@ -904,9 +994,8 @@ void kmain(void) {
         fill_rect(w, 0,     0,     1, h, COLOR_GOLD);
         fill_rect(w, w - 1, 0,     1, h, COLOR_GOLD);
 
-        draw_cursor(w, h);
-
         vga_flip(vram, w, h, pitch_px);
+        cursor_overlay_flush(vram, w, h, pitch_px);
 
         __asm__ volatile("hlt");  /* sleep until next IRQ */
     }
