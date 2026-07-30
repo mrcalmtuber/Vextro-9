@@ -672,6 +672,18 @@ void kmain(void) {
      * so the dock and the Apps menu already know about installed apps */
     store_init();
 
+#ifdef APP_SELFTEST
+    /*
+     * Run the shipped app straight from boot, before the login screen can
+     * get in the way. The loader is otherwise only reachable by typing at
+     * a terminal behind a password prompt, which is not something a
+     * headless harness can do; this makes import resolution testable.
+     */
+    serial_puts("[socrates] app selftest: running /hello\n");
+    execute_bin_internal("/hello", 0);
+    serial_puts("[socrates] app selftest: done\n");
+#endif
+
     /* If a model is sitting on the volume, start pulling it in.  The
      * work itself happens in the render loop, so this only opens the
      * file — the desktop comes up while the weights are still arriving. */

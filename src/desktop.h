@@ -531,6 +531,11 @@ void syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 1: {
         const char *str = (const char *)(uintptr_t)a0;
         if (str && !silent_launch) term_print(str);
+#ifdef APP_SELFTEST
+        /* The terminal is a framebuffer window; a headless harness cannot
+         * read it. Mirror to serial so what the app says is checkable. */
+        if (str) { serial_puts("[app] "); serial_puts(str); }
+#endif
         break;
     }
     case 2: {
@@ -601,6 +606,83 @@ static uint8_t app_stack[8192] __attribute__((aligned(16)));
  * arena NX-set without touching the format.
  */
 
+/* ===== imported symbols =====
+ *
+ * What the kernel lends to applications. See bsdfmt/bsd_format.h for why
+ * the table lives in the image rather than in the header.
+ *
+ * Unlike the aarch64 tree, this needs no deferred setter: ttf.h and gfx.h
+ * are both included before this file, so the addresses are available here
+ * and the table can simply be a constant.
+ */
+static const bsd_export_t kernel_exports[] = {
+    { "ttf_draw_string", (uint64_t)(uintptr_t)ttf_draw_string },
+    { "ttf_text_width",  (uint64_t)(uintptr_t)ttf_text_width  },
+    { "gfx_rect",        (uint64_t)(uintptr_t)gfx_rect        },
+    { 0, 0 }
+};
+
+static int bsd_name_eq(const char *a, const char *b) {
+    for (int i = 0; i < BSD_IMPORT_NAMELEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;                       /* full-width name, no terminator */
+}
+
+/*
+ * Find the import table in a loaded image and fill it in.
+ *
+ * `data` points at the image as loaded, `len` bounds it. The tag is
+ * searched for on eight-byte boundaries because the structure is
+ * eight-aligned by construction; scanning bytewise would find a tag that
+ * happened to straddle two unrelated values.
+ *
+ * The whole span is scanned rather than just the data segment. An image
+ * whose table is const — which is the natural way to write one, since the
+ * loader is the only thing that writes to it — has it folded into .rodata
+ * and linked with the text, and such an image can report data_size == 0.
+ * Searching only the data segment finds nothing in exactly the case the
+ * feature is for.
+ *
+ * Returns the number of names resolved, or -1 if the table is malformed.
+ * An image with no table at all is not an error — that is every image that
+ * existed before this — so it returns zero.
+ */
+static int bsd_resolve_imports(uint8_t *data, uint64_t len) {
+    if (!data || len < sizeof(bsd_import_hdr_t)) return 0;
+
+    uint64_t limit = len - sizeof(bsd_import_hdr_t);
+    for (uint64_t off = 0; off <= limit; off += 8) {
+        bsd_import_hdr_t *hdr = (bsd_import_hdr_t *)(data + off);
+        if (hdr->magic != BSD_IMPORT_MAGIC) continue;
+
+        if (hdr->count == 0 || hdr->count > BSD_IMPORT_MAX) return -1;
+
+        /* The entries must lie wholly inside the image. A count that
+         * overruns is the one way this can be turned into a write past
+         * the image, so it is checked before anything is written. */
+        uint64_t need = sizeof(bsd_import_hdr_t) +
+                        (uint64_t)hdr->count * sizeof(bsd_import_t);
+        if (need > len - off) return -1;
+
+        bsd_import_t *e = (bsd_import_t *)(data + off + sizeof(bsd_import_hdr_t));
+        int found = 0;
+        for (uint32_t i = 0; i < hdr->count; i++) {
+            e[i].addr = 0;
+            for (int k = 0; kernel_exports[k].name; k++) {
+                if (bsd_name_eq(e[i].name, kernel_exports[k].name)) {
+                    e[i].addr = kernel_exports[k].addr;
+                    found++;
+                    break;
+                }
+            }
+        }
+        return found;
+    }
+    return 0;                       /* no table: an ordinary image */
+}
+
 /* Load an ELF64 image (used by `hello` and `run <elf>`). */
 static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
                           uint64_t *out_entry) {
@@ -629,6 +711,7 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
     for (uint32_t i = 0; i < APP_MEM_SIZE; i++)
         app_memory[i] = 0;
 
+    uint64_t span = 0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
             (file + ehdr->e_phoff + i * ehdr->e_phentsize);
@@ -642,6 +725,21 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
         uint8_t *dst = app_memory + offset;
         for (uint64_t j = 0; j < ph->p_filesz; j++)
             dst[j] = src[j];
+        if (offset + ph->p_memsz > span) span = offset + ph->p_memsz;
+    }
+
+    /* Imports are a property of the image, not of the container it arrived
+     * in, and `hello` ships here as a plain ELF — so this belongs on both
+     * load paths, not just the .bsd one. */
+    int nimp = bsd_resolve_imports(app_memory, span);
+    if (nimp < 0) {
+        if (verbose) term_print_c("run: malformed import table\n", 2);
+        return -1;
+    }
+    if (nimp > 0) {
+        serial_puts("[socrates] elf: resolved ");
+        serial_put_dec((uint32_t)nimp);
+        serial_puts(" imported symbols\n");
     }
 
     if (verbose) term_print_c("loading ELF64: ", 3);
@@ -691,6 +789,19 @@ static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
             dst[i] = file[h.data_off + i];
     }
     /* .bss needs no work: the arena was just zeroed. */
+
+    /* Lend the image whatever kernel functions it asked for, before it can
+     * run and call through them. */
+    int nimp = bsd_resolve_imports(app_memory, bsd_image_span(&h));
+    if (nimp < 0) {
+        if (verbose) term_print_c("run: malformed import table\n", 2);
+        return -1;
+    }
+    if (nimp > 0) {
+        serial_puts("[socrates] .bsd: resolved ");
+        serial_put_dec((uint32_t)nimp);
+        serial_puts(" imported symbols\n");
+    }
 
     if (verbose) term_print_c("loading .bsd: ", 3);
     *out_entry = (uint64_t)(uintptr_t)(app_memory + (h.entry - base));

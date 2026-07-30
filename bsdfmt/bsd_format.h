@@ -70,6 +70,57 @@ typedef struct {
 _Static_assert(sizeof(bsd_header_t) == 80, "bsd_header_t must be 80 bytes");
 _Static_assert(_Alignof(bsd_header_t) == 8, "bsd_header_t must be 8-aligned");
 
+
+/* ===== imported symbols =====
+ *
+ * A `.bsd` image carries no relocations, which is what lets a loader put
+ * it anywhere as long as the text-to-data distance is preserved. That
+ * also means it has no way to reference anything outside itself, so every
+ * application statically contains whatever it uses — fine for a fractal,
+ * expensive for anything that wants the TrueType rasteriser.
+ *
+ * This is the smallest thing that fixes it without giving up the property
+ * that makes the format simple. The application places one initialised
+ * structure in its data: a magic word, a count, and that many name/address
+ * pairs with the addresses left zero. The loader finds the structure,
+ * looks each name up in the kernel's export table, and writes the
+ * addresses in. The application then calls through them.
+ *
+ * Deliberately *not* a header field. The header is a fixed eighty bytes
+ * with a static assertion on it, `bsd_validate` is shared verbatim by the
+ * host packer, the kernel loader and the store's download path, and all
+ * three would have to change together for a feature none of them need to
+ * know about. A self-describing table in the data segment costs an eight
+ * byte tag and leaves every existing image byte-for-byte valid.
+ *
+ * The loader searches for the tag rather than requiring it at a fixed
+ * offset, so no linker script has to guarantee placement — which is the
+ * kind of requirement that works until someone adds a global.
+ */
+#define BSD_IMPORT_MAGIC 0x53524D50495F4253ULL   /* "SB_IMPRS", LE */
+#define BSD_IMPORT_NAMELEN 24
+#define BSD_IMPORT_MAX 32          /* refuse anything larger as malformed */
+
+typedef struct {
+    char     name[BSD_IMPORT_NAMELEN];
+    uint64_t addr;                 /* zero in the file; filled by the loader */
+} bsd_import_t;
+
+typedef struct {
+    uint64_t magic;                /* BSD_IMPORT_MAGIC                      */
+    uint32_t count;                /* how many entries follow               */
+    uint32_t reserved;             /* keeps the entries 8-aligned           */
+} bsd_import_hdr_t;
+
+_Static_assert(sizeof(bsd_import_t) == 32, "bsd_import_t must be 32 bytes");
+_Static_assert(sizeof(bsd_import_hdr_t) == 16, "bsd_import_hdr_t must be 16 bytes");
+
+/* What the kernel offers. Name and address, terminated by a null name. */
+typedef struct {
+    const char *name;
+    uint64_t    addr;
+} bsd_export_t;
+
 /* ===== helpers (freestanding: no libc, no allocation) ===== */
 
 static inline int bsd_magic_ok(const bsd_header_t *h) {
