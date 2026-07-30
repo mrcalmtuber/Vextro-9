@@ -13,11 +13,21 @@
   <img alt="lines" src="https://img.shields.io/badge/kernel-22k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
+  <a href="https://github.com/mrcalmtuber/socrates-bsd-9-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
 </p>
 
 <p align="center">
   <img src="docs/desktop.png" width="90%" alt="The Socrates BSD 9 desktop">
 </p>
+
+> **There is an ARM64 port** —
+> **[socrates-bsd-9-arm64](https://github.com/mrcalmtuber/socrates-bsd-9-arm64)**.
+> Same desktop, same browser, same Wikipedia, same language model, on
+> aarch64: virtio devices, a GICv2 and the generic timer instead of the PIC
+> and the PIT, and Raspberry Pi 4 drivers. On Apple silicon it runs under
+> hardware virtualisation rather than emulation, which is the difference
+> between a language model answering in seconds and in minutes. That
+> repository documents the machine layer; this one documents the system.
 
 ---
 
