@@ -568,7 +568,14 @@ static fs_file_t   ai_file;
  * machine without one simply has no chat. */
 static void ai_autoload_start(void) {
     if (ai_state != AI_IDLE) return;
-    if (fs_open(AI_MODEL_PATH, &ai_file) != 0) return;
+    if (fs_open(AI_MODEL_PATH, &ai_file) != 0) {
+        /* Not an error — a machine with no model simply has no chat. But
+         * silence here is why "the chat panel does nothing" took so long
+         * to trace on the ARM tree, where this was never even called. */
+        serial_puts("[ai] no model at " AI_MODEL_PATH "\n");
+        return;
+    }
+    serial_puts("[ai] loading " AI_MODEL_PATH "\n");
     ai_state = AI_PARSE;
 }
 
@@ -589,13 +596,26 @@ static void ai_poll(void) {
         return;
 
     case AI_WEIGHTS: {
-        /* A few chunks per frame: enough to finish in reasonable time,
-         * few enough that the desktop still redraws smoothly. */
-        for (int i = 0; i < 4; i++) {
+        /*
+         * A slice of the frame, not a number of chunks.
+         *
+         * This used to read four chunks per frame regardless of how long a
+         * chunk took, and on an emulated machine one chunk is already more
+         * than a frame — so the desktop ran at 1 fps for the entire load
+         * and the pointer was unusable for the first minute after login,
+         * which is precisely when someone is looking at it.
+         *
+         * Six milliseconds of a 16.6 ms frame leaves room for the
+         * composite and the flip, so the load is invisible on a fast
+         * machine and merely slow on a slow one, instead of taking the
+         * whole desktop down with it.
+         */
+        uint64_t start = cycle_now();
+        do {
             int r = llm_load_step(&err);
             if (r < 0) { ai_err = err; ai_state = AI_FAILED; return; }
             if (r == 1) { ai_state = AI_READY; return; }
-        }
+        } while (!budget_expired_ms(start, 6));
         return;
     }
 
@@ -618,6 +638,10 @@ static int ai_progress(void) {
 }
 
 static void term_exec(char *cmdline);
+
+/* The chat engine lives in apps.h, which is included after this file;
+ * the `ask` command reaches it through this. */
+static int  wiki_ask(const char *question);
 
 static void term_build_prompt(char *out, int max) {
     str_copy(out, "socrates:", max);
@@ -1244,6 +1268,29 @@ static void term_exec(char *cmdline) {
         uint_to_str((uint32_t)(llm_arena_total() / (1024 * 1024)), nb);
         term_print_c(nb, 4);
         term_print(" MB free for weights\n");
+    } else if (str_eq(cmd, "ask")) {
+        /*
+         * The chat panel, from the shell.
+         *
+         * Every other subsystem here is driveable both ways — `zim`,
+         * `store`, `img`, `fetch` all have shell equivalents of what the
+         * windows do — and the one that was reachable only by clicking a
+         * bubble was also the one that took longest to get right, because
+         * it could not be scripted or tested without a pointer.
+         *
+         * The answer lands in the Wikipedia window's transcript as usual;
+         * this only submits it and returns, because generation is paced
+         * across frames and blocking the shell on it would freeze the
+         * desktop for exactly as long as the answer takes.
+         */
+        if (argc < 2) { term_print_c("usage: ask <question>\n", 2); return; }
+        const char *q = cmdline;
+        while (*q && *q != ' ') q++;
+        while (*q == ' ') q++;
+        if (wiki_ask(q))
+            term_print_c("thinking - the answer appears in Wikipedia\n", 3);
+        else
+            term_print_c("could not start - see the Wikipedia window\n", 2);
     } else if (str_eq(cmd, "zim")) {
         if (argc < 2) {
             term_print_c("usage: zim open <file> | info | main | find <path>"

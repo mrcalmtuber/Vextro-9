@@ -14,6 +14,58 @@ static inline uint8_t inb(uint16_t port) {
 }
 static inline void io_wait(void) { outb(0x80, 0); }
 
+/* ---- time budgets ----
+ *
+ * Several things in this kernel are too big to do in one frame and have to
+ * be handed out in pieces: reading a 400 MB model off the disk, running a
+ * transformer over a prompt, decompressing an archive. Each of them used
+ * to be paced by a *count* — four chunks per frame, two layers per frame —
+ * and a count is the wrong unit, for two reasons that pull in opposite
+ * directions.
+ *
+ * Too many, and the frame blows its deadline. The model loader read four
+ * 1 MB chunks per frame; on an emulated machine one of those chunks is
+ * already twice a frame's worth of work, so the desktop ran at 1 fps for
+ * the whole load and the pointer was unusable for a minute after login.
+ *
+ * Too few, and the work never finishes. The same pacing applied to
+ * inference limited it to two layers per frame, which throttled a
+ * three-second prompt evaluation to over two minutes on hardware that
+ * could have done it immediately.
+ *
+ * A count cannot be right for both, because the correct count depends on
+ * how fast the machine is — which is exactly what a count cannot express.
+ * Time can. `tsc_budget_ms` lets a caller spend a stated slice of the
+ * frame and stop, so the same code adapts from an emulator to bare metal
+ * without a tuning constant anywhere.
+ */
+/*
+ * The names are architecture-neutral because the code that uses them is
+ * shared verbatim with the aarch64 tree, where the counter is a system
+ * register rather than an instruction. Keeping apps.h and term.h
+ * identical between the two is worth more than calling this rdtsc().
+ */
+static inline uint64_t cycle_now(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Zero until calibrated against the PIT; a budget test then always
+ * expires, which degrades to exactly one unit of work per frame — slow,
+ * but never a stall. */
+static uint64_t cycles_per_ms = 0;
+
+static inline int budget_expired_ms(uint64_t start, uint32_t ms) {
+    if (!cycles_per_ms) return 1;
+    return (cycle_now() - start) >= (uint64_t)ms * cycles_per_ms;
+}
+
+/* For reporting an elapsed span; 0 if the counter was never calibrated. */
+static inline uint32_t cycles_to_ms(uint64_t cycles) {
+    return cycles_per_ms ? (uint32_t)(cycles / cycles_per_ms) : 0;
+}
+
 /* ---- MSR access helpers ---- */
 static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;

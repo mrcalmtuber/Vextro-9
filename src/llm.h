@@ -110,6 +110,7 @@ int      llm_load_active(void);
 int      llm_eval(int32_t token, int pos);
 /* The same, handed out a layer at a time so a UI can redraw between. */
 int      llm_eval_begin(int32_t token, int pos);
+int      llm_eval_begin_prefill(int32_t token, int pos);  /* no logit head */
 int      llm_eval_step(void);        /* 1 when the logits are ready */
 int      llm_eval_progress(void);    /* 0..100 */
 /* Greedy pick from the last eval's logits. */

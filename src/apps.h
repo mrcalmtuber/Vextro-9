@@ -1108,6 +1108,7 @@ static int        wiki_sel = 0;
 static char       wiki_status[112] = "";
 static int        wiki_mode;            /* 0 search, 1 chat */
 static void       wiki_chat_key(char ch);
+static void       wiki_feed(int k);
 static int        wiki_status_err = 0;
 static int        wiki_tried_open = 0;
 
@@ -1388,10 +1389,12 @@ static char  wiki_source[96];
 static char  wiki_answer[WIKI_ANS_MAX];
 static int   wiki_answer_len;
 
-static int32_t wiki_toks[512];
+#define WIKI_MAX_PROMPT_TOKS 512
+static int32_t wiki_toks[WIKI_MAX_PROMPT_TOKS];
 static int   wiki_ntok, wiki_tokidx;
 static int   wiki_pos, wiki_gen_n;
 static int   wiki_busy;            /* 0 idle, 1 prefill, 2 generating */
+static uint64_t wiki_t0 = 0;       /* when the question was asked        */
 static int   wiki_im_end;
 
 static void wiki_log_add(const char *s) {
@@ -1432,37 +1435,66 @@ static void wiki_html_text(const uint8_t *src, uint32_t len, char *out, int max)
     out[o] = '\0';
 }
 
-/* the longest word in the question, which is the most selective one */
-static void wiki_keyword(const char *q, char *out, int max) {
-    int best_len = 0, best_at = 0, i = 0;
-    while (q[i]) {
-        while (q[i] == ' ') i++;
-        int st = i;
-        while (q[i] && q[i] != ' ' && q[i] != '?') i++;
-        int ln = i - st;
-        if (ln > best_len) { best_len = ln; best_at = st; }
-    }
-    int o = 0;
-    for (int k = 0; k < best_len && o < max - 1; k++) out[o++] = q[best_at + k];
-    out[o] = '\0';
-    /* article titles are capitalised */
-    if (out[0] >= 'a' && out[0] <= 'z') out[0] = (char)(out[0] - 32);
+static int wiki_is_word(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9');
 }
 
-/* Find an article for the question and load its opening text. */
-static int wiki_retrieve(const char *question) {
-    wiki_context[0] = '\0';
-    wiki_source[0] = '\0';
-    if (!zim.open) return 0;
+/*
+ * Splitting a question into words is the whole of retrieval's front end,
+ * and the first version of it hung.
+ *
+ * It skipped spaces and ended a word at a space or a question mark — so
+ * on reaching a '?', the word loop stopped immediately and the space loop
+ * did not advance either, because '?' is not a space. Neither branch
+ * consumed the character and the outer loop ran forever.
+ *
+ * A question mark is how questions end, so every genuine use of the chat
+ * panel hit it. The symptom was a desktop that froze the instant return
+ * was pressed and never came back — which reads as an enormously slow
+ * language model rather than as four lines of string handling, and was
+ * diagnosed as exactly that for a while.
+ *
+ * Splitting on "is this a word character" instead of enumerating
+ * separators makes progress structural: one of the two loops always
+ * consumes the character under the cursor, whatever it is.
+ */
 
-    char key[64];
-    wiki_keyword(question, key, sizeof(key));
-    if (key[0] == '\0') return 0;
+/* Does `title` begin with `key`, ignoring case? */
+static char wiki_fold(char c) {
+    if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    if (c == '_') c = ' ';          /* a ZIM path spells a space '_' */
+    return c;
+}
+
+static int wiki_title_starts(const char *title, const char *key) {
+    int i = 0;
+    for (; key[i]; i++) {
+        char a = wiki_fold(title[i]), b = wiki_fold(key[i]);
+        if (!a || a != b) return 0;
+    }
+    /* a prefix match must end at a word boundary, so "Neutron" does not
+     * claim to be "Neutronium" */
+    char nxt = title[i];
+    return nxt == '\0' || nxt == ' ' || nxt == '_' || nxt == '(';
+}
+
+/* Try one key; fills the context and returns 1 if the archive has it. */
+static int wiki_try_key(const char *key) {
+    if (!key[0]) return 0;
 
     uint32_t idx = zim_lower_bound('C', key);
     zim_dirent_t e;
     if (idx >= zim.article_count || zim_dirent(idx, &e) != 0) return 0;
     if (e.ns != 'C') return 0;
+
+    /*
+     * lower_bound lands on the next entry alphabetically when the key is
+     * absent, so the result has to be *checked*. Without this, asking
+     * about something the archive does not cover retrieved whatever
+     * happened to sort next and fed it to the model as fact.
+     */
+    if (!wiki_title_starts(e.title, key)) return 0;
 
     const uint8_t *d;
     uint32_t n;
@@ -1472,6 +1504,87 @@ static int wiki_retrieve(const char *question) {
     wiki_html_text(d, n < 20000 ? n : 20000, wiki_context, WIKI_CTX_CHARS);
     str_copy(wiki_source, got.title, sizeof(wiki_source));
     return 1;
+}
+
+/*
+ * Find an article for the question and load its opening text.
+ *
+ * Adjacent word pairs are tried before single words, longest first, and
+ * that ordering is the difference between a useful answer and a
+ * confidently wrong one. "What is a neutron star?" has "neutron" as its
+ * longest single word, so a single-word search retrieves *Neutron* — an
+ * article about subatomic particles — and the model duly explains that a
+ * neutron star is a kind of neutron. The phrase "neutron star" is right
+ * there in the question and names the article exactly.
+ *
+ * Everything stays a prefix lookup over the archive's sorted path list,
+ * so each candidate costs about twenty reads and trying several is still
+ * far cheaper than decompressing one cluster.
+ */
+static int wiki_retrieve(const char *question) {
+    wiki_context[0] = '\0';
+    wiki_source[0] = '\0';
+    if (!zim.open) return 0;
+
+    /* split into words, longest-first ordering handled below */
+    char words[8][32];
+    int  nwords = 0, i = 0;
+    while (question[i] && nwords < 8) {
+        while (question[i] && !wiki_is_word(question[i])) i++;
+        if (!question[i]) break;
+        int st = i;
+        while (question[i] && wiki_is_word(question[i])) i++;
+        int ln = i - st;
+        if (ln > 31) ln = 31;
+        for (int k = 0; k < ln; k++) words[nwords][k] = question[st + k];
+        words[nwords][ln] = '\0';
+        nwords++;
+    }
+    if (nwords == 0) return 0;
+
+    char key[72];
+
+    /* pairs, longest combined first */
+    for (int pass = 0; pass < 2; pass++) {
+        int best = -1, best_len = 0;
+        for (int w = 0; w + 1 < nwords; w++) {
+            int ln = 0;
+            while (words[w][ln]) ln++;
+            int ln2 = 0;
+            while (words[w + 1][ln2]) ln2++;
+            if (ln + ln2 > best_len) { best_len = ln + ln2; best = w; }
+        }
+        if (best < 0) break;
+        /*
+         * Joined with an underscore, because the sorted list this
+         * searches is of *paths*, and a ZIM path spells a space as '_'.
+         * Joining with a space finds nothing, silently falls through to
+         * the single-word search, and retrieves an article about the
+         * wrong subject — which is how "neutron star" came back as
+         * "Star".
+         */
+        str_copy(key, words[best], sizeof(key));
+        str_append(key, "_", sizeof(key));
+        str_append(key, words[best + 1], sizeof(key));
+        if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+        if (wiki_try_key(key)) return 1;
+        /* that pair failed; drop its first word and look for another */
+        for (int k = best; k + 1 < nwords; k++)
+            str_copy(words[k], words[k + 1], sizeof(words[k]));
+        nwords--;
+        if (nwords < 2) break;
+    }
+
+    /* then the longest single word */
+    int best = 0, best_len = 0;
+    for (int w = 0; w < nwords; w++) {
+        int ln = 0;
+        while (words[w][ln]) ln++;
+        if (ln > best_len) { best_len = ln; best = w; }
+    }
+    str_copy(key, words[best], sizeof(key));
+    if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+    return wiki_try_key(key);
 }
 
 static void wiki_submit(void) {
@@ -1495,6 +1608,28 @@ static void wiki_submit(void) {
         return;
     }
 
+    /*
+     * Make sure the archive is open before retrieving from it.
+     *
+     * This used to happen only in wiki_draw(), so the encyclopedia was
+     * opened as a side effect of the window being painted. A question
+     * asked before that — from the shell, or from a harness that opens
+     * the window and asks in the same frame — retrieved nothing, and the
+     * model answered from its own weights with no grounding at all. It
+     * still produced a fluent paragraph, which is the worst possible
+     * failure: a confident wrong answer that looks exactly like a
+     * correct one.
+     */
+    wiki_autoopen();
+
+    /* On the serial line as well as in the transcript. A question that
+     * takes a while to answer is indistinguishable from one that was
+     * never asked, unless something says it arrived. */
+    serial_puts("[wiki] ask: ");
+    serial_puts(wiki_input);
+    serial_putc('\n');
+    wiki_t0 = cycle_now();
+
     wiki_log_add("\nYou: ");
     wiki_log_add(wiki_input);
     wiki_log_add("\n");
@@ -1506,23 +1641,60 @@ static void wiki_submit(void) {
         wiki_log_add("]\n");
     }
 
-    /* Qwen2's chat format, with the retrieved passage as the grounding */
+    /*
+     * Qwen2's chat format, with the retrieved passage as the grounding.
+     *
+     * The context is trimmed to what will still leave room for the
+     * question and the assistant turn, rather than appended and allowed to
+     * fill the buffer. str_append stops at the bound, so a long article
+     * used to silently push the question — the entire point of the
+     * exercise — off the end, and the model was asked to continue an
+     * article rather than answer anything.
+     */
     static char prompt[1400];
+    static const char sys_part[] =
+        "<|im_start|>system\nAnswer the question using the"
+        " context. Be brief.<|im_end|>\n<|im_start|>user\n";
+    static const char tail_part[] = "<|im_end|>\n<|im_start|>assistant\n";
+
     prompt[0] = '\0';
-    str_append(prompt, "<|im_start|>system\nAnswer the question using the"
-                       " context. Be brief.<|im_end|>\n<|im_start|>user\n",
-               sizeof(prompt));
+    str_append(prompt, sys_part, sizeof(prompt));
+
     if (wiki_context[0]) {
-        str_append(prompt, "Context: ", sizeof(prompt));
-        str_append(prompt, wiki_context, sizeof(prompt));
-        str_append(prompt, "\n", sizeof(prompt));
+        int used = (int)sizeof(sys_part) - 1 + 9 /* "Context: " */ + 1
+                 + 10 /* "Question: " */ + wiki_input_len
+                 + (int)sizeof(tail_part) - 1;
+        int room = (int)sizeof(prompt) - 1 - used;
+        if (room > 64) {
+            char save = 0;
+            int clen = 0;
+            while (wiki_context[clen] && clen < room) clen++;
+            save = wiki_context[clen];
+            wiki_context[clen] = '\0';
+            str_append(prompt, "Context: ", sizeof(prompt));
+            str_append(prompt, wiki_context, sizeof(prompt));
+            str_append(prompt, "\n", sizeof(prompt));
+            wiki_context[clen] = save;
+        }
     }
     str_append(prompt, "Question: ", sizeof(prompt));
     str_append(prompt, wiki_input, sizeof(prompt));
-    str_append(prompt, "<|im_end|>\n<|im_start|>assistant\n", sizeof(prompt));
+    str_append(prompt, tail_part, sizeof(prompt));
 
-    wiki_ntok = llm_encode(prompt, wiki_toks, 512);
-    if (wiki_ntok <= 0) { wiki_log_add("(could not tokenize)\n"); return; }
+    wiki_ntok = llm_encode(prompt, wiki_toks, WIKI_MAX_PROMPT_TOKS);
+    if (wiki_ntok <= 0) {
+        /* Said out loud, on both channels. Every failure below this point
+         * used to return in silence, which is why an unanswered question
+         * looked identical to a hung machine. */
+        serial_puts("[wiki] tokenizer refused the prompt\n");
+        wiki_log_add("(could not tokenize)\n");
+        return;
+    }
+    serial_puts("[wiki] prompt ");
+    serial_put_dec((uint32_t)wiki_ntok);
+    serial_puts(" tokens, context from ");
+    serial_puts(wiki_source[0] ? wiki_source : "(nothing found)");
+    serial_putc('\n');
 
     wiki_im_end = llm_token_id("<|im_end|>");
     wiki_tokidx = 0;
@@ -1531,26 +1703,75 @@ static void wiki_submit(void) {
     wiki_answer[0] = '\0';
     wiki_answer_len = 0;
     wiki_busy = 1;
-    llm_eval_begin(wiki_toks[0], 0);
+    wiki_feed(0);
 
     wiki_input[0] = '\0';
     wiki_input_len = 0;
+}
+
+/*
+ * Feed prompt token `k`, asking for logits only where they can be read.
+ *
+ * Only the last prompt token's logits choose anything — everything before
+ * it exists to fill the key/value cache. Computing the head for all of
+ * them was about three fifths of the cost of reading an article, spent
+ * entirely on numbers nothing looks at.
+ */
+static void wiki_feed(int k) {
+    if (k + 1 < wiki_ntok) llm_eval_begin_prefill(wiki_toks[k], wiki_pos);
+    else                   llm_eval_begin(wiki_toks[k], wiki_pos);
+}
+
+/*
+ * Submit a question from outside the chat panel — the shell's `ask`.
+ *
+ * Every other subsystem here is driveable both ways: `zim`, `store`,
+ * `img` and `fetch` all have shell equivalents of what their windows do.
+ * The chat was reachable only by clicking a bubble, which also made it
+ * the one feature that could not be scripted — and therefore the one
+ * whose bugs survived longest, because reproducing them needed a hand on
+ * a mouse. Returns 1 if generation started.
+ */
+static int wiki_ask(const char *question) {
+    if (!question || !question[0]) return 0;
+    str_copy(wiki_input, question, sizeof(wiki_input));
+    wiki_input_len = 0;
+    while (wiki_input[wiki_input_len]) wiki_input_len++;
+    wiki_mode = 1;                     /* show the chat, not the search */
+    wiki_submit();
+    return wiki_busy != 0;
 }
 
 /* advance generation; called once per frame */
 static void wiki_gen_poll(void) {
     if (!wiki_busy) return;
 
-    /* a few layers per frame keeps the desktop responsive */
-    for (int k = 0; k < 2; k++) {
-        if (llm_eval_step() != 1) return;
+    /*
+     * As much of the frame as can be spared, rather than two layers.
+     *
+     * A fixed two steps per frame was catastrophic in the other direction
+     * from the model loader. One step is one transformer layer or one
+     * slice of the logit head — about sixty steps per token — and the
+     * prompt is a retrieved article, two or three hundred tokens of it.
+     * At two steps per frame that is fifteen thousand frames, so a prompt
+     * evaluation the hardware can do in three seconds took over two
+     * minutes, with the desktop idling at 60 fps the whole time because it
+     * had been told not to work any harder.
+     *
+     * Eight milliseconds is a larger slice than the loader gets, because
+     * this only happens while somebody is deliberately waiting for an
+     * answer and a slightly heavier frame is the right trade then.
+     */
+    uint64_t start = cycle_now();
+    do {
+        if (llm_eval_step() != 1) continue;
 
         if (wiki_busy == 1) {
             /* still feeding the prompt in */
             wiki_tokidx++;
             wiki_pos++;
             if (wiki_tokidx < wiki_ntok) {
-                llm_eval_begin(wiki_toks[wiki_tokidx], wiki_pos);
+                wiki_feed(wiki_tokidx);
                 continue;
             }
             wiki_busy = 2;                    /* prompt consumed */
@@ -1562,6 +1783,16 @@ static void wiki_gen_poll(void) {
             wiki_log_add(wiki_answer);
             wiki_log_add("\n");
             wiki_busy = 0;
+
+            serial_puts("[wiki] answered in ");
+            serial_put_dec(cycles_to_ms(cycle_now() - wiki_t0));
+            serial_puts(" ms, ");
+            serial_put_dec((uint32_t)wiki_ntok);
+            serial_puts(" prompt + ");
+            serial_put_dec((uint32_t)wiki_gen_n);
+            serial_puts(" generated tokens\n[wiki] ");
+            serial_puts(wiki_answer);
+            serial_putc('\n');
             return;
         }
 
@@ -1574,7 +1805,7 @@ static void wiki_gen_poll(void) {
         wiki_gen_n++;
         wiki_pos++;
         llm_eval_begin(next, wiki_pos);
-    }
+    } while (!budget_expired_ms(start, 8));
 }
 
 static void wiki_chat_key(char ch) {
@@ -1677,20 +1908,44 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
     ttf_draw_string(buf, (int)w, (int)h, cx + 16, cy + 10, "Wikipedia",
                     C_GOLD, 18);
     {
-        /* While the model streams in, say so where the subtitle goes —
-         * it is the one place someone waiting to ask a question looks. */
+        /*
+         * The subtitle is the one place someone waiting for an answer
+         * looks, so every state that involves waiting has to name itself
+         * here. Three of them did not.
+         *
+         * Reading the prompt is the long one: the retrieved article is a
+         * few hundred tokens and every one is a full forward pass, so
+         * there is a real wait between pressing return and the first word
+         * appearing. Saying nothing during it makes a working machine look
+         * like a hung one — which is exactly how it looked.
+         *
+         * And "ask" was shown whenever the loader was not *currently*
+         * busy, including when there is no model on the volume at all. An
+         * invitation to do something impossible is worse than silence.
+         */
         static char ai_sub[32];
         const char *sub;
+        char nb[8];
         if (wiki_mode && ai_busy()) {
-            char nb[8];
             uint_to_str((uint32_t)ai_progress(), nb);
             str_copy(ai_sub, "loading the model ", sizeof(ai_sub));
             str_append(ai_sub, nb, sizeof(ai_sub));
             str_append(ai_sub, "%", sizeof(ai_sub));
             sub = ai_sub;
+        } else if (wiki_mode && wiki_busy == 1) {
+            /* consuming the prompt: progress is real and worth showing */
+            int pct = wiki_ntok > 0 ? wiki_tokidx * 100 / wiki_ntok : 0;
+            uint_to_str((uint32_t)pct, nb);
+            str_copy(ai_sub, "reading the article ", sizeof(ai_sub));
+            str_append(ai_sub, nb, sizeof(ai_sub));
+            str_append(ai_sub, "%", sizeof(ai_sub));
+            sub = ai_sub;
+        } else if (wiki_mode && wiki_busy) {
+            sub = "answering";
+        } else if (wiki_mode) {
+            sub = llm_weights_loaded() ? "ask" : "no model on the volume";
         } else {
-            sub = wiki_mode ? "ask" : (zim.open ? "offline archive"
-                                                : "no archive");
+            sub = zim.open ? "offline archive" : "no archive";
         }
         int tw = ttf_text_width(sub, 12);
         ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 52, cy + 16, sub,

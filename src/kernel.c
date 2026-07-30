@@ -218,6 +218,97 @@ static void irq0_handler(interrupt_frame_t *f) {
 }
 
 /*
+ * Where each frame's time goes.
+ *
+ * The ARM tree has printed a frame rate since its first milestone and this
+ * one never did, which meant "the pointer feels choppy" was a complaint
+ * with no number attached to it — and the pointer's smoothness *is* the
+ * frame rate, because the cursor is composited into the back buffer like
+ * everything else.
+ *
+ * The split matters as much as the total. Compositing the desktop and
+ * pushing the result to the panel are separately expensive and the fix for
+ * one is not the fix for the other, so they are timed separately. TSC
+ * rather than the PIT: at 60 Hz a tick is coarser than an entire frame.
+ */
+/*
+ * Cycles per millisecond, measured against a clock that is known to be
+ * right.
+ *
+ * The TSC's frequency is not discoverable portably — it is not the core
+ * clock on anything modern, and under emulation it is whatever the host
+ * decided. The PIT's frequency, on the other hand, is a fixed property of
+ * the hardware: 1,193,182 Hz. So one is counted against the other.
+ *
+ * Channel 2 in one-shot mode, spun on directly, rather than counting IRQ0
+ * ticks — and that choice is not stylistic. Interrupts are still masked
+ * here; `sti` is a hundred lines further down, after the framebuffer and
+ * every driver is up. A version of this that waited for `sys_ticks` to
+ * advance waited for an interrupt that could not arrive, and hung the
+ * kernel before its first line of output. Channel 2 signals completion
+ * through a port bit instead, which the boot animation already relies on
+ * for exactly this reason.
+ */
+#define PIT_HZ 1193182u
+
+static void tsc_calibrate(void) {
+    const uint32_t ms = 50;
+    uint32_t count = PIT_HZ * ms / 1000;          /* 59659 for 50 ms */
+
+    outb(0x43, 0xB0);                             /* ch2, mode 0, 16-bit */
+    outb(0x42, (uint8_t)(count & 0xFF));
+    outb(0x42, (uint8_t)(count >> 8));
+
+    uint8_t gate = inb(0x61);
+    outb(0x61, (uint8_t)(gate & 0xFE));           /* gate low: reset */
+    uint64_t c0 = cycle_now();
+    outb(0x61, (uint8_t)((gate | 1) & 0xFD));     /* gate high: count down */
+
+    /* Bounded: a machine with no working channel 2 must not hang here.
+     * Falling out leaves cycles_per_ms at zero, which every budget reads as
+     * "unknown" and degrades to one unit of work per frame. */
+    for (uint32_t guard = 0; guard < 200000000u; guard++)
+        if (inb(0x61) & 0x20) {                   /* OUT2 high: expired */
+            cycles_per_ms = (cycle_now() - c0) / ms;
+            break;
+        }
+
+    if (!cycles_per_ms) {
+        serial_puts("[tsc] could not calibrate - pacing one step per frame\n");
+        return;
+    }
+    serial_puts("[tsc] ");
+    serial_put_dec((uint32_t)(cycles_per_ms / 1000));
+    serial_puts(" MHz apparent\n");
+}
+
+static uint32_t frame_n = 0;
+static uint64_t frame_render_cy = 0, frame_flip_cy = 0, frame_idle_cy = 0;
+static uint32_t frame_t0_ticks = 0;
+
+static void frame_report(void) {
+    if (++frame_n < 120) return;
+
+    uint32_t elapsed = sys_ticks - frame_t0_ticks;    /* 60 Hz ticks */
+    uint32_t ms = elapsed * 1000u / 60u;
+    serial_puts("[frame] 120 in ");
+    serial_put_dec(ms);
+    serial_puts(" ms (");
+    serial_put_dec(ms ? 120000u / ms : 0);
+    serial_puts(" fps)  composite ");
+    serial_put_dec((uint32_t)(frame_render_cy / 120 / 1000));
+    serial_puts("k cyc  flip ");
+    serial_put_dec((uint32_t)(frame_flip_cy / 120 / 1000));
+    serial_puts("k cyc  idle ");
+    serial_put_dec((uint32_t)(frame_idle_cy / 120 / 1000));
+    serial_puts("k cyc\n");
+
+    frame_n = 0;
+    frame_render_cy = frame_flip_cy = frame_idle_cy = 0;
+    frame_t0_ticks = sys_ticks;
+}
+
+/*
  * Bring up the x87/SSE unit.  The kernel proper is compiled -mno-sse and
  * never touches these registers; only the inference translation unit
  * does, and it runs with interrupts enabled but never inside one, so no
@@ -519,6 +610,12 @@ void kmain(void) {
     /* Start PIT at ~60 Hz so the render loop runs even when mouse is idle */
     pit_init(cs);
 
+    /* The TSC frequency is not discoverable, but the PIT was just set to a
+     * known rate — so measure one against the other while nothing else is
+     * competing for the machine. Everything that paces itself by time
+     * rather than by a fixed count depends on this. */
+    tsc_calibrate();
+
     /* Initialize Intel e1000 NIC via PCI discovery */
     if (hhdm_request.response != NULL) {
         e1000_init(hhdm_request.response->offset);
@@ -689,10 +786,17 @@ void kmain(void) {
                 desktop_wheel_input(wheel);
             }
 
+            uint64_t t0 = cycle_now();
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
+            uint64_t t1 = cycle_now();
             draw_cursor(w, h);
             vga_flip(vram, w, h, pitch_px);
+            uint64_t t2 = cycle_now();
+            frame_render_cy += t1 - t0;
+            frame_flip_cy   += t2 - t1;
+            frame_report();
             __asm__ volatile("hlt");
+            frame_idle_cy += cycle_now() - t2;
             continue;
         }
 
