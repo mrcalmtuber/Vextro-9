@@ -90,11 +90,22 @@ PIC_SRC     := $(wildcard apps/pics/*.png)
 PIC_SCI     := $(patsubst apps/pics/%.png,build/pics/%.sci,$(PIC_SRC))
 PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
 
-.PHONY: all iso run clean cleandisk apps repo bsdtools pics FORCE
+.PHONY: all iso run clean cleandisk apps repo bsdtools pics test FORCE
 
 FORCE:
 
 all: os.iso disk.img
+
+# The article layout engine is pure computation over a byte buffer, so it
+# runs on the host. The property it exists for -- that a link must not end
+# the line -- cannot be seen in a screenshot and is awkward to assert from
+# inside the kernel, so it is checked here instead.
+test: build/wikidoc_test
+	@./build/wikidoc_test
+
+build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
 
 apps: $(REPO_BINS)
 

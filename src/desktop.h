@@ -880,6 +880,9 @@ static int execute_bin(const char *filepath) {
 
 #include "term.h"
 #include "browser.h"
+/* After browser.h: reuses brw_fold_cp for Unicode folding. Before apps.h,
+ * which is where the Wikipedia window uses it. */
+#include "wikidoc.h"
 #include "apps.h"
 #include "store.h"
 
