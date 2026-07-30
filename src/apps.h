@@ -1703,7 +1703,17 @@ static void wiki_submit(void) {
     wiki_answer[0] = '\0';
     wiki_answer_len = 0;
     wiki_busy = 1;
-    wiki_feed(0);
+    if (wiki_ntok > 1) {
+        /* everything but the last token, in batches */
+        if (llm_prefill_begin(wiki_toks, wiki_ntok - 1, 0) != 0) {
+            serial_puts("[wiki] could not start the prefill\n");
+            wiki_busy = 0;
+            return;
+        }
+    } else {
+        wiki_busy = 3;
+        wiki_feed(0);
+    }
 
     wiki_input[0] = '\0';
     wiki_input_len = 0;
@@ -1763,19 +1773,35 @@ static void wiki_gen_poll(void) {
      * answer and a slightly heavier frame is the right trade then.
      */
     uint64_t start = cycle_now();
+
+    /*
+     * Phase 1 is the prompt, read in batches.
+     *
+     * All of it but the final token goes through llm_prefill_step, which
+     * dequantises each weight once per batch of eight instead of once per
+     * token. Reading an article is where a question's time goes, and
+     * dequantisation is where reading's time goes, so this is the only
+     * change that moves the number much.
+     *
+     * The last token is fed singly, because it is the one whose logits
+     * choose the first word of the answer.
+     */
+    if (wiki_busy == 1) {
+        do {
+            if (llm_prefill_step() != 1) continue;
+            wiki_tokidx = wiki_ntok - 1;
+            wiki_pos    = wiki_ntok - 1;
+            wiki_busy   = 3;              /* prompt cached; feed the last */
+            wiki_feed(wiki_tokidx);
+            break;
+        } while (!budget_expired_ms(start, 8));
+        if (wiki_busy == 1) return;       /* more prompt to read */
+    }
+
     do {
         if (llm_eval_step() != 1) continue;
 
-        if (wiki_busy == 1) {
-            /* still feeding the prompt in */
-            wiki_tokidx++;
-            wiki_pos++;
-            if (wiki_tokidx < wiki_ntok) {
-                wiki_feed(wiki_tokidx);
-                continue;
-            }
-            wiki_busy = 2;                    /* prompt consumed */
-        }
+        if (wiki_busy == 3) wiki_busy = 2;    /* last prompt token done */
 
         int next = llm_argmax();
         if (next == wiki_im_end || wiki_gen_n >= 48 || wiki_pos + 1 >= LLM_CTX_MAX) {
@@ -1932,7 +1958,7 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
             str_append(ai_sub, nb, sizeof(ai_sub));
             str_append(ai_sub, "%", sizeof(ai_sub));
             sub = ai_sub;
-        } else if (wiki_mode && wiki_busy == 1) {
+        } else if (wiki_mode && (wiki_busy == 1 || wiki_busy == 3)) {
             /* consuming the prompt: progress is real and worth showing */
             int pct = wiki_ntok > 0 ? wiki_tokidx * 100 / wiki_ntok : 0;
             uint_to_str((uint32_t)pct, nb);

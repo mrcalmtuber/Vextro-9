@@ -111,6 +111,11 @@ int      llm_eval(int32_t token, int pos);
 /* The same, handed out a layer at a time so a UI can redraw between. */
 int      llm_eval_begin(int32_t token, int pos);
 int      llm_eval_begin_prefill(int32_t token, int pos);  /* no logit head */
+/* Read a run of prompt tokens into the cache, several at a time. This is
+ * where a long prompt's time goes, and batching divides its dominant
+ * cost — dequantisation — by the batch size. */
+int      llm_prefill_begin(const int32_t *toks, int n, int start_pos);
+int      llm_prefill_step(void);      /* 1 when the run is cached */
 int      llm_eval_step(void);        /* 1 when the logits are ready */
 int      llm_eval_progress(void);    /* 0..100 */
 /* Greedy pick from the last eval's logits. */
@@ -119,3 +124,7 @@ int      llm_argmax(void);
 int      llm_logit(int32_t token, int32_t *scaled_by_1000);
 /* Intermediate values for verification, also scaled by 1e6. */
 int      llm_probe(const char *what, int layer, int n, int32_t *out);
+/* Where the time actually goes: milliseconds for one full-size matmul,
+ * split into dequantisation and arithmetic. Optimising the wrong half of
+ * a kernel is easy and this is how to avoid it. */
+void     llm_bench(uint64_t *deq_cy, uint64_t *dot_cy, uint64_t *both_cy);

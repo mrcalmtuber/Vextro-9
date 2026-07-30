@@ -1048,6 +1048,20 @@ static void term_exec(char *cmdline) {
                          ok == 0 ? 4 : 2);
             return;
         }
+        if (argc >= 2 && str_eq(argv[1], "bench")) {
+            uint64_t d = 0, o = 0, b = 0;
+            llm_bench(&d, &o, &b);
+            if (!b) { term_print_c("load a model first\n", 2); return; }
+            char nb[16];
+            term_print("  one 896x4864 matmul, the model's largest\n");
+            term_print("  dequantise only   ");
+            uint_to_str(cycles_to_ms(d), nb); term_print(nb); term_print(" ms\n");
+            term_print("  arithmetic only   ");
+            uint_to_str(cycles_to_ms(o), nb); term_print(nb); term_print(" ms\n");
+            term_print("  as the model runs ");
+            uint_to_str(cycles_to_ms(b), nb); term_print(nb); term_print(" ms\n");
+            return;
+        }
         if (argc >= 2 && str_eq(argv[1], "weights")) {
             const char *werr = "?";
             term_print_c("loading weights (this reads the whole model)...\n", 3);

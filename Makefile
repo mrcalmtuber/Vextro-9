@@ -192,8 +192,22 @@ build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h
 # The inference unit is the one place floats are allowed: a transformer
 # is float maths end to end, while the rest of the kernel stays integer
 # only so no interrupt handler can grow an FPU dependency.
-LLM_CFLAGS := $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) \
-              -msse -msse2 -mfpmath=sse
+# -O3 for this translation unit, and deliberately *not* -ffast-math.
+#
+# Letting the compiler reassociate floating-point sums was tried, on the
+# theory that a dot product cannot vectorise without it. It was worth
+# about nothing — 40.8 s against 38.1 s on the same question, slightly
+# the wrong side of noise — because dequantisation dominates and the
+# arithmetic was never the bottleneck. `llm bench` says so directly: two
+# milliseconds to expand the model's largest weight, under one to
+# multiply by it.
+#
+# It also cost something real. With reassociation permitted, the batched
+# and unbatched paths through the same maths vectorise differently and
+# stop agreeing bit-for-bit, so which of the two ran changed the answer.
+# Paying determinism for nothing is a bad trade.
+LLM_CFLAGS := $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2 -O2,$(CFLAGS)) \
+              -msse -msse2 -mfpmath=sse -O3
 
 build/llm.o: src/llm.c src/llm.h
 	@mkdir -p build

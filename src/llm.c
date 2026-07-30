@@ -988,6 +988,11 @@ static int      head_dim, kv_dim, n_ctx;
 
 /* activations */
 static float *a_x, *a_xb, *a_xb2, *a_q, *a_k, *a_v, *a_att, *a_hb, *a_hb2;
+
+/* The same activations, for a batch of prefill positions. See the
+ * prefill kernel below for why the batch is one. */
+#define LLM_BATCH 1
+static float *b_x, *b_xb, *b_xb2, *b_q, *b_k, *b_v, *b_hb, *b_hb2;
 static float *a_logits, *kv_k, *kv_v;
 
 /* snapshots of the first layer, kept only so a reference forward pass
@@ -1147,6 +1152,16 @@ static int llm_bind_all(const char **err) {
     p_embd = (float *)arena_need(E * 4);
     p_xb0  = (float *)arena_need(E * 4);
     p_q0   = (float *)arena_need(E * 4);
+
+    /* Batched prefill activations: eight positions in flight. */
+    b_x    = (float *)arena_need((uint64_t)LLM_BATCH * E * 4);
+    b_xb   = (float *)arena_need((uint64_t)LLM_BATCH * E * 4);
+    b_xb2  = (float *)arena_need((uint64_t)LLM_BATCH * E * 4);
+    b_q    = (float *)arena_need((uint64_t)LLM_BATCH * E * 4);
+    b_k    = (float *)arena_need((uint64_t)LLM_BATCH * kv_dim * 4);
+    b_v    = (float *)arena_need((uint64_t)LLM_BATCH * kv_dim * 4);
+    b_hb   = (float *)arena_need((uint64_t)LLM_BATCH * F * 4);
+    b_hb2  = (float *)arena_need((uint64_t)LLM_BATCH * F * 4);
     if (arena_failed) { *err = "arena too small for the KV cache"; return -1; }
 
     weights_ok = 1;
@@ -1171,15 +1186,47 @@ static void deq_row(const wt_t *w, uint32_t row, float *out) {
     }
 }
 
+/*
+ * dot(row j, x), dequantising a block at a time straight into the sum.
+ *
+ * The obvious version expands the whole row into a scratch buffer and
+ * then dots it, which is what this used to do, and it costs two extra
+ * trips through memory for every weight in the model: one to write the
+ * expanded row out, one to read it back. For the feed-forward down
+ * projection alone that is 896 rows of 4864 floats — seventeen megabytes
+ * of pure round-trip, per layer, per token.
+ *
+ * It is also a cache disaster. The scratch buffer was 32 KB, larger than
+ * the L1 on most cores, so the write evicted whatever the read was about
+ * to want. A block is a kilobyte at most and stays hot.
+ *
+ * The arithmetic is identical; only the order changed.
+ */
+static float dot_row(const wt_t *w, uint32_t row, const float *x) {
+    uint32_t be, bb;
+    quant_block(w->type, &be, &bb);
+    uint64_t first = (uint64_t)row * w->ne0;
+    const uint8_t *p = w->data + (first / be) * bb;
+
+    float blk[256];
+    float s = 0.0f;
+    uint32_t n = 0;
+    while (n < w->ne0) {
+        int got = dequant_block(w->type, p, blk);
+        if (got <= 0) break;
+        uint32_t take = (uint32_t)got;
+        if (n + take > w->ne0) take = w->ne0 - n;
+        for (uint32_t i = 0; i < take; i++) s += blk[i] * x[n + i];
+        n += take;
+        p += bb;
+    }
+    return s;
+}
+
 /* out[j] = dot(row j, x) for every output row */
 static void matmul(float *out, const float *x, const wt_t *w) {
-    static float row[8192];
-    for (uint32_t j = 0; j < w->ne1; j++) {
-        deq_row(w, j, row);
-        float s = 0.0f;
-        for (uint32_t i = 0; i < w->ne0; i++) s += row[i] * x[i];
-        out[j] = s;
-    }
+    for (uint32_t j = 0; j < w->ne1; j++)
+        out[j] = dot_row(w, j, x);
 }
 
 static void rmsnorm(float *out, const float *x, const wt_t *w, uint32_t n) {
@@ -1346,6 +1393,216 @@ static int eval_begin_common(int32_t token, int pos, int want_logits) {
     return 0;
 }
 
+
+/* ---- prefill kernel ----
+ *
+ * Reading a prompt costs what it costs because of *dequantisation*, not
+ * arithmetic. `llm bench` says so directly: two milliseconds to expand
+ * the model's largest weight, under one to multiply by it. Vectorising
+ * the multiply was tried first and bought nothing, which is what sent
+ * the search here.
+ *
+ * This kernel replaces the whole prompt-reading path and is worth about
+ * three times end to end on the same question — 38 s down to 12 s, while
+ * generating rather more of an answer. That figure is reproducible; the
+ * reason it is quite that large is not fully accounted for. The obvious
+ * candidates are the per-row `quant_block` call hoisted out of the loop
+ * and a block that now stays in L1 instead of being written to a 32 KB
+ * scratch buffer and read back, but the measurement is the claim here,
+ * not the explanation.
+ *
+ * LLM_BATCH is 1, and that is a measured result rather than a
+ * placeholder. The design intent was to decode each weight block once
+ * and use it against several inputs, dividing the dominant cost by the
+ * batch size. It does not work out: eight inputs of nearly 20 KB each
+ * are 155 KB of working set against a 128 KB L1, so the reuse that was
+ * supposed to pay for itself evicts the very block it wanted hot.
+ * Measured on the same question — 1: 12 s, 8: 24 s, 4: 45 s. The
+ * machinery is kept because it is what runs, and because a wider batch
+ * becomes worth it the moment the inputs are small enough to fit.
+ */
+/* out[b][j] = dot(row j of w, x[b]) for b < nb */
+static void matmul_batch(float *out, uint32_t out_stride,
+                         const float *x, uint32_t x_stride,
+                         int nb, const wt_t *w) {
+    uint32_t be, bb;
+    quant_block(w->type, &be, &bb);
+
+    for (uint32_t j = 0; j < w->ne1; j++) {
+        const uint8_t *p = w->data + ((uint64_t)j * w->ne0 / be) * bb;
+        float acc[LLM_BATCH];
+        for (int b = 0; b < nb; b++) acc[b] = 0.0f;
+
+        float blk[256];
+        uint32_t n = 0;
+        while (n < w->ne0) {
+            int got = dequant_block(w->type, p, blk);
+            if (got <= 0) break;
+            uint32_t take = (uint32_t)got;
+            if (n + take > w->ne0) take = w->ne0 - n;
+
+            for (int b = 0; b < nb; b++) {
+                const float *xb = x + (uint64_t)b * x_stride + n;
+                float s = acc[b];
+                for (uint32_t i = 0; i < take; i++) s += blk[i] * xb[i];
+                acc[b] = s;
+            }
+            n += take;
+            p += bb;
+        }
+        for (int b = 0; b < nb; b++)
+            out[(uint64_t)b * out_stride + j] = acc[b];
+    }
+}
+
+static void add_bias(float *v, const wt_t *w, uint32_t n) {
+    static float bias[8192];
+    deq_row(w, 0, bias);
+    for (uint32_t i = 0; i < n; i++) v[i] += bias[i];
+}
+
+/*
+ * One layer, for a run of `nb` consecutive positions starting at `p0`.
+ *
+ * The projections are batched; attention is not, and cannot be — each
+ * position attends over a different span of the cache, and the positions
+ * in this very batch are part of what the later ones attend to. So the
+ * keys and values for the whole batch are written first, and only then
+ * is attention computed position by position. Getting that order wrong
+ * would let a token attend to a key that had not been written yet, which
+ * is the kind of mistake that still produces fluent output.
+ */
+static void eval_layer_batch(uint32_t l, int p0, int nb) {
+    layer_t *L = &w_layers[l];
+    uint32_t E = info.n_embd, F = info.n_ff;
+
+    for (int b = 0; b < nb; b++)
+        rmsnorm(b_xb + (uint64_t)b * E, b_x + (uint64_t)b * E, &L->attn_norm, E);
+
+    matmul_batch(b_q, E, b_xb, E, nb, &L->wq);
+    matmul_batch(b_k, (uint32_t)kv_dim, b_xb, E, nb, &L->wk);
+    matmul_batch(b_v, (uint32_t)kv_dim, b_xb, E, nb, &L->wv);
+
+    for (int b = 0; b < nb; b++) {
+        add_bias(b_q + (uint64_t)b * E, &L->bq, E);
+        add_bias(b_k + (uint64_t)b * kv_dim, &L->bk, (uint32_t)kv_dim);
+        add_bias(b_v + (uint64_t)b * kv_dim, &L->bv, (uint32_t)kv_dim);
+
+        rope(b_q + (uint64_t)b * E, (int)info.n_head, p0 + b);
+        rope(b_k + (uint64_t)b * kv_dim, (int)info.n_head_kv, p0 + b);
+
+        float *krow = kv_k + ((uint64_t)l * n_ctx + p0 + b) * kv_dim;
+        float *vrow = kv_v + ((uint64_t)l * n_ctx + p0 + b) * kv_dim;
+        for (int i = 0; i < kv_dim; i++) {
+            krow[i] = b_k[(uint64_t)b * kv_dim + i];
+            vrow[i] = b_v[(uint64_t)b * kv_dim + i];
+        }
+    }
+
+    uint32_t H = info.n_head, KVH = info.n_head_kv;
+    int group = (int)(H / KVH);
+    float inv_sqrt = 1.0f / k_sqrt((float)head_dim);
+
+    for (int b = 0; b < nb; b++) {
+        int pos = p0 + b;
+        float *xb = b_xb + (uint64_t)b * E;
+        for (uint32_t h = 0; h < H; h++) {
+            const float *qh = b_q + (uint64_t)b * E + h * head_dim;
+            int kvh = (int)h / group;
+            float *sc = a_att + (uint64_t)h * n_ctx;
+
+            for (int t = 0; t <= pos; t++) {
+                const float *kt = kv_k + ((uint64_t)l * n_ctx + t) * kv_dim
+                                       + kvh * head_dim;
+                float sdot = 0.0f;
+                for (int i = 0; i < head_dim; i++) sdot += qh[i] * kt[i];
+                sc[t] = sdot * inv_sqrt;
+            }
+            softmax(sc, pos + 1);
+
+            float *ob = xb + h * head_dim;
+            for (int i = 0; i < head_dim; i++) ob[i] = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                const float *vt = kv_v + ((uint64_t)l * n_ctx + t) * kv_dim
+                                       + kvh * head_dim;
+                float a = sc[t];
+                for (int i = 0; i < head_dim; i++) ob[i] += a * vt[i];
+            }
+        }
+    }
+
+    matmul_batch(b_xb2, E, b_xb, E, nb, &L->wo);
+    for (int b = 0; b < nb; b++)
+        for (uint32_t i = 0; i < E; i++)
+            b_x[(uint64_t)b * E + i] += b_xb2[(uint64_t)b * E + i];
+
+    for (int b = 0; b < nb; b++)
+        rmsnorm(b_xb + (uint64_t)b * E, b_x + (uint64_t)b * E, &L->ffn_norm, E);
+
+    matmul_batch(b_hb,  F, b_xb, E, nb, &L->w_gate);
+    matmul_batch(b_hb2, F, b_xb, E, nb, &L->w_up);
+
+    for (int b = 0; b < nb; b++) {
+        float *hb = b_hb + (uint64_t)b * F, *hb2 = b_hb2 + (uint64_t)b * F;
+        for (uint32_t i = 0; i < F; i++) {
+            float g = hb[i];
+            g = g / (1.0f + k_exp(-g));          /* SiLU */
+            hb[i] = g * hb2[i];
+        }
+    }
+
+    matmul_batch(b_xb2, E, b_hb, F, nb, &L->w_down);
+    for (int b = 0; b < nb; b++)
+        for (uint32_t i = 0; i < E; i++)
+            b_x[(uint64_t)b * E + i] += b_xb2[(uint64_t)b * E + i];
+}
+
+/* ---- steppable prefill, one layer of one batch per step ---- */
+static int      pf_active = 0;
+static int      pf_pos = 0, pf_left = 0, pf_nb = 0;
+static uint32_t pf_layer = 0;
+static const int32_t *pf_toks = 0;
+
+int llm_prefill_begin(const int32_t *toks, int n, int start_pos) {
+    if (!weights_ok || n <= 0) return -1;
+    if (start_pos < 0 || start_pos + n > n_ctx) return -1;
+    pf_toks = toks;
+    pf_pos = start_pos;
+    pf_left = n;
+    pf_layer = 0;
+    pf_nb = 0;
+    pf_active = 1;
+    return 0;
+}
+
+/* 1 when the whole run is in the cache, 0 while there is more to do. */
+int llm_prefill_step(void) {
+    if (!pf_active) return 1;
+
+    if (pf_nb == 0) {                       /* start a batch */
+        pf_nb = pf_left < LLM_BATCH ? pf_left : LLM_BATCH;
+        uint32_t E = info.n_embd;
+        for (int b = 0; b < pf_nb; b++)
+            deq_row(&w_tok_embd, (uint32_t)pf_toks[b], b_x + (uint64_t)b * E);
+        pf_layer = 0;
+    }
+
+    eval_layer_batch(pf_layer, pf_pos, pf_nb);
+
+    if (++pf_layer >= info.n_layer) {       /* batch done */
+        pf_toks += pf_nb;
+        pf_pos  += pf_nb;
+        pf_left -= pf_nb;
+        pf_nb = 0;
+        if (pf_left <= 0) { pf_active = 0; return 1; }
+    }
+    return 0;
+}
+
+int llm_prefill_progress(void) {
+    return pf_active ? 1 : 0;
+}
+
 int llm_eval_begin(int32_t token, int pos) {
     return eval_begin_common(token, pos, 1);
 }
@@ -1392,6 +1649,66 @@ int llm_eval_step(void) {
         return 1;
     }
     return 0;
+}
+
+
+/*
+ * Split one matmul into its two halves and time each.
+ *
+ * `w_down` is the largest weight in the model (896 x 4864) and is
+ * quantised, so it is representative of where inference actually spends
+ * itself. Timing dequantisation alone against dequantisation-plus-
+ * arithmetic says which half to attack — and the first attempt here
+ * attacked the arithmetic, made it fractionally slower, and would have
+ * gone on doing so without a number to argue with.
+ */
+/* This translation unit knows nothing about the machine, so it reads the
+ * counter directly and reports raw cycles; the caller owns the
+ * conversion because the caller is the one that calibrated it. */
+static uint64_t bench_now(void) {
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+#else
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#endif
+}
+
+void llm_bench(uint64_t *deq_cy, uint64_t *dot_cy, uint64_t *both_cy) {
+    if (deq_cy) *deq_cy = 0;
+    if (dot_cy) *dot_cy = 0;
+    if (both_cy) *both_cy = 0;
+    if (!weights_ok) return;
+
+    const wt_t *w = &w_layers[0].w_down;
+    static float x[8192];
+    static float out[8192];
+    static float row[8192];
+    for (uint32_t i = 0; i < w->ne0 && i < 8192; i++) x[i] = 0.001f * (float)(i & 63);
+
+    /* dequantisation only */
+    uint64_t t0 = bench_now();
+    for (uint32_t j = 0; j < w->ne1; j++) deq_row(w, j, row);
+    uint64_t t1 = bench_now();
+
+    /* arithmetic only, over an already-expanded row */
+    for (uint32_t j = 0; j < w->ne1; j++) {
+        float s = 0.0f;
+        for (uint32_t i = 0; i < w->ne0; i++) s += row[i] * x[i];
+        out[j] = s;
+    }
+    uint64_t t2 = bench_now();
+
+    /* both, as the model really runs it */
+    matmul(out, x, w);
+    uint64_t t3 = bench_now();
+
+    if (deq_cy)  *deq_cy  = t1 - t0;
+    if (dot_cy)  *dot_cy  = t2 - t1;
+    if (both_cy) *both_cy = t3 - t2;
 }
 
 int llm_eval_progress(void) {
