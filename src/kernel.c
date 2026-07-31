@@ -1337,6 +1337,27 @@ void kmain(void) {
                 wm_open(WK_TERM);
                 {
                     static const char *cmds[] = {
+#ifdef CU_SELFTEST
+                        "ls /", "wc /t.txt", "wc -l /t.txt",
+                        "head -n 2 /t.txt", "tail -n 1 /t.txt",
+                        "grep alpha /t.txt", "grep -c alpha /t.txt",
+                        "grep -n -i ALPHA /t.txt",
+                        "sort /t.txt", "sort -r /t.txt", "nl /t.txt",
+                        "tac /t.txt", "rev /t.txt",
+                        "cut -d ' ' -f 1 /t.txt",
+                        "tr a-z A-Z /t.txt",
+                        "file /t.txt", "stat /t.txt",
+                        "sha256sum /t.txt", "cksum /t.txt",
+                        "base64 /t.txt",
+                        "hexdump -n 32 /t.txt",
+                        "basename /a/b/c.txt", "dirname /a/b/c.txt",
+                        "realpath t.txt",
+                        "touch /t2.txt", "cp /t.txt /t3.txt",
+                        "mv /t3.txt /t4.txt", "cmp /t.txt /t4.txt",
+                        "diff /t.txt /t2.txt",
+                        "find / -name t*.txt", "du /", "tree /",
+                        "strings /t.txt", "ls /", "tr a-z A-Z /t.txt",
+#endif
                         "whoami", "pwd", "users",
                         "useradd bob hunter2",
                         "users",
@@ -1346,6 +1367,13 @@ void kmain(void) {
                         "users",
                         0
                     };
+#ifdef CU_SELFTEST
+                    fs_write_file("/t.txt",
+                        "alpha bravo charlie\n"
+                        "delta echo foxtrot\n"
+                        "alpha again\n"
+                        "delta echo foxtrot\n", 70);
+#endif
                     for (int c = 0; cmds[c]; c++) {
                         serial_puts("[usertest] $ ");
                         serial_puts(cmds[c]);
