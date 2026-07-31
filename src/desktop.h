@@ -104,7 +104,9 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "hello",            600, 430 },
     { "Agora App Store",  720, 520 },
     { "Photos",           760, 560 },
-    { "Wikipedia",        520, 520 },
+    /* Wide enough to read prose in: articles are laid out in this window
+     * now rather than handed to the browser, and 520 was a search box. */
+    { "Wikipedia",        780, 580 },
     { "Settings",         470, 390 },
     { "About Socrates",   380, 270 },
 };
@@ -2024,11 +2026,15 @@ static void desktop_wheel_input(int32_t notches) {
         store_scroll_by((int)(-step * 48));
         break;
     case WK_WIKI:
-        /* the article itself opens in the browser; here the wheel walks
-         * the result list, but not while the chat panel has the window */
-        if (wiki_mode == 0)
-            for (int32_t i = 0; i < mag; i++)
-                wiki_key(step > 0 ? KEY_UP : KEY_DOWN);
+        /* Scrolls the article when one is open, and otherwise walks the
+         * result list. Not while the chat panel has the window. */
+        if (wiki_mode == 0) {
+            if (wiki_view == 1)
+                wiki_scroll_by((int)(-step * 48));
+            else
+                for (int32_t i = 0; i < mag; i++)
+                    wiki_key(step > 0 ? KEY_UP : KEY_DOWN);
+        }
         break;
     case WK_IMAGE:
         for (int32_t i = 0; i < mag; i++)

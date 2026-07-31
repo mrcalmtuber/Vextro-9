@@ -1119,6 +1119,150 @@ static const char *wiki_candidates[4] = {
 
 static void wiki_search(void);
 
+/* ===== reading an article, in this window =====
+ *
+ * Opening a result used to hand a zim:// URL to the browser and raise the
+ * browser's window, which is why reading an article looked like being
+ * thrown into a different application — and why Back, being the browser's
+ * history, led back to whatever page the browser had been showing rather
+ * than to the search results.
+ *
+ * The article is now laid out by wikidoc.h and drawn in this window, over
+ * the result list, with its own history. The browser still understands
+ * zim:// and is untouched.
+ */
+
+#define WIKI_HIST_MAX 12
+#define WIKI_PATH_MAX 160
+
+typedef struct {
+    char path[WIKI_PATH_MAX];
+    int  scroll;
+} wiki_hist_t;
+
+static int         wiki_view = 0;             /* 0 results, 1 article */
+static char        wiki_art_path[WIKI_PATH_MAX] = "";
+static char        wiki_art_title[WD_TITLE_MAX] = "";
+static int         wiki_scroll = 0;
+static int         wiki_hover = -1;
+static wiki_hist_t wiki_hist[WIKI_HIST_MAX];
+static int         wiki_hist_n = 0;
+static int         wiki_art_wrap = 0;
+static int         wiki_last_cw = 0;
+static int         wiki_view_h = 0;           /* for the wheel handler */
+static int         wiki_sb_drag = 0;
+
+/* Text column, allowing for the margins and the scrollbar. */
+static int wiki_wrap_for(int cw) {
+    int px = cw - 28 - 14;
+    return px > 120 ? px : 120;
+}
+
+/*
+ * Turn a link found inside an article into a ZIM entry path.
+ *
+ * Article markup addresses siblings relatively — "Moon", "./Moon" and
+ * "../A/Moon" all mean the entry Moon — and percent-encodes them. Same
+ * rules the browser applies in brw_resolve_href; brw_pct_decode is reused
+ * rather than reimplemented.
+ */
+static void wiki_resolve_link(const char *href, char *out, int max) {
+    out[0] = '\0';
+    if (!href || !href[0]) return;
+    if (str_starts_with(href, "http://") || str_starts_with(href, "https://") ||
+        str_starts_with(href, "//") || str_starts_with(href, "socrates://"))
+        return;                                  /* not an archive entry */
+
+    const char *q = href;
+    if (str_starts_with(q, "zim://")) q += 6;
+    while (str_starts_with(q, "./")) q += 2;
+    while (str_starts_with(q, "../")) q += 3;
+    if (q[0] && q[1] == '/' &&
+        (q[0] == 'A' || q[0] == 'C' || q[0] == 'I' || q[0] == 'M'))
+        q += 2;
+
+    brw_pct_decode(q, out, max);
+    for (int i = 0; out[i]; i++) if (out[i] == '#') { out[i] = '\0'; break; }
+}
+
+/*
+ * Load an entry and lay it out. `push` records where we were, so Back can
+ * return to it.
+ */
+static int wiki_load(const char *path, int push) {
+    if (!zim.open || !path || !path[0]) return -1;
+
+    uint32_t idx;
+    if (!zim_find('C', path, &idx)) {
+        str_copy(wiki_status, "No entry named ", sizeof(wiki_status));
+        str_append(wiki_status, path, sizeof(wiki_status));
+        wiki_status_err = 1;
+        return -1;
+    }
+
+    const uint8_t *data;
+    uint32_t len;
+    zim_dirent_t e;
+    if (zim_content(idx, &data, &len, &e) != 0) {
+        str_copy(wiki_status, zim_err, sizeof(wiki_status));
+        wiki_status_err = 1;
+        return -1;
+    }
+
+    if (push && wiki_view == 1 && wiki_art_path[0] &&
+        wiki_hist_n < WIKI_HIST_MAX) {
+        str_copy(wiki_hist[wiki_hist_n].path, wiki_art_path, WIKI_PATH_MAX);
+        wiki_hist[wiki_hist_n].scroll = wiki_scroll;
+        wiki_hist_n++;
+    } else if (push && wiki_view == 1 && wiki_art_path[0]) {
+        /* full: drop the oldest so the most recent depth is kept */
+        for (int i = 1; i < WIKI_HIST_MAX; i++) wiki_hist[i - 1] = wiki_hist[i];
+        str_copy(wiki_hist[WIKI_HIST_MAX - 1].path, wiki_art_path, WIKI_PATH_MAX);
+        wiki_hist[WIKI_HIST_MAX - 1].scroll = wiki_scroll;
+    }
+
+    int wrap = wiki_wrap_for(wiki_last_cw > 0 ? wiki_last_cw
+                                              : wk_meta[WK_WIKI].w);
+    wdoc_parse(data, (int)len, wrap);
+    wiki_art_wrap = wrap;
+
+    str_copy(wiki_art_path, path, WIKI_PATH_MAX);
+    if (e.title[0]) str_copy(wiki_art_title, e.title, WD_TITLE_MAX);
+    else if (wd_title[0]) str_copy(wiki_art_title, wd_title, WD_TITLE_MAX);
+    else str_copy(wiki_art_title, path, WD_TITLE_MAX);
+
+    wiki_view = 1;
+    wiki_scroll = 0;
+    wiki_hover = -1;
+    wiki_status_err = 0;
+    str_copy(wiki_status, wiki_art_path, sizeof(wiki_status));
+    return 0;
+}
+
+/* Back: to the previous article, or out to the results if this was the
+ * first one. Never to another application. */
+static void wiki_back(void) {
+    if (wiki_hist_n > 0) {
+        wiki_hist_n--;
+        char path[WIKI_PATH_MAX];
+        int  sc = wiki_hist[wiki_hist_n].scroll;
+        str_copy(path, wiki_hist[wiki_hist_n].path, sizeof(path));
+        if (wiki_load(path, 0) == 0) wiki_scroll = sc;   /* restore the place */
+        return;
+    }
+    wiki_view = 0;
+    wiki_scroll = 0;
+    wiki_hover = -1;
+}
+
+static void wiki_scroll_by(int dy) {
+    int maxs = wd_total_h - wiki_view_h;
+    if (maxs < 0) maxs = 0;
+    wiki_scroll += dy;
+    if (wiki_scroll > maxs) wiki_scroll = maxs;
+    if (wiki_scroll < 0) wiki_scroll = 0;
+}
+
 /*
  * Open whatever the archive nominates as its front door.
  *
@@ -1147,18 +1291,15 @@ static void wiki_open_main_page(void) {
         return;                       /* no front door; the list stands */
     }
 
-    char url[BRW_ADDR_MAX];
-    str_copy(url, "zim://", sizeof(url));
-    str_append(url, e.url, sizeof(url));
-    brw_navigate(url);
-    wm_open(WK_BROWSER);
+    wiki_hist_n = 0;
+    wiki_load(e.url, 0);
 }
 
 /*
  * Runs from the frame loop's poll phase, not from drawing.  The archive is
- * opened lazily on the first draw of the window, but wm_open() reorders the
- * z-stack that wm_draw_all() is walking at that moment, so the landing page
- * has to be raised a step later.
+ * opened lazily on the first draw of the window, and laying out the front
+ * page from inside the draw would have it appear a frame late; doing it
+ * from the poll keeps the two in step.
  */
 static void wiki_poll(void) {
     if (!wiki_want_main) return;
@@ -1309,16 +1450,28 @@ static void wiki_open_hit(int idx) {
     if (idx < 0 || idx >= wiki_hit_count) return;
     zim_dirent_t e;
     if (zim_dirent(wiki_hits[idx].index, &e) != 0) return;
-
-    char url[BRW_ADDR_MAX];
-    str_copy(url, "zim://", sizeof(url));
-    str_append(url, e.url, sizeof(url));
-    brw_navigate(url);
-    wm_open(WK_BROWSER);
+    wiki_hist_n = 0;                 /* a new search starts a new trail */
+    wiki_load(e.url, 0);
 }
 
 static void wiki_key(char ch) {
     if (wiki_mode == 1) { wiki_chat_key(ch); return; }
+
+    /* Reading an article: the keyboard drives the page, and Backspace and
+     * Escape step back through it rather than out of the window. */
+    if (wiki_view == 1) {
+        switch (ch) {
+        case 27:  case '\b': wiki_back(); return;
+        case KEY_DOWN:  wiki_scroll_by(48);  return;
+        case KEY_UP:    wiki_scroll_by(-48); return;
+        case KEY_PGDN:  wiki_scroll_by(wiki_view_h - 40); return;
+        case KEY_PGUP:  wiki_scroll_by(-(wiki_view_h - 40)); return;
+        case KEY_HOME:  wiki_scroll = 0; return;
+        case KEY_END:   wiki_scroll_by(wd_total_h); return;
+        default: return;
+        }
+    }
+
     if (ch == 27) { wm_close(WK_WIKI); return; }
     if (ch == '\n') { wiki_open_hit(wiki_sel); return; }
     if (ch == KEY_DOWN) {
@@ -1346,15 +1499,62 @@ static void wiki_key(char ch) {
 static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
                        int32_t cx, int32_t cy, int32_t cw, int32_t chh) {
     int click = (lmb && !prev_lmb);
-    if (!click) return;
+
+    /* The scrollbar keeps tracking outside the window while held, the way
+     * a dragged scrollbar should. */
+    if (wiki_view == 1 && wiki_sb_drag) {
+        if (!lmb) { wiki_sb_drag = 0; return; }
+        int32_t vy = cy + 74, vh = chh - 74 - 22;
+        int maxs = wd_total_h - vh;
+        if (maxs > 0 && vh > 0) {
+            int rel = my - vy;
+            if (rel < 0) rel = 0;
+            if (rel > vh) rel = vh;
+            wiki_scroll = rel * maxs / (vh > 0 ? vh : 1);
+        }
+        return;
+    }
+
     if (mx < cx || mx >= cx + cw || my < cy || my >= cy + chh) return;
 
     /* the bubble in the header toggles between searching and asking */
-    if (mx >= cx + cw - 42 && mx < cx + cw - 8 && my >= cy + 8 && my < cy + 36) {
+    if (click &&
+        mx >= cx + cw - 42 && mx < cx + cw - 8 && my >= cy + 8 && my < cy + 36) {
         wiki_mode = !wiki_mode;
         return;
     }
     if (wiki_mode) return;
+
+    if (wiki_view == 1) {
+        int32_t vy = cy + 74, vh = chh - 74 - 22;
+        int32_t x0 = cx + 14;
+
+        /* hover, so links light up under the pointer */
+        wiki_hover = wdoc_hit(x0, vy, cw - 28, vh, wiki_scroll, mx, my);
+
+        if (!click) return;
+
+        /* Back chevron */
+        if (mx >= cx + 10 && mx < cx + 74 && my >= cy + 48 && my < cy + 70) {
+            wiki_back();
+            return;
+        }
+
+        int32_t sb_x = cx + cw - 12;
+        if (mx >= sb_x - 2 && wd_total_h > vh) {
+            wiki_sb_drag = 1;
+            return;
+        }
+
+        if (wiki_hover >= 0) {
+            char path[WIKI_PATH_MAX];
+            wiki_resolve_link(wdoc_href_of(wiki_hover), path, sizeof(path));
+            if (path[0]) wiki_load(path, 1);
+        }
+        return;
+    }
+
+    if (!click) return;
 
     int32_t list_y = cy + 74;
     int idx = (my - list_y) / WIKI_ROW_H;
@@ -1997,6 +2197,87 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
         wiki_chat_draw(buf, w, h, cx, cy, cw, chh, tick, focused);
         return;
     }
+
+    /* ---- reading an article ---- */
+    if (wiki_view == 1) {
+        int32_t vy = cy + 74, vh = chh - 74 - 22;
+        wiki_view_h = vh;
+
+        /* Re-lay-out if the column changed. Layout is a function of the
+         * width it was given, so this cannot drift the way the browser's
+         * stale global does. */
+        if (cw != wiki_last_cw) {
+            wiki_last_cw = cw;
+            int wrap = wiki_wrap_for(cw);
+            if (wrap != wiki_art_wrap && wiki_art_path[0]) {
+                uint32_t idx;
+                const uint8_t *data;
+                uint32_t len;
+                zim_dirent_t e;
+                if (zim_find('C', wiki_art_path, &idx) &&
+                    zim_content(idx, &data, &len, &e) == 0) {
+                    wdoc_parse(data, (int)len, wrap);
+                    wiki_art_wrap = wrap;
+                    int maxs = wd_total_h - vh;
+                    if (maxs < 0) maxs = 0;
+                    if (wiki_scroll > maxs) wiki_scroll = maxs;
+                }
+            }
+        }
+
+        /* Back chevron and the article's title */
+        {
+            int back_hot = 1;
+            uint32_t bc = back_hot ? C_GOLD_DIM : 0xB8BCC8u;
+            int32_t bx = cx + 18, by = cy + 59;
+            for (int k = 0; k < 6; k++) {
+                gfx_rect(buf, w, h, bx + k, by - k, 1, 1, bc);
+                gfx_rect(buf, w, h, bx + k, by + k, 1, 1, bc);
+            }
+            ttf_draw_string(buf, (int)w, (int)h, cx + 30, cy + 50,
+                            wiki_hist_n > 0 ? "Back" : "Results", bc, 12);
+
+            char fit[WD_TITLE_MAX];
+            store_fit(fit, sizeof(fit), wiki_art_title, cw - 110, 15);
+            int tw = ttf_text_width(fit, 15);
+            ttf_draw_string(buf, (int)w, (int)h,
+                            cx + cw - tw - 16, cy + 50, fit, C_INK, 15);
+            gfx_rect(buf, w, h, cx + 10, cy + 72, cw - 20, 1, 0xD5D8E0u);
+        }
+
+        wdoc_draw(buf, w, h, cx + 14, vy, cw - 28, vh, wiki_scroll,
+                  wiki_hover);
+
+        /* scrollbar */
+        if (wd_total_h > vh && vh > 40) {
+            int32_t sb_x = cx + cw - 12;
+            gfx_rect(buf, w, h, sb_x, vy, 10, vh, 0xE2E3E8u);
+            int knob_h = vh * vh / wd_total_h;
+            if (knob_h < 24) knob_h = 24;
+            int maxs = wd_total_h - vh;
+            int knob_y = vy + (vh - knob_h) * wiki_scroll /
+                         (maxs > 0 ? maxs : 1);
+            gfx_rect(buf, w, h, sb_x + 1, knob_y, 8, knob_h, 0xA8ACB8u);
+        }
+
+        gfx_rect(buf, w, h, cx, cy + chh - 22, cw, 22, 0xE8E9EEu);
+        gfx_rect(buf, w, h, cx, cy + chh - 22, cw, 1, 0xD5D8E0u);
+        {
+            const char *st = wiki_status;
+            char link[WIKI_PATH_MAX];
+            if (wiki_hover >= 0) {
+                wiki_resolve_link(wdoc_href_of(wiki_hover), link, sizeof(link));
+                if (link[0]) st = link;
+            }
+            char fit[112];
+            store_fit(fit, sizeof(fit), st, cw - 24, 12);
+            ttf_draw_string(buf, (int)w, (int)h, cx + 12, cy + chh - 19, fit,
+                            wiki_status_err ? 0xB0322Eu : 0x50555Fu, 12);
+        }
+        return;
+    }
+
+    wiki_last_cw = cw;
 
     /* search box */
     gfx_rect(buf, w, h, cx + 14, cy + 50, cw - 28, 24, 0xFFFFFFu);

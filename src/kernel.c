@@ -209,6 +209,21 @@ static uint32_t melt_tick = 0;
 /* Desktop mode: set after successful authentication */
 static int desktop_mode = 0;
 
+#ifdef AUTO_LOGIN
+/*
+ * Skip the login screen.
+ *
+ * A headless harness cannot get past a password it does not know, and the
+ * volume carries whatever keycode was set on it. Off by default and never
+ * in a release build; this only exists so screenshots of the desktop can
+ * be taken automatically.
+ */
+static int auto_login = 1;
+#else
+static int auto_login = 0;
+#endif
+
+
 /* HAL status flags */
 static int hal_ps2_present = 1;
 
@@ -774,6 +789,87 @@ void kmain(void) {
     serial_puts("[socrates] app selftest: done\n");
 #endif
 
+#ifdef WIKI_SELFTEST
+    /*
+     * Lay out a real article and report what came out.
+     *
+     * The property the layout engine exists for -- that a link does not end
+     * the line it is in -- is not visible in a screenshot, and the article
+     * that exercises it is the one on the volume rather than a fixture. So
+     * the numbers go to serial where a harness can assert on them.
+     */
+    {
+        serial_puts("[wikitest] opening archive\n");
+        wiki_autoopen();
+        if (!zim.open) {
+            serial_puts("[wikitest] FAIL: no archive\n");
+        } else {
+            const char *want = WIKI_SELFTEST;
+            serial_puts("[wikitest] article: ");
+            serial_puts(want);
+            serial_puts("\n");
+
+            wiki_last_cw = 780;
+            if (wiki_load(want, 0) != 0) {
+                serial_puts("[wikitest] FAIL: could not load\n");
+            } else {
+                serial_puts("[wikitest] title: ");
+                serial_puts(wiki_art_title);
+                serial_puts("\n[wikitest] lines=");
+                serial_put_dec((uint32_t)wd_line_n);
+                serial_puts(" runs=");
+                serial_put_dec((uint32_t)wd_run_n);
+                serial_puts(" chars=");
+                serial_put_dec((uint32_t)wd_text_n);
+                serial_puts(" height=");
+                serial_put_dec((uint32_t)wd_total_h);
+                serial_puts(" truncated=");
+                serial_put_dec((uint32_t)wd_truncated);
+
+                /* How many laid-out lines carry a link *and* other text?
+                 * Under the browser's model this count is necessarily
+                 * zero, because a link always ended its line. */
+                uint32_t mixed = 0, linked = 0, headings = 0;
+                for (int i = 0; i < wd_line_n; i++) {
+                    int has_link = 0, has_plain = 0;
+                    for (uint16_t k = 0; k < wd_lines[i].nrun; k++) {
+                        wd_run_t *r = &wd_runs[wd_lines[i].run0 + k];
+                        if (r->href >= 0) has_link = 1; else has_plain = 1;
+                    }
+                    if (has_link) linked++;
+                    if (has_link && has_plain) mixed++;
+                    if (wd_lines[i].style == WD_H1 ||
+                        wd_lines[i].style == WD_H2 ||
+                        wd_lines[i].style == WD_H3) headings++;
+                }
+                serial_puts("\n[wikitest] linked_lines=");
+                serial_put_dec(linked);
+                serial_puts(" mixed_lines=");
+                serial_put_dec(mixed);
+                serial_puts(" headings=");
+                serial_put_dec(headings);
+                serial_puts("\n");
+
+                /* The first few lines, so the text can be eyeballed. */
+                for (int i = 0; i < wd_line_n && i < 12; i++) {
+                    char out[220];
+                    int o = 0;
+                    for (uint16_t k = 0; k < wd_lines[i].nrun && o < 200; k++) {
+                        wd_run_t *r = &wd_runs[wd_lines[i].run0 + k];
+                        for (uint16_t t = 0; t < r->len && o < 200; t++)
+                            out[o++] = wd_text[r->start + t];
+                    }
+                    out[o] = '\0';
+                    serial_puts("[wikitest] | ");
+                    serial_puts(out);
+                    serial_puts("\n");
+                }
+            }
+        }
+        serial_puts("[wikitest] done\n");
+    }
+#endif
+
     /* If a model is sitting on the volume, start pulling it in.  The
      * work itself happens in the render loop, so this only opens the
      * file — the desktop comes up while the weights are still arriving. */
@@ -883,6 +979,34 @@ void kmain(void) {
             vga_flip(vram, w, h, pitch_px);
             __asm__ volatile("hlt");
             continue;
+        }
+
+        if (auto_login && !desktop_mode) {
+            auto_login = 0;
+            desktop_mode = 1;
+            serial_puts("[socrates] AUTO_LOGIN: skipped the login screen\n");
+            for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
+#ifdef AUTO_WIKI
+            /*
+             * Open the encyclopedia on a named article.
+             *
+             * The pointer cannot be driven headlessly on this machine:
+             * `query-mice` reports one relative PS/2 device, because the
+             * guest's absolute path is the VMware backdoor and QEMU feeds
+             * that from the *host* cursor, which does not exist with
+             * `-display none`. So the window is opened directly rather
+             * than by clicking the dock.
+             */
+            wm_open(WK_WIKI);
+            wiki_autoopen();
+            wiki_want_main = 0;      /* else the poll replaces this article
+                                      * with the archive's front page */
+            wiki_last_cw = wk_meta[WK_WIKI].w;
+            if (wiki_load(AUTO_WIKI, 0) == 0)
+                serial_puts("[socrates] AUTO_WIKI: article open\n");
+            else
+                serial_puts("[socrates] AUTO_WIKI: load failed\n");
+#endif
         }
 
         /* === DESKTOP MODE === */
