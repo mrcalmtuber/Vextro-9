@@ -191,10 +191,26 @@ static int      prev_valid = 0;
 static char typed_text[TEXT_BUF_SIZE];
 static uint32_t typed_len = 0;
 
-/* First-boot password registration */
-static int is_first_boot = 1;
-static char system_password[TEXT_BUF_SIZE];
-static uint32_t system_password_len = 0;
+/*
+ * Where the login screen is in its sequence.
+ *
+ * The machine used to have one anonymous passcode and two states: set it,
+ * or type it. With accounts there is a first run that asks for a name and
+ * a password twice, and a normal path that picks an account and asks for
+ * its password.
+ */
+enum {
+    LOGIN_PASSWORD = 0,   /* pick an account, type its password */
+    LOGIN_NEW_NAME,       /* first run: choose a username        */
+    LOGIN_NEW_PW,
+    LOGIN_NEW_CONFIRM
+};
+static int  login_stage = LOGIN_PASSWORD;
+static int  login_sel = 0;               /* which account is highlighted */
+static char login_msg[96] = "";          /* replaces the prompt when set */
+static char pending_name[USER_NAME_MAX];
+static char pending_pw[TEXT_BUF_SIZE];
+static int  login_nav_up = 0, login_nav_down = 0;
 
 /* Confirmation message state: shows gold text for ~1 second */
 static int confirm_active = 0;
@@ -223,6 +239,53 @@ static int auto_login = 1;
 static int auto_login = 0;
 #endif
 
+
+/*
+ * The accounts on this machine, above the login box.
+ *
+ * Lives here rather than in login.h because login.h is included before
+ * the filesystem layer that users.h needs, and login.h is byte-identical
+ * across the two architecture trees -- a property worth keeping.
+ *
+ * Only drawn when there is a choice to make: one account and the box on
+ * its own is the whole interface, exactly as before.
+ */
+#define ACCT_W   150
+#define ACCT_H   34
+#define ACCT_GAP 10
+
+static void login_draw_users(uint32_t *buf, uint32_t w, uint32_t h,
+                             int32_t mx, int32_t my, uint8_t lmb) {
+    static uint8_t prev = 0;
+    int click = (lmb & 1) && !prev;
+    prev = lmb & 1;
+
+    int32_t total = user_count * ACCT_W + (user_count - 1) * ACCT_GAP;
+    int32_t x0 = ((int32_t)w - total) / 2;
+    int32_t y0 = ((int32_t)h - LOGIN_BOX_H) / 2 - ACCT_H - 26;
+    if (y0 < 8) y0 = 8;
+
+    for (int i = 0; i < user_count; i++) {
+        int32_t x = x0 + i * (ACCT_W + ACCT_GAP);
+        int sel = (i == login_sel);
+        int hot = (mx >= x && mx < x + ACCT_W && my >= y0 && my < y0 + ACCT_H);
+
+        if (click && hot) login_sel = i;
+
+        gfx_rect(buf, w, h, x, y0, ACCT_W, ACCT_H,
+                 sel ? 0x2A2410u : 0x0E1017u);
+        gfx_rect_outline(buf, w, h, x, y0, ACCT_W, ACCT_H,
+                         sel ? COLOR_GOLD : (hot ? 0x6A5A20u : 0x2A3040u));
+
+        const char *nm = user_name_of(i);
+        int tw = ttf_text_width(nm, 14);
+        ttf_draw_string(buf, (int)w, (int)h, x + (ACCT_W - tw) / 2, y0 + 7,
+                        nm, sel ? COLOR_GOLD : 0x9098A8u, 14);
+
+        if (user_is_admin(i))
+            gfx_rect(buf, w, h, x + 6, y0 + 6, 4, 4, COLOR_GOLD);
+    }
+}
 
 /* HAL status flags */
 static int hal_ps2_present = 1;
@@ -875,18 +938,27 @@ void kmain(void) {
      * file — the desktop comes up while the weights are still arriving. */
     ai_autoload_start();
 
-    /* Restore the master keycode saved on a previous boot */
-    {
-        uint64_t klen = 0;
-        const void *kd = fs_read_file("/keycode.sys", &klen);
-        if (kd && klen > 0 && klen < TEXT_BUF_SIZE) {
-            const char *kp = (const char *)kd;
-            for (uint64_t i = 0; i < klen; i++)
-                system_password[i] = kp[i];
-            system_password_len = (uint32_t)klen;
-            system_password[system_password_len] = '\0';
-            is_first_boot = 0;
-        }
+    /*
+     * Accounts.
+     *
+     * A machine that predates them has a plaintext /keycode.sys and no
+     * name attached to it; rather than lock its owner out, that becomes
+     * an administrator account called "admin" with the same password.
+     * A machine with neither goes to the first-run sequence.
+     */
+    users_load();
+    if (user_count == 0 && users_migrate_keycode())
+        serial_puts("[socrates] users: migrated /keycode.sys to 'admin'\n");
+
+    if (user_count == 0) {
+        login_stage = LOGIN_NEW_NAME;
+        serial_puts("[socrates] users: no accounts, first-run setup\n");
+    } else {
+        login_stage = LOGIN_PASSWORD;
+        login_sel = 0;
+        serial_puts("[socrates] users: ");
+        serial_put_dec((uint32_t)user_count);
+        serial_puts(" account(s)\n");
     }
 
     /* Compute total system memory from Limine memory map */
@@ -1009,6 +1081,48 @@ void kmain(void) {
 #endif
         }
 
+        /*
+         * Logging out.
+         *
+         * Handled here rather than where it is requested, because both
+         * the menu and the shell ask for it from inside a draw or a
+         * command, and session_end() closes every window -- pulling the
+         * list out from under whatever is walking it.
+         */
+        if (want_logout) {
+            want_logout = 0;
+            serial_puts("[socrates] logout: ");
+            serial_puts(user_name_of(user_current));
+            serial_puts("\n");
+            session_end();
+#ifdef USER_SELFTEST
+            /* What the next person would inherit, if anything did leak. */
+            serial_puts("[usertest] after logout: history=");
+            serial_put_dec((uint32_t)term_hist_count);
+            serial_puts(" cwd=");
+            serial_puts(term_cwd);
+            serial_puts(" browser=");
+            serial_puts(brw_addr);
+            serial_puts(" wiki_view=");
+            serial_put_dec((uint32_t)wiki_view);
+            serial_puts(" windows=");
+            serial_put_dec((uint32_t)wm_stack_n);
+            serial_puts("\n");
+#endif
+            user_current = -1;
+            desktop_mode = 0;
+            login_stage = LOGIN_PASSWORD;
+            login_initialized = 0;      /* the vortex starts over */
+            prev_valid = 0;             /* whole panel is about to change */
+            typed_len = 0;
+            typed_text[0] = '\0';
+            login_msg[0] = '\0';
+            for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
+            vga_flip(vram, w, h, pitch_px);
+            __asm__ volatile("hlt");
+            continue;
+        }
+
         /* === DESKTOP MODE === */
         if (desktop_mode) {
             char dch;
@@ -1046,6 +1160,10 @@ void kmain(void) {
                 enter_pressed = 1;
             } else if (ch == '\b') {
                 if (typed_len > 0) typed_len--;
+            } else if (ch == KEY_UP) {
+                login_nav_up = 1;
+            } else if (ch == KEY_DOWN) {
+                login_nav_down = 1;
             } else if (ch >= 0x20 && ch < 0x7F &&
                        typed_len < TEXT_BUF_SIZE - 1) {
                 typed_text[typed_len++] = ch;
@@ -1054,63 +1172,161 @@ void kmain(void) {
         typed_text[typed_len] = '\0';
 
         if (enter_pressed && typed_len > 0) {
-            if (is_first_boot) {
-                /* Save the typed string as the master password */
-                for (uint32_t i = 0; i < typed_len && i < TEXT_BUF_SIZE - 1; i++)
-                    system_password[i] = typed_text[i];
-                system_password_len = typed_len;
-                system_password[system_password_len] = '\0';
+            switch (login_stage) {
 
-                is_first_boot = 0;
+            case LOGIN_NEW_NAME:
+                /* First run: no accounts exist yet. */
+                if (!user_name_ok(typed_text)) {
+                    str_copy(login_msg, user_err, sizeof(login_msg));
+                } else {
+                    str_copy(pending_name, typed_text, sizeof(pending_name));
+                    login_stage = LOGIN_NEW_PW;
+                    login_msg[0] = '\0';
+                }
                 typed_len = 0;
                 typed_text[0] = '\0';
+                break;
 
-                /* persist the keycode so it survives reboots */
-                fs_write_file("/keycode.sys", system_password,
-                              system_password_len);
+            case LOGIN_NEW_PW:
+                str_copy(pending_pw, typed_text, sizeof(pending_pw));
+                login_stage = LOGIN_NEW_CONFIRM;
+                typed_len = 0;
+                typed_text[0] = '\0';
+                break;
 
-                confirm_active = 1;
-                confirm_tick = 0;
-
-                vga_flip(vram, w, h, pitch_px);
-                __asm__ volatile("hlt");
-                continue;
-            } else {
-                /* Normal login: check against saved password */
-                int match = (typed_len == system_password_len);
-                if (match) {
-                    for (uint32_t i = 0; i < system_password_len; i++) {
-                        if (typed_text[i] != system_password[i]) { match = 0; break; }
-                    }
+            case LOGIN_NEW_CONFIRM:
+                if (!str_eq(pending_pw, typed_text)) {
+                    str_copy(login_msg, "Those did not match. Try again.",
+                             sizeof(login_msg));
+                    login_stage = LOGIN_NEW_PW;
+                } else if (user_add(pending_name, pending_pw,
+                                    user_count == 0) < 0) {
+                    str_copy(login_msg, user_err, sizeof(login_msg));
+                    login_stage = LOGIN_NEW_PW;
+                } else {
+                    /* First account on the machine is the administrator. */
+                    login_sel = user_find(pending_name);
+                    login_stage = LOGIN_PASSWORD;
+                    confirm_active = 1;
+                    confirm_tick = 0;
+                    login_msg[0] = '\0';
                 }
-                if (!match) {
+                for (uint32_t i = 0; i < sizeof(pending_pw); i++)
+                    pending_pw[i] = '\0';
+                typed_len = 0;
+                typed_text[0] = '\0';
+                break;
+
+            case LOGIN_PASSWORD:
+            default:
+                if (!user_check(login_sel, typed_text)) {
+                    typed_len = 0;
+                    typed_text[0] = '\0';
                     melt_active = 1;
                     melt_tick = 0;
                     vga_flip(vram, w, h, pitch_px);
                     __asm__ volatile("hlt");
                     continue;
                 }
-                /* Password matched — transition to desktop */
                 typed_len = 0;
                 typed_text[0] = '\0';
+                user_current = login_sel;
+                session_begin(user_name_of(user_current));
                 desktop_mode = 1;
+#ifdef USER_SELFTEST
+                /*
+                 * Exercise the account commands from the shell and report
+                 * to serial. Typing at the desktop cannot open a window --
+                 * keys go to whichever window has focus, and none does --
+                 * and the pointer cannot be driven headlessly here, so the
+                 * terminal is opened directly.
+                 */
+                wm_open(WK_TERM);
+                {
+                    static const char *cmds[] = {
+                        "whoami", "pwd", "users",
+                        "useradd bob hunter2",
+                        "users",
+                        "userdel kairav",         /* refused: in use      */
+                        "useradd bob other",      /* refused: name taken  */
+                        "useradd BOB x",          /* refused: bad name    */
+                        "users",
+                        0
+                    };
+                    for (int c = 0; cmds[c]; c++) {
+                        serial_puts("[usertest] $ ");
+                        serial_puts(cmds[c]);
+                        serial_puts("\n");
+                        char line[64];
+                        str_copy(line, cmds[c], sizeof(line));
+                        term_exec(line);
+                    }
+                    /* Leave a mark on the session, so what survives a
+                     * logout can be checked rather than assumed. */
+                    char mk[64];
+                    str_copy(mk, "echo leak-canary > /tmp-canary.txt",
+                             sizeof(mk));
+                    term_exec(mk);
+                    serial_puts("[usertest] admin=");
+                    serial_put_dec((uint32_t)(user_is_admin(user_current) ? 1 : 0));
+                    serial_puts("\n[usertest] shell history now holds ");
+                    serial_put_dec((uint32_t)term_hist_count);
+                    serial_puts(" entries, cwd ");
+                    serial_puts(term_cwd);
+                    serial_puts("\n[usertest] done\n");
+                    want_logout = 1;
+                }
+#endif
                 for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
+                serial_puts("[socrates] login: ");
+                serial_puts(user_name_of(user_current));
+                serial_puts(user_is_admin(user_current) ? " (admin)\n" : "\n");
                 vga_flip(vram, w, h, pitch_px);
                 __asm__ volatile("hlt");
                 continue;
             }
+            vga_flip(vram, w, h, pitch_px);
+            __asm__ volatile("hlt");
+            continue;
         }
 
-        /* Choose prompt based on boot state */
+        /* Up and down pick an account when there is more than one. */
+        if (login_stage == LOGIN_PASSWORD && user_count > 1) {
+            if (login_nav_up   && login_sel > 0) login_sel--;
+            if (login_nav_down && login_sel + 1 < user_count) login_sel++;
+        }
+        login_nav_up = login_nav_down = 0;
+
+        /* Choose prompt based on where in the sequence we are */
+        static char prompt_buf[96];
         const char *prompt;
-        if (is_first_boot)
-            prompt = "Socrates BSD 9 - Initialize System. Choose Master Keycode:";
-        else
-            prompt = "Socrates BSD 9 - Enter Keycode:";
+        switch (login_stage) {
+        case LOGIN_NEW_NAME:
+            prompt = "Socrates BSD 9 - Create an account. Username:";
+            break;
+        case LOGIN_NEW_PW:
+            prompt = "Choose a password:";
+            break;
+        case LOGIN_NEW_CONFIRM:
+            prompt = "Type it once more:";
+            break;
+        default:
+            str_copy(prompt_buf, "Password for ", sizeof(prompt_buf));
+            str_append(prompt_buf, user_name_of(login_sel), sizeof(prompt_buf));
+            str_append(prompt_buf, ":", sizeof(prompt_buf));
+            prompt = prompt_buf;
+            break;
+        }
+        if (login_msg[0]) prompt = login_msg;
 
         /* Mouse-reactive demoscene vortex + login interface */
         login_render(backbuf, w, h, mouse_x, mouse_y,
                      typed_text, mouse_buttons, prompt);
+
+        /* The accounts on this machine, so one can be picked. */
+        if (login_stage == LOGIN_PASSWORD && user_count > 1)
+            login_draw_users(backbuf, w, h, mouse_x, mouse_y,
+                             mouse_buttons);
 
         /* 1-pixel metallic gold border (outermost frame) */
         fill_rect(w, 0,     0,     w, 1, COLOR_GOLD);

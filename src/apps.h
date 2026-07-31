@@ -331,6 +331,19 @@ static int wall_theme = 0;
 
 static const char *dock_edge_names[3] = { "Bottom", "Left", "Right" };
 
+/* ---- the Users pane's own state ----
+ *
+ * The password is kept in the clear only for as long as it takes to hash
+ * it, and is wiped immediately after; what the field displays is a mask.
+ */
+static char set_newname[USER_NAME_MAX] = "";
+static char set_newpw[40] = "";
+static char set_newpw_mask[40] = "";
+static int  set_field = 0;              /* 0 name, 1 password */
+static int  set_user_sel = -1;
+static char set_msg[64] = "";
+static int  set_msg_err = 0;
+
 static void settings_mouse(int32_t mx, int32_t my, uint8_t lmb,
                            uint8_t prev_lmb, int32_t cx, int32_t cy,
                            int32_t cw, int32_t chh) {
@@ -376,6 +389,131 @@ static void settings_mouse(int32_t mx, int32_t my, uint8_t lmb,
                 dock_cfg.bar_w += 32;
             }
         }
+    }
+
+    /* ---- Users ---- */
+    if (!user_is_admin(user_current)) return;
+
+    for (int i = 0; i < user_count; i++) {
+        int32_t ry = cy + 380 + i * 26;
+        if (my < ry - 2 || my >= ry + 22) continue;
+        set_user_sel = i;
+
+        int32_t ax = cx + 140;
+        if (mx >= ax && mx < ax + 62) {
+            int on = (users[i].flags & USER_FLAG_ADMIN) ? 0 : 1;
+            if (user_set_admin(users[i].name, on) < 0) {
+                str_copy(set_msg, user_err, sizeof(set_msg));
+                set_msg_err = 1;
+            } else {
+                str_copy(set_msg, on ? "granted administrator"
+                                     : "removed administrator", sizeof(set_msg));
+                set_msg_err = 0;
+            }
+            return;
+        }
+
+        int32_t dx = cx + 214;
+        if (i != user_current && mx >= dx && mx < dx + 62) {
+            char nm[USER_NAME_MAX];
+            str_copy(nm, users[i].name, sizeof(nm));
+            if (user_del(nm) < 0) {
+                str_copy(set_msg, user_err, sizeof(set_msg));
+                set_msg_err = 1;
+            } else {
+                str_copy(set_msg, "deleted ", sizeof(set_msg));
+                str_append(set_msg, nm, sizeof(set_msg));
+                set_msg_err = 0;
+                set_user_sel = -1;
+            }
+            return;
+        }
+        return;
+    }
+
+    /* new-account row: two fields and an Add button */
+    {
+        int32_t ry = cy + 380 + user_count * 26 + 8;
+        if (my < ry - 3 || my >= ry + 19) return;
+
+        int32_t fx = cx + 62;
+        for (int f = 0; f < 2; f++) {
+            int32_t bx = fx + f * (96 + 8);
+            if (mx >= bx && mx < bx + 96) { set_field = f; return; }
+        }
+
+        int32_t gx = fx + 2 * (96 + 8);
+
+        /* "Set" changes the password of whichever account is selected,
+         * which is how someone changes their own without the shell ever
+         * seeing it. */
+        int32_t sx = gx + 58;
+        if (mx >= sx && mx < sx + 52) {
+            if (set_user_sel < 0) {
+                str_copy(set_msg, "pick an account first", sizeof(set_msg));
+                set_msg_err = 1;
+            } else if (user_set_password(set_user_sel, set_newpw) < 0) {
+                str_copy(set_msg, user_err, sizeof(set_msg));
+                set_msg_err = 1;
+            } else {
+                str_copy(set_msg, "password changed for ", sizeof(set_msg));
+                str_append(set_msg, user_name_of(set_user_sel), sizeof(set_msg));
+                set_msg_err = 0;
+            }
+            for (uint32_t i = 0; i < sizeof(set_newpw); i++) set_newpw[i] = '\0';
+            set_newpw_mask[0] = '\0';
+            return;
+        }
+
+        if (mx >= gx && mx < gx + 52) {
+            if (user_add(set_newname, set_newpw, 0) < 0) {
+                str_copy(set_msg, user_err, sizeof(set_msg));
+                set_msg_err = 1;
+            } else {
+                str_copy(set_msg, "created /home/", sizeof(set_msg));
+                str_append(set_msg, set_newname, sizeof(set_msg));
+                set_msg_err = 0;
+                set_newname[0] = '\0';
+                set_field = 0;
+            }
+            /* the plaintext does not outlive the hashing */
+            for (uint32_t i = 0; i < sizeof(set_newpw); i++) set_newpw[i] = '\0';
+            set_newpw_mask[0] = '\0';
+        }
+    }
+}
+
+/* Typing into the Users pane's fields. */
+static void settings_key(char ch) {
+    if (!user_is_admin(user_current)) return;
+
+    char *buf = set_field == 0 ? set_newname : set_newpw;
+    int   max = set_field == 0 ? USER_NAME_MAX : (int)sizeof(set_newpw);
+
+    int len = 0;
+    while (buf[len]) len++;
+
+    if (ch == '\t') {
+        set_field = !set_field;
+        return;
+    }
+    if (ch == '\b') {
+        if (len > 0) buf[--len] = '\0';
+    } else if (ch == '\n') {
+        set_field = set_field == 0 ? 1 : 0;
+        return;
+    } else if (ch >= 0x20 && ch < 0x7F && len < max - 1) {
+        buf[len++] = ch;
+        buf[len] = '\0';
+    } else {
+        return;
+    }
+
+    /* keep the mask in step with the password's length */
+    if (set_field == 1) {
+        int n = 0;
+        while (set_newpw[n]) { set_newpw_mask[n] = '*'; n++; }
+        set_newpw_mask[n] = '\0';
     }
 }
 
@@ -462,6 +600,88 @@ static void settings_draw(uint32_t *buf, uint32_t w, uint32_t h,
         str_append(line, " MB", sizeof(line));
         ttf_draw_string(buf, (int)w, (int)h, cx + 24, cy + 314, line,
                         0x40454Fu, 13);
+    }
+
+    /* ---- Users ----
+     *
+     * Only administrators see this. Not a security boundary -- a `.bsd`
+     * application runs with kernel privileges and could do as it likes --
+     * but the interface should not offer what it will refuse.
+     */
+    if (!user_is_admin(user_current)) return;
+
+    ttf_draw_string(buf, (int)w, (int)h, cx + 24, cy + 346, "Users",
+                    0x1A1E28u, 16);
+    gfx_rect(buf, w, h, cx + 24, cy + 370, cw - 48, 1, 0xD5D8E0u);
+
+    for (int i = 0; i < user_count; i++) {
+        int32_t ry = cy + 380 + i * 26;
+        int me = (i == user_current);
+        int adm = (users[i].flags & USER_FLAG_ADMIN) != 0;
+
+        if (i == set_user_sel)
+            gfx_rect(buf, w, h, cx + 20, ry - 2, cw - 40, 24, 0xF0EAD8u);
+
+        ttf_draw_string(buf, (int)w, (int)h, cx + 28, ry, users[i].name,
+                        me ? C_GOLD_DIM : 0x40454Fu, 13);
+
+        /* admin toggle */
+        int32_t ax = cx + 140;
+        gfx_rect(buf, w, h, ax, ry - 1, 62, 20, adm ? 0x2A2410u : 0xE4E6EBu);
+        gfx_rect_outline(buf, w, h, ax, ry - 1, 62, 20,
+                         adm ? C_GOLD : 0xB8BCC8u);
+        ttf_draw_string(buf, (int)w, (int)h, ax + 10, ry + 1, "admin",
+                        adm ? C_GOLD : 0x80858Fu, 12);
+
+        /* delete -- never for the account in use */
+        if (!me) {
+            int32_t dx = cx + 214;
+            gfx_rect(buf, w, h, dx, ry - 1, 62, 20, 0xE4E6EBu);
+            gfx_rect_outline(buf, w, h, dx, ry - 1, 62, 20, 0xC08080u);
+            ttf_draw_string(buf, (int)w, (int)h, dx + 10, ry + 1, "delete",
+                            0xA04040u, 12);
+        }
+    }
+
+    /* new-account row */
+    {
+        int32_t ry = cy + 380 + user_count * 26 + 8;
+        ttf_draw_string(buf, (int)w, (int)h, cx + 24, ry, "New:",
+                        0x60666Fu, 12);
+
+        int32_t fx = cx + 62;
+        for (int f = 0; f < 2; f++) {
+            int32_t bw2 = 96;
+            int32_t bx = fx + f * (bw2 + 8);
+            gfx_rect(buf, w, h, bx, ry - 3, bw2, 22, 0xFFFFFFu);
+            gfx_rect_outline(buf, w, h, bx, ry - 3, bw2, 22,
+                             set_field == f ? C_GOLD : 0xB8BCC8u);
+            const char *txt = f == 0 ? set_newname : set_newpw_mask;
+            const char *ph  = f == 0 ? "username" : "password";
+            if (txt[0])
+                ttf_draw_string(buf, (int)w, (int)h, bx + 6, ry, txt,
+                                C_INK, 12);
+            else
+                ttf_draw_string(buf, (int)w, (int)h, bx + 6, ry, ph,
+                                0xA0A4AEu, 12);
+        }
+
+        int32_t gx = fx + 2 * (96 + 8);
+        gfx_rect(buf, w, h, gx, ry - 3, 52, 22, 0x2A2410u);
+        gfx_rect_outline(buf, w, h, gx, ry - 3, 52, 22, C_GOLD);
+        ttf_draw_string(buf, (int)w, (int)h, gx + 12, ry, "Add",
+                        C_GOLD, 12);
+
+        /* Change the selected account's password to what is typed. */
+        int32_t sx = gx + 58;
+        gfx_rect(buf, w, h, sx, ry - 3, 52, 22, 0xE4E6EBu);
+        gfx_rect_outline(buf, w, h, sx, ry - 3, 52, 22, 0xB8BCC8u);
+        ttf_draw_string(buf, (int)w, (int)h, sx + 12, ry, "Set",
+                        0x40454Fu, 12);
+
+        if (set_msg[0])
+            ttf_draw_string(buf, (int)w, (int)h, cx + 24, ry + 26, set_msg,
+                            set_msg_err ? 0xB0322Eu : 0x50755Fu, 12);
     }
 }
 

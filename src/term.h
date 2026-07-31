@@ -151,12 +151,20 @@ static void term_putc(char ch) {
 }
 
 static void term_print_c(const char *s, int color) {
+#ifdef USER_SELFTEST
+    serial_puts(s);          /* see term_print: mirrored for the tests */
+#endif
     term_cur_color = color;
     while (*s) term_putc(*s++);
     term_cur_color = 0;
 }
 
 static void term_print(const char *s) {
+#ifdef USER_SELFTEST
+    /* The terminal is a framebuffer window a headless harness cannot
+     * read, so its output is mirrored to serial for the account tests. */
+    serial_puts(s);
+#endif
     while (*s) term_putc(*s++);
 }
 
@@ -511,6 +519,8 @@ static void term_cmd_help(void) {
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
     term_print("  open <app>        terminal browser files settings\n");
     term_print("                    paint sysmon matrix about\n");
+    term_print("  whoami / users / passwd / logout\n");
+    term_print("  useradd <name> <pw> [admin] / userdel <name>   (admin)\n");
     term_print("  history / clear / reboot / shutdown\n");
     term_print("  Any command's output can be redirected:  ls > list.txt\n");
     term_print("  PgUp/PgDn scroll, Up/Down history, Esc cancels a task\n");
@@ -643,8 +653,18 @@ static void term_exec(char *cmdline);
  * the `ask` command reaches it through this. */
 static int  wiki_ask(const char *question);
 
+/*
+ * The prompt now names who is at the keyboard, because more than one
+ * person can be. Falls back to the bare machine name when no one is
+ * logged in, which is what the harness builds see.
+ */
 static void term_build_prompt(char *out, int max) {
-    str_copy(out, "socrates:", max);
+    if (user_current >= 0) {
+        str_copy(out, user_name_of(user_current), max);
+        str_append(out, "@socrates:", max);
+    } else {
+        str_copy(out, "socrates:", max);
+    }
     str_append(out, term_cwd, max);
     str_append(out, "> ", max);
 }
@@ -1443,6 +1463,67 @@ static void term_exec(char *cmdline) {
         }
     } else if (desktop_open_app_by_name(cmd)) {
         /* bare app name works too: "browser", "files", ... */
+    } else if (str_eq(cmd, "whoami")) {
+        if (user_current < 0) { term_print("nobody\n"); return; }
+        term_print(user_name_of(user_current));
+        if (user_is_admin(user_current)) term_print_c("  (administrator)", 3);
+        term_putc('\n');
+    } else if (str_eq(cmd, "users")) {
+        for (int i = 0; i < user_count; i++) {
+            term_print_c(i == user_current ? "* " : "  ", 1);
+            term_print(users[i].name);
+            if (users[i].flags & USER_FLAG_ADMIN)
+                term_print_c("   admin", 3);
+            term_putc('\n');
+        }
+        if (user_count == 0) term_print_c("no accounts\n", 2);
+    } else if (str_eq(cmd, "passwd")) {
+        /*
+         * Typing a password into a shell that echoes it and keeps a
+         * history is not something to encourage, so this only points at
+         * the place where it can be done properly.
+         */
+        term_print_c("Change your password in Settings > Users: pick your\n", 3);
+        term_print_c("account, type a new password, press Set.\n", 3);
+    } else if (str_eq(cmd, "useradd")) {
+        if (!user_is_admin(user_current)) {
+            term_print_c("useradd: administrators only\n", 2);
+            return;
+        }
+        if (argc < 3) {
+            term_print_c("usage: useradd <name> <password> [admin]\n", 2);
+            return;
+        }
+        int adm = (argc > 3 && str_eq(argv[3], "admin"));
+        if (user_add(argv[1], argv[2], adm) < 0) {
+            term_print_c("useradd: ", 2);
+            term_print_c(user_err, 2);
+            term_putc('\n');
+        } else {
+            term_print("created ");
+            term_print(argv[1]);
+            term_print(" with /home/");
+            term_print(argv[1]);
+            term_putc('\n');
+        }
+    } else if (str_eq(cmd, "userdel")) {
+        if (!user_is_admin(user_current)) {
+            term_print_c("userdel: administrators only\n", 2);
+            return;
+        }
+        if (argc < 2) { term_print_c("usage: userdel <name>\n", 2); return; }
+        if (user_del(argv[1]) < 0) {
+            term_print_c("userdel: ", 2);
+            term_print_c(user_err, 2);
+            term_putc('\n');
+        } else {
+            term_print("deleted ");
+            term_print(argv[1]);
+            term_print_c("   (their /home is left in place)\n", 3);
+        }
+    } else if (str_eq(cmd, "logout")) {
+        term_print_c("logging out...\n", 1);
+        want_logout = 1;
     } else if (str_eq(cmd, "reboot")) {
         term_print_c("rebooting...\n", 1);
         outb(0x64, 0xFE);
