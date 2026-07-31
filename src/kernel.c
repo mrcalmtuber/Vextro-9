@@ -592,6 +592,80 @@ static int cursor_at(int32_t px, int32_t py, int32_t cx, int32_t cy,
     *out = (c == 'X') ? 0x000000u : 0xFFFFFFu;
     return 1;
 }
+
+/*
+ * The fling trail.
+ *
+ * A hard flick can carry the pointer most of the way across the screen in
+ * a couple of frames, which reads as the sprite disappearing and
+ * reappearing somewhere else. A few fading ghosts along the path make the
+ * movement legible -- you can see where it went rather than inferring it.
+ *
+ * Deliberately not always on. Below the fling threshold the trail is
+ * empty and the pointer costs exactly what it did before, which matters
+ * because slow movement is the precise mode and the last thing it wants
+ * is decoration.
+ */
+#define TRAIL_N 5
+
+static struct { int32_t x, y; uint8_t life; } trail[TRAIL_N];
+static int trail_used = 0;
+
+/* Weight of a ghost, 0-255, falling off with age. */
+static uint32_t trail_weight(uint8_t life) {
+    return (uint32_t)life * 40u;          /* life 4 -> 160, life 1 -> 40 */
+}
+
+/* Blend towards `c` by w/256, per channel, in integer arithmetic. */
+static uint32_t trail_blend(uint32_t bg, uint32_t c, uint32_t w) {
+    uint32_t br = (bg >> 16) & 0xFF, bgn = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+    uint32_t cr = (c  >> 16) & 0xFF, cg  = (c  >> 8) & 0xFF, cb = c  & 0xFF;
+    uint32_t r = br + ((cr - br) * w >> 8);
+    uint32_t g = bgn + ((cg - bgn) * w >> 8);
+    uint32_t b = bb + ((cb - bb) * w >> 8);
+    return (r << 16) | (g << 8) | b;
+}
+
+/* The strongest ghost covering a pixel, if any. */
+static int trail_at(int32_t px, int32_t py, uint32_t *colour, uint32_t *weight) {
+    uint32_t best = 0, bc = 0;
+    for (int i = 0; i < trail_used; i++) {
+        if (!trail[i].life) continue;
+        uint32_t c;
+        if (!cursor_at(px, py, trail[i].x, trail[i].y, &c)) continue;
+        uint32_t w = trail_weight(trail[i].life);
+        if (w > best) { best = w; bc = c; }
+    }
+    if (!best) return 0;
+    *colour = bc;
+    *weight = best;
+    return 1;
+}
+
+/*
+ * Age the trail by one frame, and record where the pointer was if it was
+ * moving fast enough to be worth showing.
+ */
+static void trail_step(int32_t cx, int32_t cy, int moved_fast) {
+    for (int i = 0; i < trail_used; i++)
+        if (trail[i].life) trail[i].life--;
+
+    /* compact out the dead, so the search above stays short */
+    int k = 0;
+    for (int i = 0; i < trail_used; i++)
+        if (trail[i].life) trail[k++] = trail[i];
+    trail_used = k;
+
+    if (!moved_fast) return;
+    if (trail_used == TRAIL_N) {
+        for (int i = 1; i < TRAIL_N; i++) trail[i-1] = trail[i];
+        trail_used = TRAIL_N - 1;
+    }
+    trail[trail_used].x = cx;
+    trail[trail_used].y = cy;
+    trail[trail_used].life = 4;
+    trail_used++;
+}
 static void vga_flip(volatile uint32_t *vram,
                      uint32_t w, uint32_t h, uint32_t pitch_px) {
     if (gfx_force_full_flip) {          /* someone else wrote the panel */
@@ -616,6 +690,20 @@ static void vga_flip(volatile uint32_t *vram,
         if (cur_prev_y < uy0) uy0 = cur_prev_y;
         if (cur_prev_x + CURSOR_W > ux1) ux1 = cur_prev_x + CURSOR_W;
         if (cur_prev_y + CURSOR_H > uy1) uy1 = cur_prev_y + CURSOR_H;
+    }
+
+    /*
+     * Age the trail and fold every live ghost into the same rectangle.
+     * They have to be in it whether they are being drawn or erased --
+     * prevbuf holds the clean desktop underneath them, so a ghost left
+     * out of the union is a ghost that never goes away.
+     */
+    trail_step(cx, cy, paccel_is_fling());
+    for (int i = 0; i < trail_used; i++) {
+        if (trail[i].x < ux0) ux0 = trail[i].x;
+        if (trail[i].y < uy0) uy0 = trail[i].y;
+        if (trail[i].x + CURSOR_W > ux1) ux1 = trail[i].x + CURSOR_W;
+        if (trail[i].y + CURSOR_H > uy1) uy1 = trail[i].y + CURSOR_H;
     }
     if (ux0 < 0) ux0 = 0;
     if (uy0 < 0) uy0 = 0;
@@ -648,9 +736,15 @@ static void vga_flip(volatile uint32_t *vram,
         for (uint32_t col = c0; col < c1; col++) {
             uint32_t px = src[col];
             cmp[col] = px;                    /* record the clean pixel */
-            uint32_t sprite;
-            if (in_cur && cursor_at((int32_t)col, (int32_t)row, cx, cy, &sprite))
-                px = sprite;                  /* the pointer wins, always */
+            uint32_t sprite, gw;
+            if (in_cur) {
+                /* ghosts first, so the live sprite draws over them */
+                if (trail_used &&
+                    trail_at((int32_t)col, (int32_t)row, &sprite, &gw))
+                    px = trail_blend(px, sprite, gw);
+                if (cursor_at((int32_t)col, (int32_t)row, cx, cy, &sprite))
+                    px = sprite;              /* the pointer wins, always */
+            }
             dst[col] = px;
         }
         frame_wr_px += c1 - c0;
@@ -1091,6 +1185,20 @@ void kmain(void) {
             continue;
         }
 
+#ifdef TRAIL_DEMO
+        /* Sweep the pointer fast enough to trail. The pointer cannot be
+         * driven headlessly here -- query-mice reports one relative PS/2
+         * device and qemu feeds the absolute path from the host cursor,
+         * which does not exist under -display none. */
+        if (desktop_mode) {
+            static int td = 0, tdx = 34;
+            if (++td > 90) {
+                paccel_speed = 40;            /* as if flicked */
+                mouse_x += tdx;
+                if (mouse_x > 1100 || mouse_x < 150) tdx = -tdx;
+            }
+        }
+#endif
         if (auto_login && !desktop_mode) {
             auto_login = 0;
             desktop_mode = 1;

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "idt.h"
 #include "vmmouse.h"
+#include "paccel.h"
 
 /* Global cursor position + button state — written by IRQ12, read by render loop */
 volatile int32_t mouse_x = 0;
@@ -119,9 +120,19 @@ static void mouse_packet(void) {
     if (flags & 0x10) dx |= (int32_t)0xFFFFFF00;
     if (flags & 0x20) dy |= (int32_t)0xFFFFFF00;
 
-    /* Screen y grows downwards; the mouse reports the opposite */
+    /*
+     * Accelerate. This is the relative path, which is the only one where
+     * acceleration means anything -- the VMware backdoor above reports an
+     * absolute position and is deliberately left alone.
+     *
+     * dy is negated first so the curve sees the motion in screen terms;
+     * the sign does not matter to it, but the pairing does.
+     */
+    dy = -dy;                    /* screen y grows downwards */
+    paccel_apply(&dx, &dy);
+
     mouse_x += dx;
-    mouse_y -= dy;
+    mouse_y += dy;
 
     if (mouse_x < 0)           mouse_x = 0;
     if (mouse_y < 0)           mouse_y = 0;
