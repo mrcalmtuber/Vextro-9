@@ -220,15 +220,26 @@ static int users_save(void) {
  * Salt.
  *
  * The cycle counter is the only thing here that differs run to run, so it
- * is the seed; xorshift32 spreads it, and the counter is re-read every
- * pass so two accounts created in the same session cannot collide.
+ * is the seed; the mixing step spreads it, and the counter is re-read
+ * every pass so two accounts created in the same session cannot collide.
+ *
+ * Its own generator rather than login.h's: that header sits at a
+ * different point in the include order on the two architecture trees, and
+ * a salt is not worth making this file depend on it.
  */
+static uint32_t user_rng_state = 0x9E3779B9u;
+
+static uint32_t user_rand(void) {
+    user_rng_state ^= (uint32_t)cycle_now();
+    user_rng_state ^= user_rng_state << 13;
+    user_rng_state ^= user_rng_state >> 17;
+    user_rng_state ^= user_rng_state << 5;
+    return user_rng_state;
+}
+
 static void user_make_salt(uint8_t *out) {
-    for (int i = 0; i < USER_SALT_LEN; i++) {
-        uint32_t r = xorshift32();
-        r ^= (uint32_t)cycle_now();
-        out[i] = (uint8_t)(r >> 13);
-    }
+    for (int i = 0; i < USER_SALT_LEN; i++)
+        out[i] = (uint8_t)(user_rand() >> 13);
 }
 
 static int user_add(const char *name, const char *pw, int admin) {

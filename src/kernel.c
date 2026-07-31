@@ -208,9 +208,29 @@ enum {
 static int  login_stage = LOGIN_PASSWORD;
 static int  login_sel = 0;               /* which account is highlighted */
 static char login_msg[96] = "";          /* replaces the prompt when set */
+static char login_notice[112] = "";      /* shown under the box, additive */
 static char pending_name[USER_NAME_MAX];
 static char pending_pw[TEXT_BUF_SIZE];
 static int  login_nav_up = 0, login_nav_down = 0;
+
+/*
+ * Whether the account being created is an administrator.
+ *
+ * Defaults to yes: on a machine with one user that is what they want, and
+ * it is what the first account used to be given with no say in it.
+ *
+ * Declining does not leave the machine without one. Somebody has to be
+ * able to create and remove accounts, so a separate `admin` account is
+ * made alongside -- with the same password, because the alternative is a
+ * fixed default one, and a known password on an administrator account is
+ * a hole rather than a convenience. The login screen says so plainly
+ * rather than leaving it to be discovered.
+ */
+#ifdef NO_ADMIN_DEFAULT
+static int  login_want_admin = 0;   /* test hook: start with the box clear */
+#else
+static int  login_want_admin = 1;
+#endif
 
 /* Confirmation message state: shows gold text for ~1 second */
 static int confirm_active = 0;
@@ -285,6 +305,62 @@ static void login_draw_users(uint32_t *buf, uint32_t w, uint32_t h,
         if (user_is_admin(i))
             gfx_rect(buf, w, h, x + 6, y0 + 6, 4, 4, COLOR_GOLD);
     }
+}
+
+/*
+ * The administrator checkbox, and any notice under the login box.
+ *
+ * Sits below the box during the first-run sequence, where the account is
+ * being created and the choice still means something. Same clickable
+ * shape as login.h's Show/Hide button.
+ */
+#define CHK_BOX 18
+
+static void login_draw_admin_check(uint32_t *buf, uint32_t w, uint32_t h,
+                                   int32_t mx, int32_t my, uint8_t lmb) {
+    static uint8_t prev = 0;
+    int click = (lmb & 1) && !prev;
+    prev = lmb & 1;
+
+    int32_t by = ((int32_t)h - LOGIN_BOX_H) / 2 + LOGIN_BOX_H + 22;
+    const char *label = "Make this an administrator account";
+    int32_t tw = ttf_text_width(label, 14);
+    int32_t total = CHK_BOX + 10 + tw;
+    int32_t x0 = ((int32_t)w - total) / 2;
+
+    int hot = (mx >= x0 && mx < x0 + total &&
+               my >= by - 2 && my < by + CHK_BOX + 2);
+    if (click && hot) login_want_admin = !login_want_admin;
+
+    gfx_rect(buf, w, h, x0, by, CHK_BOX, CHK_BOX,
+             login_want_admin ? 0x2A2410u : 0x0E1017u);
+    gfx_rect_outline(buf, w, h, x0, by, CHK_BOX, CHK_BOX,
+                     hot ? COLOR_GOLD : (login_want_admin ? COLOR_GOLD
+                                                          : 0x3A4050u));
+    if (login_want_admin) {
+        /* a tick, drawn as two strokes */
+        for (int k = 0; k < 4; k++)
+            gfx_rect(buf, w, h, x0 + 4 + k, by + 8 + k, 2, 2, COLOR_GOLD);
+        for (int k = 0; k < 6; k++)
+            gfx_rect(buf, w, h, x0 + 8 + k, by + 12 - k, 2, 2, COLOR_GOLD);
+    }
+
+    ttf_draw_string(buf, (int)w, (int)h, x0 + CHK_BOX + 10, by + 1, label,
+                    login_want_admin ? 0xD8DCE6u : 0x8891A0u, 14);
+
+    if (!login_want_admin)
+        ttf_draw_string(buf, (int)w, (int)h, x0, by + CHK_BOX + 8,
+                        "An 'admin' account will be created, same password",
+                        0x8A8F9Cu, 12);
+}
+
+/* A line under the box that is not the prompt, so both can be shown. */
+static void login_draw_notice(uint32_t *buf, uint32_t w, uint32_t h) {
+    if (!login_notice[0]) return;
+    int32_t by = ((int32_t)h - LOGIN_BOX_H) / 2 + LOGIN_BOX_H + 24;
+    int32_t tw = ttf_text_width(login_notice, 13);
+    ttf_draw_string(buf, (int)w, (int)h, ((int32_t)w - tw) / 2, by,
+                    login_notice, C_GOLD_DIM, 13);
 }
 
 /* HAL status flags */
@@ -1199,12 +1275,29 @@ void kmain(void) {
                     str_copy(login_msg, "Those did not match. Try again.",
                              sizeof(login_msg));
                     login_stage = LOGIN_NEW_PW;
+                } else if (!login_want_admin && str_eq(pending_name, "admin")) {
+                    /* The fallback account would collide with theirs. */
+                    str_copy(login_msg, "'admin' is the fallback name - tick "
+                             "the box or pick another.", sizeof(login_msg));
+                    login_stage = LOGIN_NEW_NAME;
                 } else if (user_add(pending_name, pending_pw,
-                                    user_count == 0) < 0) {
+                                    login_want_admin) < 0) {
                     str_copy(login_msg, user_err, sizeof(login_msg));
                     login_stage = LOGIN_NEW_PW;
                 } else {
-                    /* First account on the machine is the administrator. */
+                    /*
+                     * Someone has to be able to create and remove
+                     * accounts. If they did not want that to be them, a
+                     * separate administrator is made alongside.
+                     */
+                    if (!login_want_admin &&
+                        user_add("admin", pending_pw, 1) >= 0) {
+                        str_copy(login_notice,
+                                 "Administrator account 'admin' created, "
+                                 "same password", sizeof(login_notice));
+                        serial_puts("[socrates] users: created 'admin' "
+                                    "alongside a standard account\n");
+                    }
                     login_sel = user_find(pending_name);
                     login_stage = LOGIN_PASSWORD;
                     confirm_active = 1;
@@ -1327,6 +1420,13 @@ void kmain(void) {
         if (login_stage == LOGIN_PASSWORD && user_count > 1)
             login_draw_users(backbuf, w, h, mouse_x, mouse_y,
                              mouse_buttons);
+
+        /* The administrator choice, while the account is being made. */
+        if (login_stage != LOGIN_PASSWORD)
+            login_draw_admin_check(backbuf, w, h, mouse_x, mouse_y,
+                                   mouse_buttons);
+        else
+            login_draw_notice(backbuf, w, h);
 
         /* 1-pixel metallic gold border (outermost frame) */
         fill_rect(w, 0,     0,     w, 1, COLOR_GOLD);
