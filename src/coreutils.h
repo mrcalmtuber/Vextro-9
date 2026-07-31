@@ -1347,6 +1347,713 @@ static void cu_cmd_base64(int argc, char **argv, int decode) {
 }
 
 
+
+/* ===== more text: sed, paste, comm, join, column, fmt, pr, csplit ===== */
+
+/*
+ * sed, in the one form that carries its weight: s/old/new/[g], plus
+ * address-free d and p. A full sed is a language with its own parser and
+ * hold space; this is the substitution people actually reach for.
+ */
+static void cu_cmd_sed(int argc, char **argv) {
+    if (argc < 2) { cu_usage("sed 's/old/new/[g]' [file]   |   sed -n /pat/p [file]"); return; }
+
+    const char *script = 0, *name = 0;
+    int quiet = 0;
+    for (int a = 1; a < argc; a++) {
+        if (str_eq(argv[a], "-n")) quiet = 1;
+        else if (!script) script = argv[a];
+        else name = argv[a];
+    }
+    if (!script) { cu_usage("sed 's/old/new/[g]' [file]"); return; }
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("sed", cu_lasterr); return; }
+    uint32_t nl = cu_split_lines(d, n);
+
+    if (script[0] == 's' && script[1]) {
+        char sep = script[1];
+        char pat[128], rep[128];
+        int i = 2, k = 0;
+        while (script[i] && script[i] != sep && k < 127) pat[k++] = script[i++];
+        pat[k] = '\0';
+        if (script[i] != sep) { cu_err("sed", "unterminated s command"); return; }
+        i++; k = 0;
+        while (script[i] && script[i] != sep && k < 127) rep[k++] = script[i++];
+        rep[k] = '\0';
+        int global = 0;
+        if (script[i] == sep) { i++; if (script[i] == 'g') global = 1; }
+
+        int patn = 0; while (pat[patn]) patn++;
+        if (patn == 0) { cu_err("sed", "empty pattern"); return; }
+
+        for (uint32_t li = 0; li < nl; li++) {
+            const uint8_t *L = d + cu_line_off[li];
+            uint32_t ln = cu_line_len[li], pos = 0;
+            int done = 0;
+            while (pos < ln) {
+                int at = -1;
+                if (!done || global)
+                    at = cu_find_sub(L + pos, ln - pos, pat, 0);
+                if (at < 0) break;
+                for (int j = 0; j < at; j++) term_putc((char)L[pos + j]);
+                term_print(rep);
+                pos += (uint32_t)at + (uint32_t)patn;
+                done = 1;
+                if (!global) break;
+            }
+            for (uint32_t j = pos; j < ln; j++) term_putc((char)L[j]);
+            term_putc('\n');
+        }
+        return;
+    }
+
+    /* /pattern/p and /pattern/d */
+    if (script[0] == '/') {
+        char pat[128];
+        int i = 1, k = 0;
+        while (script[i] && script[i] != '/' && k < 127) pat[k++] = script[i++];
+        pat[k] = '\0';
+        char act = script[i] == '/' ? script[i + 1] : 'p';
+        for (uint32_t li = 0; li < nl; li++) {
+            int hit = cu_find_sub(d + cu_line_off[li], cu_line_len[li], pat, 0) >= 0;
+            if (act == 'd') { if (!hit) cu_put_line(d + cu_line_off[li], cu_line_len[li]); }
+            else            { if (hit)  cu_put_line(d + cu_line_off[li], cu_line_len[li]); }
+        }
+        return;
+    }
+    (void)quiet;
+    cu_err("sed", "only s/// and /pat/p and /pat/d are supported");
+}
+
+/* comm: three columns of set difference over two sorted files. */
+static void cu_cmd_comm(int argc, char **argv) {
+    if (argc < 3) { cu_usage("comm <file1> <file2>"); return; }
+
+    const uint8_t *a;
+    uint32_t an;
+    if (!cu_src(argv[1], &a, &an)) { cu_err("comm", cu_lasterr); return; }
+    if (an > CU_CMP_MAX) { cu_err("comm", "first file is over 512 KiB"); return; }
+    for (uint32_t i = 0; i < an; i++) cu_cmp_buf[i] = a[i];
+    uint32_t anl = cu_split_lines(cu_cmp_buf, an);
+    static uint32_t aoff[CU_MAX_LINES], alen[CU_MAX_LINES];
+    for (uint32_t i = 0; i < anl; i++) { aoff[i] = cu_line_off[i]; alen[i] = cu_line_len[i]; }
+
+    const uint8_t *b;
+    uint32_t bn;
+    if (!cu_src(argv[2], &b, &bn)) { cu_err("comm", cu_lasterr); return; }
+    uint32_t bnl = cu_split_lines(b, bn);
+
+    uint32_t i = 0, j = 0;
+    while (i < anl || j < bnl) {
+        int cmp;
+        if (i >= anl) cmp = 1;
+        else if (j >= bnl) cmp = -1;
+        else {
+            uint32_t m = alen[i] < cu_line_len[j] ? alen[i] : cu_line_len[j];
+            cmp = 0;
+            for (uint32_t k = 0; k < m; k++) {
+                if (cu_cmp_buf[aoff[i] + k] != b[cu_line_off[j] + k]) {
+                    cmp = cu_cmp_buf[aoff[i] + k] < b[cu_line_off[j] + k] ? -1 : 1;
+                    break;
+                }
+            }
+            if (cmp == 0 && alen[i] != cu_line_len[j])
+                cmp = alen[i] < cu_line_len[j] ? -1 : 1;
+        }
+        if (cmp < 0) {
+            for (uint32_t k = 0; k < alen[i]; k++) term_putc((char)cu_cmp_buf[aoff[i] + k]);
+            term_putc('\n');
+            i++;
+        } else if (cmp > 0) {
+            term_putc('\t');
+            cu_put_line(b + cu_line_off[j], cu_line_len[j]);
+            j++;
+        } else {
+            term_print("\t\t");
+            cu_put_line(b + cu_line_off[j], cu_line_len[j]);
+            i++; j++;
+        }
+    }
+}
+
+/* paste: two files side by side, tab separated. */
+static void cu_cmd_paste(int argc, char **argv) {
+    if (argc < 3) { cu_usage("paste <file1> <file2>"); return; }
+
+    const uint8_t *a;
+    uint32_t an;
+    if (!cu_src(argv[1], &a, &an)) { cu_err("paste", cu_lasterr); return; }
+    if (an > CU_CMP_MAX) { cu_err("paste", "first file is over 512 KiB"); return; }
+    for (uint32_t i = 0; i < an; i++) cu_cmp_buf[i] = a[i];
+    uint32_t anl = cu_split_lines(cu_cmp_buf, an);
+    static uint32_t aoff[CU_MAX_LINES], alen[CU_MAX_LINES];
+    for (uint32_t i = 0; i < anl; i++) { aoff[i] = cu_line_off[i]; alen[i] = cu_line_len[i]; }
+
+    const uint8_t *b;
+    uint32_t bn;
+    if (!cu_src(argv[2], &b, &bn)) { cu_err("paste", cu_lasterr); return; }
+    uint32_t bnl = cu_split_lines(b, bn);
+
+    uint32_t rows = anl > bnl ? anl : bnl;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (i < anl)
+            for (uint32_t k = 0; k < alen[i]; k++) term_putc((char)cu_cmp_buf[aoff[i] + k]);
+        term_putc('\t');
+        if (i < bnl)
+            for (uint32_t k = 0; k < cu_line_len[i]; k++)
+                term_putc((char)b[cu_line_off[i] + k]);
+        term_putc('\n');
+    }
+}
+
+/* column: pad field 1 so a table lines up. */
+static void cu_cmd_column(int argc, char **argv) {
+    char delim = ' ';
+    const char *name = 0;
+    for (int a = 1; a < argc; a++) {
+        if (str_eq(argv[a], "-s") && a + 1 < argc) delim = argv[++a][0];
+        else if (str_eq(argv[a], "-t")) continue;
+        else if (argv[a][0] != '-') name = argv[a];
+    }
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("column", cu_lasterr); return; }
+    uint32_t nl = cu_split_lines(d, n);
+
+    uint32_t widest = 0;
+    for (uint32_t i = 0; i < nl; i++) {
+        uint32_t k = 0;
+        while (k < cu_line_len[i] && (char)d[cu_line_off[i] + k] != delim) k++;
+        if (k > widest) widest = k;
+    }
+    for (uint32_t i = 0; i < nl; i++) {
+        const uint8_t *L = d + cu_line_off[i];
+        uint32_t ln = cu_line_len[i], k = 0;
+        while (k < ln && (char)L[k] != delim) { term_putc((char)L[k]); k++; }
+        for (uint32_t pad = k; pad <= widest; pad++) term_putc(' ');
+        while (k < ln && (char)L[k] == delim) k++;
+        for (; k < ln; k++) term_putc((char)L[k]);
+        term_putc('\n');
+    }
+}
+
+/* fmt: reflow a paragraph to a width. */
+static void cu_cmd_fmt(int argc, char **argv) {
+    int width = 72;
+    const char *name = 0;
+    for (int a = 1; a < argc; a++) {
+        if (str_eq(argv[a], "-w") && a + 1 < argc) width = cu_atoi(argv[++a], 72);
+        else if (argv[a][0] == '-' && argv[a][1] >= '0' && argv[a][1] <= '9')
+            width = cu_atoi(argv[a] + 1, 72);
+        else if (argv[a][0] != '-') name = argv[a];
+    }
+    if (width < 8) width = 8;
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("fmt", cu_lasterr); return; }
+
+    int col = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        while (i < n && cu_is_space((char)d[i])) i++;
+        uint32_t start = i;
+        while (i < n && !cu_is_space((char)d[i])) i++;
+        uint32_t wlen = i - start;
+        if (!wlen) break;
+        if (col && col + 1 + (int)wlen > width) { term_putc('\n'); col = 0; }
+        else if (col) { term_putc(' '); col++; }
+        for (uint32_t k = 0; k < wlen; k++) term_putc((char)d[start + k]);
+        col += (int)wlen;
+    }
+    if (col) term_putc('\n');
+}
+
+/* pr: paginate with a header. */
+static void cu_cmd_pr(int argc, char **argv) {
+    int lines = 60;
+    const char *name = 0;
+    for (int a = 1; a < argc; a++) {
+        if (str_eq(argv[a], "-l") && a + 1 < argc) lines = cu_atoi(argv[++a], 60);
+        else if (argv[a][0] != '-') name = argv[a];
+    }
+    if (lines < 5) lines = 5;
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("pr", cu_lasterr); return; }
+    uint32_t nl = cu_split_lines(d, n);
+
+    int page = 1;
+    for (uint32_t i = 0; i < nl; i++) {
+        if (i % (uint32_t)(lines - 4) == 0) {
+            if (i) term_putc('\n');
+            term_print_c(name ? name : "-", 3);
+            term_print_c("    Page ", 3);
+            cu_put_num((uint32_t)page++, 1);
+            term_print("\n\n");
+        }
+        cu_put_line(d + cu_line_off[i], cu_line_len[i]);
+    }
+}
+
+/* csplit: break a file at every line matching a pattern. */
+static void cu_cmd_csplit(int argc, char **argv) {
+    if (argc < 3) { cu_usage("csplit <file> <pattern> [prefix]"); return; }
+    const char *name = argv[1], *pat = argv[2];
+    const char *prefix = argc > 3 ? argv[3] : "xx";
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("csplit", cu_lasterr); return; }
+    uint32_t nl = cu_split_lines(d, n);
+
+    static char part[CU_PIPE_MAX];
+    uint32_t o = 0, made = 0;
+    for (uint32_t i = 0; i < nl; i++) {
+        int hit = cu_find_sub(d + cu_line_off[i], cu_line_len[i], pat, 0) >= 0;
+        if (hit && o > 0) {
+            char out[256], nb[16];
+            str_copy(out, prefix, sizeof(out));
+            uint_to_str(made++, nb);
+            str_append(out, nb, sizeof(out));
+            char abs[256];
+            term_resolve(out, abs);
+            if (fs_write_file(abs, part, o) != 0) { cu_err("csplit", fs_errstr); return; }
+            term_print("wrote "); term_print(out); term_putc('\n');
+            o = 0;
+        }
+        for (uint32_t k = 0; k < cu_line_len[i] && o < sizeof(part) - 2; k++)
+            part[o++] = (char)d[cu_line_off[i] + k];
+        if (o < sizeof(part) - 1) part[o++] = '\n';
+    }
+    if (o > 0) {
+        char out[256], nb[16];
+        str_copy(out, prefix, sizeof(out));
+        uint_to_str(made, nb);
+        str_append(out, nb, sizeof(out));
+        char abs[256];
+        term_resolve(out, abs);
+        if (fs_write_file(abs, part, o) != 0) cu_err("csplit", fs_errstr);
+        else { term_print("wrote "); term_print(out); term_putc('\n'); }
+    }
+}
+
+/* dd: copy with an offset and a count, in bytes rather than blocks --
+ * there is no device to address by block here. */
+static void cu_cmd_dd(int argc, char **argv) {
+    const char *in = 0, *out = 0;
+    uint32_t skip = 0, count = 0;
+    for (int a = 1; a < argc; a++) {
+        const char *s = argv[a];
+        if (s[0]=='i'&&s[1]=='f'&&s[2]=='=') in = s + 3;
+        else if (s[0]=='o'&&s[1]=='f'&&s[2]=='=') out = s + 3;
+        else if (s[0]=='s'&&s[1]=='k'&&s[2]=='i'&&s[3]=='p'&&s[4]=='=')
+            skip = (uint32_t)cu_atoi(s + 5, 0);
+        else if (s[0]=='c'&&s[1]=='o'&&s[2]=='u'&&s[3]=='n'&&s[4]=='t'&&s[5]=='=')
+            count = (uint32_t)cu_atoi(s + 6, 0);
+    }
+    if (!in) { cu_usage("dd if=<file> [of=<file>] [skip=n] [count=n]  (bytes)"); return; }
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(in, &d, &n)) { cu_err("dd", cu_lasterr); return; }
+    if (skip >= n) { cu_err("dd", "skip is past the end"); return; }
+    uint32_t avail = n - skip;
+    if (count == 0 || count > avail) count = avail;
+
+    if (!out) {
+        for (uint32_t i = 0; i < count; i++) term_putc((char)d[skip + i]);
+        return;
+    }
+    char abs[256];
+    term_resolve(out, abs);
+    if (fs_write_file(abs, d + skip, count) != 0) { cu_err("dd", fs_errstr); return; }
+    cu_put_num(count, 1);
+    term_print(" bytes copied\n");
+}
+
+/* shred: overwrite before unlinking. Honest about what that means on a
+ * flash-backed image with no control over remapping. */
+static void cu_cmd_shred(int argc, char **argv) {
+    if (argc < 2) { cu_usage("shred <file>"); return; }
+    char abs[256];
+    term_resolve(argv[1], abs);
+    uint64_t sz = 0;
+    int is_dir = 0;
+    if (!fs_stat(abs, &sz, &is_dir) || is_dir) { cu_err("shred", "no such file"); return; }
+    if (sz > CU_CMP_MAX) { cu_err("shred", "over 512 KiB"); return; }
+
+    for (uint32_t pass = 0; pass < 3; pass++) {
+        for (uint32_t i = 0; i < (uint32_t)sz; i++)
+            cu_cmp_buf[i] = (uint8_t)(pass == 2 ? 0 : (pass ? 0x55 : 0xAA));
+        if (fs_write_file(abs, cu_cmp_buf, (uint32_t)sz) != 0) {
+            cu_err("shred", fs_errstr);
+            return;
+        }
+    }
+    fs_delete(abs);
+    term_print("shredded (3 passes) -- note the underlying media may still\n");
+    term_print("hold the old blocks; this cannot control remapping.\n");
+}
+
+/* dos2unix / unix2dos */
+static void cu_cmd_crlf(int argc, char **argv, int to_dos) {
+    if (argc < 2) { cu_usage(to_dos ? "unix2dos <file>" : "dos2unix <file>"); return; }
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(argv[1], &d, &n)) { cu_err("dos2unix", cu_lasterr); return; }
+
+    static uint8_t buf[CU_CMP_MAX];
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < n && o < CU_CMP_MAX - 2; i++) {
+        if (d[i] == '\r') continue;
+        if (d[i] == '\n' && to_dos) buf[o++] = '\r';
+        buf[o++] = d[i];
+    }
+    char abs[256];
+    term_resolve(argv[1], abs);
+    if (fs_write_file(abs, buf, o) != 0) cu_err("dos2unix", fs_errstr);
+}
+
+/* ===== shell builtins ===== */
+
+static void cu_cmd_printf(int argc, char **argv) {
+    if (argc < 2) { cu_usage("printf <format> [args]"); return; }
+    int nexta = 2;
+    for (const char *f = argv[1]; *f; f++) {
+        if (*f == '\\' && f[1]) {
+            f++;
+            switch (*f) {
+            case 'n': term_putc('\n'); break;
+            case 't': term_putc('\t'); break;
+            case 'r': term_putc('\r'); break;
+            case '\\': term_putc('\\'); break;
+            default: term_putc(*f); break;
+            }
+            continue;
+        }
+        if (*f == '%' && f[1]) {
+            f++;
+            if (*f == '%') { term_putc('%'); continue; }
+            const char *arg = nexta < argc ? argv[nexta++] : "";
+            if (*f == 's') term_print(arg);
+            else if (*f == 'd' || *f == 'i' || *f == 'u') {
+                int v = cu_atoi(arg, 0);
+                if (v < 0) { term_putc('-'); v = -v; }
+                cu_put_num((uint32_t)v, 1);
+            } else if (*f == 'c') term_putc(arg[0]);
+            else if (*f == 'x') {
+                static const char hx[] = "0123456789abcdef";
+                uint32_t v = (uint32_t)cu_atoi(arg, 0);
+                int started = 0;
+                for (int k = 7; k >= 0; k--) {
+                    int nib = (v >> (k * 4)) & 15;
+                    if (nib || started || k == 0) { term_putc(hx[nib]); started = 1; }
+                }
+            } else term_putc(*f);
+            continue;
+        }
+        term_putc(*f);
+    }
+}
+
+static void cu_cmd_seq(int argc, char **argv) {
+    if (argc < 2) { cu_usage("seq [first [incr]] last"); return; }
+    int first = 1, incr = 1, last;
+    if (argc == 2) last = cu_atoi(argv[1], 1);
+    else if (argc == 3) { first = cu_atoi(argv[1], 1); last = cu_atoi(argv[2], 1); }
+    else { first = cu_atoi(argv[1], 1); incr = cu_atoi(argv[2], 1); last = cu_atoi(argv[3], 1); }
+    if (incr == 0) { cu_err("seq", "increment cannot be zero"); return; }
+
+    int guard = 0;
+    for (int v = first; (incr > 0 ? v <= last : v >= last) && guard < 100000; v += incr, guard++) {
+        int t = v;
+        if (t < 0) { term_putc('-'); t = -t; }
+        cu_put_num((uint32_t)t, 1);
+        term_putc('\n');
+    }
+}
+
+static void cu_cmd_yes(int argc, char **argv) {
+    /* Bounded: without a process to kill there is no way to stop an
+     * unbounded one, and the render loop would never run again. */
+    const char *word = argc >= 2 ? argv[1] : "y";
+    for (int i = 0; i < 100; i++) { term_print(word); term_putc('\n'); }
+    term_print_c("(stopped after 100 -- nothing here can interrupt a loop)\n", 3);
+}
+
+/*
+ * test / [ -- the string and file predicates. Numeric comparison too,
+ * since shell scripts lean on it.
+ */
+static void cu_cmd_test(int argc, char **argv) {
+    int n = argc;
+    if (n > 1 && str_eq(argv[n - 1], "]")) n--;      /* the `[` spelling */
+
+    int result = 0;
+    if (n == 2) {
+        result = argv[1][0] != '\0';
+    } else if (n == 3) {
+        const char *op = argv[1], *a = argv[2];
+        char abs[256];
+        term_resolve(a, abs);
+        uint64_t sz = 0;
+        int is_dir = 0, exists = fs_stat(abs, &sz, &is_dir);
+        if (str_eq(op, "-e")) result = exists;
+        else if (str_eq(op, "-f")) result = exists && !is_dir;
+        else if (str_eq(op, "-d")) result = exists && is_dir;
+        else if (str_eq(op, "-s")) result = exists && sz > 0;
+        else if (str_eq(op, "-r") || str_eq(op, "-w")) result = exists;
+        else if (str_eq(op, "-z")) result = a[0] == '\0';
+        else if (str_eq(op, "-n")) result = a[0] != '\0';
+        else if (str_eq(op, "!")) result = !(a[0] != '\0');
+    } else if (n == 4) {
+        const char *a = argv[1], *op = argv[2], *b = argv[3];
+        if (str_eq(op, "=") || str_eq(op, "==")) result = str_eq(a, b);
+        else if (str_eq(op, "!=")) result = !str_eq(a, b);
+        else {
+            int x = cu_atoi(a, 0), y = cu_atoi(b, 0);
+            if (str_eq(op, "-eq")) result = x == y;
+            else if (str_eq(op, "-ne")) result = x != y;
+            else if (str_eq(op, "-lt")) result = x < y;
+            else if (str_eq(op, "-le")) result = x <= y;
+            else if (str_eq(op, "-gt")) result = x > y;
+            else if (str_eq(op, "-ge")) result = x >= y;
+        }
+    }
+    term_print(result ? "true\n" : "false\n");
+}
+
+/* xargs: run one command with the piped words appended. */
+static void term_exec(char *cmdline);      /* defined below; see term.h */
+
+static void cu_cmd_xargs(int argc, char **argv) {
+    if (!cu_pipe_ready) { cu_err("xargs", "nothing piped in"); return; }
+    if (argc < 2) { cu_usage("<cmd> | xargs <command>"); return; }
+
+    char line[512];
+    uint32_t i = 0;
+    while (i < cu_pipe_len) {
+        int o = 0;
+        for (int a = 1; a < argc && o < 400; a++) {
+            for (int k = 0; argv[a][k] && o < 400; k++) line[o++] = argv[a][k];
+            line[o++] = ' ';
+        }
+        /* one line of input per invocation, which is the useful default
+         * when the words are filenames */
+        while (i < cu_pipe_len && cu_pipe[i] != '\n' && o < 500)
+            line[o++] = cu_pipe[i++];
+        while (i < cu_pipe_len && cu_pipe[i] == '\n') i++;
+        line[o] = '\0';
+
+        int blank = 1;
+        for (int k = 0; line[k]; k++) if (line[k] != ' ') { blank = 0; break; }
+        if (!blank) {
+            int saved = cu_pipe_ready;
+            cu_pipe_ready = 0;             /* the child reads files, not us */
+            term_exec(line);
+            cu_pipe_ready = saved;
+        }
+    }
+}
+
+/* ===== system information ===== */
+
+static void cu_cmd_hostname(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("socrates\n");
+}
+
+static void cu_cmd_arch(int argc, char **argv) {
+    (void)argc; (void)argv;
+#if defined(__aarch64__)
+    term_print("aarch64\n");
+#else
+    term_print("x86_64\n");
+#endif
+}
+
+static void cu_cmd_nproc(int argc, char **argv) {
+    (void)argc; (void)argv;
+    /* One, and it is not a guess: this kernel never starts a second CPU.
+     * There is no SMP bring-up anywhere in the tree. */
+    term_print("1\n");
+}
+
+static void cu_cmd_free(int argc, char **argv) {
+    (void)argv;
+    int kib = argc >= 2 && (str_eq(argv[1], "-k"));
+    uint32_t total_mb = (uint32_t)system_total_memory_mb;
+    term_print("               total\n");
+    term_print("Mem:      ");
+    if (kib) { cu_put_num(total_mb * 1024, 10); term_print(" KiB\n"); }
+    else     { cu_put_num(total_mb, 10); term_print(" MiB\n"); }
+    term_print_c("(no used/free split: this kernel has no allocator to ask)\n", 3);
+}
+
+static int cu_lspci_cb(const pci_dev_t *dev, void *ctx) {
+    (void)ctx;
+    static const char hx[] = "0123456789abcdef";
+    term_putc(hx[(dev->bus >> 4) & 15]); term_putc(hx[dev->bus & 15]);
+    term_putc(':');
+    term_putc(hx[(dev->slot >> 4) & 15]); term_putc(hx[dev->slot & 15]);
+    term_putc('.');
+    term_putc(hx[dev->func & 15]);
+    term_print("  ");
+
+    uint32_t cls = dev->class_code >> 16;
+    const char *what = "device";
+    switch (cls) {
+    case 0x00: what = "unclassified"; break;
+    case 0x01: what = "mass storage"; break;
+    case 0x02: what = "network"; break;
+    case 0x03: what = "display"; break;
+    case 0x04: what = "multimedia"; break;
+    case 0x05: what = "memory"; break;
+    case 0x06: what = "bridge"; break;
+    case 0x07: what = "communication"; break;
+    case 0x08: what = "system peripheral"; break;
+    case 0x09: what = "input"; break;
+    case 0x0C: what = "serial bus"; break;
+    default: break;
+    }
+    term_print(what);
+    term_print("  [");
+    for (int k = 3; k >= 0; k--) term_putc(hx[(dev->vendor >> (k * 4)) & 15]);
+    term_putc(':');
+    for (int k = 3; k >= 0; k--) term_putc(hx[(dev->device >> (k * 4)) & 15]);
+    term_print("]\n");
+    return 0;
+}
+
+static void cu_cmd_lspci(int argc, char **argv) {
+    (void)argc; (void)argv;
+    pci_scan(cu_lspci_cb, 0);
+}
+
+static void cu_cmd_lsblk(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("NAME    BUS           SIZE\n");
+    if (!blk_present()) { term_print_c("(no disk)\n", 3); return; }
+    term_print("disk0   ");
+    term_print(blk_bus_name());
+    for (int i = 0; i < 14 - (int)0; i++) { }
+    term_print("  ");
+    cu_put_num((uint32_t)(blk_sectors() / 2048), 8);
+    term_print(" MiB\n");
+    if (fs_kind != FS_NONE) {
+        term_print("  mounted ");
+        term_print(fs_name());
+        term_print(", ");
+        cu_put_num(fs_free_kb() / 1024, 1);
+        term_print(" MiB free of ");
+        cu_put_num(fs_total_kb() / 1024, 1);
+        term_print(" MiB\n");
+    }
+}
+
+static void cu_cmd_lscpu(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("Architecture:   ");
+#if defined(__aarch64__)
+    term_print("aarch64\n");
+    term_print("Byte order:     Little Endian\n");
+#else
+    term_print("x86_64\n");
+    term_print("Byte order:     Little Endian\n");
+#endif
+    term_print("CPU(s):         1   (no SMP bring-up in this kernel)\n");
+    term_print("Privilege:      supervisor throughout; no user mode\n");
+}
+
+static void cu_cmd_lsmem(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("Total online memory: ");
+    cu_put_num((uint32_t)system_total_memory_mb, 1);
+    term_print(" MiB\n");
+}
+
+/* cal: a month, computed rather than looked up. */
+static void cu_cmd_cal(int argc, char **argv) {
+    int hh, mm, ss, day, mon, yr;
+    rtc_read(&hh, &mm, &ss, &day, &mon, &yr);
+    if (argc >= 3) { mon = cu_atoi(argv[1], mon); yr = cu_atoi(argv[2], yr); }
+    else if (argc == 2) { yr = cu_atoi(argv[1], yr); mon = 1; }
+    if (mon < 1) mon = 1;
+    if (mon > 12) mon = 12;
+
+    static const char *names[13] = { "", "January", "February", "March",
+        "April", "May", "June", "July", "August", "September", "October",
+        "November", "December" };
+    static const int mdays[13] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
+
+    int leap = (yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0);
+    int dim = mdays[mon] + ((mon == 2 && leap) ? 1 : 0);
+
+    /* Zeller's congruence for the weekday of the 1st. */
+    int m = mon, y = yr;
+    if (m < 3) { m += 12; y -= 1; }
+    int K = y % 100, J = y / 100;
+    int h = (1 + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+    int first = (h + 6) % 7;                 /* 0 = Sunday */
+
+    term_print("    ");
+    term_print(names[mon]);
+    term_print(" ");
+    cu_put_num((uint32_t)yr, 1);
+    term_print("\nSu Mo Tu We Th Fr Sa\n");
+    for (int i = 0; i < first; i++) term_print("   ");
+    for (int d = 1; d <= dim; d++) {
+        if (d < 10) term_putc(' ');
+        cu_put_num((uint32_t)d, 1);
+        if ((first + d) % 7 == 0) term_putc('\n');
+        else term_putc(' ');
+    }
+    term_putc('\n');
+}
+
+static void cu_cmd_sync(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (blk_flush() == 0) term_print("flushed\n");
+    else term_print_c("sync: the device reported an error\n", 2);
+}
+
+static void cu_cmd_true_false(int is_true) {
+    term_print(is_true ? "true\n" : "false\n");
+}
+
+/* ===== networking ===== */
+
+static void cu_cmd_ifcfg_extra(int argc, char **argv) {
+    (void)argc; (void)argv;
+    char ip[20];
+    term_print("Interface  net0\n");
+    if (!e1000_found) { term_print_c("  no adapter found\n", 2); return; }
+    ip_to_str(net_our_ip, ip);
+    term_print("  address  "); term_print(ip); term_putc('\n');
+    ip_to_str(net_gw_ip, ip);
+    term_print("  gateway  "); term_print(ip); term_putc('\n');
+    ip_to_str(net_dns_ip, ip);
+    term_print("  dns      "); term_print(ip); term_putc('\n');
+}
+
+static void cu_cmd_route(int argc, char **argv) {
+    (void)argc; (void)argv;
+    char ip[20];
+    term_print("Destination     Gateway         Iface\n");
+    if (!e1000_found) { term_print_c("(no adapter)\n", 3); return; }
+    ip_to_str(net_gw_ip, ip);
+    term_print("default         ");
+    term_print(ip);
+    for (int i = 0; i < 16 - 15; i++) term_putc(' ');
+    term_print("   net0\n");
+    ip_to_str(net_our_ip, ip);
+    term_print("10.0.2.0/24     -               net0\n");
+}
+
 /* ===== dispatch =====
  *
  * A table rather than another arm on term_exec's if-chain: this file will
@@ -1402,6 +2109,47 @@ static int cu_dispatch(const char *cmd, int argc, char **argv) {
                                   { cu_cmd_cksum(argc, argv); return 1; }
     if (str_eq(cmd, "base64"))    { cu_cmd_base64(argc, argv, 0); return 1; }
     if (str_eq(cmd, "base64d"))   { cu_cmd_base64(argc, argv, 1); return 1; }
+
+    /* more text */
+    if (str_eq(cmd, "sed"))       { cu_cmd_sed(argc, argv); return 1; }
+    if (str_eq(cmd, "comm"))      { cu_cmd_comm(argc, argv); return 1; }
+    if (str_eq(cmd, "paste"))     { cu_cmd_paste(argc, argv); return 1; }
+    if (str_eq(cmd, "column"))    { cu_cmd_column(argc, argv); return 1; }
+    if (str_eq(cmd, "fmt"))       { cu_cmd_fmt(argc, argv); return 1; }
+    if (str_eq(cmd, "pr"))        { cu_cmd_pr(argc, argv); return 1; }
+    if (str_eq(cmd, "csplit"))    { cu_cmd_csplit(argc, argv); return 1; }
+    if (str_eq(cmd, "dd"))        { cu_cmd_dd(argc, argv); return 1; }
+    if (str_eq(cmd, "shred"))     { cu_cmd_shred(argc, argv); return 1; }
+    if (str_eq(cmd, "dos2unix"))  { cu_cmd_crlf(argc, argv, 0); return 1; }
+    if (str_eq(cmd, "unix2dos"))  { cu_cmd_crlf(argc, argv, 1); return 1; }
+
+    /* shell builtins */
+    if (str_eq(cmd, "printf"))    { cu_cmd_printf(argc, argv); return 1; }
+    if (str_eq(cmd, "seq"))       { cu_cmd_seq(argc, argv); return 1; }
+    if (str_eq(cmd, "yes"))       { cu_cmd_yes(argc, argv); return 1; }
+    if (str_eq(cmd, "test") || str_eq(cmd, "["))
+                                  { cu_cmd_test(argc, argv); return 1; }
+    if (str_eq(cmd, "xargs"))     { cu_cmd_xargs(argc, argv); return 1; }
+    if (str_eq(cmd, "true"))      { cu_cmd_true_false(1); return 1; }
+    if (str_eq(cmd, "false"))     { cu_cmd_true_false(0); return 1; }
+
+    /* system information */
+    if (str_eq(cmd, "hostname"))  { cu_cmd_hostname(argc, argv); return 1; }
+    if (str_eq(cmd, "arch"))      { cu_cmd_arch(argc, argv); return 1; }
+    if (str_eq(cmd, "nproc"))     { cu_cmd_nproc(argc, argv); return 1; }
+    if (str_eq(cmd, "free"))      { cu_cmd_free(argc, argv); return 1; }
+    if (str_eq(cmd, "lspci"))     { cu_cmd_lspci(argc, argv); return 1; }
+    if (str_eq(cmd, "lsblk"))     { cu_cmd_lsblk(argc, argv); return 1; }
+    if (str_eq(cmd, "lscpu"))     { cu_cmd_lscpu(argc, argv); return 1; }
+    if (str_eq(cmd, "lsmem"))     { cu_cmd_lsmem(argc, argv); return 1; }
+    if (str_eq(cmd, "cal"))       { cu_cmd_cal(argc, argv); return 1; }
+    if (str_eq(cmd, "sync"))      { cu_cmd_sync(argc, argv); return 1; }
+
+    /* networking */
+    if (str_eq(cmd, "ip") || str_eq(cmd, "addr"))
+                                  { cu_cmd_ifcfg_extra(argc, argv); return 1; }
+    if (str_eq(cmd, "route") || str_eq(cmd, "netstat"))
+                                  { cu_cmd_route(argc, argv); return 1; }
 
     return 0;
 }
