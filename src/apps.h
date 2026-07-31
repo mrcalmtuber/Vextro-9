@@ -1738,7 +1738,7 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
     if (mx < cx || mx >= cx + cw || my < cy || my >= cy + chh) return;
 
     /* the bubble in the header toggles between searching and asking */
-    if (click &&
+    if (click && ai_enabled == 1 &&
         mx >= cx + cw - 42 && mx < cx + cw - 8 && my >= cy + 8 && my < cy + 36) {
         wiki_mode = !wiki_mode;
         return;
@@ -2393,12 +2393,16 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
         } else {
             sub = zim.open ? "offline archive" : "no archive";
         }
+        if (ai_enabled != 1 && wiki_mode) wiki_mode = 0;   /* cannot be here */
         int tw = ttf_text_width(sub, 12);
         ttf_draw_string(buf, (int)w, (int)h, cx + cw - tw - 52, cy + 16, sub,
                         C_TEXT_DIM, 12);
     }
 
-    /* the chat bubble, top right */
+    /* The chat bubble, top right -- absent entirely when the account
+     * turned the model off. An affordance for something switched off is
+     * worse than no affordance. */
+    if (ai_enabled == 1)
     {
         int32_t bx = cx + cw - 40, by = cy + 10;
         uint32_t fill = wiki_mode ? C_GOLD : 0x2A3040u;

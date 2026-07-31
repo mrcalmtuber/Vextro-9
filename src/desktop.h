@@ -501,6 +501,25 @@ static int fs_list(const char *path, fs_list_cb cb) {
  * and idt.h for cycle_now, which together seed the salt. */
 #include "sha256.h"
 #include "users.h"
+/*
+ * Whether this account wants the language model at all.
+ *
+ * Not everyone does: the weights are 380 MB, loading them costs real time
+ * on every boot, and a machine used as a desktop has no need of them. So
+ * the choice is asked once, on the first login of each account, and kept.
+ *
+ *   -1  not asked yet -- the dialog is up
+ *    0  declined: nothing is loaded, and the Wikipedia window shows no
+ *       chat tab, because offering something that has been switched off
+ *       is worse than not offering it
+ *    1  accepted
+ *
+ * Stored per account in /home/<name>/settings.cfg rather than globally,
+ * since two people using the same machine can reasonably disagree.
+ */
+static int ai_enabled = -1;
+static void ai_choice_save(int on);   /* defined with the session code */
+
 /* Set by the menu or the `logout` command; the render loop acts on it,
  * because tearing the session down from inside a draw would pull the
  * window list out from under the code walking it. */
@@ -2066,6 +2085,66 @@ static void desktop_wheel_input(int32_t notches) {
     }
 }
 
+/* ===== the model opt-in =====
+ *
+ * Shown once per account, on the first login, over the desktop. It takes
+ * the whole screen's input while it is up: a modal that could be clicked
+ * behind is not a choice, it is an obstacle.
+ */
+#define AID_W 460
+#define AID_H 190
+
+static int ai_dialog_hit(int32_t mx, int32_t my, uint32_t w, uint32_t h,
+                         int which) {
+    int32_t x0 = ((int32_t)w - AID_W) / 2;
+    int32_t y0 = ((int32_t)h - AID_H) / 2;
+    int32_t by = y0 + AID_H - 52;
+    int32_t bx = which == 0 ? x0 + AID_W - 230 : x0 + AID_W - 116;
+    return mx >= bx && mx < bx + 100 && my >= by && my < by + 34;
+}
+
+static void ai_dialog_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                           int32_t mx, int32_t my) {
+    /* dim what is behind, so the dialog reads as the only live thing */
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint32_t p = buf[i];
+        buf[i] = ((p >> 1) & 0x7F7F7Fu);
+    }
+
+    int32_t x0 = ((int32_t)w - AID_W) / 2;
+    int32_t y0 = ((int32_t)h - AID_H) / 2;
+
+    gfx_rect(buf, w, h, x0, y0, AID_W, AID_H, 0x14161Eu);
+    gfx_rect_outline(buf, w, h, x0, y0, AID_W, AID_H, C_GOLD);
+    gfx_rect(buf, w, h, x0, y0, AID_W, 2, C_GOLD);
+
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 22,
+                    "Enable AI features?", C_GOLD, 18);
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 58,
+                    "This machine can run a language model on the CPU to",
+                    C_TEXT_DIM, 13);
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 78,
+                    "answer questions from the offline encyclopedia.",
+                    C_TEXT_DIM, 13);
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 102,
+                    "It loads 380 MB at every boot. You can leave it off.",
+                    0x707888u, 12);
+
+    for (int i = 0; i < 2; i++) {
+        int32_t by = y0 + AID_H - 52;
+        int32_t bx = i == 0 ? x0 + AID_W - 230 : x0 + AID_W - 116;
+        int hot = ai_dialog_hit(mx, my, w, h, i);
+        int yes = (i == 1);
+        gfx_rect(buf, w, h, bx, by, 100, 34, yes ? 0x2A2410u : 0x1B1E26u);
+        gfx_rect_outline(buf, w, h, bx, by, 100, 34,
+                         hot ? C_GOLD : (yes ? C_GOLD_DIM : 0x3A4050u));
+        const char *lbl = yes ? "Enable" : "No thanks";
+        int tw = ttf_text_width(lbl, 14);
+        ttf_draw_string(buf, (int)w, (int)h, bx + (100 - tw) / 2, by + 9,
+                        lbl, yes ? C_GOLD : C_TEXT_DIM, 14);
+    }
+}
+
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                            int32_t mx, int32_t my, uint8_t buttons) {
     desktop_tick++;
@@ -2086,6 +2165,30 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     ai_poll();
     wiki_poll();
 
+    /* ---- the opt-in, while it is unanswered ---- */
+    if (ai_enabled < 0) {
+        uint8_t lmb0 = buttons & 1;
+        int click = lmb0 && !desk_prev_lmb;
+        desk_prev_lmb = lmb0;
+
+        for (uint32_t i = 0; i < w * h; i++) buf[i] = wallpaper[i];
+        menubar_draw(buf, w, h, mx, my);
+        dock_draw(buf, w, h, mx, my);
+        ai_dialog_draw(buf, w, h, mx, my);
+
+        if (click) {
+            if (ai_dialog_hit(mx, my, w, h, 1)) {
+                ai_choice_save(1);
+                ai_autoload_start();
+                serial_puts("[ai] enabled by the user\n");
+            } else if (ai_dialog_hit(mx, my, w, h, 0)) {
+                ai_choice_save(0);
+                serial_puts("[ai] declined; model not loaded\n");
+            }
+        }
+        return;                      /* nothing else runs while it is up */
+    }
+
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;
     int consumed = menu_mouse(mx, my, lmb, desk_prev_lmb);
@@ -2104,6 +2207,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     menu_dropdown_draw(buf, w, h, mx, my);
     dock_draw(buf, w, h, mx, my);
 }
+
 
 /* ===== 12. SESSIONS =====
  *
@@ -2179,6 +2283,34 @@ static void session_begin(const char *name) {
         str_copy(term_cwd, home, sizeof(term_cwd));
         str_copy(exp_path, home, sizeof(exp_path));
     }
+
+    /* Their answer about the model, if they have given one. */
+    ai_enabled = -1;
+    {
+        char cfg[96];
+        str_copy(cfg, home, sizeof(cfg));
+        str_append(cfg, "/settings.cfg", sizeof(cfg));
+        uint64_t n = 0;
+        const void *d = fs_read_file(cfg, &n);
+        if (d && n >= 4) {
+            const char *p = (const char *)d;
+            for (uint64_t i = 0; i + 3 < n; i++)
+                if (p[i]=='a' && p[i+1]=='i' && p[i+2]=='=') {
+                    ai_enabled = (p[i+3] == '1') ? 1 : 0;
+                    break;
+                }
+        }
+    }
+}
+
+/* Record the answer so it is only asked once. */
+static void ai_choice_save(int on) {
+    ai_enabled = on;
+    if (user_current < 0) return;
+    char cfg[96];
+    user_home(user_current, cfg, sizeof(cfg));
+    str_append(cfg, "/settings.cfg", sizeof(cfg));
+    fs_write_file(cfg, on ? "ai=1\n" : "ai=0\n", 5);
 }
 
 #endif /* DESKTOP_H */

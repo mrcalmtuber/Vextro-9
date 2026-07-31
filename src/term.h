@@ -597,6 +597,9 @@ static fs_file_t   ai_file;
  * machine without one simply has no chat. */
 static void ai_autoload_start(void) {
     if (ai_state != AI_IDLE) return;
+    /* Declined, or not yet asked. Loading 380 MB on the strength of an
+     * answer nobody has given would be the wrong default. */
+    if (ai_enabled != 1) return;
     if (fs_open(AI_MODEL_PATH, &ai_file) != 0) {
         /* Not an error — a machine with no model simply has no chat. But
          * silence here is why "the chat panel does nothing" took so long
@@ -1488,6 +1491,19 @@ static void term_exec(char *cmdline) {
         }
     } else if (desktop_open_app_by_name(cmd)) {
         /* bare app name works too: "browser", "files", ... */
+    } else if (str_eq(cmd, "ai")) {
+        if (argc >= 2 && str_eq(argv[1], "on")) {
+            ai_choice_save(1);
+            ai_autoload_start();
+            term_print_c("AI features enabled\n", 4);
+        } else if (argc >= 2 && str_eq(argv[1], "off")) {
+            ai_choice_save(0);
+            term_print_c("AI features disabled for this account\n", 3);
+        } else {
+            term_print("AI features are ");
+            term_print_c(ai_enabled == 1 ? "on" : "off", ai_enabled == 1 ? 4 : 3);
+            term_print("   (ai on | ai off)\n");
+        }
     } else if (str_eq(cmd, "whoami")) {
         if (user_current < 0) { term_print("nobody\n"); return; }
         term_print(user_name_of(user_current));

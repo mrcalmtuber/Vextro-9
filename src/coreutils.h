@@ -1894,6 +1894,51 @@ static void cu_cmd_free(int argc, char **argv) {
     term_print_c("(no used/free split: this kernel has no allocator to ask)\n", 3);
 }
 
+/*
+ * lspci -- and on aarch64, the honest equivalent.
+ *
+ * The `virt` machine this port targets has no PCI host bridge at all:
+ * every device is virtio over MMIO at a fixed window, which is exactly
+ * why the port never needed an ECAM walk. Listing an empty PCI bus there
+ * would be true and useless; listing the devices that *are* present is
+ * what someone typing lspci actually wants.
+ */
+#if defined(__aarch64__)
+
+static void cu_cmd_lspci(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("no PCI host bridge on this machine; virtio-mmio devices:\n");
+    int found = 0;
+    for (uint32_t i = 0; i < VIRTIO_MMIO_COUNT; i++) {
+        uint64_t base = VIRTIO_MMIO_BASE + (uint64_t)i * VIRTIO_MMIO_STRIDE;
+        if (vio_rd(base, VIO_MAGIC) != VIO_MAGIC_VALUE) continue;
+        uint32_t id = vio_rd(base, VIO_DEVICE_ID);
+        if (id == 0) continue;
+        const char *what = "unknown";
+        switch (id) {
+        case 1:  what = "network"; break;
+        case 2:  what = "block"; break;
+        case 3:  what = "console"; break;
+        case 4:  what = "entropy"; break;
+        case 16: what = "gpu"; break;
+        case 18: what = "input"; break;
+        case 19: what = "socket"; break;
+        default: break;
+        }
+        term_print("  slot ");
+        cu_put_num(i, 2);
+        term_print("   id ");
+        cu_put_num(id, 2);
+        term_print("   ");
+        term_print(what);
+        term_putc('\n');
+        found++;
+    }
+    if (!found) term_print_c("  (none)\n", 3);
+}
+
+#else
+
 static int cu_lspci_cb(const pci_dev_t *dev, void *ctx) {
     (void)ctx;
     static const char hx[] = "0123456789abcdef";
@@ -1933,6 +1978,8 @@ static void cu_cmd_lspci(int argc, char **argv) {
     (void)argc; (void)argv;
     pci_scan(cu_lspci_cb, 0);
 }
+
+#endif /* __aarch64__ */
 
 static void cu_cmd_lsblk(int argc, char **argv) {
     (void)argc; (void)argv;

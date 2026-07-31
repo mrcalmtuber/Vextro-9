@@ -31,3 +31,4 @@ bsdfmt/*.o
 bsdfmt/*.bin
 bsdfmt/*.elf
 bsdfmt/*.bsd
+assets/

@@ -122,10 +122,37 @@ bsdtools: $(BSD_MAKER) bsdfmt/bsd_run
 # filesystem. `make cleandisk` resets it to factory contents.
 DISK_MB ?= 8192
 
+# --- The encyclopedia and the model ---
+#
+# Neither can live in the repository: wiki.zim is about 980 MB and
+# qwen2.gguf about 380 MB, and GitHub refuses any blob over 100 MB. So
+# they are fetched from where they are published and written into the
+# volume, which is what makes a fresh clone come up with an encyclopedia
+# rather than without one.
+#
+# Both are optional and the fetch never fails the build. Without them the
+# Wikipedia window reports no archive and the prompt after login has
+# nothing to offer -- a working machine, with less on it.
+#
+# ASSETS=0 skips the download entirely; ASSETS=1 takes it without asking,
+# which is what CI wants.
+ASSETS ?= ask
+
+.PHONY: assets
+assets:
+	@python3 tools/fetch_assets.py --dest assets $(if $(filter 1,$(ASSETS)),--yes,)
+
+ASSET_ZIM   := $(wildcard assets/wiki.zim)
+ASSET_MODEL := $(wildcard assets/qwen2.gguf)
+
 disk.img: | build/hello $(STORE_BINS) $(PIC_SCI)
+ifneq ($(ASSETS),0)
+	@python3 tools/fetch_assets.py --dest assets $(if $(filter 1,$(ASSETS)),--yes,) || true
+endif
 	python3 tools/mkexfat.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
+		$(wildcard assets/wiki.zim) $(wildcard assets/qwen2.gguf) \
 		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd) \
 		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)
 

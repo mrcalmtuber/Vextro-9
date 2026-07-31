@@ -31,6 +31,33 @@
 
 ---
 
+## Building it
+
+```
+git clone https://github.com/mrcalmtuber/socrates-bsd-9
+cd socrates-bsd-9
+make            # builds the ISO and the 8 GB volume
+make run
+```
+
+The first build offers to fetch the two things the repository cannot
+carry: **Simple English Wikipedia** (~980 MB) and a **Qwen2 0.5B**
+language model (~380 MB). GitHub refuses any file over 100 MB, so they are
+downloaded from Kiwix and Hugging Face and written into `disk.img`.
+
+Both are optional and the download never fails the build:
+
+```
+make ASSETS=1     # take them without asking (what CI wants)
+make ASSETS=0     # skip entirely
+make assets       # fetch later, or after saying no
+```
+
+Without them the system still boots and runs — the Wikipedia window
+reports no archive, and the prompt after login has nothing to offer.
+
+---
+
 ## The short version
 
 It boots on a real machine, draws a windowed desktop with anti-aliased type,

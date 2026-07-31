@@ -453,7 +453,6 @@ static uint32_t frame_t0_ticks = 0;
  * panel is the writing, because it races the host's sampling of it.
  */
 static uint64_t frame_wr_px = 0;      /* written by the flip    */
-static uint64_t frame_cur_px = 0;     /* written by the overlay */
 
 static void frame_report(void) {
     if (++frame_n < 120) return;
@@ -472,13 +471,11 @@ static void frame_report(void) {
     serial_put_dec((uint32_t)(frame_idle_cy / 120 / 1000));
     serial_puts("k cyc  scanout ");
     serial_put_dec((uint32_t)(frame_wr_px / 120));
-    serial_puts(" px + cursor ");
-    serial_put_dec((uint32_t)(frame_cur_px / 120));
     serial_puts(" px\n");
 
     frame_n = 0;
     frame_render_cy = frame_flip_cy = frame_idle_cy = 0;
-    frame_wr_px = frame_cur_px = 0;
+    frame_wr_px = 0;
     frame_t0_ticks = sys_ticks;
 }
 
@@ -558,145 +555,107 @@ static const char *CURSOR_IMG[18] = {
 #define CURSOR_H 18
 
 /*
- * The pointer is an overlay, not part of the picture.
+ * The pointer is composited by the flip, not drawn after it.
  *
- * It used to be stamped into the back buffer along with everything else,
- * which meant moving it *changed the frame*. The flip compares against
- * the previous frame and writes the span from the leftmost change to the
- * rightmost, so a pointer crossing the screen dirtied the rectangle it
- * left, the one it arrived at, and everything between — and those writes
- * go straight into live scanout with no vblank to hide behind. On an
- * otherwise still desktop that band was the only thing being rewritten,
- * every frame, which is exactly the shimmer that follows the cursor.
+ * It used to be stamped into the back buffer, which meant moving it
+ * changed the frame and dragged a band of unchanged desktop across the
+ * bus every time. Taking it out of the back buffer fixed that, but
+ * drawing it into scanout *after* the flip introduced a worse problem:
+ * every frame the flip wrote desktop pixels over the sprite and the
+ * overlay put it back, so on any animating screen -- the login vortex
+ * above all -- the pointer was erased and redrawn sixty times a second.
+ * There is no vblank to hide that in, so the host could sample between
+ * the two halves. That is the flicker, and it is also why the pointer
+ * looked like it was sliding *underneath* things.
  *
- * Keeping it out of `backbuf` means cursor motion dirties nothing at all:
- * the flip no longer sees the pointer, so `desktop_render`'s output is
- * identical whether the mouse moved or not.
+ * Compositing inside the flip writes every pixel exactly once with its
+ * final value, so the sprite is always on top and there is no window in
+ * which it is missing.
  *
- * There is no hardware cursor plane to hand this to. QEMU's `-vga std`
- * has none, and igpu.h is deliberately blitter-only, so the sprite is
- * composited into scanout directly, after the flip.
- *
- * Nothing needs saving from underneath. `backbuf` *is* the clean desktop
- * — by construction it never contains the pointer — so erasing means
- * copying those pixels back out of it.
+ * prevbuf still records the clean desktop pixel rather than the
+ * composited one, so change detection stays honest -- the next frame
+ * compares like with like.
  */
 static int32_t cur_prev_x = 0, cur_prev_y = 0;
-static int     cur_drawn  = 0;
+static int     cur_valid = 0;      /* cur_prev_* describe a real position */
 
-/* Repaint a rectangle of the true desktop over whatever is in scanout. */
-static void cursor_restore(volatile uint32_t *vram, uint32_t w, uint32_t h,
-                           uint32_t pitch_px, int32_t rx, int32_t ry) {
-    if (rx < 0) rx = 0;
-    if (ry < 0) ry = 0;
-    for (uint32_t row = 0; row < CURSOR_H; row++) {
-        uint32_t py = (uint32_t)ry + row;
-        if (py >= h) break;
-        const uint32_t   *src = backbuf + py * w;
-        volatile uint32_t *dst = vram + py * pitch_px;
-        for (uint32_t col = 0; col < CURSOR_W; col++) {
-            uint32_t px = (uint32_t)rx + col;
-            if (px >= w) break;
-            dst[px] = src[px];
-            frame_cur_px++;
-        }
-    }
+/* The sprite's colour at a screen position, or 0 where it does not cover. */
+static int cursor_at(int32_t px, int32_t py, int32_t cx, int32_t cy,
+                     uint32_t *out) {
+    int32_t dx = px - cx, dy = py - cy;
+    if (dx < 0 || dx >= CURSOR_W || dy < 0 || dy >= CURSOR_H) return 0;
+    char c = CURSOR_IMG[dy][dx];
+    if (c == ' ') return 0;
+    *out = (c == 'X') ? 0x000000u : 0xFFFFFFu;
+    return 1;
 }
-
-/*
- * Erase the pointer where it was, draw it where it is.
- *
- * Called after the flip. The redraw is unconditional because the flip may
- * have just written desktop content over part of the sprite; the erase is
- * not, because when the pointer has not moved there is nothing stale to
- * clean up.
- */
-static void cursor_overlay_flush(volatile uint32_t *vram, uint32_t w,
-                                 uint32_t h, uint32_t pitch_px) {
-    int32_t cx = mouse_x, cy = mouse_y;
-
-    if (cur_drawn && (cur_prev_x != cx || cur_prev_y != cy))
-        cursor_restore(vram, w, h, pitch_px, cur_prev_x, cur_prev_y);
-
-    for (uint32_t row = 0; row < CURSOR_H; row++) {
-        uint32_t py = (uint32_t)(cy + (int32_t)row);
-        if (py >= h) break;
-        const char        *line = CURSOR_IMG[row];
-        volatile uint32_t *dst  = vram + py * pitch_px;
-        for (uint32_t col = 0; col < CURSOR_W; col++) {
-            char c = line[col];
-            if (c == ' ') continue;
-            uint32_t px = (uint32_t)(cx + (int32_t)col);
-            if (px >= w) continue;
-            dst[px] = (c == 'X') ? 0x000000u : 0xFFFFFFu;
-            frame_cur_px++;
-        }
-    }
-
-    cur_prev_x = cx;
-    cur_prev_y = cy;
-    cur_drawn  = 1;
-}
-
-
-/*
- * Copy the back buffer to the panel.
- *
- * This writes straight into live scanout with nothing to synchronise
- * against, so the host can sample a row that has already been updated
- * next to one that has not — the seam that shows up as tearing.  There
- * is no vblank to wait for here, but skipping unchanged rows shrinks
- * that window to whatever actually moved, and when the screen is
- * completely still it writes nothing at all.
- */
-/*
- * Push the back buffer at the panel, touching as little as possible.
- *
- * Three things happen in one pass, and folding them together is the
- * point: finding what changed, copying it, and recording where it was.
- *
- * The row scan used to answer only "is this row identical?" and then
- * copy the whole row if not. A moving pointer changes twelve pixels of a
- * 1280-wide row, so that copied a hundred times more than it needed to —
- * and, worse, it learned nothing it could pass on. Scanning inward from
- * both ends of the row costs the same comparisons, copies only the span
- * between them, and yields a bounding box for free.
- *
- * That box is what makes the difference on virtio-gpu, where presenting
- * is an explicit transfer of guest pixels into the host's copy of the
- * resource followed by a flush. Handing it the whole screen every frame
- * means moving four megabytes to show a cursor that moved four pixels.
- */
 static void vga_flip(volatile uint32_t *vram,
                      uint32_t w, uint32_t h, uint32_t pitch_px) {
     if (gfx_force_full_flip) {          /* someone else wrote the panel */
         gfx_force_full_flip = 0;
         prev_valid = 0;
-        /* Whatever was on the panel is gone, pointer included, so there
-         * is no stale sprite to erase — and erasing would write the
-         * desktop over a rectangle the full flip is about to repaint. */
-        cur_drawn = 0;
+        cur_valid = 0;
     }
+
+    int32_t cx = mouse_x, cy = mouse_y;
+
+    /*
+     * The rectangle the pointer occupies now, unioned with the one it
+     * occupied last frame. Both have to be rewritten: the new one to
+     * paint the sprite, the old one to put the desktop back underneath
+     * it. prevbuf holds the clean pixels for both, so the row scan below
+     * would otherwise decide nothing had changed and skip them -- which
+     * is exactly what would leave a trail behind the pointer.
+     */
+    int32_t ux0 = cx, uy0 = cy, ux1 = cx + CURSOR_W, uy1 = cy + CURSOR_H;
+    if (cur_valid) {
+        if (cur_prev_x < ux0) ux0 = cur_prev_x;
+        if (cur_prev_y < uy0) uy0 = cur_prev_y;
+        if (cur_prev_x + CURSOR_W > ux1) ux1 = cur_prev_x + CURSOR_W;
+        if (cur_prev_y + CURSOR_H > uy1) uy1 = cur_prev_y + CURSOR_H;
+    }
+    if (ux0 < 0) ux0 = 0;
+    if (uy0 < 0) uy0 = 0;
+    if (ux1 > (int32_t)w) ux1 = (int32_t)w;
+    if (uy1 > (int32_t)h) uy1 = (int32_t)h;
 
     for (uint32_t row = 0; row < h; row++) {
         const uint32_t *src = backbuf + row * w;
         uint32_t       *cmp = prevbuf + row * w;
 
+        int in_cur = ((int32_t)row >= uy0 && (int32_t)row < uy1 && ux1 > ux0);
+
         uint32_t c0 = 0, c1 = w;
         if (prev_valid) {
             while (c0 < w && src[c0] == cmp[c0]) c0++;
-            if (c0 == w) continue;                  /* row unchanged */
-            while (c1 > c0 && src[c1 - 1] == cmp[c1 - 1]) c1--;
+            if (c0 == w) {
+                if (!in_cur) continue;              /* row unchanged */
+                c0 = (uint32_t)ux0;                 /* but the pointer is here */
+                c1 = (uint32_t)ux1;
+            } else {
+                while (c1 > c0 && src[c1 - 1] == cmp[c1 - 1]) c1--;
+                if (in_cur) {
+                    if ((uint32_t)ux0 < c0) c0 = (uint32_t)ux0;
+                    if ((uint32_t)ux1 > c1) c1 = (uint32_t)ux1;
+                }
+            }
         }
 
         volatile uint32_t *dst = vram + row * pitch_px;
         for (uint32_t col = c0; col < c1; col++) {
-            dst[col] = src[col];
-            cmp[col] = src[col];
+            uint32_t px = src[col];
+            cmp[col] = px;                    /* record the clean pixel */
+            uint32_t sprite;
+            if (in_cur && cursor_at((int32_t)col, (int32_t)row, cx, cy, &sprite))
+                px = sprite;                  /* the pointer wins, always */
+            dst[col] = px;
         }
         frame_wr_px += c1 - c0;
     }
     prev_valid = 1;
+    cur_prev_x = cx;
+    cur_prev_y = cy;
+    cur_valid = 1;
 }
 
 /* HAL initialization: probe PS/2 controller safely */
@@ -1218,7 +1177,6 @@ void kmain(void) {
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             uint64_t t1 = cycle_now();
             vga_flip(vram, w, h, pitch_px);
-            cursor_overlay_flush(vram, w, h, pitch_px);
             uint64_t t2 = cycle_now();
             frame_render_cy += t1 - t0;
             frame_flip_cy   += t2 - t1;
@@ -1334,6 +1292,17 @@ void kmain(void) {
                  * and the pointer cannot be driven headlessly here, so the
                  * terminal is opened directly.
                  */
+#ifdef AI_DECLINE
+                /* The pointer cannot be driven headlessly here, so the
+                 * dialog's two outcomes are reachable by build flag. */
+                ai_choice_save(0);
+                serial_puts("[aitest] declined via hook\n");
+#endif
+#ifdef AI_ACCEPT
+                ai_choice_save(1);
+                ai_autoload_start();
+                serial_puts("[aitest] accepted via hook\n");
+#endif
                 wm_open(WK_TERM);
                 {
                     static const char *cmds[] = {
@@ -1380,7 +1349,7 @@ void kmain(void) {
                         "man grep", "whatis sort", "apropos compress",
                         "unzstd /nothere.zst",
 #endif
-                        "whoami", "pwd", "users",
+                        "ai", "whoami", "pwd", "users",
                         "useradd bob hunter2",
                         "users",
                         "userdel kairav",         /* refused: in use      */
@@ -1485,7 +1454,6 @@ void kmain(void) {
         fill_rect(w, w - 1, 0,     1, h, COLOR_GOLD);
 
         vga_flip(vram, w, h, pitch_px);
-        cursor_overlay_flush(vram, w, h, pitch_px);
 
         __asm__ volatile("hlt");  /* sleep until next IRQ */
     }
