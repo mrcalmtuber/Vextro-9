@@ -2054,6 +2054,276 @@ static void cu_cmd_route(int argc, char **argv) {
     term_print("10.0.2.0/24     -               net0\n");
 }
 
+
+/* ===== archives =====
+ *
+ * The decoders were already here: zstd.h reads the app store's packages
+ * and lzma.h reads the picture format. What was missing was any way to
+ * reach them from a shell. Compression is not offered -- these are
+ * decoders, and a `gzip` that could not gzip would be a worse lie than
+ * an absent one.
+ */
+
+#define CU_UNZ_MAX (4 * 1024 * 1024)
+static uint8_t cu_unz[CU_UNZ_MAX];
+
+/* tar: list or extract a ustar archive, which is the format the ramdisk
+ * already uses, so the header walk is the same shape as tarfs's. */
+static void cu_cmd_tar(int argc, char **argv) {
+    int list = 0, extract = 0;
+    const char *name = 0;
+    for (int a = 1; a < argc; a++) {
+        if (argv[a][0] == '-' || a == 1) {
+            for (int k = 0; argv[a][k]; k++) {
+                if (argv[a][k] == 't') list = 1;
+                if (argv[a][k] == 'x') extract = 1;
+            }
+            if (argv[a][0] != '-' && !list && !extract) name = argv[a];
+        } else name = argv[a];
+    }
+    if (!list && !extract) list = 1;
+    if (!name) { cu_usage("tar -t|-x <archive.tar>"); return; }
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("tar", cu_lasterr); return; }
+
+    uint32_t off = 0, count = 0;
+    while (off + 512 <= n) {
+        const uint8_t *h = d + off;
+        if (h[0] == '\0') break;                      /* end-of-archive */
+
+        char fname[128];
+        int k = 0;
+        while (k < 99 && h[k]) { fname[k] = (char)h[k]; k++; }
+        fname[k] = '\0';
+
+        /* size is octal, in the field at offset 124 */
+        uint64_t size = 0;
+        for (int i = 124; i < 136 && h[i]; i++) {
+            if (h[i] < '0' || h[i] > '7') break;
+            size = size * 8 + (uint64_t)(h[i] - '0');
+        }
+        char type = (char)h[156];
+
+        if (list) {
+            cu_put_num((uint32_t)size, 10);
+            term_print("  ");
+            term_print_c(fname, type == '5' ? 4 : 0);
+            term_putc('\n');
+        } else if (extract && (type == '0' || type == '\0')) {
+            char abs[256];
+            term_resolve(fname, abs);
+            if (off + 512 + size <= n) {
+                if (fs_write_file(abs, d + off + 512, (uint32_t)size) != 0)
+                    cu_err("tar", fs_errstr);
+                else { term_print("x "); term_print(fname); term_putc('\n'); }
+            }
+        }
+        count++;
+        off += 512 + ((uint32_t)size + 511) / 512 * 512;
+    }
+    if (list) { cu_put_num(count, 1); term_print(" entries\n"); }
+}
+
+/* One decompressor front end, three formats. `to_file` writes beside the
+ * source with the suffix removed; otherwise it goes to the terminal. */
+static void cu_unpack(int argc, char **argv, int fmt, int to_file) {
+    const char *name = 0;
+    for (int a = 1; a < argc; a++) {
+        if (str_eq(argv[a], "-c")) to_file = 0;
+        else if (str_eq(argv[a], "-d")) continue;
+        else if (argv[a][0] != '-') name = argv[a];
+    }
+    if (!name) { cu_usage("unzstd|unxz|zcat [-c] <file>"); return; }
+
+    const uint8_t *d;
+    uint32_t n;
+    if (!cu_src(name, &d, &n)) { cu_err("unzstd", cu_lasterr); return; }
+
+    uint64_t out_len = 0;
+    const char *err = 0;
+    int rc;
+    if (fmt == 0) rc = zstd_decode(d, n, cu_unz, CU_UNZ_MAX, &out_len, &err);
+    else          rc = lzma_alone_decode(d, n, cu_unz, CU_UNZ_MAX, &out_len, &err);
+
+    if (rc != 0 || out_len == 0) {
+        cu_err(fmt == 0 ? "unzstd" : "unxz", err ? err : "not a valid stream");
+        return;
+    }
+
+    if (!to_file) {
+        for (uint64_t i = 0; i < out_len; i++) term_putc((char)cu_unz[i]);
+        return;
+    }
+    /* strip a known suffix so the result does not keep it */
+    char out[256];
+    str_copy(out, name, sizeof(out));
+    int L = 0; while (out[L]) L++;
+    static const char *sfx[] = { ".zst", ".zstd", ".xz", ".lzma", 0 };
+    for (int i = 0; sfx[i]; i++) {
+        int sl = 0; while (sfx[i][sl]) sl++;
+        if (L > sl) {
+            int m = 0;
+            while (m < sl && out[L - sl + m] == sfx[i][m]) m++;
+            if (m == sl) { out[L - sl] = '\0'; break; }
+        }
+    }
+    char abs[256];
+    term_resolve(out, abs);
+    if (fs_write_file(abs, cu_unz, (uint32_t)out_len) != 0) {
+        cu_err("unzstd", fs_errstr);
+        return;
+    }
+    cu_put_num((uint32_t)out_len, 1);
+    term_print(" bytes -> ");
+    term_print(out);
+    term_putc('\n');
+}
+
+static void cu_cmd_gzip_note(int argc, char **argv) {
+    (void)argc; (void)argv;
+    /* DEFLATE is the one codec this tree does not carry: the app store
+     * uses zstd and the picture format uses LZMA, so nothing ever needed
+     * it. Saying that is more use than a command that fails obscurely. */
+    cu_err("gzip", "no DEFLATE decoder in this build; zstd and xz work");
+}
+
+/* ===== permissions and identity ===== */
+
+static void cu_cmd_id(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (user_current < 0) { term_print("nobody\n"); return; }
+    term_print("uid=");
+    cu_put_num((uint32_t)user_current, 1);
+    term_print("(");
+    term_print(user_name_of(user_current));
+    term_print(")  groups=");
+    term_print(user_is_admin(user_current) ? "admin" : "users");
+    term_putc('\n');
+}
+
+static void cu_cmd_groups(int argc, char **argv) {
+    (void)argc; (void)argv;
+    /* Two groups, and they are the two the account flag can express.
+     * Inventing a group database would be inventing a feature. */
+    term_print(user_is_admin(user_current) ? "admin users\n" : "users\n");
+}
+
+static void cu_cmd_chmod(int argc, char **argv) {
+    (void)argc; (void)argv;
+    cu_err("chmod", "exFAT and FAT32 store no mode bits");
+}
+
+static void cu_cmd_chown(int argc, char **argv) {
+    (void)argc; (void)argv;
+    cu_err("chown", "exFAT and FAT32 store no owner");
+}
+
+static void cu_cmd_umask(int argc, char **argv) {
+    (void)argc; (void)argv;
+    term_print("0000   (no mode bits on this filesystem)\n");
+}
+
+/* ===== help ===== */
+
+typedef struct { const char *name; const char *what; } cu_doc_t;
+
+static const cu_doc_t cu_docs[] = {
+    { "basename", "strip the directory from a path" },
+    { "base64",   "encode a file; base64d decodes" },
+    { "cal",      "print a month" },
+    { "cat",      "print a file" },
+    { "cksum",    "CRC-32 and byte count" },
+    { "column",   "line a table up on its first field" },
+    { "comm",     "compare two sorted files, three columns" },
+    { "cmp",      "report the first byte at which two files differ" },
+    { "csplit",   "split a file at every line matching a pattern" },
+    { "cut",      "select fields or characters from each line" },
+    { "dd",       "copy bytes with an offset and a count" },
+    { "diff",     "line differences between two files" },
+    { "dirname",  "strip the last component from a path" },
+    { "dos2unix", "strip CR from line endings; unix2dos adds them" },
+    { "du",       "recursive size of a directory" },
+    { "expand",   "tabs to spaces; unexpand goes back" },
+    { "file",     "identify a file by its magic" },
+    { "find",     "walk a tree, -name glob and -type f|d" },
+    { "fmt",      "reflow text to a width" },
+    { "fold",     "hard-wrap at a column" },
+    { "free",     "total memory" },
+    { "grep",     "print matching lines; -i -v -n -c -l" },
+    { "head",     "first lines of a file" },
+    { "hexdump",  "hex and ASCII; xxd and od are the same tool" },
+    { "hostname", "the machine name" },
+    { "id",       "the current account and its group" },
+    { "lsblk",    "disks and the volume mounted" },
+    { "lscpu",    "processor summary" },
+    { "lspci",    "walk the PCI bus" },
+    { "nl",       "number the lines" },
+    { "paste",    "two files side by side" },
+    { "pr",       "paginate with a header" },
+    { "printf",   "format and print; %s %d %x %c and escapes" },
+    { "realpath", "resolve a path to an absolute one" },
+    { "rev",      "reverse each line" },
+    { "sed",      "s/old/new/[g], /pat/p, /pat/d" },
+    { "seq",      "print a range of numbers" },
+    { "sha256sum","SHA-256 of a file" },
+    { "shred",    "overwrite then delete" },
+    { "sort",     "sort lines; -r -u -n -f" },
+    { "split",    "break a file into numbered parts" },
+    { "stat",     "size and type of a file" },
+    { "strings",  "printable runs inside a binary" },
+    { "sync",     "flush the disk cache" },
+    { "tac",      "print lines in reverse order" },
+    { "tail",     "last lines of a file" },
+    { "tar",      "-t lists a ustar archive, -x extracts it" },
+    { "tee",      "write a pipeline to a file and to the screen" },
+    { "test",     "file and string predicates; also spelled [" },
+    { "tr",       "translate or delete characters; ranges work" },
+    { "tree",     "the directory tree" },
+    { "truncate", "set a file's length" },
+    { "uniq",     "collapse adjacent duplicate lines; -c -d -u" },
+    { "unzstd",   "decompress zstd; unxz decompresses LZMA" },
+    { "wc",       "count lines, words and bytes" },
+    { "xargs",    "run a command once per piped line" },
+    { 0, 0 }
+};
+
+static void cu_cmd_man(int argc, char **argv) {
+    if (argc < 2) { cu_usage("man <command>   (try `apropos <word>`)"); return; }
+    for (int i = 0; cu_docs[i].name; i++) {
+        if (str_eq(cu_docs[i].name, argv[1])) {
+            term_print_c(cu_docs[i].name, 3);
+            term_print(" -- ");
+            term_print(cu_docs[i].what);
+            term_putc('\n');
+            return;
+        }
+    }
+    cu_err("man", "no entry; `help` lists the built-ins");
+}
+
+static void cu_cmd_whatis(int argc, char **argv) { cu_cmd_man(argc, argv); }
+
+static void cu_cmd_apropos(int argc, char **argv) {
+    if (argc < 2) { cu_usage("apropos <word>"); return; }
+    int hits = 0;
+    for (int i = 0; cu_docs[i].name; i++) {
+        uint32_t nl = 0; while (cu_docs[i].what[nl]) nl++;
+        uint32_t namelen = 0; while (cu_docs[i].name[namelen]) namelen++;
+        if (cu_find_sub((const uint8_t *)cu_docs[i].what, nl, argv[1], 1) >= 0 ||
+            cu_find_sub((const uint8_t *)cu_docs[i].name, namelen,
+                        argv[1], 1) >= 0) {
+            term_print_c(cu_docs[i].name, 3);
+            term_print(" -- ");
+            term_print(cu_docs[i].what);
+            term_putc('\n');
+            hits++;
+        }
+    }
+    if (!hits) term_print_c("nothing matches\n", 3);
+}
+
 /* ===== dispatch =====
  *
  * A table rather than another arm on term_exec's if-chain: this file will
@@ -2151,7 +2421,29 @@ static int cu_dispatch(const char *cmd, int argc, char **argv) {
     if (str_eq(cmd, "route") || str_eq(cmd, "netstat"))
                                   { cu_cmd_route(argc, argv); return 1; }
 
+    if (str_eq(cmd, "tar"))       { cu_cmd_tar(argc, argv); return 1; }
+    if (str_eq(cmd, "unzstd") || str_eq(cmd, "zstdcat"))
+                                  { cu_unpack(argc, argv, 0, 1); return 1; }
+    if (str_eq(cmd, "unxz") || str_eq(cmd, "xzcat") || str_eq(cmd, "unlzma"))
+                                  { cu_unpack(argc, argv, 1, 1); return 1; }
+    if (str_eq(cmd, "gzip") || str_eq(cmd, "gunzip") || str_eq(cmd, "zcat"))
+                                  { cu_cmd_gzip_note(argc, argv); return 1; }
+
+    /* identity and permissions */
+    if (str_eq(cmd, "id"))        { cu_cmd_id(argc, argv); return 1; }
+    if (str_eq(cmd, "groups"))    { cu_cmd_groups(argc, argv); return 1; }
+    if (str_eq(cmd, "chmod"))     { cu_cmd_chmod(argc, argv); return 1; }
+    if (str_eq(cmd, "chown") || str_eq(cmd, "chgrp"))
+                                  { cu_cmd_chown(argc, argv); return 1; }
+    if (str_eq(cmd, "umask"))     { cu_cmd_umask(argc, argv); return 1; }
+
+    /* help */
+    if (str_eq(cmd, "man"))       { cu_cmd_man(argc, argv); return 1; }
+    if (str_eq(cmd, "whatis"))    { cu_cmd_whatis(argc, argv); return 1; }
+    if (str_eq(cmd, "apropos"))   { cu_cmd_apropos(argc, argv); return 1; }
+
     return 0;
 }
+
 
 #endif /* COREUTILS_H */

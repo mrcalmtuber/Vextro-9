@@ -1375,6 +1375,10 @@ void kmain(void) {
                         "lscpu", "lsmem", "lsblk", "lspci",
                         "cal 7 2026", "sync",
                         "ip", "route",
+                        "tar -t /initrd.tar",
+                        "id", "groups", "umask", "chmod 755 /t.txt",
+                        "man grep", "whatis sort", "apropos compress",
+                        "unzstd /nothere.zst",
 #endif
                         "whoami", "pwd", "users",
                         "useradd bob hunter2",
