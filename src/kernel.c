@@ -244,6 +244,9 @@ static uint32_t melt_tick = 0;
 
 /* Desktop mode: set after successful authentication */
 static int desktop_mode = 0;
+#ifdef AUTO_ASK
+static int auto_ask_pending = 0;
+#endif
 
 #ifdef AUTO_LOGIN
 /*
@@ -1093,6 +1096,26 @@ void kmain(void) {
             desktop_mode = 1;
             serial_puts("[socrates] AUTO_LOGIN: skipped the login screen\n");
             for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
+#ifdef AI_ACCEPT
+            /* AUTO_LOGIN skips the dialog, so the answer has to be given
+             * here -- otherwise the loader refuses on an unanswered
+             * question, which is exactly what it is meant to do. */
+            ai_choice_save(1);
+            ai_autoload_start();
+            serial_puts("[socrates] AI_ACCEPT: model enabled\n");
+#endif
+#ifdef AUTO_ASK
+            /*
+             * Open the chat panel on a question, for a screenshot. The
+             * model has to be loaded first, so this waits on ai_poll
+             * from the render loop rather than firing here.
+             */
+            wm_open(WK_WIKI);
+            wiki_autoopen();
+            wiki_want_main = 0;
+            auto_ask_pending = 1;
+            serial_puts("[autoask] queued: " AUTO_ASK "\n");
+#endif
 #ifdef AUTO_WIKI
             /*
              * Open the encyclopedia on a named article.
@@ -1173,6 +1196,13 @@ void kmain(void) {
                 desktop_wheel_input(wheel);
             }
 
+#ifdef AUTO_ASK
+            if (auto_ask_pending && llm_weights_loaded()) {
+                auto_ask_pending = 0;
+                serial_puts("[autoask] asking\n");
+                wiki_ask(AUTO_ASK);
+            }
+#endif
             uint64_t t0 = cycle_now();
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             uint64_t t1 = cycle_now();

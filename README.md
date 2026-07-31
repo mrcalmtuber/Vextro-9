@@ -147,6 +147,26 @@ The prediction sharpens as context arrives — `The` → ` following`,
 heads over 2 key/value heads, a 151,936-token vocabulary, and 373 MB of
 weights resident, on a machine with no libc and no GPU.
 
+And it is not just predicting tokens in the abstract — the Wikipedia window
+puts the whole thing together:
+
+<p align="center">
+  <img src="docs/chat.png" width="88%" alt="The Wikipedia window answering a question about photosynthesis from a retrieved article">
+</p>
+
+Asked *what is photosynthesis*, it pulled the distinctive words out of the
+question, binary-searched 399,853 sorted titles, read
+`[context: Photosynthesis]` off a 980 MB archive, and answered from that
+article — retrieval-augmented generation with no index, no database and no
+network. The wording is the model's own, mangled grammar and all; a 0.5B
+model running a token at a time on bare metal sounds like that, and tidying
+it up here would misrepresent it.
+
+That capture is from the **arm64** build under hardware virtualisation,
+which is the honest reason the port exists. The same question on the x86_64
+build under full emulation was still consuming the prompt five minutes
+later.
+
 The model loads **by itself, in the background**, while the desktop stays
 live — there is nothing to type and nothing to wait for. Q4_K
 dequantisation is checked against a reference implementation rather than
