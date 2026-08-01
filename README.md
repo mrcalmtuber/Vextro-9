@@ -332,8 +332,9 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-Roughly **22,000 lines of C**, no libc, compiled as a single translation
-unit plus one for inference.
+**29,106 lines of C**, no libc, compiled as a single translation unit plus
+one for inference. (32,052 counting the embedded typeface and the integer
+sine table, which are data rather than logic.)
 
 | | |
 |---|---|
