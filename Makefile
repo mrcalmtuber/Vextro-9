@@ -92,6 +92,14 @@ PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
 
 .PHONY: all iso run clean cleandisk apps repo bsdtools pics test FORCE
 
+# Say which target a bare `make` builds, rather than letting it fall to
+# whichever rule happens to appear first. It fell to FORCE -- a real
+# target, so make chose it, and it has no recipe -- so `make` on a fresh
+# clone printed "Nothing to be done for `FORCE'" and built nothing at
+# all. Everything still worked here because `make run` and `make all`
+# name their goal, which is exactly why it went unnoticed.
+.DEFAULT_GOAL := all
+
 FORCE:
 
 all: os.iso disk.img
