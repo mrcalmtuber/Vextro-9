@@ -65,18 +65,25 @@ MODEL_URL = os.environ.get(
     "qwen2-0_5b-instruct-q5_0.gguf",
 )
 
-def assets():
-    zim = ZIM_URL or newest_zim()
-    out = []
-    if zim:
-        out.append(("wiki.zim", zim, 200 * 1024 * 1024,
-                    "Simple English Wikipedia (~980 MB)"))
-    else:
-        print("  wiki.zim: no build found; set SOCRATES_ZIM_URL to choose one",
-              file=sys.stderr)
-    out.append(("qwen2.gguf", MODEL_URL, 100 * 1024 * 1024,
-                "Qwen2 0.5B Instruct, Q5_0 (~380 MB)"))
-    return out
+# What is wanted, and the smallest size that could plausibly be the real
+# thing rather than an error page served with a 200.
+WANTED = [
+    ("wiki.zim",   200 * 1024 * 1024, "Simple English Wikipedia (~980 MB)"),
+    ("qwen2.gguf", 100 * 1024 * 1024, "Qwen2 0.5B Instruct, Q5_0 (~380 MB)"),
+]
+
+
+def source(name):
+    """Where one of them comes from.
+
+    Kept separate from WANTED, and called only for a file that is actually
+    missing: resolving the encyclopedia's URL means listing Kiwix's index,
+    and a build that already has both files should not touch the network
+    at all. This runs on every make now, so that matters.
+    """
+    if name == "wiki.zim":
+        return ZIM_URL or newest_zim()
+    return MODEL_URL
 
 
 def human(n):
@@ -142,43 +149,65 @@ def main():
                     help="fetch just one of them")
     ap.add_argument("--yes", action="store_true",
                     help="do not ask before downloading over a gigabyte")
+    ap.add_argument("--ask-again", action="store_true",
+                    help="ask even if a previous run was declined")
     args = ap.parse_args()
 
     os.makedirs(args.dest, exist_ok=True)
 
-    want = assets()
+    # Saying no is remembered. This runs on every make now -- it has to,
+    # so that a disk built before the encyclopedia arrived is noticed --
+    # and re-asking a question already answered would be worse than the
+    # bug that made it necessary.
+    declined = os.path.join(args.dest, ".declined")
+    if args.ask_again and os.path.exists(declined):
+        os.unlink(declined)
+
+    want = WANTED
     if args.only == "zim":
         want = [a for a in want if a[0] == "wiki.zim"]
     elif args.only == "model":
         want = [a for a in want if a[0] == "qwen2.gguf"]
 
+    # Decided from the filesystem alone, before any URL is resolved.
     todo = []
-    for name, url, min_size, label in want:
+    for name, min_size, label in want:
         path = os.path.join(args.dest, name)
         if os.path.exists(path) and os.path.getsize(path) >= min_size:
             print(f"  {name}: already here ({human(os.path.getsize(path))})")
             continue
-        todo.append((name, url, min_size, label, path))
+        todo.append((name, min_size, label, path))
 
     if not todo:
         print("  nothing to fetch")
         return 0
 
+    if os.path.exists(declined) and not args.yes:
+        print("  assets: declined earlier — `make assets` to change your mind")
+        return 0
+
     print("\nThese are large, and they are optional -- the system boots and")
     print("runs without them. Skipping is a supported outcome.\n")
-    for _, _, _, label, _ in todo:
+    for _, _, label, _ in todo:
         print(f"  - {label}")
 
     if not args.yes and sys.stdin.isatty():
         try:
             if input("\nDownload now? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("skipped; run `make assets` later to change your mind")
+                open(declined, "w").close()
                 return 0
         except EOFError:
             return 0
 
     ok = True
-    for name, url, min_size, label, path in todo:
+    for name, min_size, label, path in todo:
+        url = source(name)
+        if not url:
+            print(f"  {name}: no build found; set SOCRATES_ZIM_URL to choose one",
+                  file=sys.stderr)
+            ok = False
+            continue
         if not fetch(url, path, min_size, label):
             ok = False
 

@@ -146,23 +146,60 @@ DISK_MB ?= 8192
 # which is what CI wants.
 ASSETS ?= ask
 
+ASSET_FILES := assets/wiki.zim assets/qwen2.gguf
+ASSET_LIST  := build/assets.list
+
 .PHONY: assets
 assets:
-	@python3 tools/fetch_assets.py --dest assets $(if $(filter 1,$(ASSETS)),--yes,)
+	@python3 tools/fetch_assets.py --dest assets --ask-again \
+		$(if $(filter 1,$(ASSETS)),--yes,)
+	@rm -f $(ASSET_LIST)
 
-ASSET_ZIM   := $(wildcard assets/wiki.zim)
-ASSET_MODEL := $(wildcard assets/qwen2.gguf)
-
-disk.img: | build/hello $(STORE_BINS) $(PIC_SCI)
+# --- What is actually on hand ---
+#
+# The fetch cannot live in the disk.img recipe, and the reason is a trap
+# worth naming in full, because it cost a working feature and looked like
+# success while it did.
+#
+# make expands a whole recipe before running any line of it. So
+# `$(wildcard assets/wiki.zim)` on the mkexfat line was evaluated while
+# assets/ was still empty; the fetch on the line above then downloaded
+# 1.4 GB, and mkexfat packed none of it. The build printed every sign of
+# having worked -- both files downloaded, disk written -- and the machine
+# came up with no encyclopedia and no model. It never corrected itself
+# either: disk.img existed afterwards, and nothing said it was wrong.
+#
+# Fetching therefore happens here, in a prerequisite, which is finished
+# before that recipe is expanded. And this writes down what it found, so
+# disk.img can depend on the *list* rather than on the files: a disk built
+# before the encyclopedia arrived is out of date the moment it arrives,
+# which is what makes the broken state above repair itself. The list is
+# rewritten only when its contents change, so an ordinary rebuild does not
+# repack 8 GB for nothing.
+$(ASSET_LIST): FORCE
+	@mkdir -p build
 ifneq ($(ASSETS),0)
 	@python3 tools/fetch_assets.py --dest assets $(if $(filter 1,$(ASSETS)),--yes,) || true
 endif
-	python3 tools/mkexfat.py disk.img $(DISK_MB) \
+	@for f in $(ASSET_FILES); do \
+	    if [ -f "$$f" ]; then printf '%s %s\n' "$$f" "$$(wc -c < "$$f")"; fi; \
+	done > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI)
+	@set -e; \
+	big=""; \
+	for f in $(ASSET_FILES); do \
+	    if [ -f "$$f" ]; then big="$$big $$f"; fi; \
+	done; \
+	cmd="python3 tools/mkexfat.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
-		$(wildcard assets/wiki.zim) $(wildcard assets/qwen2.gguf) \
+		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd) \
-		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)
+		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)"; \
+	echo "$$cmd"; \
+	$$cmd
 
 cleandisk:
 	rm -f disk.img
