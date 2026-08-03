@@ -7,6 +7,38 @@ CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
             -Isrc -Ikernel/include -Ibsdfmt $(EXTRA)
 
+# --- Preflight ---
+#
+# Otherwise the build stops at the first tool it cannot find, with that
+# tool's own message. `make: x86_64-elf-gcc: No such file or directory`
+# is true, and tells someone who has just cloned this nothing at all
+# about what to install. Everything missing is named at once, here,
+# before anything is built.
+#
+# Skipped for clean, which has to work on a machine with no toolchain.
+ifeq ($(filter clean cleandisk,$(MAKECMDGOALS)),)
+NEED    := $(CC) $(LD) $(HOSTCC) python3 xorriso
+MISSING := $(strip $(foreach t,$(NEED), \
+             $(if $(shell command -v $(t) 2>/dev/null),,$(t))))
+ifneq ($(MISSING),)
+$(info )
+$(info   Cannot build. Missing: $(MISSING))
+$(info )
+$(info   macOS:  brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu)
+$(info )
+$(info   Linux:  xorriso and qemu-system-x86 are packaged; an x86_64-elf)
+$(info           cross toolchain generally is not. Build one -- the OSDev)
+$(info           "GCC Cross-Compiler" guide is the usual route -- or, if)
+$(info           your host toolchain already produces ELF binaries:)
+$(info             make CC=gcc LD=ld)
+$(info )
+$(info   ffmpeg is optional. Without it the boot animation is skipped and)
+$(info   the system boots straight to the login screen.)
+$(info )
+$(error missing build tools)
+endif
+endif
+
 # --- Display mode ---
 # `resolution` is the key Limine actually reads, and it matches the card's
 # advertised VBE mode list *exactly* — ask for a mode the card does not
@@ -381,6 +413,18 @@ QEMU_DISPLAY := $(shell d=$$($(QEMU) -display help 2>/dev/null); \
 QEMU_FSKEY := $(if $(findstring cocoa,$(QEMU_DISPLAY)),Ctrl + Cmd + F,Ctrl + Alt + F)
 
 run: os.iso disk.img
+	@command -v $(QEMU) >/dev/null || { \
+	    echo ""; \
+	    echo "  $(QEMU) is not installed."; \
+	    echo ""; \
+	    echo "  It is only needed to run the system here. os.iso is"; \
+	    echo "  already built and boots on real hardware, or in any"; \
+	    echo "  other virtual machine."; \
+	    echo ""; \
+	    echo "    macOS:  brew install qemu"; \
+	    echo "    Debian: sudo apt install qemu-system-x86"; \
+	    echo ""; \
+	    exit 1; }
 	@echo ""
 	@echo "  [TIP] Toggle full-screen on/off at any time with: $(QEMU_FSKEY)"
 	@echo "  [TIP] The pointer is absolute — just move it, no click to grab."

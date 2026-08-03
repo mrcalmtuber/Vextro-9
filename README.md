@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="no libc" src="https://img.shields.io/badge/libc-none-1f2430?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-22k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/kernel-29k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
   <a href="https://github.com/mrcalmtuber/socrates-bsd-9-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
@@ -33,6 +33,27 @@
 
 ## Building it
 
+A bare-metal kernel cannot be built with the compiler that targets your
+own operating system, so this needs an **`x86_64-elf` cross toolchain**.
+On macOS that is four Homebrew formulae:
+
+```
+brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu
+```
+
+On Linux, `xorriso` and `qemu-system-x86` are packaged everywhere; the
+cross toolchain generally is not, and `gcc-x86-64-linux-gnu` is *not* a
+substitute — it targets Linux rather than bare metal. Build one, or, if
+your host toolchain already emits ELF, `make CC=gcc LD=ld` may do.
+
+`python3` builds the disk images and the assets; **`ffmpeg` is optional**
+and only makes the boot animation. Without it the build says so and boots
+straight to the login screen. `make` names everything missing at once
+rather than stopping at the first one.
+
+You will want about **11 GB free**: an 8 GB sparse volume plus 1.4 GB of
+downloads.
+
 ```
 git clone https://github.com/mrcalmtuber/socrates-bsd-9
 cd socrates-bsd-9
@@ -54,7 +75,9 @@ make assets       # fetch later, or after saying no
 ```
 
 Without them the system still boots and runs — the Wikipedia window
-reports no archive, and the prompt after login has nothing to offer.
+reports no archive, and the prompt after login has nothing to offer. Say
+no now and `make assets` later, and the next `make` notices and rebuilds
+the volume around them; nothing has to be cleaned by hand.
 
 ---
 
