@@ -53,11 +53,26 @@ extern const uint8_t boot_anim_data_end[];
 def skip(raw_path, header_path, why):
     """No animation, but still a build.
 
-    The .S that carries the frames does an .incbin of the raw file, so the
-    file has to exist even when it is empty -- an absent one is an
-    assembler error rather than an empty animation.
+    An animation that was built earlier is kept rather than blanked. make
+    reruns this whenever *this file* changes, so editing the converter on
+    a machine without ffmpeg would otherwise throw away frames that are
+    still perfectly good and cannot be regenerated here. Degrading is for
+    when there is nothing to degrade from.
+
+    Otherwise: the .S that carries the frames does an .incbin of the raw
+    file, so the file has to exist even when it is empty -- an absent one
+    is an assembler error rather than an empty animation.
     """
     print(f"  boot animation: {why}")
+
+    if (os.path.isfile(raw_path) and os.path.getsize(raw_path) > 0
+            and os.path.isfile(header_path)):
+        print("  keeping the animation already built; touching it so make "
+              "stops asking")
+        os.utime(raw_path, None)
+        os.utime(header_path, None)
+        return 0
+
     os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
     with open(raw_path, "wb"):
         pass
