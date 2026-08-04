@@ -32,9 +32,6 @@ $(info           "GCC Cross-Compiler" guide is the usual route -- or, if)
 $(info           your host toolchain already produces ELF binaries:)
 $(info             make CC=gcc LD=ld)
 $(info )
-$(info   ffmpeg is optional. Without it the boot animation is skipped and)
-$(info   the system boots straight to the login screen.)
-$(info )
 $(error missing build tools)
 endif
 endif
@@ -290,17 +287,8 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello $(STORE_BINS)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
 
-# --- Boot animation: video → raw RGB565 + header ---
-build/boot_anim.raw kernel/include/boot_animation.h: boot.mp4 tools/convert_video.py
-	@mkdir -p build kernel/include
-	python3 tools/convert_video.py boot.mp4 build/boot_anim.raw kernel/include/boot_animation.h
-
-build/boot_animation_data.o: src/boot_animation_data.S build/boot_anim.raw
-	@mkdir -p build
-	$(CC) $(CFLAGS) -c $< -o $@
-
 # --- Kernel ---
-build/kernel.o: src/kernel.c $(wildcard src/*.h) kernel/include/boot_animation.h build/res.stamp
+build/kernel.o: src/kernel.c $(wildcard src/*.h) build/res.stamp
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -328,8 +316,8 @@ build/llm.o: src/llm.c src/llm.h
 	@mkdir -p build
 	$(CC) $(LLM_CFLAGS) -c $< -o $@
 
-build/kernel: build/kernel.o build/llm.o build/boot_animation_data.o linker.ld
-	$(LD) $(LDFLAGS) build/kernel.o build/llm.o build/boot_animation_data.o -o $@
+build/kernel: build/kernel.o build/llm.o linker.ld
+	$(LD) $(LDFLAGS) build/kernel.o build/llm.o -o $@
 
 # --- ISO root population ---
 $(ISO)/boot/kernel: build/kernel
@@ -369,15 +357,10 @@ $(ISO)/boot/limine/limine.conf: limine.conf build/res.stamp
 	cp $(LIMINE)/limine-uefi-cd.bin    $(ISO)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI          $(ISO)/EFI/BOOT/
 
-# --- Bundle raw Seedance video asset into ISO root ---
-$(ISO)/boot/boot_anim.raw: build/boot_anim.raw
-	@mkdir -p $(ISO)/boot
-	cp $< $@
-
 # --- ISO image (portable El Torito, xorriso/mkisofs compatible) ---
 iso: os.iso
 
-os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/boot_anim.raw $(ISO)/boot/limine/limine.conf
+os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/limine/limine.conf
 	xorriso -as mkisofs \
 		-R -J \
 		-V "SOCRATES_BSD_9" \
@@ -448,7 +431,5 @@ clean:
 	rm -rf build os.iso \
 		$(ISO)/boot/kernel \
 		$(ISO)/boot/initrd.tar \
-		$(ISO)/boot/boot_anim.raw \
 		$(ISO)/boot/limine \
 		$(ISO)/EFI \
-		kernel/include/boot_animation.h

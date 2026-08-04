@@ -8,8 +8,6 @@ os.iso
 iso_root/boot/
 iso_root/EFI/
 
-# Generated header from video conversion
-kernel/include/boot_animation.h
 
 # Extracted limine source tree
 limine-12.3.2/

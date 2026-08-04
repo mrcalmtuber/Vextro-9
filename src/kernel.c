@@ -13,7 +13,7 @@
 #include "igpu.h"
 #include "llm.h"
 #include "desktop.h"
-#include "boot_animation.h"
+#include "bootanim.h"
 
 /*
  * Raw int 0x80 ISR stub — saves caller registers, forwards to C dispatch.
@@ -795,15 +795,30 @@ static int hal_init_devices(uint16_t cs, int32_t w, int32_t h) {
     return 0;
 }
 
-static void boot_frame_delay(void) {
-    /* ~41.67 ms per frame (24 fps) via PIT channel 2 one-shot, no IRQ needed.
-       PIT freq = 1,193,182 Hz → 1193182/24 ≈ 49716 ticks. */
+/*
+ * Frame pacing for the boot animation, in two halves.
+ *
+ * ~41.67 ms per frame (24 fps) via PIT channel 2 one-shot, no IRQ needed:
+ * PIT freq = 1,193,182 Hz, and 1193182/24 is about 49716 ticks.
+ *
+ * Split into "start the clock" and "wait for it" because a single call
+ * that does both can only sleep 41 ms *after* the frame is drawn, which
+ * makes every frame cost the drawing plus the wait. Rendering the
+ * animation takes about 18 ms under emulation, so a five second sequence
+ * ran for seven. Arming the timer first and waiting for what is left of
+ * it afterwards is the same two port writes and gives the frame rate that
+ * was asked for.
+ */
+static void boot_frame_start(void) {
     outb(0x43, 0xB0);          /* ch2, lobyte/hibyte, mode 0 (one-shot) */
     outb(0x42, 0x34);          /* low byte of 49716 */
     outb(0x42, 0xC2);          /* high byte */
     uint8_t gate = inb(0x61);
     outb(0x61, gate & 0xFE);   /* gate low — reset */
     outb(0x61, (gate | 1) & 0xFD); /* gate high, speaker off — start count */
+}
+
+static void boot_frame_wait(void) {
     while (!(inb(0x61) & 0x20)) {} /* spin until OUT2 goes high */
 }
 
@@ -823,40 +838,36 @@ static int boot_key_pressed(void) {
 static void display_boot_animation(volatile uint32_t *vram,
                                    uint32_t scr_w, uint32_t scr_h,
                                    uint32_t pitch_px) {
-    uint32_t scale_x = scr_w / BOOT_ANIM_W;
-    uint32_t scale_y = scr_h / BOOT_ANIM_H;
-    uint32_t scale = scale_x < scale_y ? scale_x : scale_y;
-    if (scale == 0) scale = 1;
+    ba_init((int)scr_w, (int)scr_h);
 
-    uint32_t dst_w = BOOT_ANIM_W * scale;
-    uint32_t dst_h = BOOT_ANIM_H * scale;
-    uint32_t off_x = (scr_w - dst_w) / 2;
-    uint32_t off_y = (scr_h - dst_h) / 2;
+    /*
+     * Composed in the back buffer and blitted, rather than drawn straight
+     * into the framebuffer.
+     *
+     * Video memory is uncached, so a store into it costs many times what
+     * the same store costs in RAM -- and the upscale writes scale x scale
+     * of them per simulated pixel, which is where nearly all of the time
+     * would go. Building the frame in RAM and copying it out once is both
+     * faster and free of the tearing that comes from a panel being scanned
+     * while it is still being written.
+     */
+    for (uint32_t i = 0; i < scr_w * scr_h; i++) backbuf[i] = 0;
 
-    const uint16_t *frames = (const uint16_t *)boot_anim_data;
-
-    for (uint32_t f = 0; f < BOOT_ANIM_FRAME_COUNT; f++) {
-        const uint16_t *src = frames + f * BOOT_ANIM_W * BOOT_ANIM_H;
-
-        for (uint32_t sy = 0; sy < BOOT_ANIM_H; sy++) {
-            for (uint32_t sx = 0; sx < BOOT_ANIM_W; sx++) {
-                uint16_t c = src[sy * BOOT_ANIM_W + sx];
-                uint32_t r = (c >> 11) & 0x1F;
-                uint32_t g = (c >> 5)  & 0x3F;
-                uint32_t b = c & 0x1F;
-                uint32_t pixel = (r << 19) | (g << 10) | (b << 3);
-
-                for (uint32_t dy = 0; dy < scale; dy++)
-                    for (uint32_t dx = 0; dx < scale; dx++)
-                        vram[(off_y + sy * scale + dy) * pitch_px +
-                             (off_x + sx * scale + dx)] = pixel;
-            }
+    for (int f = 0; f < BA_FRAMES; f++) {
+        boot_frame_start();
+        ba_render(backbuf, (int)scr_w, f);
+        for (uint32_t row = 0; row < scr_h; row++) {
+            const uint32_t *src = backbuf + (size_t)row * scr_w;
+            volatile uint32_t *dst = vram + (size_t)row * pitch_px;
+            for (uint32_t col = 0; col < scr_w; col++) dst[col] = src[col];
         }
-        boot_frame_delay();
+        boot_frame_wait();
         if (boot_key_pressed()) break;   /* any key skips the rest */
     }
 
-    /* Clear screen to black after animation finishes */
+    /* The desktop's own diff has no idea the panel was just repainted. */
+    prev_valid = 0;
+
     for (uint32_t row = 0; row < scr_h; row++)
         for (uint32_t col = 0; col < scr_w; col++)
             vram[row * pitch_px + col] = 0;

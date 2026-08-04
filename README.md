@@ -46,10 +46,11 @@ cross toolchain generally is not, and `gcc-x86-64-linux-gnu` is *not* a
 substitute — it targets Linux rather than bare metal. Build one, or, if
 your host toolchain already emits ELF, `make CC=gcc LD=ld` may do.
 
-`python3` builds the disk images and the assets; **`ffmpeg` is optional**
-and only makes the boot animation. Without it the build says so and boots
-straight to the login screen. `make` names everything missing at once
-rather than stopping at the first one.
+`python3` builds the disk images and fetches the assets. Nothing else is
+needed — the boot animation is computed by the kernel rather than decoded
+from a video, so there is no ffmpeg and no media file in the repository.
+`make` names everything missing at once rather than stopping at the first
+one.
 
 You will want about **11 GB free**: an 8 GB sparse volume plus 1.4 GB of
 downloads.
