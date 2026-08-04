@@ -98,6 +98,41 @@ nowhere else to keep a 900 MB encyclopedia.
 
 ---
 
+## First light
+
+<p align="center">
+  <img src="docs/boot.png" width="90%" alt="The boot animation: a sheet of liquid glass sliding across the Socrates mark">
+</p>
+
+**The boot animation is not a video.** A sheet of liquid glass slides across
+the mark, and the mark is only ever seen through it — four travelling waves,
+warped through one another, computed a frame at a time. The waves settle
+after the sheet has crossed, and the mark comes to rest before the login
+screen arrives.
+
+Four plain sine waves interfere into an obvious lattice; bending one
+periodic function through another is what breaks the repeat and gives the
+surface something to flow along. The slope that results both refracts what
+is behind the glass and lights it. Every wave is one-dimensional and rebuilt
+once a frame, so the inner loop does no trigonometry at all — and it is
+integer throughout, on the same 360-entry sine table the login screen uses,
+because this runs *before* the floating-point unit is switched on.
+
+It used to be a recording, and recordings are heavy: 121 frames of 320×240
+RGB565 is **18.5 MB of raw pixels**, linked into the kernel *and* copied
+into the ISO, generated from a 6.8 MB `.mp4` by ffmpeg — a build dependency
+nothing else here needed.
+
+| | before | after |
+|---|---:|---:|
+| ISO | 40 MB | **4.6 MB** |
+| in the repository | 6.8 MB of video | **none** |
+| ffmpeg | required | **not used at all** |
+
+`src/bootanim.h` is 373 lines and byte-identical on both architectures.
+
+---
+
 ## What it looks like
 
 <table>
