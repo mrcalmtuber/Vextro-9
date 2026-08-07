@@ -15,6 +15,9 @@ Script lines:
   click                       left press+release at the current position
   dblclick                    two of the above in quick succession
   wheel <n>                   scroll n notches (positive = up)
+  press / release             hold and let go of the left button
+  drag <x0> <y0> <x1> <y1>    interpolated drag, for snap and window moves
+  shake <x> <y> [amp] [n]     grab a title bar and swing it back and forth
   shot <path.ppm>             screendump
   raw <qmp-command>           execute a bare QMP command by name
 
@@ -148,6 +151,50 @@ def main():
             time.sleep(0.12)
             vm.button(False)
             time.sleep(0.12)
+        elif op == 'press':
+            vm.button(True)
+            time.sleep(0.12)
+        elif op == 'release':
+            vm.button(False)
+            time.sleep(0.12)
+        elif op == 'drag':
+            # drag <x0> <y0> <x1> <y1> [steps]
+            # Interpolated rather than a jump: the guest tracks a drag
+            # frame by frame, and a single leap looks like teleportation
+            # to anything watching the path -- which snap-to-edge is.
+            v = [int(t) for t in arg.split()]
+            x0, y0, x1, y1 = v[0], v[1], v[2], v[3]
+            steps = v[4] if len(v) > 4 else 12
+            vm.move(x0, y0)
+            time.sleep(0.15)
+            vm.button(True)
+            time.sleep(0.15)
+            for s in range(1, steps + 1):
+                vm.move(x0 + (x1 - x0) * s // steps,
+                        y0 + (y1 - y0) * s // steps)
+                time.sleep(0.05)
+            time.sleep(0.15)
+            vm.button(False)
+            time.sleep(0.15)
+        elif op == 'shake':
+            # shake <x> <y> [amplitude] [strokes]
+            # Grab a title bar and swing it back and forth. Each stroke is
+            # one full crossing, which is what the guest counts.
+            v = [int(t) for t in arg.split()]
+            x, y = v[0], v[1]
+            amp = v[2] if len(v) > 2 else 90
+            strokes = v[3] if len(v) > 3 else 8
+            vm.move(x, y)
+            time.sleep(0.15)
+            vm.button(True)
+            time.sleep(0.15)
+            for s in range(strokes):
+                target = x + (amp if (s % 2 == 0) else -amp)
+                for k in range(1, 5):
+                    vm.move(x + (target - x) * k // 4, y)
+                    time.sleep(0.02)
+            vm.button(False)
+            time.sleep(0.15)
         elif op == 'dblclick':
             for _ in range(2):
                 vm.button(True)

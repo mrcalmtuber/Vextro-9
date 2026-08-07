@@ -79,7 +79,10 @@ typedef struct {
 } dock_config_t;
 
 static dock_config_t dock_cfg = {
-    .bar_y = 0, .bar_h = 44, .bar_w = 420, .icon_sz = 32,
+    /* 40, not the 32 this started at: the taskbar is a click target for
+     * running windows now, not just a row of launchers, and Settings can
+     * still take it back down to 24. */
+    .bar_y = 0, .bar_h = 52, .bar_w = 420, .icon_sz = 40,
     .edge = DOCK_EDGE_BOTTOM,
 };
 
@@ -961,9 +964,25 @@ static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* ===== 6. WINDOW MANAGER ===== */
 
+/*
+ * A window is a rectangle plus the memory of where it used to be.
+ *
+ * Minimizing and snapping are both "put it somewhere else and be able to
+ * put it back", so they share one saved rectangle rather than keeping two
+ * that could disagree. `snap` records which edge claimed the window so a
+ * drag off that edge knows what to restore, and `have_rest` says whether
+ * the saved rectangle means anything yet -- without it, restoring a window
+ * that was never moved would snap it to a rect of zeroes.
+ */
+enum { SNAP_NONE = 0, SNAP_LEFT, SNAP_RIGHT, SNAP_MAX };
+
 typedef struct {
     int     open;
     int32_t x, y, w, h;
+    int     min;                  /* minimized to the taskbar */
+    int     snap;                 /* SNAP_* */
+    int     have_rest;
+    int32_t rx, ry, rw, rh;       /* where to put it back */
 } win_t;
 
 static win_t wins[WK_COUNT];
@@ -1004,11 +1023,17 @@ static void wm_raise(int kind) {
 static void wm_open(int kind) {
     if (kind < 0 || kind >= WK_COUNT) return;
     if (wins[kind].open) {
+        /* Launching something already running means "show me it", which
+         * for a minimized window is a restore, not just a raise. */
+        wins[kind].min = 0;
         wm_raise(kind);
         return;
     }
     win_t *win = &wins[kind];
     win->open = 1;
+    win->min = 0;
+    win->snap = SNAP_NONE;
+    win->have_rest = 0;
     win->w = wk_meta[kind].w;
     win->h = wk_meta[kind].h;
 
@@ -1041,6 +1066,87 @@ static void wm_close(int kind) {
     wm_focus = wm_stack_n > 0 ? wm_stack[wm_stack_n - 1] : -1;
 }
 
+/* --- minimize, snap, restore ---
+ *
+ * The work area is everything the menubar and the taskbar are not. Snap
+ * measures against it rather than the screen, so a maximized window does
+ * not slide under either of them.
+ */
+static void wm_work_area(int32_t *ax, int32_t *ay, int32_t *aw, int32_t *ah) {
+    *ax = 0;
+    *ay = MENUBAR_H;
+    *aw = (int32_t)scr_w_cache;
+    *ah = (int32_t)scr_h_cache - MENUBAR_H - dock_cfg.bar_h - 8;
+    if (*ah < 120) *ah = 120;
+}
+
+#define WIN_MIN_W 240
+#define WIN_MIN_H 140
+
+static void wm_save_rect(int kind) {
+    win_t *win = &wins[kind];
+    if (win->snap != SNAP_NONE) return;   /* already saved by the first snap */
+    win->rx = win->x; win->ry = win->y;
+    win->rw = win->w; win->rh = win->h;
+    win->have_rest = 1;
+}
+
+static void wm_restore_rect(int kind) {
+    win_t *win = &wins[kind];
+    if (!win->have_rest) return;
+    win->x = win->rx; win->y = win->ry;
+    win->w = win->rw; win->h = win->rh;
+    win->snap = SNAP_NONE;
+}
+
+static void wm_snap_to(int kind, int where) {
+    win_t *win = &wins[kind];
+    if (where == SNAP_NONE) { wm_restore_rect(kind); return; }
+    int32_t ax, ay, aw, ah;
+    wm_work_area(&ax, &ay, &aw, &ah);
+    wm_save_rect(kind);
+    win->snap = where;
+    win->y = ay;
+    win->h = ah;
+    if (where == SNAP_MAX) { win->x = ax;            win->w = aw; }
+    else if (where == SNAP_LEFT)  { win->x = ax;              win->w = aw / 2; }
+    else                          { win->x = ax + aw / 2;     win->w = aw - aw / 2; }
+    if (win->w < WIN_MIN_W) win->w = WIN_MIN_W;
+    if (win->h < WIN_MIN_H) win->h = WIN_MIN_H;
+}
+
+static void wm_minimize(int kind) {
+    if (!wins[kind].open || wins[kind].min) return;
+    wins[kind].min = 1;
+    if (wm_focus == kind) {
+        wm_focus = -1;
+        for (int i = wm_stack_n - 1; i >= 0; i--)
+            if (!wins[wm_stack[i]].min) { wm_focus = wm_stack[i]; break; }
+    }
+}
+
+static void wm_unminimize(int kind) {
+    if (!wins[kind].open) return;
+    wins[kind].min = 0;
+    wm_raise(kind);
+}
+
+/* Shake minimizes everything *but* the window being shaken. */
+static void wm_minimize_others(int keep) {
+    for (int i = 0; i < wm_stack_n; i++)
+        if (wm_stack[i] != keep) wm_minimize(wm_stack[i]);
+}
+
+static int wm_any_minimized(void) {
+    for (int i = 0; i < wm_stack_n; i++)
+        if (wins[wm_stack[i]].min) return 1;
+    return 0;
+}
+
+static void wm_unminimize_all(void) {
+    for (int i = 0; i < wm_stack_n; i++) wins[wm_stack[i]].min = 0;
+}
+
 static void wm_content_rect(int kind, int32_t *cx, int32_t *cy,
                             int32_t *cw, int32_t *chh) {
     win_t *win = &wins[kind];
@@ -1050,16 +1156,35 @@ static void wm_content_rect(int kind, int32_t *cx, int32_t *cy,
     *chh = win->h - 2 * WIN_BORDER - WIN_TITLE_H;
 }
 
-static int wm_hit_close(int kind, int32_t mx, int32_t my) {
-    win_t *win = &wins[kind];
-    int32_t bx = win->x + win->w - 22;
-    int32_t by = win->y + WIN_TITLE_H / 2 + WIN_BORDER;
-    int32_t dx = mx - bx, dy = my - by;
+/*
+ * Three title-bar buttons, right to left: close, maximize, minimize.
+ *
+ * They are indexed rather than named so the hit test and the drawing walk
+ * the same arithmetic -- the old single button had its position written
+ * out twice, which is exactly the kind of duplication that drifts.
+ */
+#define WM_BTN_CLOSE 0
+#define WM_BTN_MAX   1
+#define WM_BTN_MIN   2
+
+static int32_t wm_btn_x(int kind, int which) {
+    return wins[kind].x + wins[kind].w - 22 - which * 22;
+}
+
+static int32_t wm_btn_y(int kind) {
+    return wins[kind].y + WIN_TITLE_H / 2 + WIN_BORDER;
+}
+
+static int wm_hit_btn(int kind, int which, int32_t mx, int32_t my) {
+    int32_t dx = mx - wm_btn_x(kind, which);
+    int32_t dy = my - wm_btn_y(kind);
     return dx * dx + dy * dy <= 81;   /* r=9 hit circle */
 }
 
+
 static int wm_hit_window(int kind, int32_t mx, int32_t my) {
     win_t *win = &wins[kind];
+    if (win->min) return 0;        /* minimized: on the taskbar, not the desktop */
     return mx >= win->x && mx < win->x + win->w &&
            my >= win->y && my < win->y + win->h;
 }
@@ -1098,24 +1223,47 @@ static void wm_draw_frame(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     gfx_rect(buf, w, h, win->x + 1, win->y + WIN_TITLE_H, win->w - 2, 1,
              focused ? C_GOLD_DIM : 0x262B38u);
 
-    /* title text */
+    /* Title, centred in the space the buttons leave rather than in the
+     * whole title bar -- with three buttons instead of one, centring on
+     * the window would run a long title straight under them. */
     {
         const char *title = wm_title_for(kind);
+        const int32_t avail_l = win->x + 10;
+        const int32_t avail_r = wm_btn_x(kind, WM_BTN_MIN) - 12;
         int tw = ttf_text_width(title, 13);
-        int tx = win->x + (win->w - tw) / 2;
-        if (tx < win->x + 30) tx = win->x + 30;
-        ttf_draw_string(buf, (int)w, (int)h, tx, win->y + 5, title,
-                        focused ? C_TEXT : C_TEXT_DIM, 13);
+        int32_t tx = avail_l + (avail_r - avail_l - tw) / 2;
+        if (tx < avail_l) tx = avail_l;
+        ttf_draw_string_clip(buf, (int)w, (int)h, tx, win->y + 5, title,
+                             focused ? C_TEXT : C_TEXT_DIM, 13, avail_r);
     }
 
-    /* close button */
+    /* Close, maximize, minimize. The glyph inside each only appears on the
+     * focused window, so an unfocused stack reads as a row of quiet dots
+     * rather than a wall of controls competing for attention. */
     {
-        int32_t bx = win->x + win->w - 22;
-        int32_t by = win->y + WIN_TITLE_H / 2 + WIN_BORDER;
-        gfx_circle(buf, w, h, bx, by, 7, focused ? C_RED : 0x4A5060u);
-        if (focused) {
-            gfx_line(buf, w, h, bx - 3, by - 3, bx + 3, by + 3, 1, 0x5A1616u);
-            gfx_line(buf, w, h, bx - 3, by + 3, bx + 3, by - 3, 1, 0x5A1616u);
+        const int32_t by = wm_btn_y(kind);
+        for (int b = 0; b < 3; b++) {
+            const int32_t bx = wm_btn_x(kind, b);
+            uint32_t fill = 0x4A5060u;
+            if (focused)
+                fill = (b == WM_BTN_CLOSE) ? C_RED :
+                       (b == WM_BTN_MAX)   ? 0x4C7A3Cu : 0x9A7A2Cu;
+            gfx_circle(buf, w, h, bx, by, 7, fill);
+            if (!focused) continue;
+
+            if (b == WM_BTN_CLOSE) {
+                gfx_line(buf, w, h, bx - 3, by - 3, bx + 3, by + 3, 1, 0x5A1616u);
+                gfx_line(buf, w, h, bx - 3, by + 3, bx + 3, by - 3, 1, 0x5A1616u);
+            } else if (b == WM_BTN_MAX) {
+                /* an outline when it would maximize, a filled square when
+                 * it would restore -- the glyph says what the click does */
+                if (win->snap == SNAP_MAX)
+                    gfx_rect(buf, w, h, bx - 3, by - 3, 6, 6, 0x1E3416u);
+                else
+                    gfx_rect_outline(buf, w, h, bx - 3, by - 3, 6, 6, 0x1E3416u);
+            } else {
+                gfx_rect(buf, w, h, bx - 3, by + 2, 7, 2, 0x3A2E10u);
+            }
         }
     }
 }
@@ -1167,10 +1315,66 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     }
 }
 
+/* ===== AERO =====
+ *
+ * Snap, Shake and Peek are three readings of the same drag. None of them
+ * needs a gesture recogniser: an edge is a comparison, a shake is a count
+ * of direction changes, and a peek is a hover with a ramp on it.
+ */
+
+#define PEEK_RAMP     8      /* frames to fade the windows out and back */
+#define PEEK_ALPHA  216      /* how much wallpaper shows at full peek */
+#define SNAP_EDGE     8      /* how close to an edge counts as snapping */
+#define SHAKE_FLIPS   4      /* direction changes that mean "shake" */
+#define SHAKE_WINDOW 28      /* ...within this many frames */
+#define SHAKE_MIN_DX  9      /* travel that counts as a stroke, not a wobble */
+
+static int32_t aero_peek = 0;          /* 0..PEEK_RAMP */
+static int     aero_snap_hint = SNAP_NONE;
+
+static int32_t shake_last_x = 0;
+static int     shake_dir = 0, shake_flips = 0, shake_age = 0;
+
+static void aero_shake_reset(void) {
+    shake_dir = 0; shake_flips = 0; shake_age = 0;
+}
+
+/* Which edge, if any, the pointer is claiming right now. */
+static int aero_snap_zone(int32_t mx, int32_t my) {
+    if (my < MENUBAR_H + SNAP_EDGE)                  return SNAP_MAX;
+    if (mx < SNAP_EDGE)                              return SNAP_LEFT;
+    if (mx >= (int32_t)scr_w_cache - SNAP_EDGE)      return SNAP_RIGHT;
+    return SNAP_NONE;
+}
+
+/* The translucent target the snap would fill, drawn under the window. */
+static void aero_snap_preview(uint32_t *buf, uint32_t w, uint32_t h) {
+    if (aero_snap_hint == SNAP_NONE) return;
+    int32_t ax, ay, aw, ah;
+    wm_work_area(&ax, &ay, &aw, &ah);
+    int32_t px = ax, py = ay, pw = aw, ph = ah;
+    if (aero_snap_hint == SNAP_LEFT)  pw = aw / 2;
+    if (aero_snap_hint == SNAP_RIGHT) { px = ax + aw / 2; pw = aw - aw / 2; }
+    gfx_rect_blend(buf, w, h, px, py, pw, ph, C_GOLD, 34);
+    gfx_rect_outline(buf, w, h, px, py, pw, ph, C_GOLD_DIM);
+    gfx_rect_outline(buf, w, h, px + 1, py + 1, pw - 2, ph - 2, 0x2A2618u);
+}
+
+/* aero_peek_draw is further down, next to desktop_render -- it reads the
+ * wallpaper, which is not declared until after the window manager. */
+
 static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
                       int click_consumed) {
     int click = (lmb && !prev_lmb) && !click_consumed;
 
+    /* A release has to be seen before the drag is forgotten -- that is
+     * the event Snap acts on. */
+    if (!lmb && wm_drag >= 0) {
+        if (aero_snap_hint != SNAP_NONE)
+            wm_snap_to(wm_drag, aero_snap_hint);
+        aero_snap_hint = SNAP_NONE;
+        aero_shake_reset();
+    }
     if (!lmb)
         wm_drag = -1;
 
@@ -1178,12 +1382,30 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
         int hit = wm_top_at(mx, my);
         if (hit >= 0) {
             wm_raise(hit);
-            if (wm_hit_close(hit, mx, my)) {
+            if (wm_hit_btn(hit, WM_BTN_CLOSE, mx, my)) {
                 wm_close(hit);
+            } else if (wm_hit_btn(hit, WM_BTN_MAX, mx, my)) {
+                wm_snap_to(hit, wins[hit].snap == SNAP_MAX ? SNAP_NONE : SNAP_MAX);
+            } else if (wm_hit_btn(hit, WM_BTN_MIN, mx, my)) {
+                wm_minimize(hit);
             } else if (my < wins[hit].y + WIN_TITLE_H + WIN_BORDER) {
+                /* Dragging a snapped window unsnaps it, and the restored
+                 * window is hung off the cursor at the same proportion of
+                 * its width -- grab it near the right edge and it stays
+                 * near the right edge, which is where the hand expects it. */
+                if (wins[hit].snap != SNAP_NONE && wins[hit].have_rest) {
+                    const int32_t grip = wins[hit].w > 0
+                        ? (mx - wins[hit].x) * wins[hit].rw / wins[hit].w
+                        : wins[hit].rw / 2;
+                    wm_restore_rect(hit);
+                    wins[hit].x = mx - grip;
+                    wins[hit].y = my - WIN_TITLE_H / 2;
+                }
                 wm_drag = hit;
                 wm_drag_ox = mx - wins[hit].x;
                 wm_drag_oy = my - wins[hit].y;
+                shake_last_x = mx;
+                aero_shake_reset();
             }
         } else {
             wm_focus = -1;
@@ -1201,6 +1423,36 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
         if (ny > (int32_t)scr_h_cache - 60) ny = (int32_t)scr_h_cache - 60;
         win->x = nx;
         win->y = ny;
+
+        aero_snap_hint = aero_snap_zone(mx, my);
+
+        /*
+         * Shake. Only strokes longer than SHAKE_MIN_DX are counted, so
+         * the pixel jitter of a hand holding still never accumulates,
+         * and the count expires on a timer so that four slow direction
+         * changes over several seconds are just someone moving a window.
+         */
+        if (++shake_age > SHAKE_WINDOW) {
+            aero_shake_reset();
+            shake_last_x = mx;
+        }
+        const int32_t dx = mx - shake_last_x;
+        const int32_t adx = dx < 0 ? -dx : dx;
+        if (adx >= SHAKE_MIN_DX) {
+            const int dir = dx > 0 ? 1 : -1;
+            if (shake_dir && dir != shake_dir) shake_flips++;
+            shake_dir = dir;
+            shake_last_x = mx;
+            if (shake_flips >= SHAKE_FLIPS) {
+                /* The gesture is its own undo: shake once to clear the
+                 * desk, shake again to put it back the way it was. */
+                if (wm_any_minimized()) wm_unminimize_all();
+                else                    wm_minimize_others(wm_drag);
+                wm_raise(wm_drag);
+                aero_shake_reset();
+                aero_snap_hint = SNAP_NONE;
+            }
+        }
     }
 
     /* route mouse to the focused window's content handler */
@@ -1249,15 +1501,47 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
  * put the topmost window's shadow underneath every other window, which is
  * exactly the depth cue inverted.
  */
+
+/* --- taskbar previews ---
+ *
+ * One thumbnail per window kind, filled from the back buffer at the point
+ * in the walk where that window has just been drawn: at that instant its
+ * rectangle holds itself and nothing above it, so a downscale is a
+ * complete and correct capture with no offscreen re-render.
+ *
+ * Refreshed every THUMB_EVERY frames rather than every frame -- a preview
+ * does not need 60 fps, and a window that gets minimized keeps the last
+ * capture from just before it went, which is the picture the taskbar
+ * wants to show anyway.
+ */
+#define THUMB_W     144
+#define THUMB_H     90
+#define THUMB_EVERY 6
+
+static uint32_t wm_thumb[WK_COUNT][THUMB_W * THUMB_H];
+static uint8_t  wm_thumb_valid[WK_COUNT];
+
+static void wm_capture_thumb(const uint32_t *buf, uint32_t w, uint32_t h,
+                             int kind) {
+    const win_t *win = &wins[kind];
+    if (win->w <= 0 || win->h <= 0) return;
+    gfx_downscale(wm_thumb[kind], THUMB_W, THUMB_H, buf, w, h,
+                  win->x, win->y, win->w, win->h);
+    wm_thumb_valid[kind] = 1;
+}
+
 static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
+    const int grab = (desktop_tick % THUMB_EVERY) == 0;
     for (int i = 0; i < wm_stack_n; i++) {
         int kind = wm_stack[i];
+        if (wins[kind].min) continue;              /* it is on the taskbar */
         if (spawn_anim.active && spawn_anim.kind == kind)
             continue;   /* revealed when the animation lands */
         const win_t *win = &wins[kind];
         gfx_shadow(buf, w, h, win->x, win->y, win->w, win->h);
         wm_draw_frame(buf, w, h, kind);
         wm_draw_content(buf, w, h, kind);
+        if (grab) wm_capture_thumb(buf, w, h, kind);
     }
 }
 
@@ -1924,23 +2208,52 @@ static void dock_launch(int idx) {
 }
 
 /* returns 1 if the click was consumed by the dock */
-static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
-    int click = (lmb && !prev_lmb);
-    if (!click) return 0;
+/* Which window a taskbar slot stands for, or -1 if nothing is running in
+ * it. Canvas apps all share WK_HELLO, so the one actually loaded is
+ * identified by the window title rather than by kind. */
+static int dock_running_kind(int idx) {
+    const int kind = dock_items[idx].kind;
+    if (kind == WK_HELLO)
+        return (wins[WK_HELLO].open && str_eq(app_win_title, dock_item_name(idx)))
+               ? WK_HELLO : -1;
+    return wm_is_open(kind) ? kind : -1;
+}
 
-    int32_t rx, ry, rw, rh;
-    dock_bar_rect(scr_w_cache, &rx, &ry, &rw, &rh);
-    if (mx < rx || mx >= rx + rw || my < ry || my >= ry + rh)
-        return 0;
-
+static int dock_hit_item(int32_t mx, int32_t my) {
     for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(scr_w_cache, i, &ix, &iy, &iw, &ih);
         if (mx >= ix - 4 && mx < ix + iw + 4 &&
-            my >= iy - 4 && my < iy + ih + 4) {
-            dock_launch(i);
-            return 1;
-        }
+            my >= iy - 4 && my < iy + ih + 4)
+            return i;
+    }
+    return -1;
+}
+
+static int dock_hit_bar(int32_t mx, int32_t my) {
+    int32_t rx, ry, rw, rh;
+    dock_bar_rect(scr_w_cache, &rx, &ry, &rw, &rh);
+    return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+}
+
+static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
+    int click = (lmb && !prev_lmb);
+    if (!click) return 0;
+    if (!dock_hit_bar(mx, my)) return 0;
+
+    const int i = dock_hit_item(mx, my);
+    if (i >= 0) {
+        /*
+         * A taskbar button is a toggle once its window exists: click the
+         * focused one to put it away, click it again to bring it back.
+         * Only an idle slot actually launches anything.
+         */
+        const int k = dock_running_kind(i);
+        if (k < 0)                      dock_launch(i);
+        else if (wins[k].min)           wm_unminimize(k);
+        else if (wm_focus == k)         wm_minimize(k);
+        else                            wm_raise(k);
+        return 1;
     }
     return 1;   /* clicks on the bar background are still consumed */
 }
@@ -1959,7 +2272,6 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     for (int i = 0; i < dock_item_count; i++) {
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, i, &ix, &iy, &iw, &ih);
-        int kind = dock_items[i].kind;
         int hot = (mx >= ix - 4 && mx < ix + iw + 4 &&
                    my >= iy - 4 && my < iy + ih + 4);
         if (hot) hover = i;
@@ -1978,46 +2290,81 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
                 gfx_rect(buf, w, h, ix + 2, iy - 9, iw - 4, 1, 0x353C50u);
         }
 
-        /* Running indicator.  Canvas apps all share WK_HELLO, so the one
-         * that is actually loaded is identified by the window title. */
-        int running;
-        if (kind == WK_HELLO)
-            running = wins[WK_HELLO].open &&
-                      str_eq(app_win_title, dock_item_name(i));
-        else
-            running = wm_is_open(kind);
-
-        if (running) {
-            if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
-                gfx_circle(buf, w, h, ix + iw / 2, ry + rh - 4, 2, C_GOLD);
-            else if (dock_cfg.edge == DOCK_EDGE_LEFT)
-                gfx_circle(buf, w, h, rx + rw - 4, iy + ih / 2, 2, C_GOLD);
-            else
-                gfx_circle(buf, w, h, rx + 4, iy + ih / 2, 2, C_GOLD);
+        /* Running indicator: a full dot for a window on the desktop, a
+         * hollow one for a window that has been put away. */
+        const int rk = dock_running_kind(i);
+        if (rk >= 0) {
+            int32_t dx, dy;
+            if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
+                dx = ix + iw / 2;      dy = ry + rh - 4;
+            } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
+                dx = rx + rw - 4;      dy = iy + ih / 2;
+            } else {
+                dx = rx + 4;           dy = iy + ih / 2;
+            }
+            if (wins[rk].min) gfx_circle_outline(buf, w, h, dx, dy, 3, C_GOLD_DIM);
+            else              gfx_circle(buf, w, h, dx, dy, 2, C_GOLD);
         }
     }
 
-    /* tooltip */
+    /*
+     * Hover shows a preview: the window as it actually looks if one is
+     * running, and just the name if the slot is only a launcher. The
+     * thumbnail is whatever the compositor last captured, which is why a
+     * minimized window still has a picture to show.
+     */
     if (hover >= 0) {
         const char *name = dock_item_name(hover);
-        int tw = ttf_text_width(name, 12);
+        const int rk = dock_running_kind(hover);
+        const int show_thumb = (rk >= 0 && wm_thumb_valid[rk]);
+        const int pad = 6;
+        const int32_t pw = show_thumb ? THUMB_W + 2 * pad
+                                      : ttf_text_width(name, 12) + 16;
+        const int32_t ph = show_thumb ? THUMB_H + 2 * pad + 20 : 22;
+
         int32_t ix, iy, iw, ih;
         dock_icon_rect(w, hover, &ix, &iy, &iw, &ih);
 
         int32_t tx, ty;
         if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
-            tx = ix + iw / 2 - tw / 2 - 8;
-            ty = ry - 26;
+            tx = ix + iw / 2 - pw / 2;
+            ty = ry - ph - 8;
         } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
             tx = rx + rw + 8;
-            ty = iy + ih / 2 - 11;
+            ty = iy + ih / 2 - ph / 2;
         } else {
-            tx = rx - tw - 24;
-            ty = iy + ih / 2 - 11;
+            tx = rx - pw - 8;
+            ty = iy + ih / 2 - ph / 2;
         }
-        gfx_rect(buf, w, h, tx, ty, tw + 16, 22, 0x1A1E2Au);
-        gfx_rect_outline(buf, w, h, tx, ty, tw + 16, 22, C_GOLD_DIM);
-        ttf_draw_string(buf, (int)w, (int)h, tx + 8, ty + 3, name, C_TEXT, 12);
+        if (tx < 4) tx = 4;
+        if (tx + pw > (int32_t)w - 4) tx = (int32_t)w - 4 - pw;
+        if (ty < MENUBAR_H + 4) ty = MENUBAR_H + 4;
+
+        gfx_rect_blend(buf, w, h, tx, ty, pw, ph, 0x1A1E2Au, 240);
+        gfx_rect_outline(buf, w, h, tx, ty, pw, ph, C_GOLD_DIM);
+
+        if (show_thumb) {
+            /* Blit the captured thumbnail row by row; it is already at
+             * the size it is drawn, so this is a copy, not a resample. */
+            for (int32_t r = 0; r < THUMB_H; r++) {
+                const int32_t yy = ty + pad + r;
+                if (yy < 0 || yy >= (int32_t)h) continue;
+                for (int32_t c = 0; c < THUMB_W; c++) {
+                    const int32_t xx = tx + pad + c;
+                    if (xx < 0 || xx >= (int32_t)w) continue;
+                    buf[(uint32_t)yy * w + (uint32_t)xx] =
+                        wm_thumb[rk][(uint32_t)r * THUMB_W + (uint32_t)c];
+                }
+            }
+            gfx_rect_outline(buf, w, h, tx + pad, ty + pad,
+                             THUMB_W, THUMB_H, 0x333A4Cu);
+            ttf_draw_string_clip(buf, (int)w, (int)h, tx + pad,
+                                 ty + pad + THUMB_H + 3, name, C_TEXT, 12,
+                                 tx + pw - pad);
+        } else {
+            ttf_draw_string(buf, (int)w, (int)h, tx + 8, ty + 3,
+                            name, C_TEXT, 12);
+        }
     }
 }
 
@@ -2204,6 +2551,31 @@ static void ai_dialog_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/*
+ * Peek: fade every window towards what is behind it, then draw their
+ * outlines back on, so the desktop is visible but the stack is not lost.
+ *
+ * Blending the wallpaper over the whole frame is what makes this both
+ * cheap and correct: over a window pixel it is the fade, and over a
+ * wallpaper pixel it is the identity, so overlapping windows cannot fade
+ * twice the way a per-window pass would let them. One full-screen blend,
+ * and only while the pointer is actually on the taskbar.
+ */
+static void aero_peek_draw(uint32_t *buf, uint32_t w, uint32_t h) {
+    if (aero_peek <= 0) return;
+    const uint32_t a = (uint32_t)(aero_peek * PEEK_ALPHA / PEEK_RAMP);
+    gfx_blend_region(buf, wallpaper, w, h, 0, 0, (int32_t)w, (int32_t)h, a);
+    for (int i = 0; i < wm_stack_n; i++) {
+        const int kind = wm_stack[i];
+        if (wins[kind].min) continue;
+        const win_t *win = &wins[kind];
+        gfx_rect_blend(buf, w, h, win->x, win->y, win->w, 1, C_GOLD, a);
+        gfx_rect_blend(buf, w, h, win->x, win->y + win->h - 1, win->w, 1, C_GOLD, a);
+        gfx_rect_blend(buf, w, h, win->x, win->y, 1, win->h, C_GOLD, a);
+        gfx_rect_blend(buf, w, h, win->x + win->w - 1, win->y, 1, win->h, C_GOLD, a);
+    }
+}
+
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                            int32_t mx, int32_t my, uint8_t buttons) {
     desktop_tick++;
@@ -2257,6 +2629,20 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     desk_prev_lmb = lmb;
 
     /*
+     * Peek follows the pointer over the taskbar, on a ramp in both
+     * directions so it fades rather than snaps. Not while a drag is in
+     * progress: dragging a window down to the taskbar is how you move it,
+     * and having the desktop dissolve underneath at that moment would be
+     * the opposite of helpful.
+     */
+    {
+        const int want = dock_hit_bar(mx, my) && wm_drag < 0 && wm_stack_n > 0;
+        aero_peek += want ? 1 : -1;
+        if (aero_peek < 0)         aero_peek = 0;
+        if (aero_peek > PEEK_RAMP) aero_peek = PEEK_RAMP;
+    }
+
+    /*
      * ---- draw ----
      *
      * One pass, back to front, into the back buffer -- never into the
@@ -2280,8 +2666,10 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     for (uint32_t i = 0; i < w * h; i++)
         buf[i] = wallpaper[i];
 
+    aero_snap_preview(buf, w, h);     /* under the windows: it is a target */
     wm_draw_all(buf, w, h);
     spawn_anim_draw(buf, w, h);
+    aero_peek_draw(buf, w, h);        /* over the stack, under the chrome */
     menubar_draw(buf, w, h, mx, my);
     menu_dropdown_draw(buf, w, h, mx, my);
     dock_draw(buf, w, h, mx, my);
@@ -2300,12 +2688,29 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
  * touched -- a home directory is the point, not a scratch space.
  */
 static void session_end(void) {
-    /* every window shut, nothing focused */
-    for (int k = 0; k < WK_COUNT; k++) wins[k].open = 0;
+    /* every window shut, nothing focused, nothing remembered about where
+     * it used to be */
+    for (int k = 0; k < WK_COUNT; k++) {
+        wins[k].open = 0;
+        wins[k].min = 0;
+        wins[k].snap = SNAP_NONE;
+        wins[k].have_rest = 0;
+    }
     wm_stack_n = 0;
     wm_focus = -1;
     wm_drag = -1;
     menu_open_idx = -1;
+
+    /* The taskbar previews are pictures of the last person's screen --
+     * a browser page, a document, a terminal. They do not survive a
+     * logout any more than the scrollback does. */
+    for (int k = 0; k < WK_COUNT; k++) {
+        wm_thumb_valid[k] = 0;
+        for (int p = 0; p < THUMB_W * THUMB_H; p++) wm_thumb[k][p] = 0;
+    }
+    aero_peek = 0;
+    aero_snap_hint = SNAP_NONE;
+    aero_shake_reset();
 
     /* terminal: history, scrollback and working directory */
     term_hist_count = 0;

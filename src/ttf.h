@@ -607,6 +607,48 @@ static int ttf_line_height(int size) {
 
 /* Exact pixel width of a string at a given size (matches ttf_draw_string
  * advance logic) — for centering text and computing hit boxes. */
+/*
+ * Draw a string, but never past right_px.
+ *
+ * Window titles are the case this exists for: a snapped window can be half
+ * the width its title was written for, and a title running under the
+ * close button looks like a bug rather than a long name. Text that does
+ * not fit is cut at the last whole character that does and finished with
+ * an ellipsis, so the reader can see that something was removed.
+ *
+ * Measuring twice is deliberate. Drawing and then painting over the
+ * overflow would need the background back, which the caller has already
+ * overwritten by the time this runs.
+ */
+static int ttf_text_width(const char *s, int size);
+
+static void ttf_draw_string_clip(uint32_t *buf, int bw, int bh,
+                                 int topX, int topY, const char *s,
+                                 uint32_t color, int size, int right_px) {
+    if (topX >= right_px) return;
+    if (topX + ttf_text_width(s, size) <= right_px) {
+        ttf_draw_string(buf, bw, bh, topX, topY, s, color, size);
+        return;
+    }
+
+    char cut[96];
+    const int ell = ttf_text_width("...", size);
+    int n = 0;
+    for (; s[n] && n < (int)sizeof(cut) - 4; n++) {
+        cut[n] = s[n];
+        cut[n + 1] = '\0';
+        if (topX + ttf_text_width(cut, size) + ell > right_px) {
+            cut[n] = '\0';       /* this one already overflowed: drop it */
+            break;
+        }
+    }
+    cut[n] = '\0';
+    /* Three dots alone say less than nothing; leave the field empty. */
+    if (n == 0) return;
+    cut[n] = '.'; cut[n + 1] = '.'; cut[n + 2] = '.'; cut[n + 3] = '\0';
+    ttf_draw_string(buf, bw, bh, topX, topY, cut, color, size);
+}
+
 static int ttf_text_width(const char *s, int size) {
     if (!F_ready && !ttf_init()) return 0;
     int64_t muln = (int64_t)size * TTF_SS;

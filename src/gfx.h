@@ -154,6 +154,69 @@ static void gfx_rect_blend(uint32_t *buf, uint32_t bw, uint32_t bh,
         }
 }
 
+/*
+ * Blend one buffer over another inside a rectangle, both the same stride.
+ *
+ * gfx_rect_blend fades towards a single colour, which is no use for Peek:
+ * fading a window out has to reveal the wallpaper *behind that window*,
+ * which is a different pixel at every position. Same arithmetic, source
+ * read per pixel instead of held in a register.
+ *
+ * alpha is how much of src shows through, so 0 leaves buf untouched and
+ * the caller can ramp without special-casing either end.
+ */
+static void gfx_blend_region(uint32_t *buf, const uint32_t *src,
+                             uint32_t bw, uint32_t bh,
+                             int32_t x, int32_t y, int32_t w, int32_t h,
+                             uint32_t alpha) {
+    if (w <= 0 || h <= 0 || alpha == 0) return;
+    int32_t x0 = x < 0 ? 0 : x;
+    int32_t y0 = y < 0 ? 0 : y;
+    int32_t x1 = x + w; if (x1 > (int32_t)bw) x1 = (int32_t)bw;
+    int32_t y1 = y + h; if (y1 > (int32_t)bh) y1 = (int32_t)bh;
+    for (int32_t r = y0; r < y1; r++) {
+        const uint32_t row = (uint32_t)r * bw;
+        for (int32_t c = x0; c < x1; c++) {
+            const uint32_t i = row + (uint32_t)c;
+            buf[i] = gfx_mix(src[i], buf[i], alpha);
+        }
+    }
+}
+
+/*
+ * Nearest-neighbour downscale of a screen rectangle into a small buffer.
+ *
+ * This is how the taskbar gets its previews. It samples the frame that is
+ * already composited rather than re-rendering the window offscreen: at the
+ * moment a window has just been drawn in the z-order walk, its pixels in
+ * the back buffer are exactly that window and nothing on top of it yet, so
+ * the cheapest correct capture is a read.
+ *
+ * The step is a 16.16 fixed-point accumulator -- one add per output pixel,
+ * no division in the loop, and no FPU anywhere near it.
+ */
+static void gfx_downscale(uint32_t *dst, int32_t dw, int32_t dh,
+                          const uint32_t *src, uint32_t sw, uint32_t sh,
+                          int32_t sx, int32_t sy, int32_t srw, int32_t srh) {
+    if (dw <= 0 || dh <= 0 || srw <= 0 || srh <= 0) return;
+    const uint32_t stepx = ((uint32_t)srw << 16) / (uint32_t)dw;
+    const uint32_t stepy = ((uint32_t)srh << 16) / (uint32_t)dh;
+    uint32_t accy = 0;
+    for (int32_t r = 0; r < dh; r++, accy += stepy) {
+        int32_t yy = sy + (int32_t)(accy >> 16);
+        if (yy < 0) yy = 0;
+        if (yy >= (int32_t)sh) yy = (int32_t)sh - 1;
+        const uint32_t row = (uint32_t)yy * sw;
+        uint32_t accx = 0;
+        for (int32_t c = 0; c < dw; c++, accx += stepx) {
+            int32_t xx = sx + (int32_t)(accx >> 16);
+            if (xx < 0) xx = 0;
+            if (xx >= (int32_t)sw) xx = (int32_t)sw - 1;
+            dst[(uint32_t)r * (uint32_t)dw + (uint32_t)c] = src[row + (uint32_t)xx];
+        }
+    }
+}
+
 /* Vertical gradient fill */
 static void gfx_vgrad(uint32_t *buf, uint32_t bw, uint32_t bh,
                       int32_t x, int32_t y, int32_t w, int32_t h,
