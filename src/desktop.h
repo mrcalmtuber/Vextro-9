@@ -551,7 +551,10 @@ static int fs_list(const char *path, fs_list_cb cb) {
  * through, and after login.h (included by kernel.c first) for xorshift32
  * and idt.h for cycle_now, which together seed the salt. */
 #include "sha256.h"
+#include "chacha20.h"
 #include "users.h"
+/* After users.h: the policies here are per-account. */
+#include "security.h"
 /*
  * Whether this account wants the language model at all.
  *
@@ -891,6 +894,28 @@ static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
     return 0;
 }
 
+/*
+ * The name a policy decision is about: the last path component, without
+ * its extension, which is what an administrator types and what the store
+ * calls a package.
+ */
+static void policy_short_name(const char *path, char *out, int cap) {
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+    const char *p = path + last + 1;
+    int n = 0;
+    while (p[n] && n < cap - 1 && p[n] != '.') { out[n] = p[n]; n++; }
+    out[n] = '\0';
+}
+
+/*
+ * Every program in the system starts here, which is the only reason
+ * policy can be enforced at all: one door, checked once.
+ *
+ * Refusals are announced on both channels and filed with the Action
+ * Center. A program that simply does not start, with no reason given,
+ * is indistinguishable from a broken one.
+ */
 static int execute_bin_internal(const char *filepath, int verbose) {
     uint64_t fsize = 0;
     const void *fdata = fs_read_file(filepath, &fsize);
@@ -901,6 +926,49 @@ static int execute_bin_internal(const char *filepath, int verbose) {
             term_print("\n");
         }
         return -1;
+    }
+
+    char shortname[ALLOW_NAME];
+    policy_short_name(filepath, shortname, sizeof(shortname));
+
+    if (!allow_permits(shortname)) {
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Blocked by the allow list: ", sizeof(note));
+        str_append(note, shortname, sizeof(note));
+        notify_push(NOTE_WARN, note);
+        serial_puts("[policy] blocked (not on the allow list): ");
+        serial_puts(shortname);
+        serial_putc('\n');
+        if (verbose) {
+            term_print_c("run: blocked - ", 2);
+            term_print_c(shortname, 2);
+            term_print_c(" is not on this account's allow list\n", 2);
+        }
+        return -1;
+    }
+
+    if (scanner_on) {
+        const int verdict = scan_buffer((const uint8_t *)fdata,
+                                        (uint32_t)fsize);
+        if (verdict != SCAN_CLEAN) {
+            char note[NOTIFY_TEXT];
+            str_copy(note, verdict == SCAN_SIGNATURE
+                         ? "Threat blocked: " : "Refused a malformed program: ",
+                     sizeof(note));
+            str_append(note, shortname, sizeof(note));
+            notify_push(NOTE_WARN, note);
+            serial_puts("[scan] refused ");
+            serial_puts(shortname);
+            serial_puts(": ");
+            serial_puts(scan_detail);
+            serial_putc('\n');
+            if (verbose) {
+                term_print_c("run: refused - ", 2);
+                term_print_c(scan_detail, 2);
+                term_print("\n");
+            }
+            return -1;
+        }
     }
 
     const uint8_t *file = (const uint8_t *)fdata;

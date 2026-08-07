@@ -137,10 +137,18 @@ all: os.iso disk.img
 # runs on the host. The property it exists for -- that a link must not end
 # the line -- cannot be seen in a screenshot and is awkward to assert from
 # inside the kernel, so it is checked here instead.
-test: build/wikidoc_test
+test: build/wikidoc_test build/crypto_test
 	@./build/wikidoc_test
+	@./build/crypto_test
 
 build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
+
+# The cipher is checked against the RFC's published vectors, not against
+# itself: an implementation that is merely self-consistent round-trips
+# perfectly and protects nothing.
+build/crypto_test: tools/crypto_test.c src/chacha20.h src/sha256.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
 

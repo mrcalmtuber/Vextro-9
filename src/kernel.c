@@ -1096,6 +1096,9 @@ void kmain(void) {
      * A machine with neither goes to the first-run sequence.
      */
     users_load();
+    /* Policy lives beside the accounts and is enforced in the loader, so
+     * it has to be in memory before anything can be launched. */
+    policy_load();
     if (user_count == 0 && users_migrate_keycode())
         serial_puts("[vextro] users: migrated /keycode.sys to 'admin'\n");
 

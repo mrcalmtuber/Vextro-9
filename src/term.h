@@ -512,6 +512,9 @@ static void term_cmd_help(void) {
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
     term_print("  llm load <f> | weights | tok <t> | eval <tok> | probe | gen <t>\n");
+    term_print("  policy | allow | scan            security policy and scanning\n");
+    term_print("  vault seal|open <..>             encrypted containers\n");
+    term_print("  backup | restore <f> <pass>      this account's home directory\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
     term_print("                    the Agora app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
@@ -689,6 +692,208 @@ static void term_build_prompt(char *out, int max) {
     }
     str_append(out, term_cwd, max);
     str_append(out, "> ", max);
+}
+
+
+/* ===== security and archives =====
+ *
+ * Driven from the shell rather than only from a settings pane, because
+ * these are the commands an administrator reaches for, and because a
+ * passphrase typed as an argument is at least visible -- there is no
+ * hidden prompt here pretending to be more private than it is.
+ */
+static void sec_require_admin(int *ok) {
+    *ok = (user_current < 0) || user_is_admin(user_current);
+    if (!*ok) term_print_c("that needs an administrator account\n", 2);
+}
+
+static void cmd_policy(int argc, char **argv) {
+    if (argc < 2) {
+        term_print_c("Policy\n", 1);
+        term_print("  prompts    ");
+        term_print(uac_level_names[uac_level]);
+        term_print("\n  allow list ");
+        term_print(allowlist_on ? "on" : "off");
+        term_print("\n  scanner    ");
+        term_print(scanner_on ? "on" : "off");
+        term_print("\n\nNone of this isolates a running program; it decides\n"
+                   "whether one starts. See 'help policy'.\n");
+        return;
+    }
+    int ok; sec_require_admin(&ok); if (!ok) return;
+
+    if (str_eq(argv[1], "prompts") && argc >= 3) {
+        int v = argv[2][0] - '0';
+        if (v < 0 || v >= UAC_LEVELS) {
+            term_print_c("levels are 0..3\n", 2);
+            for (int i = 0; i < UAC_LEVELS; i++) {
+                char nb[4]; uint_to_str((uint32_t)i, nb);
+                term_print("  "); term_print(nb); term_print("  ");
+                term_print(uac_level_names[i]); term_print("\n");
+            }
+            return;
+        }
+        uac_level = v;
+    } else if (str_eq(argv[1], "allowlist") && argc >= 3) {
+        allowlist_on = str_eq(argv[2], "on");
+    } else if (str_eq(argv[1], "scanner") && argc >= 3) {
+        scanner_on = str_eq(argv[2], "on");
+    } else {
+        term_print_c("usage: policy [prompts <0-3>|allowlist on|off|"
+                     "scanner on|off]\n", 2);
+        return;
+    }
+    policy_save();
+    term_print_c("saved\n", 3);
+}
+
+static void cmd_allow(int argc, char **argv) {
+    if (argc < 2 || str_eq(argv[1], "list")) {
+        if (allow_count == 0) { term_print("the allow list is empty\n"); return; }
+        for (int i = 0; i < allow_count; i++) {
+            term_print("  "); term_print(allow_names[i]); term_print("\n");
+        }
+        return;
+    }
+    int ok; sec_require_admin(&ok); if (!ok) return;
+    if (str_eq(argv[1], "add") && argc >= 3) {
+        if (!allow_add(argv[2])) { term_print_c("the list is full\n", 2); return; }
+    } else if (str_eq(argv[1], "remove") && argc >= 3) {
+        if (!allow_remove(argv[2])) { term_print_c("not on the list\n", 2); return; }
+    } else {
+        term_print_c("usage: allow [list|add <name>|remove <name>]\n", 2);
+        return;
+    }
+    policy_save();
+    term_print_c("saved\n", 3);
+}
+
+static void cmd_scan(int argc, char **argv) {
+    const char *root = argc >= 2 ? argv[1] : "/apps";
+    const int n = vw_collect(root);
+    if (n == 0) { term_print("nothing to scan under "); term_print(root);
+                  term_print("\n"); return; }
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t sz = 0;
+        const void *d = fs_read_file(vw_files[i], &sz);
+        if (!d) continue;
+        const int v = scan_buffer((const uint8_t *)d, (uint32_t)sz);
+        if (v != SCAN_CLEAN) {
+            bad++;
+            term_print_c("  THREAT  ", 2);
+            term_print(vw_files[i]);
+            term_print("  ");
+            term_print_c(scan_detail, 2);
+            term_print("\n");
+        }
+    }
+    char nb[12];
+    uint_to_str((uint32_t)n, nb);
+    term_print("\n  scanned "); term_print(nb);
+    uint_to_str((uint32_t)bad, nb);
+    term_print(" files, "); term_print(nb); term_print(" flagged\n");
+    if (bad) {
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Scan flagged ", sizeof(note));
+        str_append(note, nb, sizeof(note));
+        str_append(note, " file(s)", sizeof(note));
+        notify_push(NOTE_WARN, note);
+    } else {
+        notify_push(NOTE_GOOD, "Scan found nothing");
+    }
+}
+
+static void cmd_vault(int argc, char **argv) {
+    if (argc < 4) {
+        term_print_c("usage: vault seal <dir> <file.vault> <passphrase>\n"
+                     "       vault open <file.vault> <dir> <passphrase>\n", 2);
+        return;
+    }
+    uint32_t files = 0;
+    const char *err;
+    char a[256], b[256];
+    term_resolve(argv[2], a);
+    term_resolve(argv[3], b);
+
+    if (str_eq(argv[1], "seal")) {
+        if (argc < 5) { term_print_c("a passphrase is required\n", 2); return; }
+        err = vault_seal(a, b, argv[4], &files);
+    } else if (str_eq(argv[1], "open")) {
+        if (argc < 5) { term_print_c("a passphrase is required\n", 2); return; }
+        err = vault_unseal(a, b, argv[4], &files);
+    } else {
+        term_print_c("vault: seal or open\n", 2);
+        return;
+    }
+    if (err) { term_print_c("vault: ", 2); term_print_c(err, 2);
+               term_print("\n"); return; }
+    char nb[12];
+    uint_to_str(files, nb);
+    term_print_c("  ", 3); term_print(nb);
+    term_print(str_eq(argv[1], "seal") ? " file(s) sealed into "
+                                       : " file(s) restored to ");
+    term_print(b); term_print("\n");
+}
+
+static void cmd_backup(int argc, char **argv) {
+    /*
+     * Refused rather than defaulted. With no account signed in this used
+     * to fall back to "/", which is not a home directory -- it is the
+     * whole volume, encyclopedia and model included, and the only reason
+     * it failed instead of trying was that the buffer ran out.
+     */
+    if (user_current < 0) {
+        term_print_c("backup: no account is signed in, so there is no home "
+                     "directory to archive\n", 2);
+        return;
+    }
+    char home[128];
+    user_home(user_current, home, sizeof(home));
+
+    const char *dest = argc >= 2 ? argv[1] : "/home.vault";
+    const char *pass = argc >= 3 ? argv[2] : 0;
+    if (!pass) {
+        term_print_c("usage: backup [file.vault] <passphrase>\n"
+                     "  archives this account's home directory, encrypted\n", 2);
+        return;
+    }
+    char abs[256];
+    term_resolve(dest, abs);
+    uint32_t files = 0;
+    const char *err = vault_seal(home, abs, pass, &files);
+    if (err) { term_print_c("backup: ", 2); term_print_c(err, 2);
+               term_print("\n"); return; }
+    char nb[12]; uint_to_str(files, nb);
+    term_print_c("  backed up ", 3); term_print(nb);
+    term_print(" file(s) to "); term_print(abs); term_print("\n");
+    char note[NOTIFY_TEXT];
+    str_copy(note, "Backed up ", sizeof(note));
+    str_append(note, nb, sizeof(note));
+    str_append(note, " file(s)", sizeof(note));
+    notify_push(NOTE_GOOD, note);
+}
+
+static void cmd_restore(int argc, char **argv) {
+    if (argc < 3) {
+        term_print_c("usage: restore <file.vault> <passphrase>\n", 2);
+        return;
+    }
+    if (user_current < 0) {
+        term_print_c("restore: no account is signed in\n", 2);
+        return;
+    }
+    char home[128];
+    user_home(user_current, home, sizeof(home));
+    char abs[256];
+    term_resolve(argv[1], abs);
+    uint32_t files = 0;
+    const char *err = vault_unseal(abs, home, argv[2], &files);
+    if (err) { term_print_c("restore: ", 2); term_print_c(err, 2);
+               term_print("\n"); return; }
+    char nb[12]; uint_to_str(files, nb);
+    term_print_c("  restored ", 3); term_print(nb);
+    term_print(" file(s) to "); term_print(home); term_print("\n");
 }
 
 static void term_run_command(void) {
@@ -1491,6 +1696,12 @@ static void term_exec(char *cmdline) {
         term_print_c(img_status(), 4);
         term_putc('\n');
         wm_open(WK_IMAGE);
+    } else if (str_eq(cmd, "policy"))  { cmd_policy(argc, argv);
+    } else if (str_eq(cmd, "allow"))   { cmd_allow(argc, argv);
+    } else if (str_eq(cmd, "scan"))    { cmd_scan(argc, argv);
+    } else if (str_eq(cmd, "vault"))   { cmd_vault(argc, argv);
+    } else if (str_eq(cmd, "backup"))  { cmd_backup(argc, argv);
+    } else if (str_eq(cmd, "restore")) { cmd_restore(argc, argv);
     } else if (str_eq(cmd, "store") || str_eq(cmd, "agora")) {
         store_cmd(argc, argv);
     } else if (str_eq(cmd, "open")) {
