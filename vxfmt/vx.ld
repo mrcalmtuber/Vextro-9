@@ -1,5 +1,5 @@
 /*
- * Linker script for .bsd programs.
+ * Linker script for .vx programs.
  *
  * Two PT_LOAD segments, and the data one starts on a fresh page.  That
  * page alignment is not cosmetic: mprotect() works at page granularity,
@@ -11,7 +11,7 @@
  *
  * Link with -z max-page-size=0x1000, otherwise ld pads the segments out
  * to its 2 MB default and the intermediate ELF becomes enormous.  The
- * .bsd file itself is repacked by bsd_maker either way.
+ * .vx file itself is repacked by vx_maker either way.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)

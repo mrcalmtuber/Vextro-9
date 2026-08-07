@@ -19,7 +19,7 @@
  * get wrong across the two architectures this has to build on.
  *
  * What this is not: a security boundary. Nothing on the volume is
- * encrypted, and a `.bsd` application runs with kernel privileges in a
+ * encrypted, and a `.vx` application runs with kernel privileges in a
  * shared address space, so anything already executing can do as it likes.
  * The administrator flag governs the user interface, not the hardware.
  */

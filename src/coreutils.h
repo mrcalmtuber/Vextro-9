@@ -1168,7 +1168,7 @@ static void cu_cmd_file(int argc, char **argv) {
         if (n >= 4 && d[0] == 0x7F && d[1] == 'E' && d[2] == 'L' && d[3] == 'F')
             kind = "ELF64 executable";
         else if (n >= 4 && d[0] == 'S' && d[1] == 'B' && d[2] == 'S' && d[3] == 'D')
-            kind = ".bsd executable";
+            kind = ".vx executable";
         else if (n >= 8 && d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G')
             kind = "PNG image";
         else if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF)

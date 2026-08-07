@@ -3,7 +3,7 @@
 /*
  * Symbols borrowed from the kernel.
  *
- * A `.bsd` image carries no relocations and cannot reference anything
+ * A `.vx` image carries no relocations and cannot reference anything
  * outside itself, so an application that wanted anti-aliased text used to
  * have to contain a TrueType rasteriser. This structure is the whole of
  * the alternative: a tag the loader searches the image for, a count, and

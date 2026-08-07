@@ -5,7 +5,7 @@ HOSTCC  := cc
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
             -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
-            -Isrc -Ikernel/include -Ibsdfmt $(EXTRA)
+            -Isrc -Ikernel/include -Ivxfmt $(EXTRA)
 
 # --- Preflight ---
 #
@@ -100,17 +100,17 @@ LIMINE  := limine-binary
 ISO     := iso_root
 
 # --- App store packages ---
-# Every package is a .bsd image (see bsdfmt/): compiled to ELF64, then
-# repacked by bsd_maker into the container the store and the kernel's
+# Every package is a .vx image (see vxfmt/): compiled to ELF64, then
+# repacked by vx_maker into the container the store and the kernel's
 # loader both speak.  Seeded onto the disk under /store/pkg, which is the
 # repository the Agora store installs from.  `voronoi` is deliberately
 # left out so it is only reachable over the network (see `make repo`).
 STORE_APPS  := mandel orbit life plasma
 REPO_APPS   := $(STORE_APPS) voronoi
-STORE_BINS  := $(addprefix build/store/,$(addsuffix .bsd,$(STORE_APPS)))
-REPO_BINS   := $(addprefix build/store/,$(addsuffix .bsd,$(REPO_APPS)))
+STORE_BINS  := $(addprefix build/store/,$(addsuffix .vx,$(STORE_APPS)))
+REPO_BINS   := $(addprefix build/store/,$(addsuffix .vx,$(REPO_APPS)))
 
-BSD_MAKER   := bsdfmt/bsd_maker
+VX_MAKER   := vxfmt/vx_maker
 
 # --- Pictures ---
 # PNG in, .sci out (row filters + LZMA, see src/sci.h).  tools/mkimg.py
@@ -119,7 +119,7 @@ PIC_SRC     := $(wildcard apps/pics/*.png)
 PIC_SCI     := $(patsubst apps/pics/%.png,build/pics/%.sci,$(PIC_SRC))
 PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
 
-.PHONY: all iso run clean cleandisk apps repo bsdtools pics test FORCE
+.PHONY: all iso run clean cleandisk apps repo vxtools pics test FORCE
 
 # Say which target a bare `make` builds, rather than letting it fall to
 # whichever rule happens to appear first. It fell to FORCE -- a real
@@ -156,7 +156,7 @@ apps: $(REPO_BINS)
 
 pics: $(PIC_SCI)
 
-bsdtools: $(BSD_MAKER) bsdfmt/bsd_run
+vxtools: $(VX_MAKER) vxfmt/vx_run
 
 # --- exFAT system disk ---
 # exFAT rather than FAT32 because FAT32 caps a single file at 4 GB, and
@@ -233,7 +233,7 @@ disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI)
 		apps/about.txt apps/notes.txt build/hello \
 		apps/welcome.txt:docs/welcome.txt \
 		$$big \
-		$(foreach a,$(STORE_APPS),build/store/$(a).bsd:store/pkg/$(a).bsd) \
+		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
 		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)"; \
 	echo "$$cmd"; \
 	$$cmd
@@ -259,25 +259,25 @@ build/hello.o: apps/hello.c apps/vextro.h
 build/hello: build/hello.o apps/app.ld
 	$(LD) -nostdlib -static -T apps/app.ld build/hello.o -o $@
 
-# --- .bsd toolchain (host) ---
-$(BSD_MAKER): bsdfmt/bsd_maker.c bsdfmt/bsd_format.h
+# --- .vx toolchain (host) ---
+$(VX_MAKER): vxfmt/vx_maker.c vxfmt/vx_format.h
 	$(HOSTCC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
 
-bsdfmt/bsd_run: bsdfmt/bsd_run.c bsdfmt/bsd_format.h
+vxfmt/vx_run: vxfmt/vx_run.c vxfmt/vx_format.h
 	$(HOSTCC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
 
-# --- Store apps: canvas apps compiled to ELF64, repacked as .bsd ---
-# bsd.ld puts .data on its own page so the two segments can carry
+# --- Store apps: canvas apps compiled to ELF64, repacked as .vx ---
+# vx.ld puts .data on its own page so the two segments can carry
 # different protections; -z max-page-size stops ld padding to 2 MB.
 build/store/%.o: apps/store/%.c apps/vextro.h
 	@mkdir -p build/store
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
-build/store/%.elf: build/store/%.o bsdfmt/bsd.ld
-	$(LD) -nostdlib -static -z max-page-size=0x1000 -T bsdfmt/bsd.ld $< -o $@
+build/store/%.elf: build/store/%.o vxfmt/vx.ld
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T vxfmt/vx.ld $< -o $@
 
-build/store/%.bsd: build/store/%.elf $(BSD_MAKER)
-	$(BSD_MAKER) -o $@ -e $<
+build/store/%.vx: build/store/%.elf $(VX_MAKER)
+	$(VX_MAKER) -o $@ -e $<
 
 # --- Pictures: PNG -> .sci ---
 build/pics/%.sci: apps/pics/%.png tools/mkimg.py
@@ -291,7 +291,7 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
 	cp build/hello build/initrd_staging/
-	$(foreach a,$(STORE_APPS),cp build/store/$(a).bsd build/initrd_staging/store/pkg/$(a).bsd;)
+	$(foreach a,$(STORE_APPS),cp build/store/$(a).vx build/initrd_staging/store/pkg/$(a).vx;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
 
@@ -435,7 +435,7 @@ run: os.iso disk.img
 .PRECIOUS: build/store/%.o build/store/%.elf
 
 clean:
-	$(MAKE) -C bsdfmt clean
+	$(MAKE) -C vxfmt clean
 	rm -rf build os.iso \
 		$(ISO)/boot/kernel \
 		$(ISO)/boot/initrd.tar \

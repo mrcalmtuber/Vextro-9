@@ -7,7 +7,7 @@
  *
  * These are together because they share one honest limitation, and it is
  * better stated once than implied five times: none of this is a kernel
- * enforcement boundary. `.bsd` applications execute with full privileges
+ * enforcement boundary. `.vx` applications execute with full privileges
  * in a shared address space, so what lives here is *policy* — the system
  * refusing to start something, and telling you why — not *isolation*. A
  * program that gets running can still do anything. Every panel and every
@@ -216,7 +216,7 @@ static int allow_remove(const char *name) {
 
 /* ===== 4. THE SCANNER =====
  *
- * Signatures plus a small number of structural checks over a `.bsd` image
+ * Signatures plus a small number of structural checks over a `.vx` image
  * before it is allowed to start.
  *
  * The signature list is deliberately tiny and the heuristics deliberately
@@ -264,7 +264,7 @@ static int scan_buffer(const uint8_t *data, uint32_t len) {
         }
     }
 
-    /* Structural: a .bsd that claims a section past its own end is either
+    /* Structural: a .vx that claims a section past its own end is either
      * truncated or tampered with, and either way must not be executed. */
     if (len >= 16) {
         const uint32_t claimed = (uint32_t)data[8]

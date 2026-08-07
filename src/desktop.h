@@ -6,7 +6,7 @@
 #include "gfx.h"
 #include "fat32.h"
 #include "exfat.h"
-#include "bsd_format.h"
+#include "vx_format.h"
 #include "sci.h"
 
 /*
@@ -686,30 +686,30 @@ static uint8_t app_stack[8192] __attribute__((aligned(16)));
  * independent — neither loader processes relocations.
  *
  * Note that the kernel runs apps in ring 0 out of a static buffer, so it
- * cannot enforce W^X the way the host-side loader in bsdfmt/bsd_run.c
- * does; the .bsd page alignment is still honoured, and is what would let
+ * cannot enforce W^X the way the host-side loader in vxfmt/vx_run.c
+ * does; the .vx page alignment is still honoured, and is what would let
  * a future paging-aware loader mark the text arena NX-clear and the data
  * arena NX-set without touching the format.
  */
 
 /* ===== imported symbols =====
  *
- * What the kernel lends to applications. See bsdfmt/bsd_format.h for why
+ * What the kernel lends to applications. See vxfmt/vx_format.h for why
  * the table lives in the image rather than in the header.
  *
  * Unlike the aarch64 tree, this needs no deferred setter: ttf.h and gfx.h
  * are both included before this file, so the addresses are available here
  * and the table can simply be a constant.
  */
-static const bsd_export_t kernel_exports[] = {
+static const vx_export_t kernel_exports[] = {
     { "ttf_draw_string", (uint64_t)(uintptr_t)ttf_draw_string },
     { "ttf_text_width",  (uint64_t)(uintptr_t)ttf_text_width  },
     { "gfx_rect",        (uint64_t)(uintptr_t)gfx_rect        },
     { 0, 0 }
 };
 
-static int bsd_name_eq(const char *a, const char *b) {
-    for (int i = 0; i < BSD_IMPORT_NAMELEN; i++) {
+static int vx_name_eq(const char *a, const char *b) {
+    for (int i = 0; i < VX_IMPORT_NAMELEN; i++) {
         if (a[i] != b[i]) return 0;
         if (a[i] == '\0') return 1;
     }
@@ -735,29 +735,29 @@ static int bsd_name_eq(const char *a, const char *b) {
  * An image with no table at all is not an error — that is every image that
  * existed before this — so it returns zero.
  */
-static int bsd_resolve_imports(uint8_t *data, uint64_t len) {
-    if (!data || len < sizeof(bsd_import_hdr_t)) return 0;
+static int vx_resolve_imports(uint8_t *data, uint64_t len) {
+    if (!data || len < sizeof(vx_import_hdr_t)) return 0;
 
-    uint64_t limit = len - sizeof(bsd_import_hdr_t);
+    uint64_t limit = len - sizeof(vx_import_hdr_t);
     for (uint64_t off = 0; off <= limit; off += 8) {
-        bsd_import_hdr_t *hdr = (bsd_import_hdr_t *)(data + off);
-        if (hdr->magic != BSD_IMPORT_MAGIC) continue;
+        vx_import_hdr_t *hdr = (vx_import_hdr_t *)(data + off);
+        if (hdr->magic != VX_IMPORT_MAGIC) continue;
 
-        if (hdr->count == 0 || hdr->count > BSD_IMPORT_MAX) return -1;
+        if (hdr->count == 0 || hdr->count > VX_IMPORT_MAX) return -1;
 
         /* The entries must lie wholly inside the image. A count that
          * overruns is the one way this can be turned into a write past
          * the image, so it is checked before anything is written. */
-        uint64_t need = sizeof(bsd_import_hdr_t) +
-                        (uint64_t)hdr->count * sizeof(bsd_import_t);
+        uint64_t need = sizeof(vx_import_hdr_t) +
+                        (uint64_t)hdr->count * sizeof(vx_import_t);
         if (need > len - off) return -1;
 
-        bsd_import_t *e = (bsd_import_t *)(data + off + sizeof(bsd_import_hdr_t));
+        vx_import_t *e = (vx_import_t *)(data + off + sizeof(vx_import_hdr_t));
         int found = 0;
         for (uint32_t i = 0; i < hdr->count; i++) {
             e[i].addr = 0;
             for (int k = 0; kernel_exports[k].name; k++) {
-                if (bsd_name_eq(e[i].name, kernel_exports[k].name)) {
+                if (vx_name_eq(e[i].name, kernel_exports[k].name)) {
                     e[i].addr = kernel_exports[k].addr;
                     found++;
                     break;
@@ -816,8 +816,8 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
 
     /* Imports are a property of the image, not of the container it arrived
      * in, and `hello` ships here as a plain ELF — so this belongs on both
-     * load paths, not just the .bsd one. */
-    int nimp = bsd_resolve_imports(app_memory, span);
+     * load paths, not just the .vx one. */
+    int nimp = vx_resolve_imports(app_memory, span);
     if (nimp < 0) {
         if (verbose) term_print_c("run: malformed import table\n", 2);
         return -1;
@@ -834,20 +834,20 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
     return 0;
 }
 
-/* Load a .bsd image — the format every app store package uses. */
-static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
+/* Load a .vx image — the format every app store package uses. */
+static int load_vx_image(const uint8_t *file, uint64_t fsize, int verbose,
                           uint64_t *out_entry) {
     /* Copy the header out byte-wise: the filesystem cache hands back a
      * plain byte buffer and we do not want to assume its alignment. */
-    bsd_header_t h;
+    vx_header_t h;
     uint8_t *hp = (uint8_t *)&h;
     if (fsize < sizeof(h)) {
-        if (verbose) term_print_c("run: file too small for a .bsd header\n", 2);
+        if (verbose) term_print_c("run: file too small for a .vx header\n", 2);
         return -1;
     }
     for (uint64_t i = 0; i < sizeof(h); i++) hp[i] = file[i];
 
-    const char *bad = bsd_validate(&h, fsize);
+    const char *bad = vx_validate(&h, fsize);
     if (bad) {
         if (verbose) {
             term_print_c("run: ", 2);
@@ -856,7 +856,7 @@ static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
         }
         return -1;
     }
-    if (bsd_image_span(&h) > APP_MEM_SIZE) {
+    if (vx_image_span(&h) > APP_MEM_SIZE) {
         if (verbose) term_print_c("run: image too large for the app arena\n", 2);
         return -1;
     }
@@ -878,18 +878,18 @@ static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
 
     /* Lend the image whatever kernel functions it asked for, before it can
      * run and call through them. */
-    int nimp = bsd_resolve_imports(app_memory, bsd_image_span(&h));
+    int nimp = vx_resolve_imports(app_memory, vx_image_span(&h));
     if (nimp < 0) {
         if (verbose) term_print_c("run: malformed import table\n", 2);
         return -1;
     }
     if (nimp > 0) {
-        serial_puts("[vextro] .bsd: resolved ");
+        serial_puts("[vextro] .vx: resolved ");
         serial_put_dec((uint32_t)nimp);
         serial_puts(" imported symbols\n");
     }
 
-    if (verbose) term_print_c("loading .bsd: ", 3);
+    if (verbose) term_print_c("loading .vx: ", 3);
     *out_entry = (uint64_t)(uintptr_t)(app_memory + (h.entry - base));
     return 0;
 }
@@ -975,15 +975,15 @@ static int execute_bin_internal(const char *filepath, int verbose) {
     uint64_t entry_addr = 0;
     int rc;
 
-    if (file[0] == (uint8_t)BSD_MAGIC0 && file[1] == (uint8_t)BSD_MAGIC1 &&
-        file[2] == (uint8_t)BSD_MAGIC2 && file[3] == (uint8_t)BSD_MAGIC3) {
-        rc = load_bsd_image(file, fsize, verbose, &entry_addr);
+    if (file[0] == (uint8_t)VX_MAGIC0 && file[1] == (uint8_t)VX_MAGIC1 &&
+        file[2] == (uint8_t)VX_MAGIC2 && file[3] == (uint8_t)VX_MAGIC3) {
+        rc = load_vx_image(file, fsize, verbose, &entry_addr);
     } else if (file[0] == 0x7F && file[1] == 'E' && file[2] == 'L' &&
                file[3] == 'F') {
         rc = load_elf_image(file, fsize, verbose, &entry_addr);
     } else {
         if (verbose)
-            term_print_c("run: not a .bsd or ELF64 executable\n", 2);
+            term_print_c("run: not a .vx or ELF64 executable\n", 2);
         return -1;
     }
     if (rc != 0) return -1;

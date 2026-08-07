@@ -1,5 +1,5 @@
 /*
- * bsd_run — load and execute a .bsd image on a POSIX host.
+ * vx_run — load and execute a .vx image on a POSIX host.
  *
  * The interesting part is the memory protection dance.  You cannot just
  * malloc() a buffer, copy machine code into it and jump: on any modern
@@ -31,7 +31,7 @@
  * libcs spell the unlock differently. */
 #if defined(__linux__)
 #  define _GNU_SOURCE 1
-#elif defined(__APPLE__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__FreeVX__)
 #  define _DARWIN_C_SOURCE 1
 #else
 #  define _POSIX_C_SOURCE 200809L
@@ -47,7 +47,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "bsd_format.h"
+#include "vx_format.h"
 
 #ifndef MAP_ANONYMOUS
 #  ifdef MAP_ANON
@@ -59,25 +59,25 @@
  * machine code for that ISA.  Jumping to it anywhere else earns a
  * SIGILL, so say what went wrong instead of letting the CPU say it. */
 #if defined(__x86_64__) || defined(_M_X64)
-#  define BSD_HOST_IS_X86_64 1
+#  define VX_HOST_IS_X86_64 1
 #else
-#  define BSD_HOST_IS_X86_64 0
+#  define VX_HOST_IS_X86_64 0
 #endif
 
-typedef long (*bsd_entry_fn)(long);
+typedef long (*vx_entry_fn)(long);
 
 static void die(const char *msg) {
-    fprintf(stderr, "bsd_run: %s\n", msg);
+    fprintf(stderr, "vx_run: %s\n", msg);
     exit(1);
 }
 
 static void die_errno(const char *msg) {
-    fprintf(stderr, "bsd_run: %s: %s\n", msg, strerror(errno));
+    fprintf(stderr, "vx_run: %s: %s\n", msg, strerror(errno));
     exit(1);
 }
 
 static void usage(FILE *out) {
-    fputs("usage: bsd_run [-n] [-a ARG] [-q] IMAGE.bsd\n"
+    fputs("usage: vx_run [-n] [-a ARG] [-q] IMAGE.vx\n"
           "  -n   map and protect the image but do not call it\n"
           "  -a   integer argument passed to the entry point in RDI\n"
           "  -q   print only the return value\n", out);
@@ -129,12 +129,12 @@ int main(int argc, char **argv) {
     close(fd);
 
     /* ---- validate before trusting a single field ---- */
-    bsd_header_t h;
+    vx_header_t h;
     memcpy(&h, file, sizeof(h));
 
-    const char *bad = bsd_validate(&h, file_size);
+    const char *bad = vx_validate(&h, file_size);
     if (bad) {
-        fprintf(stderr, "bsd_run: %s: %s\n", path, bad);
+        fprintf(stderr, "vx_run: %s: %s\n", path, bad);
         return 1;
     }
 
@@ -143,11 +143,11 @@ int main(int argc, char **argv) {
     uint64_t host_pg = (uint64_t)pgsz;
 
     uint64_t base_vaddr = h.text_vaddr;
-    uint64_t span = bsd_round_up(bsd_image_span(&h), host_pg);
+    uint64_t span = vx_round_up(vx_image_span(&h), host_pg);
 
     int has_data = (h.data_size || h.bss_size);
     uint64_t text_at   = h.text_vaddr - base_vaddr;        /* always 0 */
-    uint64_t text_prot = bsd_round_up(h.text_size, host_pg);
+    uint64_t text_prot = vx_round_up(h.text_size, host_pg);
     uint64_t data_at   = has_data ? h.data_vaddr - base_vaddr : 0;
 
     /*
@@ -166,14 +166,14 @@ int main(int argc, char **argv) {
 
     if (!wx_possible && !no_exec) {
         fprintf(stderr,
-                "bsd_run: %s: host pages are %llu bytes but the segments "
+                "vx_run: %s: host pages are %llu bytes but the segments "
                 "are %llu bytes apart,\n"
                 "         so text and data share a page and W^X cannot be "
                 "honoured. Run this\n"
                 "         image on a host with %u-byte pages (any x86_64 "
                 "system), or use -n to inspect it.\n",
                 path, (unsigned long long)host_pg,
-                (unsigned long long)data_at, BSD_PAGE_SIZE);
+                (unsigned long long)data_at, VX_PAGE_SIZE);
         free(file);
         return 1;
     }
@@ -198,22 +198,22 @@ int main(int argc, char **argv) {
 
         if (has_data) {
             uint64_t data_prot =
-                bsd_round_up(h.data_size + h.bss_size, host_pg);
+                vx_round_up(h.data_size + h.bss_size, host_pg);
             if (mprotect(mem + data_at, (size_t)data_prot,
                          PROT_READ | PROT_WRITE) != 0)
                 die_errno("mprotect(data, PROT_READ|PROT_WRITE)");
         }
     }
 
-    bsd_entry_fn entry;
+    vx_entry_fn entry;
     /* POSIX guarantees this cast; a union keeps -Wpedantic quiet about
      * ISO C's stance on object-to-function pointer conversions. */
-    union { void *obj; bsd_entry_fn fn; } cast;
+    union { void *obj; vx_entry_fn fn; } cast;
     cast.obj = mem + (h.entry - base_vaddr);
     entry = cast.fn;
 
     if (!quiet) {
-        printf("bsd_run: %s\n", path);
+        printf("vx_run: %s\n", path);
         printf("  mapped %llu bytes at %p (host page %llu)\n",
                (unsigned long long)span, base,
                (unsigned long long)host_pg);
@@ -239,9 +239,9 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!BSD_HOST_IS_X86_64) {
+    if (!VX_HOST_IS_X86_64) {
         fprintf(stderr,
-                "bsd_run: %s holds x86_64 machine code, but this bsd_run was "
+                "vx_run: %s holds x86_64 machine code, but this vx_run was "
                 "built for another\n"
                 "         architecture. Run it on an x86_64 host, or use -n "
                 "to map and inspect it here.\n", path);

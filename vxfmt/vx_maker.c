@@ -1,5 +1,5 @@
 /*
- * bsd_maker — build a .bsd executable.
+ * vx_maker — build a .vx executable.
  *
  * Two input modes:
  *
@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "bsd_format.h"
+#include "vx_format.h"
 
 #define DEFAULT_TEXT_VADDR 0x1000u
 
@@ -72,7 +72,7 @@ static void die(const char *fmt, ...)
 static void die(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fputs("bsd_maker: ", stderr);
+    fputs("vx_maker: ", stderr);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
@@ -150,7 +150,7 @@ static void from_elf(const char *path, image_t *img) {
         if (ph[i].p_type != PT_LOAD) continue;
         if (ph[i].p_memsz == 0) continue;
         if (nseg == 2) die("%s has more than two PT_LOAD segments; "
-                           "link it with apps/bsd.ld", path);
+                           "link it with apps/vx.ld", path);
         if (ph[i].p_offset > len || ph[i].p_filesz > len - ph[i].p_offset)
             die("%s: PT_LOAD %u runs past the end of the file", path, i);
         if (ph[i].p_filesz > ph[i].p_memsz)
@@ -191,7 +191,7 @@ static void from_elf(const char *path, image_t *img) {
         img->bss_size   = seg[0]->p_memsz - seg[0]->p_filesz;
         if (img->bss_size)
             die("%s: .bss is inside the text segment; link it with "
-                "apps/bsd.ld so .bss lands in a separate PT_LOAD", path);
+                "apps/vx.ld so .bss lands in a separate PT_LOAD", path);
     }
 
     img->entry = eh->e_entry;
@@ -202,10 +202,10 @@ static void from_elf(const char *path, image_t *img) {
 
 static void usage(FILE *out) {
     fputs(
-"usage: bsd_maker -o OUT.bsd -t TEXT.bin [-d DATA.bin] [-b BSS_BYTES] [opts]\n"
-"       bsd_maker -o OUT.bsd -e PROGRAM.elf [opts]\n"
+"usage: vx_maker -o OUT.vx -t TEXT.bin [-d DATA.bin] [-b BSS_BYTES] [opts]\n"
+"       vx_maker -o OUT.vx -e PROGRAM.elf [opts]\n"
 "\n"
-"  -o, --output FILE     .bsd image to write (required)\n"
+"  -o, --output FILE     .vx image to write (required)\n"
 "  -t, --text FILE       raw x86_64 machine code for the text segment\n"
 "  -d, --data FILE       raw bytes for the data segment\n"
 "  -b, --bss N           zero-filled bytes to append after the data\n"
@@ -277,39 +277,39 @@ int main(int argc, char **argv) {
         img.text_vaddr = have_text_vaddr ? text_vaddr : DEFAULT_TEXT_VADDR;
         img.data_vaddr = have_data_vaddr
             ? data_vaddr
-            : img.text_vaddr + bsd_round_up(img.text_size, BSD_PAGE_SIZE);
+            : img.text_vaddr + vx_round_up(img.text_size, VX_PAGE_SIZE);
         img.entry = have_entry ? entry : img.text_vaddr;
     }
 
     /* ---- lay the file out ---- */
-    bsd_header_t h;
+    vx_header_t h;
     memset(&h, 0, sizeof(h));
-    h.magic[0] = BSD_MAGIC0;
-    h.magic[1] = BSD_MAGIC1;
-    h.magic[2] = BSD_MAGIC2;
-    h.magic[3] = (uint8_t)BSD_MAGIC3;
-    h.version    = BSD_VERSION;
+    h.magic[0] = VX_MAGIC0;
+    h.magic[1] = VX_MAGIC1;
+    h.magic[2] = VX_MAGIC2;
+    h.magic[3] = (uint8_t)VX_MAGIC3;
+    h.version    = VX_VERSION;
     h.entry      = img.entry;
     h.text_vaddr = img.text_vaddr;
     h.text_size  = img.text_size;
     h.data_vaddr = img.data_vaddr;
     h.data_size  = img.data_size;
     h.bss_size   = img.bss_size;
-    h.flags      = BSD_F_NONE;
+    h.flags      = VX_F_NONE;
 
     /* Segments start on a page, and each file offset is congruent to
      * its virtual address, so a loader can mmap() straight from the fd. */
-    h.text_off = BSD_PAGE_SIZE;
+    h.text_off = VX_PAGE_SIZE;
     /* A pure-.bss data segment contributes nothing to the file, so its
      * offset stays 0 rather than pointing past the end of it. */
     h.data_off = img.data_size
-        ? h.text_off + bsd_round_up(img.text_size, BSD_PAGE_SIZE)
+        ? h.text_off + vx_round_up(img.text_size, VX_PAGE_SIZE)
         : 0;
 
     uint64_t file_size = img.data_size ? h.data_off + img.data_size
                                        : h.text_off + img.text_size;
 
-    const char *bad = bsd_validate(&h, file_size);
+    const char *bad = vx_validate(&h, file_size);
     if (bad) die("refusing to write a bad image: %s", bad);
 
     FILE *f = fopen(out_path, "wb");
@@ -342,9 +342,9 @@ int main(int argc, char **argv) {
                (unsigned long long)h.data_size);
         printf("  bss         %llu bytes\n", (unsigned long long)h.bss_size);
         printf("  image span  %llu bytes\n",
-               (unsigned long long)bsd_image_span(&h));
+               (unsigned long long)vx_image_span(&h));
     } else {
-        printf("bsd_maker: %s (text %llu, data %llu, bss %llu)\n", out_path,
+        printf("vx_maker: %s (text %llu, data %llu, bss %llu)\n", out_path,
                (unsigned long long)h.text_size,
                (unsigned long long)h.data_size,
                (unsigned long long)h.bss_size);

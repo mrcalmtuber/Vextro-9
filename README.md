@@ -318,7 +318,7 @@ most often assumed to be present:
 | **Enterprise networking** | `src/netstack.h` is ARP, IPv4, ICMP, UDP, DHCP, DNS and one TCP connection at a time. No VPN, no branch caching, no directory services. |
 | **TLS** | No cryptographic transport, so `https://` is refused rather than faked. |
 | **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
-| **Application sandboxing** | `.bsd` applications run with full kernel privileges in a shared address space. The allow list and scanner decide whether a program *starts*; nothing constrains what it does once running. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
+| **Application sandboxing** | `.vx` applications run with full kernel privileges in a shared address space. The allow list and scanner decide whether a program *starts*; nothing constrains what it does once running. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
 | **Device management, biometrics, multi-touch** | No hardware to drive: this configuration exposes no fingerprint reader and no touch digitiser. |
 | **TV recording, media streaming to network devices** | No tuner driver, and no streaming protocol. |
 
@@ -413,13 +413,13 @@ what makes the finer sampling affordable at 60 fps.
 
 ### Its own executable format
 
-Store packages are `.bsd` images: an 80-byte header, page-separated text
-and data, no relocations. The same `bsd_validate()` runs in the host
+Store packages are `.vx` images: an 80-byte header, page-separated text
+and data, no relocations. The same `vx_validate()` runs in the host
 packer, the kernel loader and the store's download path — one validator,
 three consumers, so a payload cannot be accepted by one and rejected by
 another.
 
-`bsdfmt/bsd_run.c` is a POSIX loader for the same format, which means an
+`vxfmt/vx_run.c` is a POSIX loader for the same format, which means an
 image can be checked on your laptop before it is ever handed to the kernel.
 Text and data never share a page, so `mprotect()` can give them different
 protections and **W^X holds** — and on hosts with pages coarser than 4 KB
@@ -482,7 +482,7 @@ make
 ```
 
 `make` compiles the kernel, the userland app and the store packages (each
-linked to ELF64 then repacked as `.bsd`), converts the boot video to raw
+linked to ELF64 then repacked as `.vx`), converts the boot video to raw
 RGB565 frames, assembles `os.iso`, and creates `disk.img` — an 8 GB sparse
 exFAT volume seeded with the starter files, the package repository and the
 sample pictures.
@@ -542,7 +542,7 @@ sine table, which are data rather than logic.)
 | **Graphics** | Integer TrueType rasteriser, Intel Gen9 blitter with hang capture, firmware framebuffer fallback |
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
-| **Userland** | `.bsd` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
+| **Userland** | `.vx` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
 | **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels — all policy, none of it isolation |
 | **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
@@ -576,7 +576,7 @@ src/
   keyboard.h    PS/2 keyboard         mouse.h  Pointer + wheel
   vmmouse.h     VMware backdoor (absolute pointer, no grab)
   xhci.h        USB HID — incomplete, off by default, honest about it
-bsdfmt/         The .bsd executable format, its packer and a POSIX loader
+vxfmt/         The .vx executable format, its packer and a POSIX loader
 apps/           Userland source, store packages, seed files, pictures
 tools/          exFAT/FAT32 formatters, image and video converters,
                 package repository server, QEMU test driver

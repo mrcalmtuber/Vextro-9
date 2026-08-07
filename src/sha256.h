@@ -17,7 +17,7 @@
  * stored password from being *readable*, and salting stops one leaked
  * hash from being reused against the other accounts on the volume. It is
  * not a defence against someone who has the disk and is willing to spend
- * time on it: there is no disk encryption here, and a `.bsd` application
+ * time on it: there is no disk encryption here, and a `.vx` application
  * runs with kernel privileges in a shared address space, so anything
  * already executing can read whatever it likes. The login screen is a
  * door, not a vault.

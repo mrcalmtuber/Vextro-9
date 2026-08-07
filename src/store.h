@@ -74,16 +74,16 @@ typedef struct {
 static const store_shipped_t store_shipped[] = {
     { "mandel", "Mandelbrot", "1.0", "Graphics",
       "Escape-time fractal drawn in 16.16 fixed point - no FPU.",
-      "/store/pkg/mandel.bsd", SI_FRACTAL },
+      "/store/pkg/mandel.vx", SI_FRACTAL },
     { "orbit", "Orbit", "1.0", "Simulation",
       "Five bodies under Newtonian gravity, integrated on integers.",
-      "/store/pkg/orbit.bsd", SI_ORBIT },
+      "/store/pkg/orbit.vx", SI_ORBIT },
     { "life", "Game of Life", "1.1", "Simulation",
       "149x100 torus run for 160 generations over a heat map.",
-      "/store/pkg/life.bsd", SI_GRID },
+      "/store/pkg/life.vx", SI_GRID },
     { "plasma", "Plasma", "1.0", "Graphics",
       "Interference field from a sine table built by an oscillator.",
-      "/store/pkg/plasma.bsd", SI_WAVE },
+      "/store/pkg/plasma.vx", SI_WAVE },
 };
 
 #define STORE_SHIPPED_COUNT \
@@ -139,7 +139,7 @@ static void store_say2(const char *a, const char *b, int col) {
 static void store_app_path(const char *id, char *out /* >= STORE_PATH_MAX */) {
     str_copy(out, "/apps/", STORE_PATH_MAX);
     str_append(out, id, STORE_PATH_MAX);
-    str_append(out, ".bsd", STORE_PATH_MAX);
+    str_append(out, ".vx", STORE_PATH_MAX);
 }
 
 /* Payload lookup that also sees the ustar ramdisk, so the storefront
@@ -433,17 +433,17 @@ static int store_parse_index(const uint8_t *data, int len) {
 /* ===== INSTALL / REMOVE / LAUNCH ===== */
 
 /*
- * Packages are .bsd images, and they arrive over the network, so the
+ * Packages are .vx images, and they arrive over the network, so the
  * header is checked in full before a single byte reaches the disk —
- * bsd_validate() is where every bound and alignment rule of the format
+ * vx_validate() is where every bound and alignment rule of the format
  * is enforced.
  */
 static const char *store_check_payload(const uint8_t *data, uint32_t len) {
-    if (len < sizeof(bsd_header_t)) return "payload is too small to be a .bsd";
-    bsd_header_t h;
+    if (len < sizeof(vx_header_t)) return "payload is too small to be a .vx";
+    vx_header_t h;
     uint8_t *hp = (uint8_t *)&h;
     for (uint32_t i = 0; i < sizeof(h); i++) hp[i] = data[i];
-    return bsd_validate(&h, len);
+    return vx_validate(&h, len);
 }
 
 static int store_commit(store_pkg_t *p, const uint8_t *data, uint32_t len) {

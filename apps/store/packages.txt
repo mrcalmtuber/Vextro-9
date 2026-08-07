@@ -13,7 +13,7 @@ ver:1.0
 cat:Graphics
 icon:fractal
 desc:Escape-time fractal drawn in 16.16 fixed point - no FPU.
-url:pkg/mandel.bsd
+url:pkg/mandel.vx
 
 pkg:orbit
 name:Orbit
@@ -21,7 +21,7 @@ ver:1.0
 cat:Simulation
 icon:orbit
 desc:Five bodies under Newtonian gravity, integrated on integers.
-url:pkg/orbit.bsd
+url:pkg/orbit.vx
 
 pkg:life
 name:Game of Life
@@ -29,7 +29,7 @@ ver:1.1
 cat:Simulation
 icon:grid
 desc:149x100 torus run for 160 generations over a heat map.
-url:pkg/life.bsd
+url:pkg/life.vx
 
 pkg:plasma
 name:Plasma
@@ -37,7 +37,7 @@ ver:1.0
 cat:Graphics
 icon:wave
 desc:Interference field from a sine table built by an oscillator.
-url:pkg/plasma.bsd
+url:pkg/plasma.vx
 
 pkg:voronoi
 name:Voronoi
@@ -45,4 +45,4 @@ ver:1.0
 cat:Graphics
 icon:pkg
 desc:28-site nearest-neighbour partition, integer distances only.
-url:pkg/voronoi.bsd
+url:pkg/voronoi.vx

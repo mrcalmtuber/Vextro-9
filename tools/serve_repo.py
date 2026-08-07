@@ -6,13 +6,13 @@ then downloads each payload with its own HTTP GET.  This script builds
 that layout out of the compiled apps and serves it:
 
     build/repo/index.sr        the index, with real `size:` values
-    build/repo/pkg/<id>.bsd    the payloads
+    build/repo/pkg/<id>.vx    the payloads
 
 Usage:
     serve_repo.py [--out DIR] [--port N] [--stage-only] <binary> ...
 
-Each <binary> is a built .bsd image whose basename is the package id,
-e.g. build/store/mandel.bsd.  Packages listed in apps/store/packages.txt
+Each <binary> is a built .vx image whose basename is the package id,
+e.g. build/store/mandel.vx.  Packages listed in apps/store/packages.txt
 with no matching binary are dropped from the served index.
 
 Inside the guest the repository lives at the QEMU user-networking
@@ -60,7 +60,7 @@ def stage(out_dir, binaries):
         if not os.path.isfile(path):
             print(f'  skip (not built): {path}', file=sys.stderr)
             continue
-        # build/store/mandel.bsd -> package id "mandel"
+        # build/store/mandel.vx -> package id "mandel"
         have[os.path.splitext(os.path.basename(path))[0]] = path
 
     lines = ['# Vextro 9 package repository',
@@ -72,7 +72,7 @@ def stage(out_dir, binaries):
         if src is None:
             print(f'  skip (no binary): {pkg_id}', file=sys.stderr)
             continue
-        dest = os.path.join(pkg_dir, f'{pkg_id}.bsd')
+        dest = os.path.join(pkg_dir, f'{pkg_id}.vx')
         shutil.copyfile(src, dest)
         size = os.path.getsize(dest)
 

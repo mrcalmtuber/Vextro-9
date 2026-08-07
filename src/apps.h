@@ -642,7 +642,7 @@ static void settings_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* ---- Users ----
      *
-     * Only administrators see this. Not a security boundary -- a `.bsd`
+     * Only administrators see this. Not a security boundary -- a `.vx`
      * application runs with kernel privileges and could do as it likes --
      * but the interface should not offer what it will refuse.
      */
