@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="no libc" src="https://img.shields.io/badge/libc-none-1f2430?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-29k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/kernel-32k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
   <a href="https://github.com/mrcalmtuber/vextro-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
@@ -174,9 +174,10 @@ no secrets on a machine with no users.</td>
 <td><b>Offline Wikipedia</b> — live prefix search across
 <b>399,853 entries</b>, answered by binary search over the archive's sorted
 path list. About twenty reads, and it barely slows as the archive grows.</td>
-<td><b>Articles</b> render through the browser at <code>zim://</code>, with
-internal links resolved back into the archive — so you can read from one
-article to the next, with Back working.</td>
+<td><b>Articles</b> render in the Wikipedia window itself, through a
+layout engine with a run-based line model — so a sentence full of links
+stays one sentence. Internal links resolve back into the archive, and Back
+restores your reading position.</td>
 </tr>
 <tr>
 <td><img src="docs/store.png" alt="Agora app store"></td>
@@ -198,10 +199,88 @@ no FPU at all.</td>
 <td><b>Photos</b> — a custom image format: PNG-style row prediction filters
 over an LZMA stream. The status bar is not marketing, it is the file:
 <b>623 KB → 12 KB</b>.</td>
-<td><b>Login</b> — the keycode is stored on the volume, so the machine
-remembers you. A wrong one melts the screen.</td>
+<td><b>Login</b> — real accounts. Salted SHA-256 iterated 4,096 times,
+compared in constant time, with per-user home directories. A wrong
+password melts the screen.</td>
 </tr>
 </table>
+
+---
+
+## The desktop
+
+<table>
+<tr>
+<td width="50%"><img src="docs/aero.png" alt="Peek and a taskbar preview"></td>
+<td width="50%"><img src="docs/snap.png" alt="A window snapped to half the screen"></td>
+</tr>
+<tr>
+<td><b>Peek and previews</b> — hovering the taskbar fades every window
+towards what is behind it and leaves its outline. The preview above the
+button is the window itself, captured out of the compositor.</td>
+<td><b>Snap</b> — drag a window to an edge and it takes half the work
+area; drag it to the top and it fills it. The target is previewed while
+the button is held, so the gesture can be abandoned.</td>
+</tr>
+<tr>
+<td><img src="docs/search.png" alt="Start menu search"></td>
+<td><img src="docs/calculator.png" alt="Calculator"></td>
+</tr>
+<tr>
+<td><b>Search</b> — type in the start menu and it looks through the
+applications, the things each app was recently pointed at, and the volume
+itself, breadth-first under a budget so it cannot cost a frame.</td>
+<td><b>Calculator</b> — three modes, and not one floating-point
+instruction. Values are 64-bit integers scaled by a million, so 12.5 × 8
+is exactly 100 and 1000 mm is exactly 1 m.</td>
+</tr>
+</table>
+
+**Windows.** Minimize, maximize and snap share one saved rectangle rather
+than three that could disagree. Shake a window — four direction changes
+inside half a second, counting only strokes long enough not to be a hand
+holding still — and everything else gets out of the way; shake it again
+and the desk comes back.
+
+**Taskbar.** Pinned launchers that become window buttons once something is
+running: click the focused one to put it away, click again to bring it
+back. Right-click opens a jump list of what that app was last pointed at.
+
+**Gadgets.** A clock, a system meter and a network panel, drawn on the
+desktop under the window stack. The CPU meter is fed by the render loop's
+own cycle counters — a meter driven by a counter that ticks whether or not
+anything is happening would be decoration, not instrumentation.
+
+**Action Center.** A flag on the menubar with an unread count, and a panel
+listing the last sixteen things the system did: signing in, an app being
+installed, the language model being enabled, the network link changing.
+Nothing in it steals focus or blocks.
+
+**Power.** The render loop parks the core between frames rather than
+spinning through them. After ninety seconds without a pointer move, click
+or keystroke the screen fades down, and comes back four times as fast as
+it went — once the fade settles every frame equals the last, so the flip's
+row diff finds nothing to send to the panel.
+
+---
+
+## What is not here
+
+Vextro is one person's operating system, and the honest list of what it
+cannot do is longer than the list of what it can. These are the things
+most often assumed to be present:
+
+| | Why not |
+|---|---|
+| **3D graphics API** | The Gen9 driver in `src/igpu.h` is a 2D blitter and nothing more. There is no shader compiler, no command-buffer scheduler and no 3D pipeline. |
+| **H.264, AAC, DivX** | No video or audio decoder of any kind ships here. `src/ac97.h` brings up the codec; there is no proven playback path above it, so there is no media player either. |
+| **A virtualised legacy environment** | There is no hypervisor. The kernel runs on the metal and has no facility for running another operating system inside itself. |
+| **Enterprise networking** | `src/netstack.h` is ARP, IPv4, ICMP, UDP, DHCP, DNS and one TCP connection at a time. No VPN, no branch caching, no directory services. |
+| **TLS** | No cryptographic transport, so `https://` is refused rather than faked. |
+| **Full-disk or removable-media encryption** | Passwords are hashed; nothing on the volume is encrypted. |
+| **Application sandboxing** | `.bsd` applications run with full kernel privileges in a shared address space. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
+| **Anti-malware, device management, biometrics, multi-touch** | Not implemented. |
+| **TV recording, media streaming to network devices** | No tuner driver, and no streaming protocol. |
 
 ---
 
@@ -409,13 +488,14 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-**29,106 lines of C**, no libc, compiled as a single translation unit plus
-one for inference. (32,052 counting the embedded typeface and the integer
+**32,146 lines of C**, no libc, compiled as a single translation unit plus
+one for inference. (35,092 counting the embedded typeface and the integer
 sine table, which are data rather than logic.)
 
 | | |
 |---|---|
-| **Desktop** | Window manager (z-order, drag, focus, shadows), menu bar, dock, five wallpaper themes, absolute pointer, scroll wheel routed to the focused window |
+| **Desktop** | Window manager with minimize, maximize, snap-to-edge, shake-to-clear and a peek that fades the stack; taskbar with live window previews and jump lists; desktop gadgets; start-menu search over apps, recent items and the volume; Action Center; five wallpaper themes with an optional slideshow; idle dimming |
+| **Applications** | Terminal with 38 Unix commands, browser, file manager, offline Wikipedia reader, image viewer, paint, system monitor, package store, calculator, settings |
 | **Filesystem** | Read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO — behind one 512-byte sector view |
 | **Network** | IPv4, ICMP, UDP, DNS, TCP, async HTTP/1.0 with redirects; Intel e1000 driver |
@@ -423,7 +503,8 @@ sine table, which are data rather than logic.)
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
 | **Userland** | `.bsd` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
-| **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation decoded from raw RGB565 by the kernel itself |
+| **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
+| **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
 
 <details>
 <summary><b>Source layout</b></summary>
