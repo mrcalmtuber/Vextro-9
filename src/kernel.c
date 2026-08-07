@@ -1568,6 +1568,14 @@ void kmain(void) {
                 serial_puts("[vextro] login: ");
                 serial_puts(user_name_of(user_current));
                 serial_puts(user_is_admin(user_current) ? " (admin)\n" : "\n");
+                {
+                    char note[NOTIFY_TEXT];
+                    str_copy(note, "Signed in as ", sizeof(note));
+                    str_append(note, user_name_of(user_current), sizeof(note));
+                    if (user_is_admin(user_current))
+                        str_append(note, " (administrator)", sizeof(note));
+                    notify_push(NOTE_GOOD, note);
+                }
                 vga_flip(vram, w, h, pitch_px);
                 __asm__ volatile("hlt");
                 continue;

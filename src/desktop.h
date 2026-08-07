@@ -65,7 +65,7 @@ static uint64_t system_total_memory_mb = 0;
 #define DOCK_EDGE_RIGHT  2
 
 /* Built-in launchers, plus one slot per app installed from the store. */
-#define DOCK_BASE_COUNT 11
+#define DOCK_BASE_COUNT 12
 #define DOCK_MAX_ITEMS  25
 
 static int dock_item_count = DOCK_BASE_COUNT;
@@ -110,6 +110,7 @@ enum {
     WK_IMAGE,
     WK_WIKI,
     WK_SETTINGS,
+    WK_CALC,
     WK_ABOUT,
     WK_COUNT
 };
@@ -126,6 +127,17 @@ static void recent_push(int kind, const char *label, const char *path);
  * every app that handles a kind is in scope. The start menu and the jump
  * lists both reach it from above that point. */
 static void desktop_open_recent(int kind, const char *path);
+
+/*
+ * The Action Center's ring is in shell.h too, but the subsystems that
+ * report into it -- the store, the login loop, the network watch -- are
+ * all in scope well before that. What an entry looks like is declared
+ * here so they can file one; where the entries are kept is not their
+ * business.
+ */
+#define NOTIFY_TEXT 72
+enum { NOTE_INFO = 0, NOTE_GOOD, NOTE_WARN };
+static void notify_push(int cat, const char *text);
 
 typedef struct {
     const char *title;
@@ -147,7 +159,8 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Wikipedia",         UI_SNAP(780), UI_SNAP(580) },
     /* Taller since the Users pane joined it. */
     { "Settings",          UI_SNAP(470), UI_SNAP(560) },
-    { "About Vextro",    UI_SNAP(380), UI_SNAP(270) },
+    { "Calculator",        UI_SNAP(330), UI_SNAP(500) },
+    { "About Vextro",      UI_SNAP(380), UI_SNAP(270) },
 };
 
 /* ===== 2. TARFS ===== */
@@ -959,6 +972,7 @@ static int execute_bin(const char *filepath) {
  * state the system monitor does, and the jump lists read the recent-item
  * lists the apps push into. */
 #include "shell.h"
+#include "calc.h"
 
 /* Canvas app (WK_HELLO) content drawer */
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
@@ -1321,6 +1335,9 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     case WK_WIKI:
         wiki_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
+    case WK_CALC:
+        calc_draw(buf, w, h, cx, cy, cw, chh, mouse_x, mouse_y);
+        break;
     case WK_SETTINGS:
         settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
@@ -1496,6 +1513,9 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
             break;
         case WK_WIKI:
             wiki_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_CALC:
+            calc_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
             break;
         case WK_PAINT:
             paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
@@ -1804,6 +1824,7 @@ static void menu_rebuild(void) {
     n = menu_add(n, "App Store", WK_STORE);
     n = menu_add(n, "Photos",    WK_IMAGE);
     n = menu_add(n, "Wikipedia", WK_WIKI);
+    n = menu_add(n, "Calculator", WK_CALC);
     const int after_docs = n;
     n = menu_add(n, "Goldsmith", WK_PAINT);
     n = menu_add(n, "Monolith",  WK_SYSMON);
@@ -1969,6 +1990,143 @@ static int menu_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
     return 0;
 }
 
+/* ===== ACTION CENTER =====
+ *
+ * A flag at the right of the menubar carrying the unread count, and a
+ * panel that drops from it. The flag is always drawn, so its quiet state
+ * is as legible as its loud one.
+ */
+#define AC_W       320
+#define AC_ROW_H   34
+#define AC_HEAD_H  28
+
+static int ac_open = 0;
+
+/*
+ * The flag's x is measured, not guessed. The menubar lays its right-hand
+ * cluster out right to left from the clock, so where the flag ends up
+ * depends on how wide the clock and date happen to set -- a fixed offset
+ * put it on top of the date. menubar_draw records the position it
+ * actually used and everything else reads it from here.
+ */
+static int32_t ac_flag_px = 0;
+
+static int32_t ac_flag_x(uint32_t w) {
+    return ac_flag_px ? ac_flag_px : (int32_t)w - 200;
+}
+
+static int ac_hit_flag(uint32_t w, int32_t mx, int32_t my) {
+    const int32_t fx = ac_flag_x(w);
+    return my >= 0 && my < MENUBAR_H && mx >= fx - 12 && mx < fx + 12;
+}
+
+static int32_t ac_height(void) {
+    const int rows = notify_n ? notify_n : 1;
+    return AC_HEAD_H + rows * AC_ROW_H + 8;
+}
+
+static void ac_draw_flag(uint32_t *buf, uint32_t w, uint32_t h,
+                         int32_t mx, int32_t my) {
+    const int32_t fx = ac_flag_x(w), fy = MENUBAR_H / 2;
+    const int hot = ac_hit_flag(w, mx, my) || ac_open;
+
+    /* Highest category still unread decides the colour: an alert must
+     * not read the same as a note. */
+    uint32_t col = notify_unread ? C_GOLD : 0x555C6Eu;
+    for (int i = 0; i < notify_unread && i < notify_n; i++) {
+        const notify_t *e = notify_at(i);
+        if (e && e->cat == NOTE_WARN) { col = C_RED; break; }
+    }
+    if (hot) gfx_rect(buf, w, h, fx - 12, 2, 24, MENUBAR_H - 5, 0x252B3Cu);
+
+    /* a flag: staff, and a pennant that is filled only when unread */
+    gfx_rect(buf, w, h, fx - 5, fy - 8, 1, 16, col);
+    if (notify_unread)
+        gfx_tri(buf, w, h, fx - 4, fy - 8, fx + 6, fy - 4, fx - 4, fy, col);
+    else
+        for (int i = 0; i < 5; i++)
+            gfx_rect(buf, w, h, fx - 4 + i, fy - 8 + i / 2, 1, 8 - i, col);
+
+    if (notify_unread) {
+        char nb[8];
+        uint_to_str((uint32_t)notify_unread, nb);
+        ttf_draw_string(buf, (int)w, (int)h, fx + 8, 7, nb, col, 11);
+    }
+}
+
+static void ac_draw_panel(uint32_t *buf, uint32_t w, uint32_t h) {
+    if (!ac_open) return;
+    int32_t x = ac_flag_x(w) - AC_W + 60;
+    if (x + AC_W > (int32_t)w - 6) x = (int32_t)w - 6 - AC_W;
+    if (x < 6) x = 6;
+    const int32_t y = MENUBAR_H;
+    const int32_t hgt = ac_height();
+
+    gfx_rect_blend(buf, w, h, x + 3, y + 3, AC_W, hgt, 0x000000u, 70);
+    gfx_rect_blend(buf, w, h, x, y, AC_W, hgt, 0x12151Fu, 248);
+    gfx_rect_outline(buf, w, h, x, y, AC_W, hgt, C_GOLD_DIM);
+
+    ttf_draw_string(buf, (int)w, (int)h, x + 12, y + 7, "ACTION CENTER",
+                    C_GOLD_DIM, 10);
+    ttf_draw_string(buf, (int)w, (int)h, x + AC_W - 60, y + 7,
+                    "Clear", C_TEXT_DIM, 11);
+    gfx_rect(buf, w, h, x + 10, y + AC_HEAD_H - 4, AC_W - 20, 1, 0x2A3142u);
+
+    if (notify_n == 0) {
+        ttf_draw_string(buf, (int)w, (int)h, x + 14, y + AC_HEAD_H + 8,
+                        "Nothing needs your attention", C_TEXT_DIM, 12);
+        return;
+    }
+
+    for (int i = 0; i < notify_n; i++) {
+        const notify_t *e = notify_at(i);
+        const int32_t ry = y + AC_HEAD_H + i * AC_ROW_H;
+        const uint32_t dot = e->cat == NOTE_WARN ? C_RED :
+                             e->cat == NOTE_GOOD ? C_GREEN : C_GOLD_DIM;
+        gfx_circle(buf, w, h, x + 16, ry + 12, 3, dot);
+        ttf_draw_string_clip(buf, (int)w, (int)h, x + 28, ry + 4, e->text,
+                             i < notify_unread ? C_TEXT : C_TEXT_DIM, 12,
+                             x + AC_W - 52);
+        char ts[8], nb[6];
+        uint_to_str((uint32_t)e->hh, nb);
+        str_copy(ts, e->hh < 10 ? "0" : "", sizeof(ts));
+        str_append(ts, nb, sizeof(ts));
+        str_append(ts, ":", sizeof(ts));
+        uint_to_str((uint32_t)e->mm, nb);
+        if (e->mm < 10) str_append(ts, "0", sizeof(ts));
+        str_append(ts, nb, sizeof(ts));
+        ttf_draw_string(buf, (int)w, (int)h, x + AC_W - 44, ry + 5, ts,
+                        0x606878u, 11);
+        if (i + 1 < notify_n)
+            gfx_rect(buf, w, h, x + 28, ry + AC_ROW_H - 1, AC_W - 44, 1,
+                     0x1E2430u);
+    }
+}
+
+/* Returns 1 if the click belonged to the Action Center. */
+static int ac_mouse(uint32_t w, int32_t mx, int32_t my) {
+    if (ac_hit_flag(w, mx, my)) {
+        ac_open = !ac_open;
+        if (ac_open) notify_unread = 0;   /* opening it is reading it */
+        return 1;
+    }
+    if (!ac_open) return 0;
+
+    int32_t x = ac_flag_x(w) - AC_W + 60;
+    if (x + AC_W > (int32_t)w - 6) x = (int32_t)w - 6 - AC_W;
+    if (x < 6) x = 6;
+    const int32_t y = MENUBAR_H, hgt = ac_height();
+    if (mx < x || mx >= x + AC_W || my < y || my >= y + hgt) {
+        ac_open = 0;
+        return 1;                         /* dismissing consumes the click */
+    }
+    if (my < y + AC_HEAD_H && mx >= x + AC_W - 64) {
+        notify_clear();
+        ac_open = 0;
+    }
+    return 1;
+}
+
 static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
                          int32_t mx, int32_t my) {
     gfx_rect(buf, w, h, 0, 0, (int32_t)w, MENUBAR_H, C_BG_PANEL);
@@ -2029,6 +2187,10 @@ static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
             up = (status & E1000_STATUS_LU) ? 1 : 0;
         }
         gfx_circle(buf, w, h, x, MENUBAR_H / 2, 4, up ? C_GREEN : 0x555C6Eu);
+
+        x -= 26;
+        ac_flag_px = x;
+        ac_draw_flag(buf, w, h, mx, my);
     }
 }
 
@@ -2108,7 +2270,7 @@ typedef struct {
 
 static const int dock_base_kinds[DOCK_BASE_COUNT] = {
     WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_IMAGE, WK_WIKI, WK_PAINT,
-    WK_SYSMON, WK_MATRIX, WK_HELLO, WK_SETTINGS,
+    WK_SYSMON, WK_MATRIX, WK_HELLO, WK_CALC, WK_SETTINGS,
 };
 
 static dock_item_t dock_items[DOCK_MAX_ITEMS];
@@ -2182,6 +2344,17 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
     int32_t q = sz / 4;
 
     switch (kind) {
+    case WK_CALC: {
+        /* a keypad: the outline of the case and a four-by-four of keys */
+        gfx_rect_outline(buf, w, h, cx - q - 2, cy - q * 2 + 2,
+                         q * 2 + 4, q * 4 - 4, C_GOLD);
+        gfx_rect(buf, w, h, cx - q, cy - q * 2 + 4, q * 2, q - 1, C_GOLD_DIM);
+        for (int r = 0; r < 2; r++)
+            for (int c = 0; c < 3; c++)
+                gfx_rect(buf, w, h, cx - q + c * (q * 2 / 3), cy + r * (q - 1),
+                         q / 2, q / 2, C_GOLD);
+        break;
+    }
     case WK_TERM:
         mono_text(buf, w, h, x + q / 2 + 2, cy - 4, ">_", C_GOLD, 1);
         break;
@@ -2704,6 +2877,7 @@ static int desktop_open_app_by_name(const char *name) {
 
 /* Route one keyboard character to the focused window */
 static void desktop_key_input(char ch) {
+    dim_wake();
     if (menu_open_valid()) {
         /*
          * With the Apps menu open the keyboard belongs to its search
@@ -2741,6 +2915,12 @@ static void desktop_key_input(char ch) {
             search_q[search_q_n] = '\0';
             search_run();
         }
+        return;
+    }
+    if (wm_focus == WK_CALC) {
+        /* The keypad and the keyboard are the same machine, so the
+         * calculator takes the raw character and decides itself. */
+        calc_key(ch);
         return;
     }
     if (wm_focus == WK_TERM) {
@@ -2945,6 +3125,22 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
         }
     }
 
+    /*
+     * Link state, watched here because nothing else notices it changing.
+     * Only transitions are reported; the state itself is already on the
+     * menubar and in the Network gadget.
+     */
+    {
+        static int link_was = -1;
+        const int link_now = e1000_found &&
+            (e1000_read(E1000_STATUS) & E1000_STATUS_LU) != 0;
+        if (link_was >= 0 && link_now != link_was)
+            notify_push(link_now ? NOTE_GOOD : NOTE_WARN,
+                        link_now ? "Network cable connected"
+                                 : "Network cable disconnected");
+        link_was = link_now;
+    }
+
     /* async engines */
     term_async_poll();
     brw_poll();
@@ -2968,15 +3164,29 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
                 ai_choice_save(1);
                 ai_autoload_start();
                 serial_puts("[ai] enabled by the user\n");
+                notify_push(NOTE_INFO, "Language model enabled; loading weights");
             } else if (ai_dialog_hit(mx, my, w, h, 0)) {
                 ai_choice_save(0);
                 serial_puts("[ai] declined; model not loaded\n");
+                notify_push(NOTE_INFO, "Language model left off");
             }
         }
         return;                      /* nothing else runs while it is up */
     }
 
     /* ---- input ---- */
+    /* Anything the hand does counts as presence. Comparing against the
+     * last frame rather than watching for events, because this is the
+     * only place both the pointer and the buttons are visible. */
+    {
+        static int32_t last_mx = -1, last_my = -1;
+        static uint8_t last_btn = 0;
+        if (mx != last_mx || my != last_my || buttons != last_btn) {
+            dim_wake();
+            last_mx = mx; last_my = my; last_btn = buttons;
+        }
+    }
+
     uint8_t lmb = buttons & 1;
     uint8_t rmb = (buttons >> 1) & 1;
 
@@ -2992,6 +3202,8 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     int consumed = 0;
     if (jl_open >= 0 && lmb && !desk_prev_lmb)
         consumed = jl_click(mx, my);
+    if (!consumed && lmb && !desk_prev_lmb)
+        consumed = ac_mouse(w, mx, my);
     if (!consumed)
         consumed = menu_mouse(mx, my, lmb, desk_prev_lmb);
     if (!consumed)
@@ -3044,8 +3256,18 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     aero_peek_draw(buf, w, h);        /* over the stack, under the chrome */
     menubar_draw(buf, w, h, mx, my);
     menu_dropdown_draw(buf, w, h, mx, my);
+    ac_draw_panel(buf, w, h);
     dock_draw(buf, w, h, mx, my);
     jl_draw(buf, w, h, mx, my);       /* over the taskbar it belongs to */
+
+    /* Last of all, so it dims the finished frame including the chrome --
+     * a menubar left at full brightness over a dimmed desktop would look
+     * like a fault rather than a setting. */
+    {
+        const uint32_t d = dim_step();
+        if (d) gfx_rect_blend(buf, w, h, 0, 0, (int32_t)w, (int32_t)h,
+                              0x000000u, d);
+    }
 }
 
 
@@ -3085,7 +3307,10 @@ static void session_end(void) {
     aero_snap_hint = SNAP_NONE;
     aero_shake_reset();
     jl_open = -1;
+    ac_open = 0;
+    notify_clear();
     recent_clear_all();
+    calc_clear();
 
     /* terminal: history, scrollback and working directory */
     term_hist_count = 0;

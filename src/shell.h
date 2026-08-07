@@ -195,7 +195,104 @@ static void search_clear(void) {
     search_hit_n = 0;
 }
 
-/* ===== 3. THE BUSY METER =====
+/* ===== 3. THE ACTION CENTER =====
+ *
+ * One place where the system says what it has been doing, instead of
+ * each subsystem inventing its own way to interrupt.
+ *
+ * A ring of the last NOTIFY_MAX events with a category on each, and an
+ * unread count on the menubar. Nothing here steals focus or blocks: a
+ * notification that has to be dismissed before work continues is a
+ * dialog, and dialogs are for questions, not for news.
+ *
+ * The categories are the three the flag colours itself from -- an alert
+ * has to look different from a note at a glance, or the flag says only
+ * "something happened", which the timestamp already said.
+ */
+
+/* NOTIFY_TEXT and the NOTE_* categories are declared up in desktop.h,
+ * where the subsystems that file notifications can see them. */
+#define NOTIFY_MAX 16
+
+typedef struct {
+    char    text[NOTIFY_TEXT];
+    uint8_t cat;
+    int     hh, mm;          /* when, off the clock the menubar shows */
+} notify_t;
+
+static notify_t notify_ring[NOTIFY_MAX];
+static int      notify_n = 0;        /* how many are held, <= NOTIFY_MAX */
+static int      notify_head = 0;     /* next slot to write */
+static int      notify_unread = 0;
+
+static void notify_push(int cat, const char *text) {
+    if (!text || !text[0]) return;
+    notify_t *e = &notify_ring[notify_head];
+    str_copy(e->text, text, NOTIFY_TEXT);
+    e->cat = (uint8_t)cat;
+
+    int ss, day, mon, yr;
+    rtc_read(&e->hh, &e->mm, &ss, &day, &mon, &yr);
+
+    notify_head = (notify_head + 1) % NOTIFY_MAX;
+    if (notify_n < NOTIFY_MAX) notify_n++;
+    if (notify_unread < NOTIFY_MAX) notify_unread++;
+}
+
+/* Newest first, which is the order they are read in. */
+static const notify_t *notify_at(int i) {
+    if (i < 0 || i >= notify_n) return 0;
+    int idx = notify_head - 1 - i;
+    while (idx < 0) idx += NOTIFY_MAX;
+    return &notify_ring[idx];
+}
+
+static void notify_clear(void) {
+    notify_n = 0;
+    notify_head = 0;
+    notify_unread = 0;
+}
+
+/* ===== 4. IDLE DIMMING =====
+ *
+ * A screen nobody is looking at does not need to be at full brightness.
+ * After DIM_IDLE seconds without a pointer move, a click or a keystroke
+ * the frame fades down, and the first input brings it straight back.
+ *
+ * There is no backlight to turn down here -- this is a blend towards
+ * black over the composited frame, which is the only lever a framebuffer
+ * gives you. It still saves real work downstream: once the fade settles,
+ * every frame is identical to the last, so the flip's row diff finds
+ * nothing to send to the panel.
+ *
+ * The wake ramp is four times the sleep ramp. Fading away slowly is
+ * calm; coming back slowly is the machine feeling unresponsive.
+ */
+
+#define DIM_IDLE_SECS 90
+#define DIM_RAMP      48       /* frames to fade all the way down */
+#define DIM_DEPTH     168      /* how black it gets, 0..255 */
+
+static uint32_t dim_last_input = 0;
+static int32_t  dim_t = 0;
+
+static void dim_wake(void) {
+    dim_last_input = desktop_tick;
+}
+
+/* Returns how dark the frame should be, 0..255. */
+static uint32_t dim_step(void) {
+    const uint32_t idle = desktop_tick - dim_last_input;
+    if (idle > (uint32_t)DIM_IDLE_SECS * 60u) {
+        if (dim_t < DIM_RAMP) dim_t++;
+    } else {
+        dim_t -= 4;
+        if (dim_t < 0) dim_t = 0;
+    }
+    return (uint32_t)(dim_t * DIM_DEPTH / DIM_RAMP);
+}
+
+/* ===== 5. THE BUSY METER =====
  *
  * The render loop already counts cycles spent compositing, flipping and
  * idling, to report them on the serial line. Turning that into one

@@ -488,6 +488,12 @@ static int store_commit(store_pkg_t *p, const uint8_t *data, uint32_t len) {
     char sz[16];
     store_size_str(len, sz);
     store_say2("Installed ", p->name, 3);
+    {
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Installed ", sizeof(note));
+        str_append(note, p->name, sizeof(note));
+        notify_push(NOTE_GOOD, note);
+    }
     str_append(store_status, " (", sizeof(store_status));
     str_append(store_status, sz, sizeof(store_status));
     str_append(store_status, ") to ", sizeof(store_status));
