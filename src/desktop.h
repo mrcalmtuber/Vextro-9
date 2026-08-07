@@ -27,8 +27,30 @@
 
 /* ===== 1. GLOBALS ===== */
 
-#define MENUBAR_H   30
-#define WIN_TITLE_H 26
+/* ===== THE GRID =====
+ *
+ * Chrome heights and window sizes were whatever number looked about
+ * right when each was written -- 30 here, 26 there, 470 somewhere else --
+ * and nothing lined up with anything. A menubar 30 tall against a title
+ * bar 26 puts every window's content on a different odd offset, and the
+ * eye reads that as sloppiness long before it can say why.
+ *
+ * So one number governs all of it. UI_SNAP rounds to the nearest 8 at
+ * compile time -- the operand is always a literal, so the AND folds away
+ * and this costs nothing at runtime -- and everything laid out below is
+ * declared through it rather than adjusted by hand to agree.
+ *
+ * Eight because the font is 13 px on 8 px metrics and the icon grid is
+ * already a multiple of it, so snapping to 8 moves the fewest things.
+ * Dimensions only: negative operands would need a different rounding and
+ * there are none here.
+ */
+#define UI_GRID       8
+#define UI_SNAP(v)    (((v) + (UI_GRID / 2)) & ~(UI_GRID - 1))
+#define UI_SNAP_UP(v) (((v) + UI_GRID - 1) & ~(UI_GRID - 1))
+
+#define MENUBAR_H   UI_SNAP(30)      /* 32 */
+#define WIN_TITLE_H UI_SNAP(26)      /* 24 */
 #define WIN_BORDER  1
 
 static uint32_t desktop_tick = 0;
@@ -95,21 +117,21 @@ typedef struct {
 } wk_meta_t;
 
 static const wk_meta_t wk_meta[WK_COUNT] = {
-    { "Terminal",         740, 480 },
-    { "Socrates Browser", 800, 560 },
-    { "Files",            600, 430 },
-    { "Goldsmith",        640, 470 },
-    { "Monolith",         400, 480 },
-    { "Matrix",           620, 420 },
-    { "hello",            600, 430 },
-    { "Agora App Store",  720, 520 },
-    { "Photos",           760, 560 },
+    { "Terminal",          UI_SNAP(740), UI_SNAP(480) },
+    { "Socrates Browser",  UI_SNAP(800), UI_SNAP(560) },
+    { "Files",             UI_SNAP(600), UI_SNAP(430) },
+    { "Goldsmith",         UI_SNAP(640), UI_SNAP(470) },
+    { "Monolith",          UI_SNAP(400), UI_SNAP(480) },
+    { "Matrix",            UI_SNAP(620), UI_SNAP(420) },
+    { "hello",             UI_SNAP(600), UI_SNAP(430) },
+    { "Agora App Store",   UI_SNAP(720), UI_SNAP(520) },
+    { "Photos",            UI_SNAP(760), UI_SNAP(560) },
     /* Wide enough to read prose in: articles are laid out in this window
      * now rather than handed to the browser, and 520 was a search box. */
-    { "Wikipedia",        780, 580 },
+    { "Wikipedia",         UI_SNAP(780), UI_SNAP(580) },
     /* Taller since the Users pane joined it. */
-    { "Settings",         470, 560 },
-    { "About Socrates",   380, 270 },
+    { "Settings",          UI_SNAP(470), UI_SNAP(560) },
+    { "About Socrates",    UI_SNAP(380), UI_SNAP(270) },
 };
 
 /* ===== 2. TARFS ===== */
@@ -1216,11 +1238,24 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
     }
 }
 
+/*
+ * Every window, bottom of the stack upward.
+ *
+ * Shadow, frame, content -- in that order and per window, not shadows for
+ * all of them and then frames for all of them. Drawn in one pass over the
+ * stack, a window's shadow lands on whatever is already beneath it and is
+ * then covered by whatever is drawn after, which is what makes the stack
+ * read as a stack. Hoisting the shadows into a pass of their own would
+ * put the topmost window's shadow underneath every other window, which is
+ * exactly the depth cue inverted.
+ */
 static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
     for (int i = 0; i < wm_stack_n; i++) {
         int kind = wm_stack[i];
         if (spawn_anim.active && spawn_anim.kind == kind)
             continue;   /* revealed when the animation lands */
+        const win_t *win = &wins[kind];
+        gfx_shadow(buf, w, h, win->x, win->y, win->w, win->h);
         wm_draw_frame(buf, w, h, kind);
         wm_draw_content(buf, w, h, kind);
     }
@@ -1279,73 +1314,90 @@ static int      wall_cur_theme = 0;
 static uint32_t wall_gen_w = 0;
 static uint32_t wall_gen_h = 0;
 
+/*
+ * The dragon.
+ *
+ * Placed and scaled by the caller rather than centred on the buffer,
+ * because there are two of them now: the wallpaper draws it full size in
+ * the middle of the screen, and the boot animation draws it half size and
+ * off to the left, so its head has somewhere to breathe. Same polygons
+ * either way -- the thing on the login screen's other side is the same
+ * drawing, not a second one that has to be kept in step.
+ *
+ * num/den scale every coordinate about (cx,cy); pass 1,1 for full size.
+ */
 static void wall_dragon(uint32_t *buf, uint32_t w, uint32_t h,
+                        int cx, int cy, int num, int den,
                         uint32_t body, uint32_t accent, uint32_t bright) {
-    int cx = (int)w / 2;
-    int cy = ((int)h + MENUBAR_H) / 2;
+#define DX(v) (cx + ((v) * num) / den)
+#define DY(v) (cy + ((v) * num) / den)
+#define DW(v) (((v) * num) / den < 1 ? 1 : ((v) * num) / den)
 
     /* wing */
-    gfx_tri(buf, w, h, cx+80,cy-50,  cx-300,cy-350, cx-20,cy-35,   body);
-    gfx_tri(buf, w, h, cx-20,cy-35,  cx-300,cy-350, cx-360,cy-15,  body);
-    gfx_tri(buf, w, h, cx-300,cy-350, cx-360,cy-15, cx-400,cy-120, body);
-    gfx_line(buf, w, h, cx+60,cy-45,  cx-280,cy-330, 2, accent);
-    gfx_line(buf, w, h, cx+60,cy-45,  cx-380,cy-100, 2, accent);
-    gfx_line(buf, w, h, cx-340,cy-10, cx-380,cy-100, 2, accent);
+    gfx_tri(buf, w, h, DX(+80),DY(-50),  DX(-300),DY(-350), DX(-20),DY(-35),   body);
+    gfx_tri(buf, w, h, DX(-20),DY(-35),  DX(-300),DY(-350), DX(-360),DY(-15),  body);
+    gfx_tri(buf, w, h, DX(-300),DY(-350), DX(-360),DY(-15), DX(-400),DY(-120), body);
+    gfx_line(buf, w, h, DX(+60),DY(-45),  DX(-280),DY(-330), DW(2), accent);
+    gfx_line(buf, w, h, DX(+60),DY(-45),  DX(-380),DY(-100), DW(2), accent);
+    gfx_line(buf, w, h, DX(-340),DY(-10), DX(-380),DY(-100), DW(2), accent);
 
     /* tail */
-    gfx_tri(buf, w, h, cx-180,cy+20,  cx-160,cy+120, cx-290,cy+80,  body);
-    gfx_tri(buf, w, h, cx-180,cy+20,  cx-290,cy+80,  cx-420,cy+50,  body);
-    gfx_tri(buf, w, h, cx-290,cy+80,  cx-420,cy+50,  cx-480,cy-50,  body);
-    gfx_tri(buf, w, h, cx-460,cy-40,  cx-485,cy-25,  cx-465,cy+5,   accent);
+    gfx_tri(buf, w, h, DX(-180),DY(+20),  DX(-160),DY(+120), DX(-290),DY(+80),  body);
+    gfx_tri(buf, w, h, DX(-180),DY(+20),  DX(-290),DY(+80),  DX(-420),DY(+50),  body);
+    gfx_tri(buf, w, h, DX(-290),DY(+80),  DX(-420),DY(+50),  DX(-480),DY(-50),  body);
+    gfx_tri(buf, w, h, DX(-460),DY(-40),  DX(-485),DY(-25),  DX(-465),DY(+5),   accent);
 
     /* body */
-    gfx_tri(buf, w, h, cx+80,cy-50,   cx+130,cy+80,  cx-20,cy-35,   body);
-    gfx_tri(buf, w, h, cx+130,cy+80,  cx-20,cy-35,   cx+80,cy+100,  body);
-    gfx_tri(buf, w, h, cx-20,cy-35,   cx+80,cy+100,  cx-180,cy+20,  body);
-    gfx_tri(buf, w, h, cx+80,cy+100,  cx-180,cy+20,  cx-120,cy+140, body);
-    gfx_tri(buf, w, h, cx-180,cy+20,  cx-120,cy+140, cx-160,cy+120, body);
+    gfx_tri(buf, w, h, DX(+80),DY(-50),   DX(+130),DY(+80),  DX(-20),DY(-35),   body);
+    gfx_tri(buf, w, h, DX(+130),DY(+80),  DX(-20),DY(-35),   DX(+80),DY(+100),  body);
+    gfx_tri(buf, w, h, DX(-20),DY(-35),   DX(+80),DY(+100),  DX(-180),DY(+20),  body);
+    gfx_tri(buf, w, h, DX(+80),DY(+100),  DX(-180),DY(+20),  DX(-120),DY(+140), body);
+    gfx_tri(buf, w, h, DX(-180),DY(+20),  DX(-120),DY(+140), DX(-160),DY(+120), body);
 
     /* neck + head */
-    gfx_tri(buf, w, h, cx+190,cy-95,  cx+340,cy+25,  cx+80,cy-50,   body);
-    gfx_tri(buf, w, h, cx+340,cy+25,  cx+80,cy-50,   cx+130,cy+80,  body);
-    gfx_tri(buf, w, h, cx+260,cy-210, cx+400,cy-30,  cx+190,cy-95,  body);
-    gfx_tri(buf, w, h, cx+400,cy-30,  cx+190,cy-95,  cx+340,cy+25,  body);
-    gfx_tri(buf, w, h, cx+400,cy-30,  cx+340,cy+25,  cx+390,cy+60,  body);
+    gfx_tri(buf, w, h, DX(+190),DY(-95),  DX(+340),DY(+25),  DX(+80),DY(-50),   body);
+    gfx_tri(buf, w, h, DX(+340),DY(+25),  DX(+80),DY(-50),   DX(+130),DY(+80),  body);
+    gfx_tri(buf, w, h, DX(+260),DY(-210), DX(+400),DY(-30),  DX(+190),DY(-95),  body);
+    gfx_tri(buf, w, h, DX(+400),DY(-30),  DX(+190),DY(-95),  DX(+340),DY(+25),  body);
+    gfx_tri(buf, w, h, DX(+400),DY(-30),  DX(+340),DY(+25),  DX(+390),DY(+60),  body);
 
     /* horns */
-    gfx_tri(buf, w, h, cx+255,cy-205, cx+225,cy-320, cx+200,cy-180, body);
-    gfx_tri(buf, w, h, cx+185,cy-175, cx+150,cy-290, cx+150,cy-150, body);
-    gfx_tri(buf, w, h, cx+225,cy-320, cx+240,cy-270, cx+210,cy-265, accent);
-    gfx_tri(buf, w, h, cx+150,cy-290, cx+165,cy-245, cx+135,cy-240, accent);
+    gfx_tri(buf, w, h, DX(+255),DY(-205), DX(+225),DY(-320), DX(+200),DY(-180), body);
+    gfx_tri(buf, w, h, DX(+185),DY(-175), DX(+150),DY(-290), DX(+150),DY(-150), body);
+    gfx_tri(buf, w, h, DX(+225),DY(-320), DX(+240),DY(-270), DX(+210),DY(-265), accent);
+    gfx_tri(buf, w, h, DX(+150),DY(-290), DX(+165),DY(-245), DX(+135),DY(-240), accent);
 
     /* eye */
-    gfx_tri(buf, w, h, cx+340,cy-80,  cx+352,cy-60,  cx+340,cy-40,  bright);
-    gfx_tri(buf, w, h, cx+340,cy-80,  cx+328,cy-60,  cx+340,cy-40,  bright);
+    gfx_tri(buf, w, h, DX(+340),DY(-80),  DX(+352),DY(-60),  DX(+340),DY(-40),  bright);
+    gfx_tri(buf, w, h, DX(+340),DY(-80),  DX(+328),DY(-60),  DX(+340),DY(-40),  bright);
 
     /* spine ridges */
-    gfx_tri(buf, w, h, cx+55,cy-53,   cx+40,cy-78,   cx+25,cy-53,   accent);
-    gfx_tri(buf, w, h, cx+15,cy-42,   cx+0,cy-65,    cx-15,cy-42,   accent);
-    gfx_tri(buf, w, h, cx-25,cy-38,   cx-40,cy-58,   cx-55,cy-38,   accent);
-    gfx_tri(buf, w, h, cx-70,cy-25,   cx-85,cy-45,   cx-100,cy-25,  accent);
-    gfx_tri(buf, w, h, cx-115,cy-12,  cx-130,cy-32,  cx-145,cy-12,  accent);
+    gfx_tri(buf, w, h, DX(+55),DY(-53),   DX(+40),DY(-78),   DX(+25),DY(-53),   accent);
+    gfx_tri(buf, w, h, DX(+15),DY(-42),   DX(+0),DY(-65),    DX(-15),DY(-42),   accent);
+    gfx_tri(buf, w, h, DX(-25),DY(-38),   DX(-40),DY(-58),   DX(-55),DY(-38),   accent);
+    gfx_tri(buf, w, h, DX(-70),DY(-25),   DX(-85),DY(-45),   DX(-100),DY(-25),  accent);
+    gfx_tri(buf, w, h, DX(-115),DY(-12),  DX(-130),DY(-32),  DX(-145),DY(-12),  accent);
 
     /* belly scales */
-    gfx_tri(buf, w, h, cx+100,cy+95,  cx+80,cy+112,  cx+100,cy+112, accent);
-    gfx_tri(buf, w, h, cx+65,cy+110,  cx+45,cy+125,  cx+65,cy+125,  accent);
-    gfx_tri(buf, w, h, cx+30,cy+122,  cx+10,cy+136,  cx+30,cy+136,  accent);
-    gfx_tri(buf, w, h, cx-5,cy+132,   cx-25,cy+145,  cx-5,cy+145,   accent);
+    gfx_tri(buf, w, h, DX(+100),DY(+95),  DX(+80),DY(+112),  DX(+100),DY(+112), accent);
+    gfx_tri(buf, w, h, DX(+65),DY(+110),  DX(+45),DY(+125),  DX(+65),DY(+125),  accent);
+    gfx_tri(buf, w, h, DX(+30),DY(+122),  DX(+10),DY(+136),  DX(+30),DY(+136),  accent);
+    gfx_tri(buf, w, h, DX(-5),DY(+132),   DX(-25),DY(+145),  DX(-5),DY(+145),   accent);
 
     /* legs + claws */
-    gfx_line(buf, w, h, cx+90,cy+95,   cx+140,cy+220, 5, body);
-    gfx_line(buf, w, h, cx+140,cy+220, cx+110,cy+300, 4, body);
-    gfx_line(buf, w, h, cx-100,cy+130, cx-80,cy+230,  5, body);
-    gfx_line(buf, w, h, cx-80,cy+230,  cx-120,cy+300, 4, body);
-    gfx_tri(buf, w, h, cx+110,cy+298, cx+95,cy+318,  cx+108,cy+318, accent);
-    gfx_tri(buf, w, h, cx+110,cy+298, cx+112,cy+320, cx+122,cy+315, accent);
-    gfx_tri(buf, w, h, cx+110,cy+298, cx+128,cy+312, cx+132,cy+302, accent);
-    gfx_tri(buf, w, h, cx-120,cy+298, cx-135,cy+318, cx-122,cy+318, accent);
-    gfx_tri(buf, w, h, cx-120,cy+298, cx-118,cy+320, cx-108,cy+315, accent);
-    gfx_tri(buf, w, h, cx-120,cy+298, cx-102,cy+312, cx-98,cy+302,  accent);
+    gfx_line(buf, w, h, DX(+90),DY(+95),   DX(+140),DY(+220), DW(5), body);
+    gfx_line(buf, w, h, DX(+140),DY(+220), DX(+110),DY(+300), DW(4), body);
+    gfx_line(buf, w, h, DX(-100),DY(+130), DX(-80),DY(+230),   DW(5), body);
+    gfx_line(buf, w, h, DX(-80),DY(+230),  DX(-120),DY(+300), DW(4), body);
+    gfx_tri(buf, w, h, DX(+110),DY(+298), DX(+95),DY(+318),  DX(+108),DY(+318), accent);
+    gfx_tri(buf, w, h, DX(+110),DY(+298), DX(+112),DY(+320), DX(+122),DY(+315), accent);
+    gfx_tri(buf, w, h, DX(+110),DY(+298), DX(+128),DY(+312), DX(+132),DY(+302), accent);
+    gfx_tri(buf, w, h, DX(-120),DY(+298), DX(-135),DY(+318), DX(-122),DY(+318), accent);
+    gfx_tri(buf, w, h, DX(-120),DY(+298), DX(-118),DY(+320), DX(-108),DY(+315), accent);
+    gfx_tri(buf, w, h, DX(-120),DY(+298), DX(-102),DY(+312), DX(-98),DY(+302),  accent);
+#undef DX
+#undef DY
+#undef DW
 }
 
 static void wallpaper_regen(uint32_t w, uint32_t h) {
@@ -1368,7 +1420,8 @@ static void wallpaper_regen(uint32_t w, uint32_t h) {
 
     uint32_t body   = gfx_mix(0x000000u, bot, 150);
     uint32_t accent = C_GOLD_DIM;
-    wall_dragon(wallpaper, w, h, body, accent, C_GOLD);
+    wall_dragon(wallpaper, w, h, (int)w / 2, ((int)h + MENUBAR_H) / 2,
+                1, 1, body, accent, C_GOLD);
 
     /* signature bottom-left */
     ttf_draw_string(wallpaper, (int)w, (int)h, 24, (int)h - 46,
@@ -2197,7 +2250,27 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     wm_update(mx, my, lmb, desk_prev_lmb, consumed);
     desk_prev_lmb = lmb;
 
-    /* ---- draw ---- */
+    /*
+     * ---- draw ----
+     *
+     * One pass, back to front, into the back buffer -- never into the
+     * panel. Order is the whole of it:
+     *
+     *   the wallpaper clears the frame, which is why there is no separate
+     *     clear: every pixel is written, so clearing first would be a
+     *     second full-screen write for nothing;
+     *   then the window stack, each window casting its shadow onto what
+     *     is already under it before its own frame and content go down;
+     *   then the chrome, which is always on top of every window;
+     *   and the pointer, which is composited inside the flip rather than
+     *     here -- see vga_flip -- because drawing it into this buffer is
+     *     what made it shimmer.
+     *
+     * The frame reaches the panel from vga_flip, which diffs against the
+     * previous one and writes only the rows that changed, through the
+     * Gen9 blitter where there is one and a plain copy where there is
+     * not.
+     */
     for (uint32_t i = 0; i < w * h; i++)
         buf[i] = wallpaper[i];
 

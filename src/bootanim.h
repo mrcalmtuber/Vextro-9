@@ -21,200 +21,324 @@
  *
  * ---- what it draws ----
  *
- * A sheet of liquid glass slides across the mark, left to right, and the
- * mark is only ever seen through it. That is a deliberate choice and not
- * only an aesthetic one: the simulation runs at a fraction of the panel's
- * resolution and is scaled up, so there is no fine detail to lose behind
- * the refraction. What would be a limitation in a photograph is the
- * subject here.
+ * The dragon off the desktop wallpaper draws breath and sets fire to the
+ * screen, and the screen burns away to nothing, and then you log in.
  *
- * The glass is four travelling waves at different orientations, speeds
- * and wavelengths -- x, y, x+y and x-y. Four is the smallest number that
- * stops the interference pattern reading as a grid, and because each one
- * varies along a single axis, all four are one-dimensional tables rebuilt
- * once per frame and then only indexed per pixel. The inner loop does no
- * trigonometry at all.
+ * It is the same dragon. wall_dragon() takes a centre and a scale now, so
+ * the wallpaper draws it full size in the middle and this draws it half
+ * size and left of centre, from one set of polygons. The alternative --
+ * a second dragon that has to be kept in step with the first -- is how
+ * two drawings of the same thing slowly stop being the same thing.
  *
- * From those tables come the two things that make glass look like glass:
+ * Two coupled fields do the work, and they are deliberately different
+ * mechanisms because they are different phenomena:
  *
- *   the slope of the surface, which bends what is behind it -- the mark
- *   is sampled at an offset proportional to the gradient, so it swims;
+ *   FIRE is advected. Each cell pulls heat from the cell to its left and
+ *   the cells below, so heat streams away from the mouth and rises, and a
+ *   little noise per cell keeps the flame from looking laminar. The mix
+ *   between "left" and "below" shifts over the sequence: the jet leaves
+ *   the mouth almost flat, and once the breath stops what is left of it
+ *   turns upward and gutters out, which is what fire does.
  *
- *   and the same slope against a light direction, which is the highlight
- *   that runs along a moving surface and is most of what the eye reads as
- *   "wet".
+ *   THE BURN is a front. Fire is not what destroys the screen -- the
+ *   thing fire leaves behind is -- so the burn is a separate field that
+ *   ignites where the jet lands and then eats outward on its own, with a
+ *   bright ember rim and cold char behind it. It spreads in a distance
+ *   metric squashed along x, so it runs ahead of itself in the direction
+ *   the breath went.
  *
- * The leading edge carries a brighter flare, so the sheet has a front
- * rather than simply fading in. After it has crossed, the amplitude
- * decays and the mark settles.
+ * Neither needs a square root. The burn front compares squared distance
+ * against a squared radius, perturbed per cell by a tiled noise field,
+ * which is what makes its edge ragged instead of a circle -- a perfect
+ * circle expanding out of a dragon's mouth reads as a shockwave, not as
+ * something catching light.
  *
  * ---- constraints ----
  *
  * Integer only, like everything else in this kernel: the 360-entry sine
- * table at 1024 scale is the only source of curves, and every divide is a
- * shift. This runs before fpu_init(), before the IDT exists and before
- * any driver has been probed, so it can depend on nothing but the
- * framebuffer it is given.
+ * table at 1024 scale is the only source of curves, and every divide by a
+ * constant is a shift. This runs before fpu_init(), before the IDT exists
+ * and before any driver has been probed, so it can depend on nothing but
+ * the framebuffer it is given.
  *
- * Include after ttf.h: the wordmark is set in the system's own face.
+ * Include after desktop.h -- it borrows the dragon -- and after ttf.h,
+ * because the wordmark is set in the system's own face.
  */
 
-#define BA_MAXW   640
-#define BA_MAXH   400
+#define BA_W      640          /* simulation grid */
+#define BA_H      400
 #define BA_FRAMES 120          /* 5 seconds at 24 fps */
 
-#define BA_GOLD_R 0xD4         /* C_GOLD, spelled out: gfx.h may not be */
-#define BA_GOLD_G 0xAF         /* included yet where this is used       */
-#define BA_GOLD_B 0x37
+#define BA_GOLD_R 0xD4         /* C_GOLD, spelled out: this has to work  */
+#define BA_GOLD_G 0xAF         /* whatever else has or has not been      */
+#define BA_GOLD_B 0x37         /* included by the time it is used        */
 
-/* The mark, drawn once. Stride is ba_w, not BA_MAXW. */
-static uint32_t ba_bg[BA_MAXW * BA_MAXH];
+/* The scene before anything happens to it: dragon, wordmark, ground. */
+static uint32_t ba_bg[BA_W * BA_H];
 
-static int ba_w = 320, ba_h = 200;    /* simulation size  */
-static int ba_scale = 1;              /* integer upscale  */
-static int ba_offx = 0, ba_offy = 0;  /* centring         */
+/* Fire, and what fire leaves. 0 in ba_burn means untouched; otherwise it
+ * counts down from ignition, so one byte carries both "is it burnt" and
+ * "how recently", which is what the ember rim is drawn from. */
+static uint8_t ba_heat[BA_W * BA_H];
+static uint8_t ba_burn[BA_W * BA_H];
 
-/*
- * Per-frame wave tables. Height and slope for each of the four
- * orientations; the diagonals are indexed by x+y and by x-y+ba_h, so both
- * need ba_w + ba_h entries.
- */
-static int16_t ba_hx[BA_MAXW], ba_gxt[BA_MAXW];
-static int16_t ba_hy[BA_MAXH], ba_gyt[BA_MAXH];
-/*
- * The diagonals are read at a warped index -- see ba_render -- so they are
- * built over a wider range than the screen needs and addressed with a
- * bias. Sizing the table for the warp instead of clamping every lookup
- * keeps two compares out of the inner loop.
- */
-#define BA_BIAS 128
-#define BA_DIAG (BA_MAXW + BA_MAXH + 2 * BA_BIAS)
+/* Ragged edge for the burn front. Tiled rather than per-pixel: 16 KB
+ * against 256 KB, and at 128 across the repeat never lands twice inside
+ * one flame. It has to be stable frame to frame or the edge boils. */
+#define BA_NOISE 128
+static uint8_t ba_noise[BA_NOISE * BA_NOISE];
 
-static int16_t ba_hd[BA_DIAG], ba_gdt[BA_DIAG];
-static int16_t ba_he[BA_DIAG], ba_get[BA_DIAG];
+/* Heat to colour. Black, through the reds, into orange, yellow and white,
+ * built once because a 256-entry table is cheaper than deciding this per
+ * pixel per frame and far easier to tune. */
+static uint32_t ba_pal[256];
 
-/* How much glass covers each column this frame, and the flare at its
- * leading edge. Both vary along x alone. */
-static int16_t ba_env[BA_MAXW], ba_flare[BA_MAXW];
+static int ba_scale = 1;              /* integer upscale to the panel */
+static int ba_offx = 0, ba_offy = 0;  /* centring                     */
+static int ba_mx = 0, ba_my = 0;      /* the mouth: origin of all of it */
 
-static inline int32_t ba_sin(int32_t d) {
-    d %= 360; if (d < 0) d += 360;
-    return int_sin[d];
-}
-static inline int32_t ba_cos(int32_t d) {
-    d %= 360; if (d < 0) d += 360;
-    return int_cos[d];
+static uint32_t ba_rng = 0x1BADB002u;
+static inline uint32_t ba_rand(void) {
+    ba_rng ^= ba_rng << 13;
+    ba_rng ^= ba_rng >> 17;
+    ba_rng ^= ba_rng << 5;
+    return ba_rng;
 }
 
 static inline int32_t ba_clampi(int32_t v, int32_t lo, int32_t hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* ===== the mark ===== */
+/* ===== the scene ===== */
 
-static void ba_draw_bg(void) {
-    const int w = ba_w, h = ba_h;
-    const int cx = w / 2;
-    const int cy = h * 40 / 100;
+static void ba_build_palette(void) {
+    for (int i = 0; i < 256; i++) {
+        int32_t r, g, b;
+        if (i < 32)        { r = i * 3;                  g = 0;               b = 0; }
+        else if (i < 96)   { r = 96 + (i - 32) * 159 / 64;  g = (i - 32) * 40 / 64;  b = 0; }
+        else if (i < 168)  { r = 255; g = 40 + (i - 96) * 150 / 72;  b = (i - 96) * 20 / 72; }
+        else if (i < 216)  { r = 255; g = 190 + (i - 168) * 65 / 48; b = 20 + (i - 168) * 60 / 48; }
+        else               { r = 255; g = 255; b = 80 + (i - 216) * 175 / 40; }
+        ba_pal[i] = ((uint32_t)ba_clampi(r, 0, 255) << 16) |
+                    ((uint32_t)ba_clampi(g, 0, 255) << 8) |
+                     (uint32_t)ba_clampi(b, 0, 255);
+    }
+}
 
-    /* A cold vertical gradient with a warm glow behind the mark. The
-     * falloff is quadratic rather than a real radius: a soft glow is
-     * exactly the case where nobody can tell, and it saves a square root
-     * per pixel at a point in boot where there is no FPU switched on. */
-    const int32_t glow_k = (w * w + h * h) / 900 + 1;
-
-    for (int y = 0; y < h; y++) {
-        const int32_t t = (y * 255) / (h - 1);
-        const int32_t br = 4 + ((t * 6) >> 8);
-        const int32_t bg_ = 5 + ((t * 8) >> 8);
-        const int32_t bb = 9 + ((t * 13) >> 8);
-
-        for (int x = 0; x < w; x++) {
-            const int dx = x - cx, dy = y - cy;
-            int32_t glow = 230 - (dx * dx + dy * dy) / glow_k;
-            if (glow < 0) glow = 0;
-
-            int32_t r = br + ((glow * BA_GOLD_R) >> 11);
-            int32_t g = bg_ + ((glow * BA_GOLD_G) >> 11);
-            int32_t b = bb + ((glow * BA_GOLD_B) >> 11);
-
-            ba_bg[y * w + x] = ((uint32_t)ba_clampi(r, 0, 255) << 16) |
-                               ((uint32_t)ba_clampi(g, 0, 255) << 8) |
-                                (uint32_t)ba_clampi(b, 0, 255);
-        }
+static void ba_draw_scene(void) {
+    /* A cold ground, darkest at the top, so the fire has something to be
+     * warmer than. */
+    for (int y = 0; y < BA_H; y++) {
+        const int32_t t = (y * 255) / (BA_H - 1);
+        const uint32_t c = ((uint32_t)(3 + ((t * 7) >> 8)) << 16) |
+                           ((uint32_t)(4 + ((t * 9) >> 8)) << 8) |
+                            (uint32_t)(7 + ((t * 14) >> 8));
+        for (int x = 0; x < BA_W; x++) ba_bg[y * BA_W + x] = c;
     }
 
-    /* The diamond the menubar wears, at |dx| + |dy| <= r. Hollow, because
-     * a ring catches the refraction along two edges instead of one and
-     * reads far better through moving glass than a solid does. */
-    const int dr = h / 9;
-    const int thick = dr / 4 + 1;
-    for (int y = cy - dr; y <= cy + dr; y++) {
-        if (y < 0 || y >= h) continue;
-        for (int x = cx - dr; x <= cx + dr; x++) {
-            if (x < 0 || x >= w) continue;
-            int ax = x - cx; if (ax < 0) ax = -ax;
-            int ay = y - cy; if (ay < 0) ay = -ay;
-            const int d = ax + ay;
-            if (d > dr || d < dr - thick) continue;
-            ba_bg[y * w + x] = ((uint32_t)BA_GOLD_R << 16) |
-                               ((uint32_t)BA_GOLD_G << 8) | BA_GOLD_B;
-        }
-    }
+    /*
+     * The dragon, half size and left of centre. Left because the head is
+     * on the right of the drawing and everything that happens next comes
+     * out of its mouth, so it needs room in front of it rather than
+     * behind.
+     */
+    const int cx = BA_W * 42 / 100;
+    const int cy = BA_H * 52 / 100;
+    wall_dragon(ba_bg, BA_W, BA_H, cx, cy, 1, 2,
+                0x2C3752u, 0x4A5C82u,
+                ((uint32_t)BA_GOLD_R << 16) | ((uint32_t)BA_GOLD_G << 8) | BA_GOLD_B);
 
-    /* The wordmark, in the face the system draws itself in. */
+    /* Mouth: the head's leading point in wall_dragon is (+400,-30) before
+     * scaling, and the jaw runs back from there. */
+    ba_mx = cx + 200;
+    ba_my = cy - 12;
+
+    /* The wordmark, in the face the system draws itself in, low enough
+     * that the burn reaches it late. */
     {
         const char *s = "SOCRATES BSD 9";
-        const int size = (h >= 300) ? 30 : 15;
+        const int size = 26;
         const int tw = ttf_text_width(s, size);
-        ttf_draw_string(ba_bg, w, h, (w - tw) / 2, cy + dr + h / 14,
-                        s, ((uint32_t)BA_GOLD_R << 16) |
-                           ((uint32_t)BA_GOLD_G << 8) | BA_GOLD_B, size);
+        ttf_draw_string(ba_bg, BA_W, BA_H, (BA_W - tw) / 2, BA_H - 78, s,
+                        ((uint32_t)BA_GOLD_R << 16) |
+                        ((uint32_t)BA_GOLD_G << 8) | BA_GOLD_B, size);
+    }
+}
+
+static void ba_init(int dst_w, int dst_h) {
+    ba_scale = dst_w / BA_W;
+    const int sy = dst_h / BA_H;
+    if (sy < ba_scale) ba_scale = sy;
+    if (ba_scale < 1) ba_scale = 1;    /* smaller panel: clip, do not skip */
+
+    ba_offx = (dst_w - BA_W * ba_scale) / 2;
+    ba_offy = (dst_h - BA_H * ba_scale) / 2;
+    if (ba_offx < 0) ba_offx = 0;
+    if (ba_offy < 0) ba_offy = 0;
+
+    for (int i = 0; i < BA_W * BA_H; i++) { ba_heat[i] = 0; ba_burn[i] = 0; }
+    for (int i = 0; i < BA_NOISE * BA_NOISE; i++) ba_noise[i] = (uint8_t)ba_rand();
+
+    ba_build_palette();
+    ba_draw_scene();
+}
+
+/* ===== the fire ===== */
+
+/*
+ * One step of advection.
+ *
+ * x descends and y ascends, and every read is from column x-1 or from row
+ * y+1 -- both of which this pass has not reached yet. So the whole grid
+ * is updated from the previous frame's values without a second buffer,
+ * which is 256 KB and a copy per frame saved for the price of iterating
+ * in the one order that makes it safe.
+ */
+static void ba_fire_step(int frame) {
+    /* Early the jet is flat and fast; once the breath stops what is left
+     * of it stands up and rises. */
+    int32_t rise = frame < 40 ? 1 : (frame < 76 ? 3 : 6);
+    int32_t cool = frame < 76 ? 2 : 6;
+
+    for (int x = BA_W - 1; x >= 1; x--) {
+        for (int y = 0; y < BA_H; y++) {
+            const int i = y * BA_W + x;
+
+            int32_t acc = (int32_t)ba_heat[i - 1] * (8 - rise);
+            if (y > 0)          acc += (int32_t)ba_heat[i - 1 - BA_W];
+            if (y < BA_H - 1)   acc += (int32_t)ba_heat[i - 1 + BA_W];
+            if (y < BA_H - 1)   acc += (int32_t)ba_heat[i + BA_W] * rise;
+
+            int32_t v = acc / 10 - cool;
+
+            /* Flicker, scaled by how hot the cell already is: cold air
+             * does not shimmer, and applying it flat makes a grey haze
+             * over the whole screen instead of a flame. */
+            if (v > 0) v -= (int32_t)((ba_rand() >> 24) * (uint32_t)v) >> 11;
+
+            ba_heat[i] = (uint8_t)ba_clampi(v, 0, 255);
+        }
     }
 }
 
 /*
- * Choose a simulation size for this panel and draw the mark into it.
+ * The breath.
  *
- * Two sizes rather than one: 320x200 is 16:10 and scales by a whole
- * number onto most panels, but on anything 1280x800 or larger there is
- * room for four times the detail at the same cost per output pixel, and
- * the mark is worth it. Both are exact integer upscales, so nothing is
- * ever resampled.
+ * Advection alone will not carry a jet across a screen: the flicker is
+ * multiplicative, so whatever survives one cell survives the next a
+ * little less, and the flame dies about forty cells out however hard it
+ * is thrown. So the jet is *drawn* -- a cone from the mouth, widening and
+ * cooling along its length, its axis wobbling on the sine table -- and
+ * advection is left to do what it is good at, which is smearing the edges
+ * and lifting the whole thing as it goes.
+ *
+ * Injected rather than assigned, so the fire the last frame left is not
+ * cut away by the cone this frame draws.
  */
-static void ba_init(int dst_w, int dst_h) {
-    ba_w = 320; ba_h = 200;
-    if (dst_w >= 1280 && dst_h >= 800) { ba_w = 640; ba_h = 400; }
+static void ba_breathe(int32_t strength, int32_t reach, int32_t phase) {
+    if (strength <= 0 || reach <= 0) return;
 
-    ba_scale = dst_w / ba_w;
-    const int sy = dst_h / ba_h;
-    if (sy < ba_scale) ba_scale = sy;
-    if (ba_scale < 1) {
-        /* A panel smaller than the simulation: fall back to the small
-         * one, and accept clipping rather than not drawing at all. */
-        ba_w = 320; ba_h = 200; ba_scale = 1;
+    for (int32_t t = 0; t < reach; t++) {
+        const int x = ba_mx + (int)t;
+        if (x < 0) continue;
+        if (x >= BA_W) break;
+
+        /* Broader the further it has travelled, and cooler -- but on a
+         * curve rather than a ramp. A linear falloff spends most of the
+         * jet's length lukewarm and the flame reads as a thin ribbon;
+         * holding the temperature and then dropping it late is what makes
+         * it a body of fire with a tip. */
+        const int32_t spread = 4 + t / 3;
+        const int32_t fall   = (t * t) / (reach + 1);
+        const int32_t temp   = strength - (fall * strength) / (reach + 1);
+        if (temp <= 0) break;
+
+        /* The axis is not a straight line. Amplitude grows with distance,
+         * so it leaves the mouth aimed and loses its aim downrange. */
+        const int32_t wob = (int_sin[(int)((t * 3 + phase) % 360)] * (t / 4)) >> 10;
+
+        for (int32_t dy = -spread; dy <= spread; dy++) {
+            const int y = ba_my + (int)(dy + wob);
+            if (y < 0 || y >= BA_H) continue;
+
+            int32_t v = temp - (temp * dy * dy) / (spread * spread + 1);
+            v -= (int32_t)(ba_rand() >> 26);
+            if (v <= 0) continue;
+
+            const int i = y * BA_W + x;
+            if (v > (int32_t)ba_heat[i]) ba_heat[i] = (uint8_t)ba_clampi(v, 0, 255);
+        }
     }
+}
 
-    ba_offx = (dst_w - ba_w * ba_scale) / 2;
-    ba_offy = (dst_h - ba_h * ba_scale) / 2;
-    if (ba_offx < 0) ba_offx = 0;
-    if (ba_offy < 0) ba_offy = 0;
+/* ===== the burn ===== */
 
-    ba_draw_bg();
+/*
+ * The front, as a squared radius the whole grid is tested against.
+ *
+ * Squashing dx by half means the front runs about 1.4x further along the
+ * axis the breath went, which is the difference between the screen
+ * catching fire from the flame and the screen having a circle drawn on
+ * it. R grows linearly so the front moves at a constant speed; R2 is what
+ * the test actually uses, because comparing squares costs two multiplies
+ * and taking a root costs a loop.
+ */
+static void ba_burn_step(int frame) {
+    if (frame < 34) return;
+
+    const int32_t R  = (frame - 34) * 9;
+    const int32_t R2 = R * R;
+
+    for (int y = 0; y < BA_H; y++) {
+        const int32_t dy = y - ba_my;
+        const int32_t dy2 = dy * dy;
+        const uint8_t *nrow = &ba_noise[(y & (BA_NOISE - 1)) * BA_NOISE];
+
+        for (int x = 0; x < BA_W; x++) {
+            const int i = y * BA_W + x;
+            if (ba_burn[i]) {
+                /* Ageing, and the rate is the whole character of it. At
+                 * one step a frame the ember outlives the animation and
+                 * the burnt screen just glows orange; at fourteen it is
+                 * cold char a few frames behind the front, which is
+                 * roughly what burning paper does. Never to zero, because
+                 * zero means "never burnt" and this pixel is burnt. */
+                ba_burn[i] = (uint8_t)(ba_burn[i] > 23 ? ba_burn[i] - 22 : 1);
+                continue;
+            }
+
+            const int32_t dx = x - ba_mx;
+            /*
+             * Strongly squashed downrange and not at all behind, so the
+             * front travels about two and a half times further the way
+             * the breath went. Without that bias it is a circle, and a
+             * circle means the screen behind the dragon catches light
+             * before the flame in front of it has touched anything --
+             * which is the fire and the burn plainly disagreeing about
+             * what just happened.
+             */
+            const int32_t sx = dx > 0 ? (dx * dx) / 6 : (dx * dx);
+            const int32_t d2 = sx + dy2;
+
+            /* The ragged edge, as a fraction of the radius rather than a
+             * fixed distance -- perturbing d2 by a constant makes the
+             * front a torn mess while it is small and a smooth circle
+             * once it is large. */
+            const int32_t jag = (int32_t)nrow[x & (BA_NOISE - 1)] * (R2 >> 11);
+
+            if (d2 + jag < R2 || ba_heat[i] > 120) ba_burn[i] = 255;
+        }
+    }
 }
 
 /* ===== one frame ===== */
 
-/* 4x4 ordered dither, applied at the panel's resolution rather than the
- * simulation's. The gradient behind the mark spans a handful of levels
- * over hundreds of rows, which bands visibly on a flat panel; scattering
- * the rounding error at full resolution costs one table lookup per output
- * pixel and removes it.
- *
- * Kept to a single level. The gradient steps by one at a time, so one
- * level is all that is needed to break it -- and the screen is mostly
- * near-black, where a wider spread stops being a smoothing and becomes a
- * visible weave. */
+/* 4x4 ordered dither at the panel's resolution. The ground behind the
+ * dragon spans a handful of levels over hundreds of rows, which bands
+ * visibly on a flat panel; scattering the rounding error removes it. One
+ * level is enough -- the gradient steps by one at a time, and the screen
+ * is mostly near-black, where a wider spread stops being a smoothing and
+ * becomes a visible weave. */
 static const int8_t ba_bayer[16] = {
     -1,  1, -1,  1,
      1, -1,  0, -1,
@@ -222,184 +346,84 @@ static const int8_t ba_bayer[16] = {
      0, -1,  1, -1,
 };
 
-static void ba_tables(int frame) {
-    const int32_t t = frame;
-
-    /* Amplitude: full while the sheet is crossing, then decaying to a
-     * residual shimmer rather than to nothing -- glass that has stopped
-     * moving entirely stops reading as liquid. */
-    int32_t amp = 256;
-    if (t > 62) {
-        amp = 256 - ((t - 62) * 210) / 46;
-        if (amp < 46) amp = 46;
-    }
-
-    /*
-     * Two scales, and the coupling between them is the whole trick.
-     *
-     * Four plain sine waves interfere into a lattice -- regular, obviously
-     * synthetic, and nothing like a liquid. So the first pair are slow and
-     * broad and are not really waves at all: they are a flow field, and
-     * their height is used in ba_render to displace where the second,
-     * finer pair is sampled. Bending a periodic function through another
-     * periodic function is what breaks the repeat and gives the surface
-     * something to flow along.
-     */
-    for (int x = 0; x < ba_w; x++) {
-        const int32_t p = x * 2 + t * 7;
-        ba_hx[x]  = (int16_t)((ba_sin(p) * 44 * amp) >> 16);
-        ba_gxt[x] = (int16_t)((ba_cos(p) * 7 * amp) >> 16);
-    }
-    for (int y = 0; y < ba_h; y++) {
-        const int32_t p = y * 3 - t * 5;
-        ba_hy[y]  = (int16_t)((ba_sin(p) * 38 * amp) >> 16);
-        ba_gyt[y] = (int16_t)((ba_cos(p) * 7 * amp) >> 16);
-    }
-    const int n = ba_w + ba_h + 2 * BA_BIAS;
-    for (int i = 0; i < n; i++) {
-        const int32_t j = i - BA_BIAS;
-        const int32_t p1 = j * 9 + t * 11;
-        ba_hd[i]  = (int16_t)((ba_sin(p1) * 10 * amp) >> 16);
-        ba_gdt[i] = (int16_t)((ba_cos(p1) * 15 * amp) >> 16);
-        const int32_t p2 = j * 13 - t * 8;
-        ba_he[i]  = (int16_t)((ba_sin(p2) * 8 * amp) >> 16);
-        ba_get[i] = (int16_t)((ba_cos(p2) * 13 * amp) >> 16);
-    }
-
-    /*
-     * The sheet's leading edge, sweeping past the right-hand side by the
-     * time it has finished. The ramp behind it is what makes it a sheet
-     * arriving rather than the whole screen switching on.
-     */
-    const int32_t ramp = ba_w / 6 + 1;
-    const int32_t edge = (t * (ba_w + 2 * ramp)) / 60 - ramp;
-
-    for (int x = 0; x < ba_w; x++) {
-        int32_t e = ((edge - x) * 256) / ramp;
-        ba_env[x] = (int16_t)ba_clampi(e, 0, 256);
-
-        /* A flare on the edge itself: brightest where the ramp is
-         * steepest, which is where a real sheet would catch the light. */
-        int32_t d = edge - x; if (d < 0) d = -d;
-        int32_t f = 256 - (d * 256) / (ramp / 2 + 1);
-        ba_flare[x] = (int16_t)ba_clampi(f, 0, 256);
-    }
-}
-
 /*
  * Render one frame into a 32-bit XRGB buffer.
  *
- * The caller owns presentation: the x86 tree writes straight to the
- * framebuffer and paces on the PIT, the aarch64 tree composes into its
- * back buffer and paces on the architected timer. Everything above that
- * line is the same on both, which is why it lives in one file.
+ * The caller owns presentation: both trees compose into their back buffer
+ * and blit, but they pace themselves off different clocks. Everything
+ * above that line is the same on both, which is why it lives in one file.
  */
 static void ba_render(uint32_t *dst, int stride, int frame) {
-    ba_tables(frame);
+    /* The breath: a beat of ignition at the mouth, then the jet, then it
+     * stops and the fire has to live on what it was given. */
+    int32_t jet = 0, reach = 0;
+    if (frame >= 16 && frame < 30) {          /* the intake, at the mouth */
+        jet = 70 + (frame - 16) * 13;
+        reach = 6 + (frame - 16) * 3;
+    } else if (frame >= 30 && frame < 70) {   /* the breath */
+        jet = 255;
+        reach = 48 + (frame - 30) * 9;
+        if (reach > 300) reach = 300;
+    } else if (frame >= 70 && frame < 80) {   /* and it stops */
+        jet = 255 - (frame - 70) * 25;
+        reach = 300 - (frame - 70) * 28;
+    }
 
-    /* The last stretch dims to black, so the login screen does not
-     * arrive as a cut. */
+    ba_breathe(jet, reach, frame * 11);
+    ba_fire_step(frame);
+    ba_burn_step(frame);
+
+    /* In at the start, out at the end. */
     int32_t fade = 256;
-    if (frame >= BA_FRAMES - 18)
-        fade = ((BA_FRAMES - 1 - frame) * 256) / 18;
+    if (frame < 12) fade = frame * 256 / 12;
+    else if (frame >= BA_FRAMES - 20)
+        fade = ((BA_FRAMES - 1 - frame) * 256) / 20;
 
-    const int w = ba_w, h = ba_h, sc = ba_scale;
+    const int sc = ba_scale;
 
-    for (int y = 0; y < h; y++) {
-        const int16_t gy_row = ba_gyt[y];
+    for (int y = 0; y < BA_H; y++) {
+        for (int x = 0; x < BA_W; x++) {
+            const int i = y * BA_W + x;
 
-        for (int x = 0; x < w; x++) {
-            const int32_t e = ba_env[x];
+            const uint32_t c = ba_bg[i];
+            int32_t r = (int32_t)((c >> 16) & 0xFF);
+            int32_t g = (int32_t)((c >> 8) & 0xFF);
+            int32_t b = (int32_t)(c & 0xFF);
 
-            int32_t r, g, b;
+            /* What the fire left. 255 is this instant's ignition and 1 is
+             * cold char, so the countdown is the ember. */
+            const int32_t bn = ba_burn[i];
+            if (bn) {
+                /* Char first: whatever was here is mostly gone. */
+                r >>= 3; g >>= 3; b >>= 3;
 
-            if (e == 0) {
-                /* Ahead of the sheet: bare mark, well below the glass. */
-                const uint32_t c = ba_bg[y * w + x];
-                r = (int32_t)((c >> 16) & 0xFF) >> 2;
-                g = (int32_t)((c >> 8) & 0xFF) >> 2;
-                b = (int32_t)(c & 0xFF) >> 2;
-            } else {
-                /* Where the flow field carries this pixel. Bounded by
-                 * construction, which is why the tables above are wider
-                 * than the screen and no clamp is needed here. */
-                int32_t warp = (ba_hx[x] + ba_hy[y]) >> 3;
-                if (warp >  BA_BIAS - 8) warp =  BA_BIAS - 8;
-                if (warp < -(BA_BIAS - 8)) warp = -(BA_BIAS - 8);
-
-                const int d1 = x + y + warp + BA_BIAS;
-                const int d2 = x - y + h - warp + BA_BIAS;
-
-                const int32_t gx = ba_gxt[x] + ba_gdt[d1] + ba_get[d2];
-                const int32_t gy = gy_row + ba_gdt[d1] - ba_get[d2];
-
-                /* Refraction: sample the mark where the surface bends it
-                 * to, scaled by how much glass is over this column. */
-                int sxp = x + ((gx * e) >> 12);
-                int syp = y + ((gy * e) >> 12);
-                sxp = ba_clampi(sxp, 0, w - 1);
-                syp = ba_clampi(syp, 0, h - 1);
-
-                const uint32_t c = ba_bg[syp * w + sxp];
-                r = (int32_t)((c >> 16) & 0xFF);
-                g = (int32_t)((c >> 8) & 0xFF);
-                b = (int32_t)(c & 0xFF);
-
-                /* Thickness: the glass is not colourless, it carries a
-                 * trace of the gold it is lying on. */
-                const int32_t hsum = ba_hx[x] + ba_hy[y] + ba_hd[d1] + ba_he[d2];
-                const int32_t tint = (hsum * e) >> 12;
-                r += (tint * BA_GOLD_R) >> 8;
-                g += (tint * BA_GOLD_G) >> 8;
-                b += (tint * BA_GOLD_B) >> 8;
-
-                /* Specular: the slope against a light up and to the left.
-                 * Squared, so the highlight is a band rather than a wash;
-                 * this is most of what the eye reads as a wet surface. */
-                int32_t sp = gx - gy;
-                if (sp > 0) {
-                    sp = (sp * sp) >> 8;
-                    sp = (sp * e) >> 8;
-                    if (sp > 255) sp = 255;
-                    r += sp;
-                    g += (sp * 246) >> 8;
-                    b += (sp * 214) >> 8;
-                }
-                /* and a cool rim down the far side, which is what
-                 * gives a wave a back as well as a front. */
-                else {
-                    int32_t rim = ((-sp) * e) >> 13;
-                    if (rim > 30) rim = 30;
-                    r += rim >> 1;
-                    g += (rim * 3) >> 2;
-                    b += rim;
-                }
-
-                /* The leading edge itself. */
-                const int32_t fl = ba_flare[x];
-                if (fl) {
-                    r += (fl * 90) >> 8;
-                    g += (fl * 80) >> 8;
-                    b += (fl * 52) >> 8;
+                /* Then the rim, which is only the leading edge -- the
+                 * top of the count, not the whole of it. */
+                if (bn > 170) {
+                    const int32_t e = (bn - 170) * 3;
+                    r += (e * 235) >> 8;
+                    g += (e * 110) >> 8;
+                    b += (e *  20) >> 8;
+                } else if (bn > 60) {
+                    const int32_t e = (bn - 60) * 2;
+                    r += (e * 90) >> 8;
+                    g += (e * 22) >> 8;
                 }
             }
 
-            r = (r * fade) >> 8;
-            g = (g * fade) >> 8;
-            b = (b * fade) >> 8;
+            /* The flame itself, over the top of all of it. */
+            const int32_t hv = ba_heat[i];
+            if (hv > 8) {
+                const uint32_t f = ba_pal[hv];
+                r += (int32_t)((f >> 16) & 0xFF);
+                g += (int32_t)((f >> 8) & 0xFF);
+                b += (int32_t)(f & 0xFF);
+            }
 
-            /*
-             * Dither once, then fill.
-             *
-             * This used to perturb and re-pack every output pixel, which
-             * put a table lookup and three clamps inside the upscale and
-             * cost more than the simulation it was upscaling -- the whole
-             * animation ran at 15 fps under emulation instead of 24.
-             * Dithering the simulated pixel instead scatters the same
-             * rounding error over a slightly coarser grid, which the eye
-             * cannot tell apart on a gradient this soft, and leaves the
-             * inner loop as stores.
-             */
+            r = (ba_clampi(r, 0, 255) * fade) >> 8;
+            g = (ba_clampi(g, 0, 255) * fade) >> 8;
+            b = (ba_clampi(b, 0, 255) * fade) >> 8;
+
             const int32_t d = ba_bayer[((y & 3) << 2) | (x & 3)];
             const uint32_t px = ((uint32_t)ba_clampi(r + d, 0, 255) << 16) |
                                 ((uint32_t)ba_clampi(g + d, 0, 255) << 8) |
