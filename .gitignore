@@ -30,3 +30,10 @@ vxfmt/*.bin
 vxfmt/*.elf
 vxfmt/*.vx
 assets/
+
+# Fuzzer working directory: AFL's queue, crashes and stats are session
+# state, not source. The seed corpus in vxfmt/fuzz/in/ IS checked in.
+vxfmt/fuzz/out/
+vxfmt/fuzz/harness
+vxfmt/fuzz/harness-repl
+vxfmt/fuzz/*.dSYM/
