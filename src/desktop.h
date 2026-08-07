@@ -114,6 +114,19 @@ enum {
     WK_COUNT
 };
 
+/*
+ * Defined in shell.h, which cannot be included until after the apps --
+ * the gadgets there read state the apps own. The apps, in turn, are what
+ * record recent items, so the declaration has to come first and the
+ * definition later.
+ */
+static void recent_push(int kind, const char *label, const char *path);
+
+/* Reopening a remembered item is app-specific, so this is defined once
+ * every app that handles a kind is in scope. The start menu and the jump
+ * lists both reach it from above that point. */
+static void desktop_open_recent(int kind, const char *path);
+
 typedef struct {
     const char *title;
     int32_t w, h;
@@ -942,6 +955,10 @@ static int execute_bin(const char *filepath) {
 #include "wikidoc.h"
 #include "apps.h"
 #include "store.h"
+/* After apps.h and store.h: the gadgets read the same network and memory
+ * state the system monitor does, and the jump lists read the recent-item
+ * lists the apps push into. */
+#include "shell.h"
 
 /* Canvas app (WK_HELLO) content drawer */
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
@@ -1737,6 +1754,7 @@ static void wallpaper_set_theme(int idx) {
 #define MENU_ACT_LOGOUT   102
 
 #define MENU_ACT_APP_BASE 200      /* + index into store_inst[] */
+#define MENU_ACT_HIT_BASE 400      /* + index into search_hits[]  */
 
 typedef struct {
     const char *label;
@@ -1763,25 +1781,64 @@ static const char *menu_labels[MENU_COUNT] = { "Vextro", "Apps" };
 static const menu_item_t *menu_items[MENU_COUNT] = { menu_system, menu_apps };
 static int menu_item_count[MENU_COUNT] = { 5, 0 };
 
+/*
+ * Everything in the Apps menu goes through here, so a query filters the
+ * built-in entries and the installed packages by the same rule. A
+ * separator only earns its row if something was drawn above it and
+ * something ends up below it, which is why they are added lazily.
+ */
+static int menu_add(int n, const char *label, int action) {
+    if (n >= MENU_APPS_MAX) return n;
+    if (search_q_n > 0 && action >= 0 && !str_contains_ci(label, search_q))
+        return n;
+    menu_apps[n].label = label;
+    menu_apps[n].action = action;
+    return n + 1;
+}
+
 static void menu_rebuild(void) {
     int n = 0;
-    menu_apps[n].label = "Terminal";     menu_apps[n++].action = WK_TERM;
-    menu_apps[n].label = "Browser";      menu_apps[n++].action = WK_BROWSER;
-    menu_apps[n].label = "Files";        menu_apps[n++].action = WK_FILES;
-    menu_apps[n].label = "App Store";    menu_apps[n++].action = WK_STORE;
-    menu_apps[n].label = "Photos";       menu_apps[n++].action = WK_IMAGE;
-    menu_apps[n].label = "Wikipedia";    menu_apps[n++].action = WK_WIKI;
-    menu_apps[n].label = "-";            menu_apps[n++].action = -1;
-    menu_apps[n].label = "Goldsmith";    menu_apps[n++].action = WK_PAINT;
-    menu_apps[n].label = "Monolith";     menu_apps[n++].action = WK_SYSMON;
-    menu_apps[n].label = "Matrix";       menu_apps[n++].action = WK_MATRIX;
-    menu_apps[n].label = "hello.elf";    menu_apps[n++].action = WK_HELLO;
+    n = menu_add(n, "Terminal",  WK_TERM);
+    n = menu_add(n, "Browser",   WK_BROWSER);
+    n = menu_add(n, "Files",     WK_FILES);
+    n = menu_add(n, "App Store", WK_STORE);
+    n = menu_add(n, "Photos",    WK_IMAGE);
+    n = menu_add(n, "Wikipedia", WK_WIKI);
+    const int after_docs = n;
+    n = menu_add(n, "Goldsmith", WK_PAINT);
+    n = menu_add(n, "Monolith",  WK_SYSMON);
+    n = menu_add(n, "Matrix",    WK_MATRIX);
+    n = menu_add(n, "hello.elf", WK_HELLO);
+    if (after_docs > 0 && n > after_docs && search_q_n == 0) {
+        /* reopen the gap the separator belongs in */
+        for (int i = n; i > after_docs; i--) menu_apps[i] = menu_apps[i - 1];
+        menu_apps[after_docs].label = "-";
+        menu_apps[after_docs].action = -1;
+        n++;
+    }
 
     if (store_inst_count > 0) {
-        menu_apps[n].label = "-";        menu_apps[n++].action = -1;
-        for (int i = 0; i < store_inst_count && n < MENU_APPS_MAX; i++) {
-            menu_apps[n].label = store_inst[i].name;
-            menu_apps[n].action = MENU_ACT_APP_BASE + i;
+        const int before = n;
+        for (int i = 0; i < store_inst_count && n < MENU_APPS_MAX; i++)
+            n = menu_add(n, store_inst[i].name, MENU_ACT_APP_BASE + i);
+        if (n > before && before > 0 && n < MENU_APPS_MAX) {
+            for (int i = n; i > before; i--) menu_apps[i] = menu_apps[i - 1];
+            menu_apps[before].label = "-";
+            menu_apps[before].action = -1;
+            n++;
+        }
+    }
+
+    /* Files and folders found on the volume, below the applications. */
+    if (search_q_n > 0 && search_hit_n > 0 && n < MENU_APPS_MAX) {
+        if (n > 0) {
+            menu_apps[n].label = "-";
+            menu_apps[n].action = -1;
+            n++;
+        }
+        for (int i = 0; i < search_hit_n && n < MENU_APPS_MAX; i++) {
+            menu_apps[n].label = search_hits[i].label;
+            menu_apps[n].action = MENU_ACT_HIT_BASE + i;
             n++;
         }
     }
@@ -1791,8 +1848,27 @@ static void menu_rebuild(void) {
 
 static int menu_open_idx = -1;
 
-#define MENU_ITEM_H 26
-#define MENU_DD_W   170
+/* menu_open_idx is only ever set from a loop bounded by MENU_COUNT, but
+ * that is not visible to the compiler everywhere it is used to index the
+ * per-menu tables. One guard states the invariant instead of leaving each
+ * subscript to be proved separately. */
+static int menu_open_valid(void) {
+    return menu_open_idx >= 0 && menu_open_idx < MENU_COUNT;
+}
+
+#define MENU_ITEM_H   26
+#define MENU_DD_W     170
+#define MENU_SEARCH_H 32
+
+/*
+ * The Apps menu is wider than the system menu because it has to hold
+ * search results -- an article title or a file path in 170px would be
+ * ellipsis with a couple of letters attached.
+ */
+static int32_t menu_dd_w(int idx) { return idx == 1 ? 264 : MENU_DD_W; }
+
+/* Rows start below the search field on the menu that has one. */
+static int32_t menu_head_h(int idx) { return idx == 1 ? MENU_SEARCH_H : 0; }
 
 /* label x range in the bar */
 static void menu_label_rect(int idx, int32_t *x0, int32_t *x1) {
@@ -1810,7 +1886,20 @@ static void menu_label_rect(int idx, int32_t *x0, int32_t *x1) {
 }
 
 static void menu_action(int action) {
-    if (action >= MENU_ACT_APP_BASE) {
+    if (action >= MENU_ACT_HIT_BASE) {
+        const int i = action - MENU_ACT_HIT_BASE;
+        if (i < search_hit_n) {
+            /* A folder opens in Files at that folder; a file opens in
+             * whichever app claims its extension. */
+            if (search_hits[i].is_dir) {
+                wm_open(WK_FILES);
+                str_copy(exp_path, search_hits[i].path, EXP_PATH_MAX);
+                exp_scan();
+            } else {
+                desktop_open_recent(search_hits[i].kind, search_hits[i].path);
+            }
+        }
+    } else if (action >= MENU_ACT_APP_BASE) {
         store_launch_inst(action - MENU_ACT_APP_BASE);
     } else if (action >= 0 && action < WK_COUNT) {
         if (action == WK_HELLO) {
@@ -1843,6 +1932,7 @@ static int menu_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
             menu_label_rect(i, &x0, &x1);
             if (mx >= x0 && mx < x1) {
                 menu_open_idx = (menu_open_idx == i) ? -1 : i;
+                search_clear();
                 return 1;
             }
         }
@@ -1851,12 +1941,13 @@ static int menu_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
     }
 
     /* click inside an open dropdown */
-    if (menu_open_idx >= 0) {
+    if (menu_open_valid()) {
         int32_t x0, x1;
         menu_label_rect(menu_open_idx, &x0, &x1);
         int n = menu_item_count[menu_open_idx];
-        int32_t dy = MENUBAR_H;
-        if (mx >= x0 && mx < x0 + MENU_DD_W &&
+        const int32_t ddw = menu_dd_w(menu_open_idx);
+        int32_t dy = MENUBAR_H + menu_head_h(menu_open_idx);
+        if (mx >= x0 && mx < x0 + ddw &&
             my >= dy && my < dy + n * MENU_ITEM_H) {
             int idx = (my - dy) / MENU_ITEM_H;
             if (idx >= 0 && idx < n && menu_items[menu_open_idx][idx].action >= 0) {
@@ -1865,9 +1956,14 @@ static int menu_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
             menu_open_idx = -1;
             return 1;
         }
+        /* A click on the search field is a click *in* the menu, so it
+         * must not dismiss it -- that would make the field impossible to
+         * aim at. */
+        if (mx >= x0 && mx < x0 + ddw &&
+            my >= MENUBAR_H && my < dy)
+            return 1;
         menu_open_idx = -1;
-        /* fall through: the click still hits whatever was underneath? no —
-         * closing a menu consumes the click, like every other desktop */
+        /* closing a menu consumes the click, like every other desktop */
         return 1;
     }
     return 0;
@@ -1938,36 +2034,65 @@ static void menubar_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
 static void menu_dropdown_draw(uint32_t *buf, uint32_t w, uint32_t h,
                                int32_t mx, int32_t my) {
-    if (menu_open_idx < 0) return;
+    if (!menu_open_valid()) return;
 
     int32_t x0, x1;
     menu_label_rect(menu_open_idx, &x0, &x1);
     int n = menu_item_count[menu_open_idx];
     int32_t dy = MENUBAR_H;
-    int32_t dh = n * MENU_ITEM_H;
 
-    gfx_rect_blend(buf, w, h, x0 + 3, dy + 3, MENU_DD_W, dh, 0x000000u, 70);
-    gfx_rect(buf, w, h, x0, dy, MENU_DD_W, dh, 0x1A1E2Au);
-    gfx_rect_outline(buf, w, h, x0, dy, MENU_DD_W, dh, C_GOLD_DIM);
+    /* The Apps menu carries a search field. It is always there rather
+     * than appearing on the first keystroke, because a field that is
+     * invisible until used cannot tell anyone it exists. */
+    const int searchable = (menu_open_idx == 1);
+    const int32_t head = menu_head_h(menu_open_idx);
+    const int32_t ddw  = menu_dd_w(menu_open_idx);
+    int32_t dh = head + n * MENU_ITEM_H;
+    if (searchable && n == 0) dh = head + MENU_ITEM_H;
+
+    gfx_rect_blend(buf, w, h, x0 + 3, dy + 3, ddw, dh, 0x000000u, 70);
+    gfx_rect(buf, w, h, x0, dy, ddw, dh, 0x1A1E2Au);
+    gfx_rect_outline(buf, w, h, x0, dy, ddw, dh, C_GOLD_DIM);
+
+    if (searchable) {
+        gfx_rect(buf, w, h, x0 + 1, dy + 1, ddw - 2, head - 2, 0x12151Fu);
+        gfx_rect(buf, w, h, x0 + 10, dy + head - 6, ddw - 20, 1, 0x2E3444u);
+        if (search_q_n > 0) {
+            ttf_draw_string_clip(buf, (int)w, (int)h, x0 + 14, dy + 6,
+                                 search_q, C_TEXT, 13, x0 + ddw - 14);
+            /* a caret, so it reads as a field being typed into */
+            if ((desktop_tick / 20) & 1)
+                gfx_rect(buf, w, h,
+                         x0 + 15 + ttf_text_width(search_q, 13), dy + 7,
+                         1, 14, C_GOLD);
+        } else {
+            ttf_draw_string(buf, (int)w, (int)h, x0 + 14, dy + 6,
+                            "Search apps and files", 0x5A6070u, 13);
+        }
+        if (n == 0 && search_q_n > 0)
+            ttf_draw_string(buf, (int)w, (int)h, x0 + 14, dy + head + 5,
+                            "No matches", C_TEXT_DIM, 13);
+    }
+    dy += head;
 
     for (int i = 0; i < n; i++) {
         const menu_item_t *it = &menu_items[menu_open_idx][i];
         int32_t iy = dy + i * MENU_ITEM_H;
         if (it->action < 0) {
-            gfx_rect(buf, w, h, x0 + 10, iy + MENU_ITEM_H / 2, MENU_DD_W - 20,
+            gfx_rect(buf, w, h, x0 + 10, iy + MENU_ITEM_H / 2, ddw - 20,
                      1, 0x2E3444u);
             continue;
         }
-        int hot = (mx >= x0 && mx < x0 + MENU_DD_W &&
+        int hot = (mx >= x0 && mx < x0 + ddw &&
                    my >= iy && my < iy + MENU_ITEM_H);
         if (hot)
-            gfx_rect(buf, w, h, x0 + 1, iy, MENU_DD_W - 2, MENU_ITEM_H,
+            gfx_rect(buf, w, h, x0 + 1, iy, ddw - 2, MENU_ITEM_H,
                      0x2A2410u);
         ttf_draw_string(buf, (int)w, (int)h, x0 + 14, iy + 5, it->label,
                         hot ? C_GOLD : C_TEXT, 13);
         /* open-window marker */
-        if (it->action < WK_COUNT && wm_is_open(it->action))
-            gfx_circle(buf, w, h, x0 + MENU_DD_W - 12, iy + MENU_ITEM_H / 2,
+        if (it->action >= 0 && it->action < WK_COUNT && wm_is_open(it->action))
+            gfx_circle(buf, w, h, x0 + ddw - 12, iy + MENU_ITEM_H / 2,
                        2, C_GOLD);
     }
 }
@@ -2258,6 +2383,160 @@ static int dock_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb) {
     return 1;   /* clicks on the bar background are still consumed */
 }
 
+/* ===== JUMP LISTS =====
+ *
+ * Right-click a taskbar button and it opens upward: the things that app
+ * was last pointed at, then the actions that apply to it. Recent items
+ * come from recents[] in shell.h, which the apps push into as they go, so
+ * the list is what actually happened rather than a guess.
+ *
+ * One list is open at a time and it is identified by the taskbar slot,
+ * not the window kind -- the canvas apps all share one kind, and a jump
+ * list per app is the point of having one at all.
+ */
+#define JL_ROW_H    24
+#define JL_HEAD_H   22
+#define JL_W       248
+
+static int jl_open = -1;        /* dock item index, or -1 */
+
+static int jl_action_count(int idx) {
+    return dock_running_kind(idx) >= 0 ? 2 : 1;   /* +close when running */
+}
+
+/*
+ * dock_rebuild only ever stores valid window kinds, but that invariant is
+ * not visible to the compiler through the inlined lookup, and an
+ * unchecked recents[kind] indexed off it trips -Warray-bounds. One
+ * accessor states the invariant once instead of four unchecked reads.
+ */
+static int jl_kind(int idx) {
+    if (idx < 0 || idx >= dock_item_count) return -1;
+    const int k = dock_items[idx].kind;
+    return (k >= 0 && k < WK_COUNT) ? k : -1;
+}
+
+static int jl_recent_count(int idx) {
+    const int k = jl_kind(idx);
+    return k < 0 ? 0 : recent_n[k];
+}
+
+static void jl_rect(int idx, int32_t *ox, int32_t *oy,
+                    int32_t *ow, int32_t *oh) {
+    const int nrec = jl_recent_count(idx);
+    const int nact = jl_action_count(idx);
+
+    int32_t hgt = JL_HEAD_H + nact * JL_ROW_H + 8;
+    if (nrec) hgt += JL_HEAD_H + nrec * JL_ROW_H;
+
+    int32_t ix, iy, iw, ih;
+    dock_icon_rect(scr_w_cache, idx, &ix, &iy, &iw, &ih);
+
+    *ow = JL_W;
+    *oh = hgt;
+    if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {
+        *ox = ix + iw / 2 - JL_W / 2;
+        *oy = iy - hgt - 10;
+    } else if (dock_cfg.edge == DOCK_EDGE_LEFT) {
+        *ox = ix + iw + 10;
+        *oy = iy + ih / 2 - hgt / 2;
+    } else {
+        *ox = ix - JL_W - 10;
+        *oy = iy + ih / 2 - hgt / 2;
+    }
+    if (*ox < 4) *ox = 4;
+    if (*ox + *ow > (int32_t)scr_w_cache - 4) *ox = (int32_t)scr_w_cache - 4 - *ow;
+    if (*oy < MENUBAR_H + 4) *oy = MENUBAR_H + 4;
+}
+
+/*
+ * Rows are numbered top to bottom across both sections: 0..nrec-1 are the
+ * recent items, then the actions. Returning one index for the whole list
+ * keeps the hit test and the drawing walking the same arithmetic.
+ */
+static int jl_row_at(int idx, int32_t mx, int32_t my) {
+    int32_t x, y, w2, h2;
+    jl_rect(idx, &x, &y, &w2, &h2);
+    if (mx < x || mx >= x + w2 || my < y || my >= y + h2) return -1;
+
+    const int nrec = jl_recent_count(idx);
+    int32_t ry2 = y;
+
+    if (nrec) {
+        ry2 += JL_HEAD_H;
+        for (int i = 0; i < nrec; i++, ry2 += JL_ROW_H)
+            if (my >= ry2 && my < ry2 + JL_ROW_H) return i;
+    }
+    ry2 += JL_HEAD_H;
+    for (int a = 0; a < jl_action_count(idx); a++, ry2 += JL_ROW_H)
+        if (my >= ry2 && my < ry2 + JL_ROW_H) return nrec + a;
+    return -1;
+}
+
+static void jl_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                    int32_t mx, int32_t my) {
+    if (jl_open < 0 || jl_open >= dock_item_count) return;
+
+    int32_t x, y, w2, h2;
+    jl_rect(jl_open, &x, &y, &w2, &h2);
+    const int kind = jl_kind(jl_open);
+    const int nrec = jl_recent_count(jl_open);
+    const int hot  = jl_row_at(jl_open, mx, my);
+    if (kind < 0) return;
+
+    gfx_rect_blend(buf, w, h, x, y, w2, h2, 0x12151Fu, 246);
+    gfx_rect_outline(buf, w, h, x, y, w2, h2, C_GOLD_DIM);
+
+    int32_t ry2 = y;
+    if (nrec) {
+        ttf_draw_string(buf, (int)w, (int)h, x + 10, ry2 + 4, "RECENT",
+                        C_GOLD_DIM, 10);
+        ry2 += JL_HEAD_H;
+        for (int i = 0; i < nrec; i++, ry2 += JL_ROW_H) {
+            if (hot == i)
+                gfx_rect(buf, w, h, x + 1, ry2, w2 - 2, JL_ROW_H, 0x232A3Cu);
+            ttf_draw_string_clip(buf, (int)w, (int)h, x + 14, ry2 + 5,
+                                 recents[kind][i].label, C_TEXT, 12,
+                                 x + w2 - 10);
+        }
+        gfx_rect(buf, w, h, x + 8, ry2 + 2, w2 - 16, 1, 0x2A3142u);
+    }
+
+    ttf_draw_string(buf, (int)w, (int)h, x + 10, ry2 + 4,
+                    dock_item_name(jl_open), C_GOLD_DIM, 10);
+    ry2 += JL_HEAD_H;
+
+    static const char *const act_open  = "Open";
+    static const char *const act_close = "Close window";
+    for (int a = 0; a < jl_action_count(jl_open); a++, ry2 += JL_ROW_H) {
+        if (hot == nrec + a)
+            gfx_rect(buf, w, h, x + 1, ry2, w2 - 2, JL_ROW_H, 0x232A3Cu);
+        ttf_draw_string(buf, (int)w, (int)h, x + 14, ry2 + 5,
+                        a == 0 ? act_open : act_close,
+                        a == 0 ? C_TEXT : C_TEXT_DIM, 12);
+    }
+}
+
+static int jl_click(int32_t mx, int32_t my) {
+    if (jl_open < 0) return 0;
+    const int idx = jl_open;
+    const int row = jl_row_at(idx, mx, my);
+    jl_open = -1;                     /* any click closes it */
+    if (row < 0) return 1;            /* ...including one that misses */
+
+    const int kind = jl_kind(idx);
+    const int nrec = jl_recent_count(idx);
+    if (kind >= 0 && row < nrec) {
+        desktop_open_recent(kind, recents[kind][row].path);
+    } else if (row == nrec) {
+        dock_launch(idx);
+    } else {
+        const int k = dock_running_kind(idx);
+        if (k >= 0) wm_close(k);
+    }
+    return 1;
+}
+
 static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
                       int32_t mx, int32_t my) {
     int32_t rx, ry, rw, rh;
@@ -2313,7 +2592,7 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
      * thumbnail is whatever the compositor last captured, which is why a
      * minimized window still has a picture to show.
      */
-    if (hover >= 0) {
+    if (hover >= 0 && hover != jl_open) {
         const char *name = dock_item_name(hover);
         const int rk = dock_running_kind(hover);
         const int show_thumb = (rk >= 0 && wm_thumb_valid[rk]);
@@ -2368,9 +2647,32 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/*
+ * Reopen something off a jump list.
+ *
+ * Each app already knows how to be pointed at a thing; this only picks
+ * which one to ask, and raises its window so the result is visible. Kinds
+ * with nothing meaningful to reopen just come to the front.
+ */
+static void desktop_open_recent(int kind, const char *path) {
+    if (!path || !path[0]) return;
+    switch (kind) {
+    case WK_BROWSER: wm_open(WK_BROWSER); brw_navigate(path);      break;
+    case WK_WIKI:    wm_open(WK_WIKI);    wiki_load(path, 0);      break;
+    case WK_IMAGE:   wm_open(WK_IMAGE);   img_open_path(path);     break;
+    case WK_FILES:
+        wm_open(WK_FILES);
+        str_copy(exp_path, path, EXP_PATH_MAX);
+        exp_scan();
+        break;
+    default: wm_open(kind); break;
+    }
+}
+
 /* ===== 10. RENDER GLUE ===== */
 
 static uint8_t desk_prev_lmb = 0;
+static uint8_t desk_prev_rmb = 0;
 
 static int desktop_open_app_by_name(const char *name) {
     int kind = -1;
@@ -2402,8 +2704,43 @@ static int desktop_open_app_by_name(const char *name) {
 
 /* Route one keyboard character to the focused window */
 static void desktop_key_input(char ch) {
-    if (menu_open_idx >= 0) {
-        if (ch == 27) menu_open_idx = -1;
+    if (menu_open_valid()) {
+        /*
+         * With the Apps menu open the keyboard belongs to its search
+         * field. Escape backs out one step at a time -- it clears a query
+         * first and only closes the menu once there is nothing to clear,
+         * so a mistyped search does not cost the menu as well.
+         */
+        if (ch == 27) {
+            if (menu_open_idx == 1 && search_q_n > 0) search_clear();
+            else menu_open_idx = -1;
+            return;
+        }
+        if (menu_open_idx != 1) return;
+
+        if (ch == '\b') {
+            if (search_q_n > 0) {
+                search_q[--search_q_n] = '\0';
+                search_run();
+            }
+            return;
+        }
+        if (ch == '\n') {
+            /* Enter takes the first result, which is what a search box
+             * is for -- type three letters and press return. */
+            if (menu_apps_n > 0 && menu_apps[0].action >= 0) {
+                const int a = menu_apps[0].action;
+                menu_open_idx = -1;
+                search_clear();
+                menu_action(a);
+            }
+            return;
+        }
+        if (ch >= ' ' && ch < 127 && search_q_n < SEARCH_Q_MAX - 1) {
+            search_q[search_q_n++] = ch;
+            search_q[search_q_n] = '\0';
+            search_run();
+        }
         return;
     }
     if (wm_focus == WK_TERM) {
@@ -2574,6 +2911,11 @@ static void aero_peek_draw(uint32_t *buf, uint32_t w, uint32_t h) {
         gfx_rect_blend(buf, w, h, win->x, win->y, 1, win->h, C_GOLD, a);
         gfx_rect_blend(buf, w, h, win->x + win->w - 1, win->y, 1, win->h, C_GOLD, a);
     }
+    /* The gadgets are desktop, not window: blending the bare wallpaper
+     * over the frame had been erasing them along with the stack, so the
+     * one thing Peek exists to show was the thing it hid. Redrawing them
+     * here puts them back on top of the faded windows. */
+    gadgets_draw(buf, w, h);
 }
 
 static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
@@ -2588,6 +2930,20 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
 
     if (wall_gen_w != w || wall_gen_h != h)
         wallpaper_regen(w, h);
+
+    /*
+     * Wallpaper slideshow. desktop_tick counts frames at 60 Hz, so the
+     * interval is in frames here; the comparison is unsigned subtraction
+     * so it stays correct across the tick counter wrapping.
+     */
+    if (wall_slide > 0 && wall_slide < WALL_SLIDE_COUNT) {
+        const uint32_t period = (uint32_t)wall_slide_secs[wall_slide] * 60u;
+        if (desktop_tick - wall_slide_last >= period) {
+            wall_slide_last = desktop_tick;
+            wall_theme = (wall_theme + 1) % WALL_THEME_COUNT;
+            wallpaper_set_theme(wall_theme);
+        }
+    }
 
     /* async engines */
     term_async_poll();
@@ -2622,7 +2978,22 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* ---- input ---- */
     uint8_t lmb = buttons & 1;
-    int consumed = menu_mouse(mx, my, lmb, desk_prev_lmb);
+    uint8_t rmb = (buttons >> 1) & 1;
+
+    /* Right-click on a taskbar button opens its jump list, and on the
+     * same button again closes it. Anywhere else dismisses. */
+    if (rmb && !desk_prev_rmb) {
+        const int i = dock_hit_bar(mx, my) ? dock_hit_item(mx, my) : -1;
+        jl_open = (i >= 0 && i != jl_open) ? i : -1;
+    }
+    desk_prev_rmb = rmb;
+
+    /* An open jump list takes the click before anything underneath it. */
+    int consumed = 0;
+    if (jl_open >= 0 && lmb && !desk_prev_lmb)
+        consumed = jl_click(mx, my);
+    if (!consumed)
+        consumed = menu_mouse(mx, my, lmb, desk_prev_lmb);
     if (!consumed)
         consumed = dock_mouse(mx, my, lmb, desk_prev_lmb);
     wm_update(mx, my, lmb, desk_prev_lmb, consumed);
@@ -2666,6 +3037,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     for (uint32_t i = 0; i < w * h; i++)
         buf[i] = wallpaper[i];
 
+    gadgets_draw(buf, w, h);          /* on the desktop, under everything */
     aero_snap_preview(buf, w, h);     /* under the windows: it is a target */
     wm_draw_all(buf, w, h);
     spawn_anim_draw(buf, w, h);
@@ -2673,6 +3045,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     menubar_draw(buf, w, h, mx, my);
     menu_dropdown_draw(buf, w, h, mx, my);
     dock_draw(buf, w, h, mx, my);
+    jl_draw(buf, w, h, mx, my);       /* over the taskbar it belongs to */
 }
 
 
@@ -2711,6 +3084,8 @@ static void session_end(void) {
     aero_peek = 0;
     aero_snap_hint = SNAP_NONE;
     aero_shake_reset();
+    jl_open = -1;
+    recent_clear_all();
 
     /* terminal: history, scrollback and working directory */
     term_hist_count = 0;

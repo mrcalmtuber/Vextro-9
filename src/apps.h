@@ -44,6 +44,7 @@ static void exp_list_cb(const char *name, uint32_t size, int is_dir) {
 }
 
 static void exp_scan(void) {
+    recent_push(WK_FILES, exp_path, exp_path);
     exp_entry_count = 0;
     exp_selected = -1;
 
@@ -329,6 +330,19 @@ static const uint32_t wall_theme_bot[WALL_THEME_COUNT] = {
 };
 static int wall_theme = 0;
 
+/*
+ * Wallpaper slideshow. The interval is in seconds and 0 means off; the
+ * choices are spread widely rather than evenly because the useful range
+ * is "while I watch" at one end and "while I work" at the other.
+ */
+#define WALL_SLIDE_COUNT 4
+static const int32_t wall_slide_secs[WALL_SLIDE_COUNT]  = { 0, 30, 120, 600 };
+static const char   *wall_slide_names[WALL_SLIDE_COUNT] = {
+    "Off", "30s", "2m", "10m",
+};
+static int wall_slide = 0;                  /* index into the above */
+static uint32_t wall_slide_last = 0;        /* desktop_tick of the last change */
+
 static const char *dock_edge_names[3] = { "Bottom", "Left", "Right" };
 
 /* ---- the Users pane's own state ----
@@ -358,6 +372,17 @@ static void settings_mouse(int32_t mx, int32_t my, uint8_t lmb,
         if (mx >= sx && mx < sx + 44 && my >= sy && my < sy + 34) {
             wall_theme = i;
             wallpaper_set_theme(i);
+            return;
+        }
+    }
+
+    /* slideshow interval, on the same row as the theme name */
+    for (int i = 0; i < WALL_SLIDE_COUNT; i++) {
+        int32_t bx = cx + 130 + i * 58;
+        int32_t by = cy + 88;
+        if (mx >= bx && mx < bx + 50 && my >= by && my < by + 22) {
+            wall_slide = i;
+            wall_slide_last = desktop_tick;
             return;
         }
     }
@@ -539,6 +564,19 @@ static void settings_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
     ttf_draw_string(buf, (int)w, (int)h, cx + 24, cy + 92,
                     wall_theme_names[wall_theme], 0x60666Fu, 12);
+
+    /* Slideshow: how often the wallpaper moves to the next theme. */
+    for (int i = 0; i < WALL_SLIDE_COUNT; i++) {
+        int32_t bx = cx + 130 + i * 58;
+        int32_t by = cy + 88;
+        const int on = (i == wall_slide);
+        gfx_rect(buf, w, h, bx, by, 50, 22, on ? 0xE8E2CCu : 0xF0F1F4u);
+        gfx_rect_outline(buf, w, h, bx, by, 50, 22,
+                         on ? C_GOLD : 0xC8CCD4u);
+        const int tw2 = ttf_text_width(wall_slide_names[i], 11);
+        ttf_draw_string(buf, (int)w, (int)h, bx + (50 - tw2) / 2, by + 4,
+                        wall_slide_names[i], on ? 0x6A5410u : 0x60666Fu, 11);
+    }
 
     ttf_draw_string(buf, (int)w, (int)h, cx + 24, cy + 116, "Dock",
                     0x1A1E28u, 16);
@@ -1120,6 +1158,8 @@ static int img_open_path(const char *path) {
         return -1;
     }
 
+    recent_push(WK_IMAGE, path, path);
+
     const char *bad = sci_decode((const uint8_t *)data, len, &img_info);
     if (bad) {
         img_loaded = 0;
@@ -1450,6 +1490,10 @@ static int wiki_load(const char *path, int push) {
     if (e.title[0]) str_copy(wiki_art_title, e.title, WD_TITLE_MAX);
     else if (wd_title[0]) str_copy(wiki_art_title, wd_title, WD_TITLE_MAX);
     else str_copy(wiki_art_title, path, WD_TITLE_MAX);
+
+    /* Recorded by title, since that is what an article is called, but
+     * reopened by its ZIM path, which is what the archive is keyed on. */
+    recent_push(WK_WIKI, wiki_art_title, path);
 
     wiki_view = 1;
     wiki_scroll = 0;

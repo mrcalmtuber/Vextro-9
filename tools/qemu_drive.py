@@ -15,6 +15,7 @@ Script lines:
   click                       left press+release at the current position
   dblclick                    two of the above in quick succession
   wheel <n>                   scroll n notches (positive = up)
+  rclick                      right press+release (jump lists)
   press / release             hold and let go of the left button
   drag <x0> <y0> <x1> <y1>    interpolated drag, for snap and window moves
   shake <x> <y> [amp] [n]     grab a title bar and swing it back and forth
@@ -150,6 +151,11 @@ def main():
             vm.button(True)
             time.sleep(0.12)
             vm.button(False)
+            time.sleep(0.12)
+        elif op == 'rclick':
+            vm.button(True, 'right')
+            time.sleep(0.12)
+            vm.button(False, 'right')
             time.sleep(0.12)
         elif op == 'press':
             vm.button(True)

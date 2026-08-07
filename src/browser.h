@@ -33,6 +33,11 @@ typedef struct {
 
 static brw_line_t brw_lines[BRW_MAX_LINES];
 static int   brw_line_count = 0;
+/* The internal page scheme, in one place, with its length derived rather
+ * than written down a second time. */
+#define BRW_SCHEME     "vextro://"
+#define BRW_SCHEME_LEN (sizeof(BRW_SCHEME) - 1)
+
 static char  brw_addr[BRW_ADDR_MAX] = "vextro://home";
 static int   brw_addr_len = 15;
 static int   brw_addr_cur = 15;
@@ -742,7 +747,22 @@ static void brw_set_addr(const char *url) {
     brw_addr_cur = brw_addr_len;
 }
 
+/* Re-file the current page under its finished title. brw_navigate_no_hist
+ * records it under its URL before the page exists; this runs once the
+ * title is real, and recent_push dedupes on the address. */
+static void brw_note_recent(void) {
+    if (brw_addr[0]) recent_push(WK_BROWSER, brw_title, brw_addr);
+}
+
 static void brw_navigate_no_hist(const char *url) {
+    /* Recorded here rather than in brw_navigate so that the page opened
+     * with the window, and pages reached with Back, count as visits too.
+     * The address is what reopens a page; the title is not known yet for
+     * anything fetched over the network, so this records it under its URL
+     * and the load re-records it under its title -- recent_push dedupes on
+     * the path and keeps the newer label. */
+    recent_push(WK_BROWSER, url, url);
+
     brw_loading = 0;
     brw_addr_focus = 0;
 
@@ -757,8 +777,12 @@ static void brw_navigate_no_hist(const char *url) {
         return;
     }
 
-    if (str_starts_with(url_buf, "vextro://")) {
-        const char *page = url_buf + 11;
+    if (str_starts_with(url_buf, BRW_SCHEME)) {
+        /* Length taken from the scheme itself. This was a hardcoded 11 --
+         * the length of the old scheme -- and renaming the system to a
+         * shorter one silently ate the first two letters of every page
+         * name, so every internal page became "unknown". */
+        const char *page = url_buf + BRW_SCHEME_LEN;
         brw_set_addr(url_buf);
         if (str_eq(page, "home") || page[0] == '\0') brw_page_home();
         else if (str_eq(page, "help"))  brw_page_help();
@@ -766,6 +790,7 @@ static void brw_navigate_no_hist(const char *url) {
         else if (str_starts_with(page, "file/")) brw_page_file(page + 5);
         else brw_page_error("Unknown internal page.");
         brw_set_status("Ready");
+        brw_note_recent();
         return;
     }
 
@@ -874,6 +899,9 @@ static void brw_poll(void) {
         str_append(canon, http_host, BRW_ADDR_MAX);
         str_append(canon, http_path, BRW_ADDR_MAX);
         brw_set_addr(canon);
+        /* After brw_set_addr, so a redirect is filed under where it
+         * actually landed rather than where it was aimed. */
+        brw_note_recent();
         return;
     }
     if (http_state == HTTP_ERROR) {

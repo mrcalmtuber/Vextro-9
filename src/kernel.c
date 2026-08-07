@@ -457,6 +457,12 @@ static uint32_t frame_t0_ticks = 0;
  */
 static uint64_t frame_wr_px = 0;      /* written by the flip    */
 
+/* Short accumulators for the desktop busy meter, reset four times a
+ * second -- the serial report's own counters run for two seconds, which
+ * is far too coarse for something being watched on screen. */
+static uint64_t busy_acc = 0, idle_acc = 0;
+static uint32_t busy_frames = 0;
+
 static void frame_report(void) {
     if (++frame_n < 120) return;
 
@@ -1330,8 +1336,28 @@ void kmain(void) {
             frame_render_cy += t1 - t0;
             frame_flip_cy   += t2 - t1;
             frame_report();
+            /*
+             * hlt parks the core until the next interrupt. The PIT is
+             * running at 60 Hz, so this sleeps out whatever is left of
+             * the frame instead of spinning through it -- and the cycles
+             * it does not spend are what the System gadget reports as
+             * idle.
+             */
             __asm__ volatile("hlt");
-            frame_idle_cy += cycle_now() - t2;
+            uint64_t t3 = cycle_now();
+            frame_idle_cy += t3 - t2;
+
+            /* Feed the desktop meter four times a second: often enough to
+             * respond to something starting, slow enough that the bar is
+             * readable rather than a flicker. */
+            busy_acc += t2 - t0;
+            idle_acc += t3 - t2;
+            if (++busy_frames >= 15) {
+                sys_busy_record((uint32_t)(busy_acc / busy_frames),
+                                (uint32_t)(idle_acc / busy_frames));
+                busy_acc = idle_acc = 0;
+                busy_frames = 0;
+            }
             continue;
         }
 
