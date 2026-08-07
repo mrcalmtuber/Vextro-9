@@ -1985,6 +1985,30 @@ static int wiki_try_key(const char *key) {
  * so each candidate costs about twenty reads and trying several is still
  * far cheaper than decompressing one cluster.
  */
+/*
+ * Words that ask a question rather than name its subject. Skipped on the
+ * first single-word sweep so that the noun wins the tie, and only fallen
+ * back to if nothing else in the sentence matches anything.
+ */
+static int wiki_is_stopword(const char *w) {
+    static const char *const stop[] = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "what", "which", "who", "whom", "whose", "where", "when", "why",
+        "how", "do", "does", "did", "can", "could", "would", "should",
+        "of", "in", "on", "at", "to", "for", "from", "by", "with",
+        "and", "or", "but", "it", "its", "this", "that", "these", "those",
+        "made", "make", "about", "tell", "me", "you", "there", "many",
+        "much", "some", "any", "have", "has", "had", "not", "no", 0
+    };
+    for (int i = 0; stop[i]; i++) {
+        int k = 0;
+        while (stop[i][k] && w[k] &&
+               (w[k] | 32) == stop[i][k]) k++;
+        if (!stop[i][k] && !w[k]) return 1;
+    }
+    return 0;
+}
+
 static int wiki_retrieve(const char *question) {
     wiki_context[0] = '\0';
     wiki_source[0] = '\0';
@@ -2008,23 +2032,50 @@ static int wiki_retrieve(const char *question) {
 
     char key[72];
 
-    /* pairs, longest combined first */
-    for (int pass = 0; pass < 2; pass++) {
-        int best = -1, best_len = 0;
+    /*
+     * Pairs first, longest combined, each tried at most once.
+     *
+     * They are *marked* as tried rather than dissolved. The previous
+     * version deleted a failed pair's first word from the list, which
+     * quietly destroyed the best single-word candidate: "what is the moon
+     * made of" forms "Moon_made", misses, and throws "moon" away -- after
+     * which the single-word pass could never reach *Moon*, retrieval
+     * returned nothing at all, and the model was handed a question with
+     * no context and answered "first first first first" forty times.
+     */
+    int pair_tried[8];
+    for (int k = 0; k < 8; k++) pair_tried[k] = 0;
+
+    for (;;) {
+        int best = -1, best_len = -1, best_content = -1;
         for (int w = 0; w + 1 < nwords; w++) {
-            int ln = 0;
-            while (words[w][ln]) ln++;
-            int ln2 = 0;
-            while (words[w + 1][ln2]) ln2++;
-            if (ln + ln2 > best_len) { best_len = ln + ln2; best = w; }
+            if (pair_tried[w]) continue;
+            /*
+             * A pair of two question-words names nothing. Without this,
+             * "what is the moon made of" forms "What_is", which is a real
+             * prefix in the archive -- it retrieves "What Is a Woman?" and
+             * the model is asked what the moon is made of while reading an
+             * article about something else entirely. Content words are
+             * ranked above length for the same reason.
+             */
+            const int c = (wiki_is_stopword(words[w]) ? 0 : 1)
+                        + (wiki_is_stopword(words[w + 1]) ? 0 : 1);
+            if (c == 0) { pair_tried[w] = 1; continue; }
+            int ln = 0;  while (words[w][ln]) ln++;
+            int ln2 = 0; while (words[w + 1][ln2]) ln2++;
+            if (c > best_content ||
+                (c == best_content && ln + ln2 > best_len)) {
+                best_content = c; best_len = ln + ln2; best = w;
+            }
         }
         if (best < 0) break;
+        pair_tried[best] = 1;
         /*
          * Joined with an underscore, because the sorted list this
          * searches is of *paths*, and a ZIM path spells a space as '_'.
          * Joining with a space finds nothing, silently falls through to
          * the single-word search, and retrieves an article about the
-         * wrong subject — which is how "neutron star" came back as
+         * wrong subject -- which is how "neutron star" came back as
          * "Star".
          */
         str_copy(key, words[best], sizeof(key));
@@ -2032,23 +2083,36 @@ static int wiki_retrieve(const char *question) {
         str_append(key, words[best + 1], sizeof(key));
         if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
         if (wiki_try_key(key)) return 1;
-        /* that pair failed; drop its first word and look for another */
-        for (int k = best; k + 1 < nwords; k++)
-            str_copy(words[k], words[k + 1], sizeof(words[k]));
-        nwords--;
-        if (nwords < 2) break;
     }
 
-    /* then the longest single word */
-    int best = 0, best_len = 0;
-    for (int w = 0; w < nwords; w++) {
-        int ln = 0;
-        while (words[w][ln]) ln++;
-        if (ln > best_len) { best_len = ln; best = w; }
+    /*
+     * Then single words, longest first, and *every* one of them rather
+     * than only the longest. Question words are skipped on the first
+     * sweep: "what" and "moon" are both four letters, and whichever the
+     * tie-break happened to pick decided whether the answer was about the
+     * Moon or about nothing.
+     */
+    int used[8];
+    for (int k = 0; k < 8; k++) used[k] = 0;
+
+    for (int skip_stop = 1; skip_stop >= 0; skip_stop--) {
+        for (int k = 0; k < 8; k++) used[k] = 0;
+        for (;;) {
+            int best = -1, best_len = 0;
+            for (int w = 0; w < nwords; w++) {
+                if (used[w]) continue;
+                if (skip_stop && wiki_is_stopword(words[w])) continue;
+                int ln = 0; while (words[w][ln]) ln++;
+                if (ln > best_len) { best_len = ln; best = w; }
+            }
+            if (best < 0) break;
+            used[best] = 1;
+            str_copy(key, words[best], sizeof(key));
+            if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+            if (wiki_try_key(key)) return 1;
+        }
     }
-    str_copy(key, words[best], sizeof(key));
-    if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
-    return wiki_try_key(key);
+    return 0;
 }
 
 static void wiki_submit(void) {

@@ -3385,6 +3385,20 @@ static void session_begin(const char *name) {
                 }
         }
     }
+
+    /*
+     * Now that the answer is known, act on it.
+     *
+     * The boot-time autoload runs before anyone has logged in, when
+     * ai_enabled is still -1, so it declines and returns -- correctly,
+     * because loading 380 MB on the strength of an answer nobody has
+     * given would be the wrong default. But nothing tried again once the
+     * answer was read, so the model loaded on the *first* login, when the
+     * dialog's Enable button started it, and never on any login after
+     * that. The chat panel then sat there offering to answer questions
+     * against weights that were never coming.
+     */
+    if (ai_enabled == 1) ai_autoload_start();
 }
 
 /* Record the answer so it is only asked once. */
