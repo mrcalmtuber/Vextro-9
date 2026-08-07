@@ -1122,6 +1122,17 @@ static void term_exec(char *cmdline) {
         }
         if (argc >= 2 && str_eq(argv[1], "eval")) {
             if (argc < 3) { term_print_c("usage: llm eval <token> [pos]\n", 2); return; }
+            /*
+             * Without this the command runs the forward pass against
+             * whatever is in the weight buffer -- zeros, before the load
+             * finishes -- and prints a confident argmax computed from
+             * nothing. Silently wrong is worse than refusing.
+             */
+            if (!llm_weights_loaded()) {
+                term_print_c("no weights resident; run 'llm load' or wait "
+                             "for the model to finish loading\n", 2);
+                return;
+            }
             int32_t tk = 0;
             for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++) tk = tk * 10 + (*q - '0');
             int pos = 0;
