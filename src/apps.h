@@ -1866,6 +1866,16 @@ static int   wiki_im_end;
 #define WIKI_GEN_TRACE 8
 static int   wiki_gen_ids[WIKI_GEN_TRACE];
 
+/*
+ * The last few tokens this answer produced, held back from the next pick
+ * so decoding cannot settle into emitting one token forever. Only
+ * *generated* tokens go in -- penalising the prompt would hold back the
+ * very words the retrieved article is about.
+ */
+#define WIKI_REPEAT_WIN 24
+static int32_t wiki_recent[WIKI_REPEAT_WIN];
+static int     wiki_recent_n;
+
 static void wiki_log_add(const char *s) {
     int n = str_len(wiki_log);
     int i = 0;
@@ -2235,6 +2245,7 @@ static void wiki_submit(void) {
     wiki_gen_n = 0;
     wiki_answer[0] = '\0';
     wiki_answer_len = 0;
+    wiki_recent_n = 0;
     wiki_busy = 1;
     if (wiki_ntok > 1) {
         /* everything but the last token, in batches */
@@ -2336,7 +2347,7 @@ static void wiki_gen_poll(void) {
 
         if (wiki_busy == 3) wiki_busy = 2;    /* last prompt token done */
 
-        int next = llm_argmax();
+        int next = llm_argmax_penalized(wiki_recent, wiki_recent_n);
         if (next == wiki_im_end || wiki_gen_n >= 48 || wiki_pos + 1 >= LLM_CTX_MAX) {
             wiki_log_add("AI: ");
             wiki_log_add(wiki_answer);
@@ -2366,6 +2377,14 @@ static void wiki_gen_poll(void) {
         }
 
         if (wiki_gen_n < WIKI_GEN_TRACE) wiki_gen_ids[wiki_gen_n] = next;
+
+        if (wiki_recent_n < WIKI_REPEAT_WIN) {
+            wiki_recent[wiki_recent_n++] = next;
+        } else {
+            for (int i = 0; i + 1 < WIKI_REPEAT_WIN; i++)
+                wiki_recent[i] = wiki_recent[i + 1];
+            wiki_recent[WIKI_REPEAT_WIN - 1] = next;
+        }
 
         char piece[64];
         llm_decode(next, piece, sizeof(piece));

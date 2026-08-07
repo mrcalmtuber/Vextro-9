@@ -696,6 +696,39 @@ int llm_encode(const char *text, int32_t *out, int max_out) {
 
     int pos = 0;
     while (pos < len) {
+        /*
+         * Control tokens first.
+         *
+         * Qwen2's chat format is built out of <|im_start|> and <|im_end|>,
+         * and each of those is ONE token in the vocabulary. Fed to the
+         * byte-level BPE below they came out as literal text -- '<', '|',
+         * 'im', '_', 'start', '|', '>' -- so every prompt this system
+         * built was a chat template the model had never seen in training.
+         * It answered accordingly: "first first first first" with no
+         * context, and forty-eight newlines with one.
+         *
+         * Matching is exact and anchored: the run from "<|" to the first
+         * "|>" is looked up whole, and only used if the vocabulary really
+         * has it. Text that merely looks like a marker is left to BPE.
+         */
+        if (text[pos] == '<' && pos + 1 < len && text[pos + 1] == '|') {
+            int end = pos + 2;
+            while (end + 1 < len && !(text[end] == '|' && text[end + 1] == '>'))
+                end++;
+            if (end + 1 < len) {
+                const int tlen = end + 2 - pos;
+                if (tlen > 0 && tlen < PIECE_MAX) {
+                    const int id = tok_find(text + pos, tlen);
+                    if (id >= 0) {
+                        if (n_out >= max_out) return n_out;
+                        out[n_out++] = id;
+                        pos += tlen;
+                        continue;
+                    }
+                }
+            }
+        }
+
         int plen = next_piece(text + pos, len - pos);
         if (plen <= 0) break;
 
@@ -1726,6 +1759,37 @@ int llm_eval(int32_t token, int pos) {
     if (llm_eval_begin(token, pos) != 0) return -1;
     while (llm_eval_step() == 0) { }
     return 0;
+}
+
+/*
+ * Greedy, but with the recently emitted tokens held back.
+ *
+ * Pure argmax has no memory, so once it picks a token whose own logit is
+ * highest after emitting it, it emits it forever -- which is exactly the
+ * newline loop this was written for. The penalty is the conventional one:
+ * divide a positive logit, multiply a negative one, so a token is pushed
+ * down whichever side of zero it sits on. It only reweights; it never
+ * forbids, so a word that genuinely should repeat still can.
+ *
+ * The window is short on purpose. Penalising everything ever said would
+ * stop the model using "the".
+ */
+int llm_argmax_penalized(const int32_t *recent, int n_recent) {
+    if (!weights_ok) return -1;
+    const float penalty = 1.15f;
+
+    for (int i = 0; i < n_recent; i++) {
+        const int32_t t = recent[i];
+        if (t < 0 || (uint32_t)t >= info.n_vocab) continue;
+        if (a_logits[t] > 0.0f) a_logits[t] /= penalty;
+        else                    a_logits[t] *= penalty;
+    }
+
+    int best = 0;
+    float bv = a_logits[0];
+    for (uint32_t i = 1; i < info.n_vocab; i++)
+        if (a_logits[i] > bv) { bv = a_logits[i]; best = (int)i; }
+    return best;
 }
 
 int llm_argmax(void) {

@@ -85,6 +85,10 @@ int          llm_encode(const char *text, int32_t *out, int max_out);
 /* Append token id's text to out (UTF-8), NUL-terminated. */
 int          llm_decode(int32_t id, char *out, int max);
 int          llm_token_id(const char *piece);   /* -1 if absent */
+/* Greedy pick with the recently emitted tokens held back, so decoding
+ * cannot fall into emitting one token forever. Modifies the logit buffer
+ * in place, so it may be called only once per forward pass. */
+int          llm_argmax_penalized(const int32_t *recent, int n_recent);
 
 /* Proof that the floating-point unit is actually usable in the kernel.
  * The result comes back scaled by 10000 as an integer, because the
