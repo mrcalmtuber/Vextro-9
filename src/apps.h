@@ -1860,6 +1860,11 @@ static int   wiki_pos, wiki_gen_n;
 static int   wiki_busy;            /* 0 idle, 1 prefill, 2 generating */
 static uint64_t wiki_t0 = 0;       /* when the question was asked        */
 static int   wiki_im_end;
+/* The first few generated token ids, kept so that an answer which comes
+ * out empty can say what it actually produced. An empty string on the
+ * serial line is indistinguishable from a crash. */
+#define WIKI_GEN_TRACE 8
+static int   wiki_gen_ids[WIKI_GEN_TRACE];
 
 static void wiki_log_add(const char *s) {
     int n = str_len(wiki_log);
@@ -2347,8 +2352,20 @@ static void wiki_gen_poll(void) {
             serial_puts(" generated tokens\n[wiki] ");
             serial_puts(wiki_answer);
             serial_putc('\n');
+            if (wiki_answer_len == 0 && wiki_gen_n > 0) {
+                serial_puts("[wiki] answer decoded empty; first ids:");
+                const int n = wiki_gen_n < WIKI_GEN_TRACE
+                            ? wiki_gen_n : WIKI_GEN_TRACE;
+                for (int i = 0; i < n; i++) {
+                    serial_putc(' ');
+                    serial_put_dec((uint32_t)wiki_gen_ids[i]);
+                }
+                serial_putc('\n');
+            }
             return;
         }
+
+        if (wiki_gen_n < WIKI_GEN_TRACE) wiki_gen_ids[wiki_gen_n] = next;
 
         char piece[64];
         llm_decode(next, piece, sizeof(piece));
