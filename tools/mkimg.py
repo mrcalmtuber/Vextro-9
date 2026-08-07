@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a PNG or PPM image into the Socrates .sci format.
+"""Convert a PNG or PPM image into the Vextro .sci format.
 
 .sci is PNG's idea reused: per-row prediction filters followed by one
 LZMA stream (see src/sci.h).  The kernel decodes it with the same LZMA

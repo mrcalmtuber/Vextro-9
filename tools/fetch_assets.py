@@ -21,7 +21,7 @@ Usage:
     tools/fetch_assets.py [--dest DIR] [--only zim|model] [--yes]
 
 Environment overrides, for a mirror or a different model:
-    SOCRATES_ZIM_URL, SOCRATES_MODEL_URL
+    VEXTRO_ZIM_URL, VEXTRO_MODEL_URL
 """
 import argparse
 import os
@@ -44,7 +44,7 @@ def newest_zim():
     import re
     try:
         req = urllib.request.Request(ZIM_DIR,
-                                     headers={"User-Agent": "socrates-bsd/9"})
+                                     headers={"User-Agent": "vextro/9"})
         with urllib.request.urlopen(req, timeout=60) as r:
             index = r.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError) as e:
@@ -54,13 +54,13 @@ def newest_zim():
     return ZIM_DIR + names[-1] if names else None
 
 
-ZIM_URL = os.environ.get("SOCRATES_ZIM_URL")
+ZIM_URL = os.environ.get("VEXTRO_ZIM_URL")
 
 # Qwen2 0.5B Instruct, Q5_0. Small enough to load in seconds and to run a
 # token at a time inside a render loop; the quantisations this kernel
 # decodes are Q4_K, Q5_0, Q6_K and Q8_0.
 MODEL_URL = os.environ.get(
-    "SOCRATES_MODEL_URL",
+    "VEXTRO_MODEL_URL",
     "https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF/resolve/main/"
     "qwen2-0_5b-instruct-q5_0.gguf",
 )
@@ -104,7 +104,7 @@ def fetch(url, dest, min_size, label):
     print(f"  {label}\n    {url}")
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "socrates-bsd/9"})
+        req = urllib.request.Request(url, headers={"User-Agent": "vextro/9"})
         with urllib.request.urlopen(req) as r, open(tmp, "wb") as out:
             total = int(r.headers.get("Content-Length") or 0)
             got = 0
@@ -204,7 +204,7 @@ def main():
     for name, min_size, label, path in todo:
         url = source(name)
         if not url:
-            print(f"  {name}: no build found; set SOCRATES_ZIM_URL to choose one",
+            print(f"  {name}: no build found; set VEXTRO_ZIM_URL to choose one",
                   file=sys.stderr)
             ok = False
             continue

@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /*
- * Socrates BSD 9 network stack.
+ * Vextro 9 network stack.
  *
  * Layers: Ethernet / ARP / IPv4 / ICMP / UDP / TCP, plus a DNS resolver
  * and an asynchronous HTTP/1.0 client on top.  Everything is polled from
@@ -1009,7 +1009,7 @@ static void http_tick(void) {
             parts[1] = http_path;
             parts[2] = " HTTP/1.0\r\nHost: ";
             parts[3] = http_host;
-            parts[4] = "\r\nUser-Agent: SocratesBSD/9.0\r\nAccept: text/html, text/plain\r\n";
+            parts[4] = "\r\nUser-Agent: Vextro/9.0\r\nAccept: text/html, text/plain\r\n";
             parts[5] = "Connection: close\r\n\r\n";
             parts[6] = 0;
             for (int i = 0; parts[i]; i++)

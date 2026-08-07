@@ -1864,7 +1864,7 @@ static void cu_cmd_xargs(int argc, char **argv) {
 
 static void cu_cmd_hostname(int argc, char **argv) {
     (void)argc; (void)argv;
-    term_print("socrates\n");
+    term_print("vextro\n");
 }
 
 static void cu_cmd_arch(int argc, char **argv) {

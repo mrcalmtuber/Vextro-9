@@ -1,4 +1,4 @@
-# Socrates BSD 9 package index (source form)
+# Vextro 9 package index (source form)
 #
 # tools/serve_repo.py copies this file into the served repository,
 # filling in each `size:` from the built binary.  The kernel parses the

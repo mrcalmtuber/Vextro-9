@@ -1,4 +1,4 @@
-#include "socrates.h"
+#include "vextro.h"
 
 /*
  * Symbols borrowed from the kernel.
@@ -31,7 +31,7 @@ typedef void (*ttf_draw_string_fn)(unsigned int *, int, int, int, int,
                                    const char *, unsigned int, int);
 
 void _start(void) {
-    os_print("Hello from Socrates BSD 9!\n");
+    os_print("Hello from Vextro 9!\n");
     os_print("Hybrid syscall framework active.\n");
 
     uint32_t gold = 0xD4AF37;

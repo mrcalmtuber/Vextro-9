@@ -2,7 +2,7 @@
 #define TERM_H
 
 /*
- * Socrates Terminal — monospace grid renderer with scrollback, command
+ * Vextro Terminal — monospace grid renderer with scrollback, command
  * history, line editing and async network commands (ping / dns / fetch).
  *
  * Included from desktop.h; relies on forward declarations there for
@@ -501,7 +501,7 @@ static void term_cmd_date(void) {
 }
 
 static void term_cmd_help(void) {
-    term_print_c("Socrates BSD 9 shell commands\n", 1);
+    term_print_c("Vextro 9 shell commands\n", 1);
     term_print("  ls [dir]  cat <f>  cd <dir>  pwd     browse the disk\n");
     term_print("  echo <text> > f    write a file  (>> appends)\n");
     term_print("  rm <f>  mkdir <d>  cp <a> <b>  df    manage the disk\n");
@@ -683,9 +683,9 @@ static int  wiki_ask(const char *question);
 static void term_build_prompt(char *out, int max) {
     if (user_current >= 0) {
         str_copy(out, user_name_of(user_current), max);
-        str_append(out, "@socrates:", max);
+        str_append(out, "@vextro:", max);
     } else {
-        str_copy(out, "socrates:", max);
+        str_copy(out, "vextro:", max);
     }
     str_append(out, term_cwd, max);
     str_append(out, "> ", max);
@@ -808,12 +808,12 @@ static void term_exec(char *cmdline) {
     } else if (str_eq(cmd, "clear")) {
         term_clear();
     } else if (str_eq(cmd, "about")) {
-        term_print_c("Socrates BSD 9\n", 1);
+        term_print_c("Vextro 9\n", 1);
         term_print("A bare-metal x86_64 operating system.\n");
         term_print("TrueType rasterizer, window manager, TCP/IP stack,\n");
         term_print("HTTP browser and PS/2 HAL - no libc, no floats.\n");
     } else if (str_eq(cmd, "uname")) {
-        term_print("Socrates BSD 9.0 x86_64 bare-metal\n");
+        term_print("Vextro 9.0 x86_64 bare-metal\n");
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {
         term_cmd_ls(argc >= 2 ? argv[1] : 0);
     } else if (str_eq(cmd, "cat")) {
@@ -1793,7 +1793,7 @@ static int term_banner_done = 0;
 static void term_banner(void) {
     if (term_banner_done) return;
     term_banner_done = 1;
-    term_print_c("Socrates BSD 9.0 ", 1);
+    term_print_c("Vextro 9.0 ", 1);
     term_print_c("(x86_64 bare metal)\n", 3);
     if (fs_writable()) {
         char nb[16];

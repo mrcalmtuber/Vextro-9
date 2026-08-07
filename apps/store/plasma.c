@@ -1,5 +1,5 @@
 /*
- * plasma — interference field renderer for Socrates BSD 9.
+ * plasma — interference field renderer for Vextro 9.
  *
  * There is no libm and no FPU here, so the sine table is generated at
  * startup by running a magic-circle oscillator:
@@ -10,7 +10,7 @@
  * few parts in ten thousand, and because it is symplectic the vector
  * stays on the unit circle instead of spiralling out over 256 steps.
  */
-#include "../socrates.h"
+#include "../vextro.h"
 
 #define FP    16
 #define ONE   (1 << FP)

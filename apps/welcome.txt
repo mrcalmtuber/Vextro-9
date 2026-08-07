@@ -1,4 +1,4 @@
-Welcome to the Socrates BSD 9 filesystem.
+Welcome to the Vextro 9 filesystem.
 
 This volume is a real, writable FAT32 disk. Everything you create
 here survives a reboot - and you can even mount disk.img on your

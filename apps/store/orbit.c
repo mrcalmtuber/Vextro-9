@@ -1,5 +1,5 @@
 /*
- * orbit — Newtonian gravity integrator for Socrates BSD 9.
+ * orbit — Newtonian gravity integrator for Vextro 9.
  *
  * Five bodies fall around a central star under a = -GM r / |r|^3,
  * advanced with a semi-implicit (Euler-Cromer) step so the orbits stay
@@ -8,7 +8,7 @@
  * All state is 16.16 fixed point pixels; the square root is a
  * bit-by-bit integer isqrt over int64_t.  No FPU is involved.
  */
-#include "../socrates.h"
+#include "../vextro.h"
 
 #define FP     16
 #define ONE    (1 << FP)

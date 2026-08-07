@@ -244,7 +244,7 @@ build/limine-tool: $(LIMINE)/limine.c
 	$(HOSTCC) -O2 -o $@ $<
 
 # --- User app: hello ---
-build/hello.o: apps/hello.c apps/socrates.h
+build/hello.o: apps/hello.c apps/vextro.h
 	@mkdir -p build
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
@@ -261,7 +261,7 @@ bsdfmt/bsd_run: bsdfmt/bsd_run.c bsdfmt/bsd_format.h
 # --- Store apps: canvas apps compiled to ELF64, repacked as .bsd ---
 # bsd.ld puts .data on its own page so the two segments can carry
 # different protections; -z max-page-size stops ld padding to 2 MB.
-build/store/%.o: apps/store/%.c apps/socrates.h
+build/store/%.o: apps/store/%.c apps/vextro.h
 	@mkdir -p build/store
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
@@ -363,7 +363,7 @@ iso: os.iso
 os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/limine/limine.conf
 	xorriso -as mkisofs \
 		-R -J \
-		-V "SOCRATES_BSD_9" \
+		-V "VEXTRO_9" \
 		-b boot/limine/limine-bios-cd.bin \
 		-no-emul-boot -boot-load-size 4 -boot-info-table \
 		--efi-boot boot/limine/limine-uefi-cd.bin \

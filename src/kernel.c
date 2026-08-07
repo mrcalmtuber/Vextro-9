@@ -990,9 +990,9 @@ void kmain(void) {
      * a terminal behind a password prompt, which is not something a
      * headless harness can do; this makes import resolution testable.
      */
-    serial_puts("[socrates] app selftest: running /hello\n");
+    serial_puts("[vextro] app selftest: running /hello\n");
     execute_bin_internal("/hello", 0);
-    serial_puts("[socrates] app selftest: done\n");
+    serial_puts("[vextro] app selftest: done\n");
 #endif
 
 #ifdef WIKI_SELFTEST
@@ -1091,15 +1091,15 @@ void kmain(void) {
      */
     users_load();
     if (user_count == 0 && users_migrate_keycode())
-        serial_puts("[socrates] users: migrated /keycode.sys to 'admin'\n");
+        serial_puts("[vextro] users: migrated /keycode.sys to 'admin'\n");
 
     if (user_count == 0) {
         login_stage = LOGIN_NEW_NAME;
-        serial_puts("[socrates] users: no accounts, first-run setup\n");
+        serial_puts("[vextro] users: no accounts, first-run setup\n");
     } else {
         login_stage = LOGIN_PASSWORD;
         login_sel = 0;
-        serial_puts("[socrates] users: ");
+        serial_puts("[vextro] users: ");
         serial_put_dec((uint32_t)user_count);
         serial_puts(" account(s)\n");
     }
@@ -1213,7 +1213,7 @@ void kmain(void) {
         if (auto_login && !desktop_mode) {
             auto_login = 0;
             desktop_mode = 1;
-            serial_puts("[socrates] AUTO_LOGIN: skipped the login screen\n");
+            serial_puts("[vextro] AUTO_LOGIN: skipped the login screen\n");
             for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
 #ifdef AI_ACCEPT
             /* AUTO_LOGIN skips the dialog, so the answer has to be given
@@ -1221,7 +1221,7 @@ void kmain(void) {
              * question, which is exactly what it is meant to do. */
             ai_choice_save(1);
             ai_autoload_start();
-            serial_puts("[socrates] AI_ACCEPT: model enabled\n");
+            serial_puts("[vextro] AI_ACCEPT: model enabled\n");
 #endif
 #ifdef AUTO_ASK
             /*
@@ -1252,9 +1252,9 @@ void kmain(void) {
                                       * with the archive's front page */
             wiki_last_cw = wk_meta[WK_WIKI].w;
             if (wiki_load(AUTO_WIKI, 0) == 0)
-                serial_puts("[socrates] AUTO_WIKI: article open\n");
+                serial_puts("[vextro] AUTO_WIKI: article open\n");
             else
-                serial_puts("[socrates] AUTO_WIKI: load failed\n");
+                serial_puts("[vextro] AUTO_WIKI: load failed\n");
 #endif
         }
 
@@ -1268,7 +1268,7 @@ void kmain(void) {
          */
         if (want_logout) {
             want_logout = 0;
-            serial_puts("[socrates] logout: ");
+            serial_puts("[vextro] logout: ");
             serial_puts(user_name_of(user_current));
             serial_puts("\n");
             session_end();
@@ -1402,7 +1402,7 @@ void kmain(void) {
                         str_copy(login_notice,
                                  "Administrator account 'admin' created, "
                                  "same password", sizeof(login_notice));
-                        serial_puts("[socrates] users: created 'admin' "
+                        serial_puts("[vextro] users: created 'admin' "
                                     "alongside a standard account\n");
                     }
                     login_sel = user_find(pending_name);
@@ -1539,7 +1539,7 @@ void kmain(void) {
                 }
 #endif
                 for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
-                serial_puts("[socrates] login: ");
+                serial_puts("[vextro] login: ");
                 serial_puts(user_name_of(user_current));
                 serial_puts(user_is_admin(user_current) ? " (admin)\n" : "\n");
                 vga_flip(vram, w, h, pitch_px);
@@ -1563,7 +1563,7 @@ void kmain(void) {
         const char *prompt;
         switch (login_stage) {
         case LOGIN_NEW_NAME:
-            prompt = "Socrates BSD 9 - Create an account. Username:";
+            prompt = "Vextro 9 - Create an account. Username:";
             break;
         case LOGIN_NEW_PW:
             prompt = "Choose a password:";

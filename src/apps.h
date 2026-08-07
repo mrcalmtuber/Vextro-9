@@ -155,9 +155,9 @@ static void exp_open_file(const char *name) {
         return;
     }
 
-    /* full ramdisk path for socrates://file/ */
+    /* full ramdisk path for vextro://file/ */
     char url[300];
-    str_copy(url, "socrates://file/", sizeof(url));
+    str_copy(url, "vextro://file/", sizeof(url));
     const char *p = exp_path;
     if (p[0] == '/') p++;
     if (p[0]) {
@@ -583,7 +583,7 @@ static void settings_draw(uint32_t *buf, uint32_t w, uint32_t h,
     {
         char line[64], nb[16];
 
-        str_copy(line, "Socrates BSD 9.0  x86_64", sizeof(line));
+        str_copy(line, "Vextro 9.0  x86_64", sizeof(line));
         ttf_draw_string(buf, (int)w, (int)h, cx + 24, cy + 274, line,
                         0x40454Fu, 13);
 
@@ -1390,7 +1390,7 @@ static void wiki_resolve_link(const char *href, char *out, int max) {
     out[0] = '\0';
     if (!href || !href[0]) return;
     if (str_starts_with(href, "http://") || str_starts_with(href, "https://") ||
-        str_starts_with(href, "//") || str_starts_with(href, "socrates://"))
+        str_starts_with(href, "//") || str_starts_with(href, "vextro://"))
         return;                                  /* not an archive entry */
 
     const char *q = href;
@@ -2573,7 +2573,7 @@ static void about_draw(uint32_t *buf, uint32_t w, uint32_t h,
     gfx_tri(buf, w, h, dx - 20, dy + 12, dx, dy - 8, dx + 20, dy + 12, 0x10131Cu);
 
     {
-        const char *t = "Socrates BSD 9";
+        const char *t = "Vextro 9";
         int tw = ttf_text_width(t, 20);
         ttf_draw_string(buf, (int)w, (int)h, cx + (cw - tw) / 2, cy + 78,
                         t, C_TEXT, 20);

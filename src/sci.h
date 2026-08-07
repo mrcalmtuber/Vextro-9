@@ -5,7 +5,7 @@
 #include "lzma.h"
 
 /*
- * .sci — Socrates Compressed Image.
+ * .sci — Vextro Compressed Image.
  *
  * Full-colour images small enough to keep on a 64 MB disk.  The scheme
  * is the one PNG uses, because on photographic and synthetic images it

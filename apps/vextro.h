@@ -1,8 +1,8 @@
-#ifndef SOCRATES_H
-#define SOCRATES_H
+#ifndef VEXTRO_H
+#define VEXTRO_H
 
 /*
- * Socrates BSD 9 — Native Hybrid Application Header
+ * Vextro 9 — Native Hybrid Application Header
  *
  * Provides inline assembly wrappers around the kernel's int 0x80
  * syscall gateway.  Include this in any standalone ELF64 app to
@@ -65,4 +65,4 @@ static inline void os_get_mouse(int32_t *out) {
     );
 }
 
-#endif /* SOCRATES_H */
+#endif /* VEXTRO_H */

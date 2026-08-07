@@ -156,7 +156,7 @@ static void ba_draw_scene(void) {
     /* The wordmark, in the face the system draws itself in, low enough
      * that the burn reaches it late. */
     {
-        const char *s = "SOCRATES BSD 9";
+        const char *s = "VEXTRO 9";
         const int size = 26;
         const int tw = ttf_text_width(s, size);
         ttf_draw_string(ba_bg, BA_W, BA_H, (BA_W - tw) / 2, BA_H - 78, s,

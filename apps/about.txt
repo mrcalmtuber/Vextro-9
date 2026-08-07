@@ -1,4 +1,4 @@
-Socrates BSD 9 Operating System
+Vextro 9 Operating System
 Custom TrueType Rasterizer Engine
 Hardware Abstraction Layer (HAL)
 Ramdisk Tar File System (Tarfs)

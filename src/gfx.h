@@ -5,7 +5,7 @@
 #include "font.h"
 
 /*
- * Shared UI theme + software drawing primitives for the Socrates desktop.
+ * Shared UI theme + software drawing primitives for the Vextro desktop.
  * All colors are 0xRRGGBB in a 32-bit XRGB backbuffer.
  */
 

@@ -10,7 +10,7 @@
 #include "sci.h"
 
 /*
- * Socrates BSD 9 desktop.
+ * Vextro 9 desktop.
  *
  * Layout of this file:
  *   1. shared globals + dock config + window-kind registry
@@ -118,7 +118,7 @@ typedef struct {
 
 static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Terminal",          UI_SNAP(740), UI_SNAP(480) },
-    { "Socrates Browser",  UI_SNAP(800), UI_SNAP(560) },
+    { "Vextro Browser",  UI_SNAP(800), UI_SNAP(560) },
     { "Files",             UI_SNAP(600), UI_SNAP(430) },
     { "Goldsmith",         UI_SNAP(640), UI_SNAP(470) },
     { "Monolith",          UI_SNAP(400), UI_SNAP(480) },
@@ -131,7 +131,7 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Wikipedia",         UI_SNAP(780), UI_SNAP(580) },
     /* Taller since the Users pane joined it. */
     { "Settings",          UI_SNAP(470), UI_SNAP(560) },
-    { "About Socrates",    UI_SNAP(380), UI_SNAP(270) },
+    { "About Vextro",    UI_SNAP(380), UI_SNAP(270) },
 };
 
 /* ===== 2. TARFS ===== */
@@ -567,7 +567,7 @@ static const char *img_status(void);
 /* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
 
 /*
- * Syscall ABI (see apps/socrates.h):
+ * Syscall ABI (see apps/vextro.h):
  *   RAX = number, RDI = arg0, RSI = arg1, RDX = arg2, via int 0x80
  *   1 = print string    2 = draw pixel on app canvas    3 = mouse state
  */
@@ -791,7 +791,7 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
         return -1;
     }
     if (nimp > 0) {
-        serial_puts("[socrates] elf: resolved ");
+        serial_puts("[vextro] elf: resolved ");
         serial_put_dec((uint32_t)nimp);
         serial_puts(" imported symbols\n");
     }
@@ -852,7 +852,7 @@ static int load_bsd_image(const uint8_t *file, uint64_t fsize, int verbose,
         return -1;
     }
     if (nimp > 0) {
-        serial_puts("[socrates] .bsd: resolved ");
+        serial_puts("[vextro] .bsd: resolved ");
         serial_put_dec((uint32_t)nimp);
         serial_puts(" imported symbols\n");
     }
@@ -1024,7 +1024,7 @@ static void wm_open(int kind) {
 
     /* first-open hooks */
     if (kind == WK_BROWSER && brw_line_count == 0)
-        brw_navigate_no_hist("socrates://home");
+        brw_navigate_no_hist("vextro://home");
     if (kind == WK_FILES)
         exp_scan();
     if (kind == WK_STORE)
@@ -1423,11 +1423,17 @@ static void wallpaper_regen(uint32_t w, uint32_t h) {
     wall_dragon(wallpaper, w, h, (int)w / 2, ((int)h + MENUBAR_H) / 2,
                 1, 1, body, accent, C_GOLD);
 
-    /* signature bottom-left */
-    ttf_draw_string(wallpaper, (int)w, (int)h, 24, (int)h - 46,
-                    "SOCRATES BSD 9", gfx_mix(C_GOLD, bot, 140), 15);
-    gfx_rect(wallpaper, w, h, 24, (int32_t)h - 24, 120, 1,
-             gfx_mix(C_GOLD, bot, 90));
+    /* Signature bottom-left, with the rule under it measured rather than
+     * guessed — it used to be 120px because that happened to be how wide the
+     * old name set, and a shorter one would have left the rule hanging. */
+    {
+        const char *sig = "VEXTRO 9";
+        const int32_t sw = ttf_text_width(sig, 15);
+        ttf_draw_string(wallpaper, (int)w, (int)h, 24, (int)h - 46,
+                        sig, gfx_mix(C_GOLD, bot, 140), 15);
+        gfx_rect(wallpaper, w, h, 24, (int32_t)h - 24, sw, 1,
+                 gfx_mix(C_GOLD, bot, 90));
+    }
 
     wall_gen_w = w;
     wall_gen_h = h;
@@ -1454,7 +1460,7 @@ typedef struct {
 } menu_item_t;
 
 static const menu_item_t menu_system[] = {
-    { "About Socrates", WK_ABOUT },
+    { "About Vextro", WK_ABOUT },
     { "Settings",       WK_SETTINGS },
     { "-",              -1 },
     { "Log Out",        MENU_ACT_LOGOUT },
@@ -1469,7 +1475,7 @@ static menu_item_t menu_apps[MENU_APPS_MAX];
 static int         menu_apps_n = 0;
 
 #define MENU_COUNT 2
-static const char *menu_labels[MENU_COUNT] = { "Socrates", "Apps" };
+static const char *menu_labels[MENU_COUNT] = { "Vextro", "Apps" };
 static const menu_item_t *menu_items[MENU_COUNT] = { menu_system, menu_apps };
 static int menu_item_count[MENU_COUNT] = { 5, 0 };
 
@@ -2313,7 +2319,7 @@ static void session_end(void) {
     brw_hist_n = 0;
     brw_line_count = 0;
     brw_scroll = 0;
-    str_copy(brw_addr, "socrates://home", BRW_ADDR_MAX);
+    str_copy(brw_addr, "vextro://home", BRW_ADDR_MAX);
     brw_title[0] = '\0';
 
     /* encyclopedia: reading position, trail and search */

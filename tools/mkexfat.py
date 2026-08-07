@@ -3,7 +3,7 @@
 
 Pure stdlib — no mounting, no privileges, no mkfs.exfat.  The output is a
 partition-less exFAT "superfloppy" (VBR at sector 0), which macOS, Linux,
-Windows and the Socrates kernel all understand.
+Windows and the Vextro kernel all understand.
 
 exFAT is what lifts FAT32's 4 GB per-file ceiling, which is the whole
 reason the system volume moved over: a Wikipedia ZIM is far larger than
@@ -261,7 +261,7 @@ class Dir:
         return self.children[name]
 
 
-def layout(vol, d, upcase, is_root=False, label='SOCRATES'):
+def layout(vol, d, upcase, is_root=False, label='VEXTRO'):
     """Depth-first: place every file and subdirectory, then build this
     directory's own entry stream.  Sizes are known before the parent
     writes its entry set because children are laid out first."""

@@ -1,4 +1,4 @@
-<h1 align="center">Socrates BSD 9</h1>
+<h1 align="center">Vextro 9</h1>
 
 <p align="center">
   <b>A desktop operating system written from nothing.</b><br>
@@ -13,15 +13,15 @@
   <img alt="lines" src="https://img.shields.io/badge/kernel-29k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
-  <a href="https://github.com/mrcalmtuber/socrates-bsd-9-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
+  <a href="https://github.com/mrcalmtuber/vextro-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
 </p>
 
 <p align="center">
-  <img src="docs/desktop.png" width="90%" alt="The Socrates BSD 9 desktop">
+  <img src="docs/desktop.png" width="90%" alt="The Vextro 9 desktop">
 </p>
 
 > **There is an ARM64 port** —
-> **[socrates-bsd-9-arm64](https://github.com/mrcalmtuber/socrates-bsd-9-arm64)**.
+> **[vextro-arm64](https://github.com/mrcalmtuber/vextro-arm64)**.
 > Same desktop, same browser, same Wikipedia, same language model, on
 > aarch64: virtio devices, a GICv2 and the generic timer instead of the PIC
 > and the PIT, and Raspberry Pi 4 drivers. On Apple silicon it runs under
@@ -56,8 +56,8 @@ You will want about **11 GB free**: an 8 GB sparse volume plus 1.4 GB of
 downloads.
 
 ```
-git clone https://github.com/mrcalmtuber/socrates-bsd-9
-cd socrates-bsd-9
+git clone https://github.com/mrcalmtuber/vextro
+cd vextro
 make            # builds the ISO and the 8 GB volume
 make run
 ```
@@ -471,4 +471,4 @@ Source released under the [Apache License 2.0](LICENSE).
 Comic Neue is under the [SIL Open Font License 1.1](assets/OFL.txt).
 Limine is [BSD 2-Clause](https://github.com/limine-bootloader/limine).
 
-<p align="center"><sub>There is also an <a href="https://github.com/mrcalmtuber/socrates-bsd-9-arm64">ARM64 port</a>, which runs under hardware virtualisation on Apple silicon.</sub></p>
+<p align="center"><sub>There is also an <a href="https://github.com/mrcalmtuber/vextro-arm64">ARM64 port</a>, which runs under hardware virtualisation on Apple silicon.</sub></p>

@@ -10,7 +10,7 @@
  *
  *   elf    -e program.elf
  *          Reads a linked ELF64's program headers and repacks its two
- *          PT_LOAD segments.  This is how the Socrates app store's
+ *          PT_LOAD segments.  This is how the Vextro app store's
  *          packages are built, because the linker is what knows the
  *          real .bss size and the text/data split.
  *

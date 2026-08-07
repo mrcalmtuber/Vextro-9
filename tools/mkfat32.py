@@ -2,7 +2,7 @@
 """Format a FAT32 "superfloppy" disk image and populate it with files.
 
 Pure stdlib — no mtools, no mounting.  Layout is a partition-less FAT32
-volume (VBR at sector 0), which macOS/Linux/mtools and the Socrates
+volume (VBR at sector 0), which macOS/Linux/mtools and the Vextro
 kernel all understand.
 
 Usage:
@@ -87,7 +87,7 @@ class Volume:
         self.next_free = 3
         # dir tree: cluster -> bytearray of entries
         self.dirs = {2: bytearray()}
-        self.dirs[2] += struct.pack('<11sB', b'SOCRATES   ', 0x08) + bytes(20)
+        self.dirs[2] += struct.pack('<11sB', b'VEXTRO   ', 0x08) + bytes(20)
 
     def alloc_chain(self, nclus):
         chain = []
@@ -182,7 +182,7 @@ class Volume:
         # boot sector
         bpb = bytearray(SECTOR)
         bpb[0:3] = b'\xEB\x58\x90'
-        bpb[3:11] = b'SOCRATES'
+        bpb[3:11] = b'VEXTRO'
         struct.pack_into('<H', bpb, 11, SECTOR)          # bytes/sector
         bpb[13] = SPC
         struct.pack_into('<H', bpb, 14, RESVD)
@@ -204,7 +204,7 @@ class Volume:
         bpb[64] = 0x80                                   # drive number
         bpb[66] = 0x29                                   # boot signature
         struct.pack_into('<I', bpb, 67, int(time.time()) & 0xFFFFFFFF)
-        bpb[71:82] = b'SOCRATES   '
+        bpb[71:82] = b'VEXTRO   '
         bpb[82:90] = b'FAT32   '
         bpb[510] = 0x55
         bpb[511] = 0xAA

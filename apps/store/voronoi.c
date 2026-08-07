@@ -1,5 +1,5 @@
 /*
- * voronoi — nearest-site partition of the canvas, for Socrates BSD 9.
+ * voronoi — nearest-site partition of the canvas, for Vextro 9.
  *
  * This one is deliberately absent from the disk-seeded repository: it
  * only exists in the network repository, so installing it exercises the
@@ -8,7 +8,7 @@
  * Squared distances are compared directly, which keeps the whole thing
  * on 32-bit integers with no square root anywhere.
  */
-#include "../socrates.h"
+#include "../vextro.h"
 
 #define SITES 28
 

@@ -1,12 +1,12 @@
 /*
- * life — Conway's Game of Life for Socrates BSD 9.
+ * life — Conway's Game of Life for Vextro 9.
  *
  * A 149x100 torus seeded from a linear congruential soup, run for 160
  * generations.  The final board is drawn over a heat map of everywhere
  * life has ever been, so the still lifes and oscillators that survive
  * stand out against the burnt-out region they grew from.
  */
-#include "../socrates.h"
+#include "../vextro.h"
 
 #define GW    149
 #define GH    100

@@ -2,7 +2,7 @@
 #define STORE_H
 
 /*
- * Agora — the Socrates BSD 9 app store.
+ * Agora — the Vextro 9 app store.
  *
  * Two package sources feed one catalog:
  *
@@ -220,7 +220,7 @@ static void store_registry_save(void) {
     int p = 0;
     store_dbbuf[0] = '\0';
 
-    const char *hdr = "# socrates installed apps - id|name|version|icon|path\n";
+    const char *hdr = "# vextro installed apps - id|name|version|icon|path\n";
     while (hdr[p]) { store_dbbuf[p] = hdr[p]; p++; }
 
     for (int i = 0; i < store_inst_count && p < (int)sizeof(store_dbbuf) - 160;
@@ -992,7 +992,7 @@ static void store_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
     ttf_draw_string(buf, (int)w, (int)h, cx + 46, cy + 10, "Agora", C_GOLD, 21);
     ttf_draw_string(buf, (int)w, (int)h, cx + 46, cy + 36,
-                    "Socrates App Store", C_TEXT_DIM, 12);
+                    "Agora App Store", C_TEXT_DIM, 12);
     {
         char sum[48], nb[12];
         uint_to_str((uint32_t)store_pkg_count, nb);

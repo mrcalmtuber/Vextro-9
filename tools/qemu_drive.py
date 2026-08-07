@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the Socrates BSD 9 VM through QEMU's QMP socket.
+"""Drive the Vextro 9 VM through QEMU's QMP socket.
 
 Usage: qemu_drive.py <qmp-port> <script-file>
 

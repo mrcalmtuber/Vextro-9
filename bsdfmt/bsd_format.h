@@ -35,7 +35,7 @@
  * place the image anywhere as long as it preserves the distance between
  * the text and data segments.
  *
- * This header is shared by the host tools and by the Socrates kernel,
+ * This header is shared by the host tools and by the Vextro kernel,
  * so it stays freestanding: stdint.h and nothing else.
  */
 

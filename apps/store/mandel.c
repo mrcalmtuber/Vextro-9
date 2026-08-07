@@ -1,12 +1,12 @@
 /*
- * mandel — escape-time Mandelbrot renderer for Socrates BSD 9.
+ * mandel — escape-time Mandelbrot renderer for Vextro 9.
  *
  * Everything is 16.16 fixed point: the kernel is built without SSE and
  * without an FPU, so userland apps have no floats either.  Squares are
  * taken through int64_t because a 16.16 value squared needs 64 bits
  * before the shift back down.
  */
-#include "../socrates.h"
+#include "../vextro.h"
 
 #define FP        16
 #define ONE       (1 << FP)

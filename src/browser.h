@@ -2,7 +2,7 @@
 #define BROWSER_H
 
 /*
- * Socrates Browser — HTTP/1.0 + internal socrates:// pages.
+ * Vextro Browser — HTTP/1.0 + internal vextro:// pages.
  *
  * Pages are parsed into a flat list of styled, word-wrapped lines.
  * Lines can carry an href, making links clickable.  Loading is fully
@@ -33,11 +33,11 @@ typedef struct {
 
 static brw_line_t brw_lines[BRW_MAX_LINES];
 static int   brw_line_count = 0;
-static char  brw_addr[BRW_ADDR_MAX] = "socrates://home";
+static char  brw_addr[BRW_ADDR_MAX] = "vextro://home";
 static int   brw_addr_len = 15;
 static int   brw_addr_cur = 15;
 static int   brw_addr_focus = 0;
-static char  brw_title[BRW_TITLE_MAX] = "Socrates Browser";
+static char  brw_title[BRW_TITLE_MAX] = "Vextro Browser";
 static int   brw_scroll = 0;         /* px */
 static int   brw_total_h = 0;        /* px */
 static int   brw_loading = 0;
@@ -145,7 +145,7 @@ static void brw_doc_reset(void) {
     brw_last_blank = 1;
     brw_scroll = 0;
     brw_hover_line = -1;
-    str_copy(brw_title, "Socrates Browser", BRW_TITLE_MAX);
+    str_copy(brw_title, "Vextro Browser", BRW_TITLE_MAX);
 }
 
 static void brw_doc_finish(void) {
@@ -238,7 +238,7 @@ static void brw_resolve_href(const char *href, char *out, int out_max) {
      */
     if (brw_zim_mode &&
         !str_starts_with(href, "http://") && !str_starts_with(href, "https://") &&
-        !str_starts_with(href, "socrates://") && !str_starts_with(href, "//")) {
+        !str_starts_with(href, "vextro://") && !str_starts_with(href, "//")) {
         const char *q = href;
         while (str_starts_with(q, "./")) q += 2;
         while (str_starts_with(q, "../")) q += 3;
@@ -254,7 +254,7 @@ static void brw_resolve_href(const char *href, char *out, int out_max) {
     }
     if (str_starts_with(href, "http://") ||
         str_starts_with(href, "https://") ||
-        str_starts_with(href, "socrates://")) {
+        str_starts_with(href, "vextro://")) {
         str_copy(out, href, out_max);
         return;
     }
@@ -579,9 +579,9 @@ static void brw_parse_plain(const uint8_t *src, int len) {
 
 static void brw_page_home(void) {
     brw_doc_reset();
-    str_copy(brw_title, "Home - Socrates Browser", BRW_TITLE_MAX);
+    str_copy(brw_title, "Home - Vextro Browser", BRW_TITLE_MAX);
 
-    brw_add_text("Socrates Browser", BS_H1, 0);
+    brw_add_text("Vextro Browser", BS_H1, 0);
     brw_line_flush();
     brw_add_text("A tiny HTTP/1.0 browser running on a homemade TCP/IP stack,", BS_BODY, 0);
     brw_add_text("straight on the metal. No libc, no TLS, no fear.", BS_BODY, 0);
@@ -596,10 +596,10 @@ static void brw_page_home(void) {
     brw_line_flush();
     brw_add_text("http://neverssl.com", BS_LINK, "http://neverssl.com");
     brw_line_flush();
-    brw_add_text("socrates://help  -  how to drive this thing", BS_LINK,
-                 "socrates://help");
+    brw_add_text("vextro://help  -  how to drive this thing", BS_LINK,
+                 "vextro://help");
     brw_line_flush();
-    brw_add_text("socrates://about", BS_LINK, "socrates://about");
+    brw_add_text("vextro://about", BS_LINK, "vextro://about");
     brw_line_flush();
     brw_line_flush();
     brw_add_text("https:// sites will not load - there is no TLS on bare", BS_DIM, 0);
@@ -609,7 +609,7 @@ static void brw_page_home(void) {
 
 static void brw_page_help(void) {
     brw_doc_reset();
-    str_copy(brw_title, "Help - Socrates Browser", BRW_TITLE_MAX);
+    str_copy(brw_title, "Help - Vextro Browser", BRW_TITLE_MAX);
     brw_add_text("Using the browser", BS_H1, 0);
     brw_line_flush();
     brw_add_text("Click the address bar, type a URL, press Enter.", BS_BODY, 0);
@@ -623,18 +623,18 @@ static void brw_page_help(void) {
     brw_line_flush();
     brw_add_text("Pages:", BS_H3, 0);
     brw_line_flush();
-    brw_add_text("socrates://home", BS_LINK, "socrates://home");
+    brw_add_text("vextro://home", BS_LINK, "vextro://home");
     brw_line_flush();
-    brw_add_text("socrates://about", BS_LINK, "socrates://about");
+    brw_add_text("vextro://about", BS_LINK, "vextro://about");
     brw_line_flush();
-    brw_add_text("socrates://file/<name> shows a ramdisk file", BS_BODY, 0);
+    brw_add_text("vextro://file/<name> shows a ramdisk file", BS_BODY, 0);
     brw_doc_finish();
 }
 
 static void brw_page_about(void) {
     brw_doc_reset();
-    str_copy(brw_title, "About - Socrates Browser", BRW_TITLE_MAX);
-    brw_add_text("Socrates BSD 9", BS_H1, 0);
+    str_copy(brw_title, "About - Vextro Browser", BRW_TITLE_MAX);
+    brw_add_text("Vextro 9", BS_H1, 0);
     brw_line_flush();
     brw_add_text("Bare-metal x86_64 hobby operating system.", BS_BODY, 0);
     brw_line_flush();
@@ -653,13 +653,13 @@ static void brw_page_about(void) {
 
 static void brw_page_error(const char *msg) {
     brw_doc_reset();
-    str_copy(brw_title, "Error - Socrates Browser", BRW_TITLE_MAX);
+    str_copy(brw_title, "Error - Vextro Browser", BRW_TITLE_MAX);
     brw_add_text("Page failed to load", BS_H2, 0);
     brw_line_flush();
     brw_add_text(msg, BS_BODY, 0);
     brw_line_flush();
     brw_line_flush();
-    brw_add_text("Back to home", BS_LINK, "socrates://home");
+    brw_add_text("Back to home", BS_LINK, "vextro://home");
     brw_doc_finish();
 }
 
@@ -757,7 +757,7 @@ static void brw_navigate_no_hist(const char *url) {
         return;
     }
 
-    if (str_starts_with(url_buf, "socrates://")) {
+    if (str_starts_with(url_buf, "vextro://")) {
         const char *page = url_buf + 11;
         brw_set_addr(url_buf);
         if (str_eq(page, "home") || page[0] == '\0') brw_page_home();
@@ -911,7 +911,7 @@ static void brw_go(void) {
     char url[BRW_ADDR_MAX];
     if (!str_starts_with(brw_addr, "http://") &&
         !str_starts_with(brw_addr, "https://") &&
-        !str_starts_with(brw_addr, "socrates://")) {
+        !str_starts_with(brw_addr, "vextro://")) {
         str_copy(url, "http://", BRW_ADDR_MAX);
         str_append(url, brw_addr, BRW_ADDR_MAX);
     } else {
