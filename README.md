@@ -264,6 +264,46 @@ row diff finds nothing to send to the panel.
 
 ---
 
+## Security, and exactly what it is worth
+
+**Encrypted containers.** `vault seal <dir> <file> <passphrase>` puts a
+directory into one file: ustar, then ChaCha20 over the archive. The
+header carries the salt and nonce in the clear — they are not secrets —
+and a *verifier* that is not the key. That last part is the one that
+matters. A stream cipher cannot tell a wrong key from a right one; it
+decrypts to garbage either way. Without the verifier, a mistyped
+passphrase would cheerfully write noise over a home directory and call it
+a restore. It says `wrong passphrase` and writes nothing.
+
+The cipher is ChaCha20 rather than AES for a reason specific to this
+machine: it is add, xor and rotate on 32-bit words and nothing else. AES
+without AES-NI means a table-driven implementation whose timing depends
+on the key, which is worse than useless. It is checked against the
+published RFC 8439 vectors, not against itself — an implementation that
+is merely self-consistent round-trips perfectly and protects nothing.
+
+**Backup and restore.** `backup <file> <passphrase>` seals this account's
+home directory; `restore` puts it back. `make test` covers the cipher;
+the round trip was exercised on the machine.
+
+**Allow list, scanner, prompt levels.** Three settings in
+`/etc/policy.cfg`, read before anything can be launched and enforced at
+the single point every program passes through. A refusal is announced on
+the serial line, in the terminal, and in the Action Center — a program
+that simply fails to start, with no reason given, is indistinguishable
+from a broken one. The scanner's signature list includes the EICAR
+standard test string, which exists precisely so a scanner can be
+demonstrated without keeping a real sample on the disk; what it is
+genuinely good at is catching a binary altered since it was installed.
+
+**What none of this is.** It decides whether a program starts. It does
+not constrain one that is running, and it is not a kernel enforcement
+boundary. That sentence is in the source, in the `policy` command's own
+output, and here, because "login" and "scanner" are words that imply more
+than this system delivers.
+
+---
+
 ## What is not here
 
 Vextro is one person's operating system, and the honest list of what it
@@ -277,9 +317,9 @@ most often assumed to be present:
 | **A virtualised legacy environment** | There is no hypervisor. The kernel runs on the metal and has no facility for running another operating system inside itself. |
 | **Enterprise networking** | `src/netstack.h` is ARP, IPv4, ICMP, UDP, DHCP, DNS and one TCP connection at a time. No VPN, no branch caching, no directory services. |
 | **TLS** | No cryptographic transport, so `https://` is refused rather than faked. |
-| **Full-disk or removable-media encryption** | Passwords are hashed; nothing on the volume is encrypted. |
-| **Application sandboxing** | `.bsd` applications run with full kernel privileges in a shared address space. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
-| **Anti-malware, device management, biometrics, multi-touch** | Not implemented. |
+| **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
+| **Application sandboxing** | `.bsd` applications run with full kernel privileges in a shared address space. The allow list and scanner decide whether a program *starts*; nothing constrains what it does once running. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
+| **Device management, biometrics, multi-touch** | No hardware to drive: this configuration exposes no fingerprint reader and no touch digitiser. |
 | **TV recording, media streaming to network devices** | No tuner driver, and no streaming protocol. |
 
 ---
@@ -504,6 +544,7 @@ sine table, which are data rather than logic.)
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
 | **Userland** | `.bsd` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
+| **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels — all policy, none of it isolation |
 | **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
 
 <details>
