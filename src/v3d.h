@@ -1,6 +1,10 @@
 #ifndef VEXTRO_V3D_H
 #define VEXTRO_V3D_H
 
+/* Included rather than assumed: the two trees pull the trig table in at
+ * different points, and rotation is not optional here. */
+#include "sincos_lut.h"
+
 /*
  * src/v3d.h — a software 3D rasteriser.
  *

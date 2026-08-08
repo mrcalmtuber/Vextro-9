@@ -304,6 +304,39 @@ than this system delivers.
 
 ---
 
+## Fuzzing the loader
+
+`vx_validate()` is the only thing between a `.vx` payload downloaded over
+plain HTTP and a loader that runs it with kernel privileges in a shared
+address space, so it is fuzzed rather than trusted.
+
+```sh
+cd vxfmt/fuzz && make
+AFL_MAP_SIZE=65536 afl-fuzz -i in -o out -m none -- ./harness @@
+```
+
+The harness calls `vx_validate()` and returns. It deliberately does not go
+through `vx_run`'s `main()`, which after validating goes on to `mmap`,
+`mprotect` and **call the image's entry point** — a fuzzer that reached
+that would be executing attacker bytes rather than testing the check meant
+to stop them.
+
+Last run: **33,644 executions, 71.2% edge coverage, 100% stability, zero
+crashes and zero hangs** under AddressSanitizer.
+
+Two things that reading found and the fuzzer would not, both still open
+and written up in `vxfmt/fuzz/README.md`:
+
+- `vx_run.c` `malloc`s exactly `file_size` bytes and then unconditionally
+  `memcpy`s 80 of them *before* validating, so any file of 1–79 bytes is a
+  heap over-read. The kernel's own loader checks the size first — the two
+  loaders disagree and the POSIX one is wrong.
+- The import table is outside everything `vx_validate()` looks at.
+  `vx_resolve_imports()` reads a `count` from the loaded image and walks
+  that many entries; its bounds live in the resolver, not the validator.
+
+---
+
 ## What is not here
 
 Vextro is one person's operating system, and the honest list of what it
@@ -312,9 +345,9 @@ most often assumed to be present:
 
 | | Why not |
 |---|---|
-| **3D graphics API** | The Gen9 driver in `src/igpu.h` is a 2D blitter and nothing more. There is no shader compiler, no command-buffer scheduler and no 3D pipeline. |
-| **H.264, AAC, DivX** | No video or audio decoder of any kind ships here. `src/ac97.h` brings up the codec; there is no proven playback path above it, so there is no media player either. |
-| **A virtualised legacy environment** | There is no hypervisor. The kernel runs on the metal and has no facility for running another operating system inside itself. |
+| **A 3D graphics *API*** | There is a software rasteriser (`src/v3d.h`, and the **Solid** app) — integer 16.16, z-buffered, backface-culled, flat-shaded from real face normals. What does not exist is an *API* over a GPU: no shader compiler, no command-buffer scheduler, and `src/igpu.h` remains a 2D blitter. |
+| **H.264, AAC, DivX** | Still no compressed-media decoder of any kind — each is months of work. The **Media Player** handles uncompressed PCM in a RIFF/WAVE container, which is what `src/ac97.h` can now actually play. |
+| **A virtualised legacy environment** | There is no hypervisor, and there will not be one. What exists instead is a real *emulator* for a real legacy machine: `src/chip8.h` interprets all thirty-five CHIP-8 instructions in software, with a ROM written in-tree. Interpreting a 4 KB machine honestly beats emulating x86 badly. |
 | **Enterprise networking** | `src/netstack.h` is ARP, IPv4, ICMP, UDP, DHCP, DNS and one TCP connection at a time. No VPN, no branch caching, no directory services. |
 | **TLS** | No cryptographic transport, so `https://` is refused rather than faked. |
 | **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
@@ -544,6 +577,9 @@ sine table, which are data rather than logic.)
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
 | **Userland** | `.vx` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
+| **Audio** | AC97 bus-master playback out of a descriptor list, verified by capturing the guest's output to a WAV on the host and measuring it — 438.3 Hz against 440 requested |
+| **3D** | Integer software rasteriser: 16.16 fixed point, perspective divide once per vertex, 1/z depth buffer, backface culling, flat shading from cross-product normals with a bit-by-bit integer square root |
+| **Emulation** | A complete CHIP-8 interpreter — all 35 opcodes, 4 KB address space masked on every access, collision flag on sprite XOR |
 | **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels — all policy, none of it isolation |
 | **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
 

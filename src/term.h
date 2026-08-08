@@ -909,6 +909,14 @@ static void cmd_restore(int argc, char **argv) {
 static int16_t tone_buf[TONE_SAMPLES];
 
 static void cmd_beep(int argc, char **argv) {
+#ifndef VEXTRO_HAVE_AUDIO
+    /* This port has no sound device at all, so there is nothing to
+     * configure and nothing to fix -- say which, rather than failing as
+     * though something were wrong. */
+    (void)argc; (void)argv;
+    term_print_c("this port has no audio device\n", 2);
+}
+#else
     if (!ac97_found) {
         term_print_c("no AC97 device on this machine\n", 2);
         return;
@@ -949,6 +957,7 @@ static void cmd_beep(int argc, char **argv) {
     uint_to_str(hz, nb);
     term_print("  playing "); term_print(nb); term_print(" Hz for 0.5 s\n");
 }
+#endif
 
 static void term_run_command(void) {
     /* Echo prompt + command into the scrollback */

@@ -223,13 +223,16 @@ static void media_draw(uint32_t *buf, uint32_t w, uint32_t h,
     if (mw > 40) {
         gfx_rect(buf, w, h, mx0, by + 8, mw, 10, 0x1A1E2Au);
         if (playing) {
+            /* A travelling bar rather than a level: this is drawn from the
+             * frame counter, not from the samples, and dressing it up as a
+             * VU meter would be claiming to measure something it does not
+             * look at. It says "running", which is what it knows. */
+            const int32_t seg = mw / 16;
             for (int i = 0; i < 16; i++) {
-                const int32_t seg = mw / 16;
-                const int deg = (int)((desktop_tick * 7 + i * 31) % 360);
-                const int32_t amp = (int_sin[deg] > 0 ? int_sin[deg] : -int_sin[deg]);
-                if (amp > 380)
+                const uint32_t ph = (desktop_tick / 3 + (uint32_t)i) % 16u;
+                if (ph < 5)
                     gfx_rect(buf, w, h, mx0 + i * seg, by + 8, seg - 2, 10,
-                             gfx_mix(C_GOLD, 0x1A1E2Au, (uint32_t)(amp >> 2)));
+                             gfx_mix(C_GOLD, 0x1A1E2Au, 60u + ph * 40u));
             }
         }
     }
