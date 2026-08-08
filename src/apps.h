@@ -1841,11 +1841,15 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
  * and redraws.
  */
 
-#define WIKI_CTX_CHARS 480
+/* Room for more than one passage: retrieval gathers up to three
+ * articles now, and one lead paragraph each is what makes the difference
+ * between a question the context answers and one it merely touches. */
+#define WIKI_CTX_CHARS 1100
+#define WIKI_PASSAGES  3
 #define WIKI_ANS_MAX   512
 #define WIKI_LOG_MAX   1600
 
-static char  wiki_input[160];
+static char  wiki_input[WIKI_INPUT_MAX];
 static int   wiki_input_len;
 static char  wiki_log[WIKI_LOG_MAX];
 static char  wiki_context[WIKI_CTX_CHARS + 8];
@@ -1884,22 +1888,82 @@ static void wiki_log_add(const char *s) {
 }
 
 /* strip tags and entities out of an article, keeping the readable text */
+/* Is the tag starting at src[i] named `name`? Case-insensitive, and the
+ * name must end at a delimiter so <s> does not read as <style>. */
+static int wiki_tag_is(const uint8_t *src, uint32_t len, uint32_t i,
+                       const char *name) {
+    uint32_t k = 0;
+    while (name[k]) {
+        if (i + 1 + k >= len) return 0;
+        char a = (char)src[i + 1 + k];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (a != name[k]) return 0;
+        k++;
+    }
+    if (i + 1 + k >= len) return 0;
+    const char nxt = (char)src[i + 1 + k];
+    return nxt == '>' || nxt == ' ' || nxt == '\t' || nxt == '\n' ||
+           nxt == '\r' || nxt == '/';
+}
+
+/*
+ * HTML to plain text, for feeding an article to the model.
+ *
+ * The style and script elements have to be skipped *whole*, contents and
+ * all. The previous version tried to, with a flag set by any tag whose
+ * name began with 's' -- span, strong, sup, section -- and cleared again
+ * by the very next character, so it skipped nothing. What reached the
+ * model as the article on the Moon was:
+ *
+ *     .mw-parser-output .hatnote{font-style:italic} ...
+ *
+ * -- a stylesheet. Every article whose HTML opens with a style block was
+ * grounded on CSS, and the model, given no facts at all, either invented
+ * some or said it did not know. This is the kind of bug that looks like a
+ * bad model.
+ */
 static void wiki_html_text(const uint8_t *src, uint32_t len, char *out, int max) {
-    int o = 0, in_tag = 0, space = 1, skip = 0;
+    int o = 0, in_tag = 0, space = 1;
     for (uint32_t i = 0; i < len && o < max - 1; i++) {
         char c = (char)src[i];
+
         if (c == '<') {
-            /* drop the contents of script and style outright */
-            if (i + 7 < len && (src[i+1] == 's' || src[i+1] == 'S')) skip = 1;
+            /* a comment runs to "-->", not to the first '>' */
+            if (i + 3 < len && src[i+1] == '!' && src[i+2] == '-' &&
+                src[i+3] == '-') {
+                uint32_t j = i + 4;
+                while (j + 2 < len &&
+                       !(src[j] == '-' && src[j+1] == '-' && src[j+2] == '>'))
+                    j++;
+                i = (j + 2 < len) ? j + 2 : len;
+                continue;
+            }
+            /* style and script: skip the element and everything in it */
+            const char *elem = 0;
+            if (wiki_tag_is(src, len, i, "style"))  elem = "style";
+            else if (wiki_tag_is(src, len, i, "script")) elem = "script";
+            if (elem) {
+                uint32_t j = i + 1;
+                while (j + 1 < len) {
+                    if (src[j] == '<' && src[j+1] == '/' &&
+                        wiki_tag_is(src, len, j + 1, elem)) break;
+                    j++;
+                }
+                while (j < len && src[j] != '>') j++;
+                i = j;
+                continue;
+            }
             in_tag = 1;
             continue;
         }
         if (c == '>') { in_tag = 0; continue; }
         if (in_tag) continue;
-        if (skip && c != ' ') { skip = 0; }
+
         if (c == '&') {
+            /* An entity becomes a space rather than nothing: dropping
+             * &nbsp; outright welds the words on either side together. */
             while (i < len && src[i] != ';' && src[i] != ' ') i++;
-            continue;
+            c = ' ';
         }
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
         if (c == ' ') {
@@ -1958,52 +2022,26 @@ static int wiki_title_starts(const char *title, const char *key) {
     return nxt == '\0' || nxt == ' ' || nxt == '_' || nxt == '(';
 }
 
-/* Try one key; fills the context and returns 1 if the archive has it. */
-static int wiki_try_key(const char *key) {
-    if (!key[0]) return 0;
-
-    uint32_t idx = zim_lower_bound('C', key);
-    zim_dirent_t e;
-    if (idx >= zim.article_count || zim_dirent(idx, &e) != 0) return 0;
-    if (e.ns != 'C') return 0;
-
-    /*
-     * lower_bound lands on the next entry alphabetically when the key is
-     * absent, so the result has to be *checked*. Without this, asking
-     * about something the archive does not cover retrieved whatever
-     * happened to sort next and fed it to the model as fact.
-     */
-    if (!wiki_title_starts(e.title, key)) return 0;
-
-    const uint8_t *d;
-    uint32_t n;
-    zim_dirent_t got;
-    if (zim_content(idx, &d, &n, &got) != 0) return 0;
-
-    wiki_html_text(d, n < 20000 ? n : 20000, wiki_context, WIKI_CTX_CHARS);
-    str_copy(wiki_source, got.title, sizeof(wiki_source));
-    return 1;
-}
-
 /*
- * Find an article for the question and load its opening text.
+ * Candidate scoring, before anything is decompressed.
  *
- * Adjacent word pairs are tried before single words, longest first, and
- * that ordering is the difference between a useful answer and a
- * confidently wrong one. "What is a neutron star?" has "neutron" as its
- * longest single word, so a single-word search retrieves *Neutron* — an
- * article about subatomic particles — and the model duly explains that a
- * neutron star is a kind of neutron. The phrase "neutron star" is right
- * there in the question and names the article exactly.
+ * The old retrieval took the first key that matched anything, which is
+ * how "what berries are poisonous" ended up reading the article on
+ * *Poison*: "poisonous" is the longest word in the question, it matches,
+ * and the search stopped there. "Berry" was never considered, and the
+ * model was asked about berries while holding a page about toxicology.
  *
- * Everything stays a prefix lookup over the archive's sorted path list,
- * so each candidate costs about twenty reads and trying several is still
- * far cheaper than decompressing one cluster.
+ * So candidates are collected and *ranked* instead, on the title alone --
+ * a directory entry is about twenty reads, while decompressing a cluster
+ * is far more, so ranking on titles and fetching only the winners is what
+ * makes considering several affordable.
  */
+
 /*
- * Words that ask a question rather than name its subject. Skipped on the
- * first single-word sweep so that the noun wins the tie, and only fallen
- * back to if nothing else in the sentence matches anything.
+ * Words that ask a question rather than name its subject. Skipped when
+ * choosing what to look up, so the noun wins: "what" and "moon" are both
+ * four letters, and whichever a tie-break happened to pick decided
+ * whether the answer was about the Moon or about nothing.
  */
 static int wiki_is_stopword(const char *w) {
     static const char *const stop[] = {
@@ -2024,12 +2062,234 @@ static int wiki_is_stopword(const char *w) {
     return 0;
 }
 
+#define WIKI_MAX_CAND 12
+
+typedef struct {
+    uint32_t idx;
+    int      score;
+    char     title[96];
+} wiki_cand_t;
+
+static wiki_cand_t wiki_cands[WIKI_MAX_CAND];
+static int         wiki_ncand;
+
+/* Whole-word, case-insensitive: does `hay` contain `needle` as a word? */
+static int wiki_word_in(const char *hay, const char *needle) {
+    if (!needle[0]) return 0;
+    for (int i = 0; hay[i]; i++) {
+        if (i && wiki_is_word(hay[i - 1])) continue;   /* not a boundary */
+        int k = 0;
+        while (needle[k] && hay[i + k] &&
+               wiki_fold(hay[i + k]) == wiki_fold(needle[k])) k++;
+        if (!needle[k] && !wiki_is_word(hay[i + k])) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Singular form of an English plural, well enough for article titles.
+ * Wikipedia titles the article about berries *Berry*, so without this the
+ * one word in the question that names the subject matches nothing.
+ */
+static void wiki_singular(const char *w, char *out, int max) {
+    int n = 0;
+    while (w[n] && n < max - 1) { out[n] = w[n]; n++; }
+    out[n] = '\0';
+    if (n > 3 && out[n - 3] == 'i' && out[n - 2] == 'e' && out[n - 1] == 's') {
+        out[n - 3] = 'y'; out[n - 2] = '\0';          /* berries -> berry */
+    } else if (n > 3 && out[n - 2] == 'e' && out[n - 1] == 's' &&
+               (out[n - 3] == 'h' || out[n - 3] == 's' || out[n - 3] == 'x')) {
+        out[n - 2] = '\0';                            /* bushes -> bush   */
+    } else if (n > 3 && out[n - 1] == 's' && out[n - 2] != 's') {
+        out[n - 1] = '\0';                            /* plants -> plant  */
+    }
+}
+
+/*
+ * Does this text contain the question's word, allowing for endings?
+ *
+ * Whole-word matching is too strict across an inflection: the question
+ * says "poisonous" and the article says "poison". Comparing a stem --
+ * the word less its last few letters, but never fewer than four -- makes
+ * those the same term without making unrelated short words collide.
+ */
+static int wiki_stem_in(const char *hay, const char *word) {
+    int n = 0;
+    while (word[n]) n++;
+    int stem = n - 3;
+    if (stem < 4) stem = 4;
+    if (stem > n) stem = n;
+
+    for (int i = 0; hay[i]; i++) {
+        if (i && wiki_is_word(hay[i - 1])) continue;
+        int k = 0;
+        while (k < stem && hay[i + k] &&
+               wiki_fold(hay[i + k]) == wiki_fold(word[k])) k++;
+        if (k == stem) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Pick the passage *inside* an article that answers the question.
+ *
+ * Retrieval used to hand the model each article's opening paragraph,
+ * which is the right default and the wrong answer surprisingly often.
+ * "What berries are poisonous" retrieves *Berry*, whose lead explains
+ * what a berry is and names raspberry and blueberry -- so the model was
+ * given a passage that mentions berries, does not mention poison, and
+ * cannot answer the question. The sentence that does is further down.
+ *
+ * So the article is read further in, and the window of it with the most
+ * of the question's content words is what gets sent. Ties go to the
+ * earlier window, which keeps the lead as the default when nothing
+ * matches better.
+ */
+#define WIKI_ART_CHARS 3600
+
+static char wiki_article[WIKI_ART_CHARS + 8];
+
+static void wiki_pick_passage(const char *text, char words[][32], int nwords,
+                              int room, char *out, int outmax) {
+    int len = 0;
+    while (text[len]) len++;
+    if (room > outmax - 1) room = outmax - 1;
+
+    if (len <= room) {
+        int i = 0;
+        for (; i < len; i++) out[i] = text[i];
+        out[i] = '\0';
+        return;
+    }
+
+    int best = 0, best_score = -1;
+    for (int st = 0; st < len; st += 48) {
+        int end = st + room;
+        if (end > len) { st = len - room; end = len; }
+
+        int score = 0;
+        for (int w = 0; w < nwords; w++) {
+            if (wiki_is_stopword(words[w])) continue;
+            /* whole-word, inside this window only */
+            for (int i = st; i + 0 < end; i++) {
+                if (i > st && wiki_is_word(text[i - 1])) continue;
+                int k = 0;
+                while (words[w][k] && i + k < end &&
+                       wiki_fold(text[i + k]) == wiki_fold(words[w][k])) k++;
+                if (!words[w][k] && !wiki_is_word(text[i + k])) {
+                    score += 4;
+                    /*
+                     * A definition beats a mention.
+                     *
+                     * An encyclopedia article opens with a hatnote and an
+                     * infobox -- "Alternative names Luna Adjectives lunar,
+                     * selenic Orbit..." -- in which the subject appears
+                     * many times and is never defined. The sentence that
+                     * defines it says "The Moon is ...", so a window where
+                     * the subject is followed shortly by a copula is worth
+                     * more than one where it merely occurs.
+                     */
+                    for (int j = i + k; j < end && j < i + k + 3; j++) {
+                        if (text[j] != ' ') continue;
+                        const char *cop[] = { "is ", "are ", "was ", "were ", 0 };
+                        for (int cc = 0; cop[cc]; cc++) {
+                            int m = 0;
+                            while (cop[cc][m] && j + 1 + m < end &&
+                                   wiki_fold(text[j + 1 + m]) == cop[cc][m]) m++;
+                            if (!cop[cc][m]) { score += 6; break; }
+                        }
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        if (score > best_score) { best_score = score; best = st; }
+        if (end == len) break;
+    }
+
+    /* Start on a word boundary, so the passage does not open mid-word. */
+    while (best > 0 && wiki_is_word(text[best])) best--;
+    while (best > 0 && text[best] == ' ') best--;
+    if (best > 0) best++;
+
+    int i = 0;
+    while (i < room && text[best + i]) { out[i] = text[best + i]; i++; }
+    out[i] = '\0';
+}
+
+/*
+ * Look one key up and, if the archive has it, record it as a candidate.
+ *
+ * Scoring, in order of what actually decides a good answer:
+ *   an exact title match is worth most -- the question named the article
+ *   every *other* content word from the question that appears in the
+ *     title is worth a lot, because it means the article is about the
+ *     intersection rather than one half of it
+ *   a longer key beats a shorter one, being more specific
+ *   a disambiguated title ("Poison (band)") is penalised
+ */
+static void wiki_consider(const char *key, char words[][32], int nwords,
+                          int bonus) {
+    if (!key[0] || wiki_ncand >= WIKI_MAX_CAND) return;
+
+    uint32_t idx = zim_lower_bound('C', key);
+    zim_dirent_t e;
+    if (idx >= zim.article_count || zim_dirent(idx, &e) != 0) return;
+    if (e.ns != 'C') return;
+    /*
+     * lower_bound lands on the next entry alphabetically when the key is
+     * absent, so the result has to be checked. Without this, asking about
+     * something the archive does not cover retrieves whatever happened to
+     * sort next and feeds it to the model as fact.
+     */
+    if (!wiki_title_starts(e.title, key)) return;
+
+    for (int i = 0; i < wiki_ncand; i++)
+        if (wiki_cands[i].idx == idx) return;         /* already have it */
+
+    int score = bonus;
+    int klen = 0; while (key[klen]) klen++;
+    score += klen;
+
+    int tlen = 0; while (e.title[tlen] && tlen < 95) tlen++;
+    if (tlen == klen) score += 24;                    /* exact title */
+
+    for (int w = 0; w < nwords; w++) {
+        if (wiki_is_stopword(words[w])) continue;
+        if (wiki_word_in(key, words[w])) continue;    /* already counted */
+        if (wiki_word_in(e.title, words[w])) score += 18;
+    }
+    for (int i = 0; e.title[i]; i++)
+        if (e.title[i] == '(') { score -= 12; break; }
+
+    wiki_cand_t *c = &wiki_cands[wiki_ncand++];
+    c->idx = idx;
+    c->score = score;
+    str_copy(c->title, e.title, sizeof(c->title));
+}
+
+/*
+ * Find articles for the question and load their opening text.
+ *
+ * Pairs of adjacent content words are considered before single words,
+ * because a phrase names an article exactly where either half of it does
+ * not: "What is a neutron star?" has "neutron" as its longest single
+ * word, and a single-word search retrieves an article about subatomic
+ * particles.
+ *
+ * Up to three articles are then read, best first, and concatenated. One
+ * passage answers a question only when the question happens to be about
+ * exactly one article; most are not.
+ *
+ * Returns the number of passages placed in wiki_context.
+ */
 static int wiki_retrieve(const char *question) {
     wiki_context[0] = '\0';
     wiki_source[0] = '\0';
+    wiki_ncand = 0;
     if (!zim.open) return 0;
 
-    /* split into words, longest-first ordering handled below */
     char words[8][32];
     int  nwords = 0, i = 0;
     while (question[i] && nwords < 8) {
@@ -2045,95 +2305,172 @@ static int wiki_retrieve(const char *question) {
     }
     if (nwords == 0) return 0;
 
-    char key[72];
+    char key[72], sing[32];
 
     /*
-     * Pairs first, longest combined, each tried at most once.
+     * Adjacent content-word pairs. A pair of two question-words names
+     * nothing: without the content test, "what is the moon made of" forms
+     * "What_is", which is a real prefix -- it retrieves "What Is a
+     * Woman?" and the model is asked about the moon while reading about
+     * something else entirely.
      *
-     * They are *marked* as tried rather than dissolved. The previous
-     * version deleted a failed pair's first word from the list, which
-     * quietly destroyed the best single-word candidate: "what is the moon
-     * made of" forms "Moon_made", misses, and throws "moon" away -- after
-     * which the single-word pass could never reach *Moon*, retrieval
-     * returned nothing at all, and the model was handed a question with
-     * no context and answered "first first first first" forty times.
+     * Joined with an underscore, because the sorted list this searches is
+     * of *paths*, and a ZIM path spells a space as '_'.
      */
-    int pair_tried[8];
-    for (int k = 0; k < 8; k++) pair_tried[k] = 0;
-
-    for (;;) {
-        int best = -1, best_len = -1, best_content = -1;
-        for (int w = 0; w + 1 < nwords; w++) {
-            if (pair_tried[w]) continue;
-            /*
-             * A pair of two question-words names nothing. Without this,
-             * "what is the moon made of" forms "What_is", which is a real
-             * prefix in the archive -- it retrieves "What Is a Woman?" and
-             * the model is asked what the moon is made of while reading an
-             * article about something else entirely. Content words are
-             * ranked above length for the same reason.
-             */
-            const int c = (wiki_is_stopword(words[w]) ? 0 : 1)
-                        + (wiki_is_stopword(words[w + 1]) ? 0 : 1);
-            if (c == 0) { pair_tried[w] = 1; continue; }
-            int ln = 0;  while (words[w][ln]) ln++;
-            int ln2 = 0; while (words[w + 1][ln2]) ln2++;
-            if (c > best_content ||
-                (c == best_content && ln + ln2 > best_len)) {
-                best_content = c; best_len = ln + ln2; best = w;
-            }
-        }
-        if (best < 0) break;
-        pair_tried[best] = 1;
-        /*
-         * Joined with an underscore, because the sorted list this
-         * searches is of *paths*, and a ZIM path spells a space as '_'.
-         * Joining with a space finds nothing, silently falls through to
-         * the single-word search, and retrieves an article about the
-         * wrong subject -- which is how "neutron star" came back as
-         * "Star".
-         */
-        str_copy(key, words[best], sizeof(key));
+    for (int w = 0; w + 1 < nwords; w++) {
+        if (wiki_is_stopword(words[w]) && wiki_is_stopword(words[w + 1]))
+            continue;
+        str_copy(key, words[w], sizeof(key));
         str_append(key, "_", sizeof(key));
-        str_append(key, words[best + 1], sizeof(key));
+        str_append(key, words[w + 1], sizeof(key));
         if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
-        if (wiki_try_key(key)) return 1;
+        wiki_consider(key, words, nwords, 30);     /* a phrase is worth more */
+    }
+
+    /* Then every content word, and its singular, which is what an
+     * encyclopedia actually titles its articles with. */
+    for (int w = 0; w < nwords; w++) {
+        if (wiki_is_stopword(words[w])) continue;
+        str_copy(key, words[w], sizeof(key));
+        if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+        wiki_consider(key, words, nwords, 0);
+
+        wiki_singular(words[w], sing, sizeof(sing));
+        if (!str_eq(sing, words[w])) {
+            str_copy(key, sing, sizeof(key));
+            if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+            wiki_consider(key, words, nwords, 6);   /* prefer the singular */
+        }
     }
 
     /*
-     * Then single words, longest first, and *every* one of them rather
-     * than only the longest. Question words are skipped on the first
-     * sweep: "what" and "moon" are both four letters, and whichever the
-     * tie-break happened to pick decided whether the answer was about the
-     * Moon or about nothing.
+     * No fallback to the question words themselves.
+     *
+     * There used to be one, for questions made entirely of common words.
+     * But that is precisely the case where finding "something" is worse
+     * than finding nothing: "what is a qwertzuiop" has no subject in the
+     * archive, and the fallback matched *Ask* -- a redirect to
+     * "Question" -- so the model was handed an article about questions
+     * and answered "Types of question" with every appearance of
+     * confidence. If no content word names an article, the honest answer
+     * is that the archive does not cover it.
      */
-    int used[8];
-    for (int k = 0; k < 8; k++) used[k] = 0;
+    if (wiki_ncand == 0) return 0;
 
-    for (int skip_stop = 1; skip_stop >= 0; skip_stop--) {
-        for (int k = 0; k < 8; k++) used[k] = 0;
-        for (;;) {
-            int best = -1, best_len = 0;
-            for (int w = 0; w < nwords; w++) {
-                if (used[w]) continue;
-                if (skip_stop && wiki_is_stopword(words[w])) continue;
-                int ln = 0; while (words[w][ln]) ln++;
-                if (ln > best_len) { best_len = ln; best = w; }
-            }
-            if (best < 0) break;
-            used[best] = 1;
-            str_copy(key, words[best], sizeof(key));
-            if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
-            if (wiki_try_key(key)) return 1;
+    /* ---- read the best few ---- */
+    char taken_titles[WIKI_PASSAGES][96];
+    int used = 0, taken = 0, best_cover = 0;
+
+    int content_words = 0;
+    for (int w = 0; w < nwords; w++)
+        if (!wiki_is_stopword(words[w])) content_words++;
+    for (int pass = 0; pass < WIKI_PASSAGES; pass++) {
+        int best = -1;
+        for (int c = 0; c < wiki_ncand; c++)
+            if (wiki_cands[c].score > -1000 &&
+                (best < 0 || wiki_cands[c].score > wiki_cands[best].score))
+                best = c;
+        if (best < 0) break;
+        wiki_cands[best].score = -1000;               /* consumed */
+
+        const uint8_t *d;
+        uint32_t n;
+        zim_dirent_t got;
+        if (zim_content(wiki_cands[best].idx, &d, &n, &got) != 0) continue;
+
+        /*
+         * Duplicates can only be spotted here, after resolution. The
+         * candidates were deduplicated by directory index, but "Berries"
+         * and "Berry" are two different entries that redirect to one
+         * article -- so the plural and the singular both scored, both
+         * won, and the same passage went into the context twice, taking
+         * a slot from something that might have answered the question.
+         */
+        int dup = 0;
+        for (int t = 0; t < taken; t++)
+            if (str_eq(taken_titles[t], got.title)) { dup = 1; break; }
+        if (dup) { pass--; continue; }
+
+        /* Share the budget between passages, and label each one so the
+         * model can tell which article a fact came from. */
+        const int room = (WIKI_CTX_CHARS - used) /
+                         (WIKI_PASSAGES - pass > 0 ? WIKI_PASSAGES - pass : 1);
+        if (room < 80) break;
+
+        /* Read well past the lead, then choose the part that matches. */
+        wiki_html_text(d, n < 60000 ? n : 60000, wiki_article, WIKI_ART_CHARS);
+        char one[WIKI_CTX_CHARS + 8];
+        wiki_pick_passage(wiki_article, words, nwords, room - 4,
+                          one, (int)sizeof(one));
+
+        if (used) { str_append(wiki_context, "\n", sizeof(wiki_context)); }
+        str_append(wiki_context, "[", sizeof(wiki_context));
+        str_append(wiki_context, got.title, sizeof(wiki_context));
+        str_append(wiki_context, "] ", sizeof(wiki_context));
+        str_append(wiki_context, one, sizeof(wiki_context));
+
+        used = 0;
+        while (wiki_context[used]) used++;
+
+        if (taken == 0) str_copy(wiki_source, got.title, sizeof(wiki_source));
+        else {
+            str_append(wiki_source, " + ", sizeof(wiki_source));
+            str_append(wiki_source, got.title, sizeof(wiki_source));
         }
+        str_copy(taken_titles[taken], got.title, sizeof(taken_titles[0]));
+
+        /*
+         * How much of the question this one passage covers, on its own.
+         *
+         * Per passage, not across all of them, and that distinction is
+         * the whole point. "What berries are poisonous" retrieves *Berry*
+         * and *Poison*: between them every word of the question is
+         * present, and the model duly welded the two together and
+         * reported that raspberries and strawberries are poisonous. No
+         * single passage said anything of the kind. A fact the archive
+         * does not state is not made true by being spread across two
+         * articles.
+         */
+        int cover = 0;
+        for (int w = 0; w < nwords; w++) {
+            if (wiki_is_stopword(words[w])) continue;
+            char sg[32];
+            wiki_singular(words[w], sg, sizeof(sg));
+            if (wiki_stem_in(one, words[w]) || wiki_stem_in(one, sg)) cover++;
+        }
+        if (cover > best_cover) best_cover = cover;
+
+        taken++;
     }
-    return 0;
+
+    /*
+     * Every content word has to appear in one passage, or this is not an
+     * answer the archive contains. Refusing here is what stops a small
+     * model from bridging two articles into a confident falsehood, and a
+     * refusal is worth more than a fluent sentence that is wrong.
+     */
+    if (taken && content_words > 1 && best_cover < content_words) {
+        serial_puts("[wiki] no single passage covers the question (");
+        serial_put_dec((uint32_t)best_cover);
+        serial_puts(" of ");
+        serial_put_dec((uint32_t)content_words);
+        serial_puts(" terms)\n");
+        wiki_context[0] = '\0';
+        return 0;
+    }
+    return taken;
 }
 
 static void wiki_submit(void) {
     if (wiki_busy) return;
     if (wiki_input_len == 0) return;
     if (!llm_weights_loaded()) {
+        /* The transcript already says why, but the transcript is a
+         * window somebody has to go and look at. Say it on the serial
+         * line too, so a refused question is diagnosable from a log. */
+        serial_puts("[wiki] refused: weights not resident (ai_state ");
+        serial_put_dec((uint32_t)ai_state);
+        serial_puts(")\n");
         if (ai_busy()) {
             char nb[8];
             uint_to_str((uint32_t)ai_progress(), nb);
@@ -2177,12 +2514,27 @@ static void wiki_submit(void) {
     wiki_log_add(wiki_input);
     wiki_log_add("\n");
 
-    wiki_retrieve(wiki_input);
-    if (wiki_source[0]) {
-        wiki_log_add("[context: ");
-        wiki_log_add(wiki_source);
-        wiki_log_add("]\n");
+    /*
+     * Retrieve first, and refuse if nothing was found.
+     *
+     * This is a retrieval-augmented answer or it is nothing. A 0.5B model
+     * asked a question with no context will still produce a confident,
+     * fluent paragraph out of its own weights -- which is the worst
+     * possible failure, because it is indistinguishable from a correct
+     * answer until you check it. Saying "not in the archive" is worth
+     * more than a plausible sentence.
+     */
+    const int passages = wiki_retrieve(wiki_input);
+    if (passages == 0 || !wiki_context[0]) {
+        serial_puts("[wiki] no article matched; refusing to answer\n");
+        wiki_log_add("AI: The archive does not have an article that answers "
+                     "that, so I have nothing to answer from. I only answer "
+                     "from Wikipedia, never from memory.\n");
+        return;
     }
+    wiki_log_add("[context: ");
+    wiki_log_add(wiki_source);
+    wiki_log_add("]\n");
 
     /*
      * Qwen2's chat format, with the retrieved passage as the grounding.
@@ -2194,10 +2546,28 @@ static void wiki_submit(void) {
      * exercise — off the end, and the model was asked to continue an
      * article rather than answer anything.
      */
-    static char prompt[1400];
+    /* Sized for the system instruction, three passages and the
+     * question. The token budget below is the real limit: 512 prompt
+     * tokens is about two thousand characters, so this buffer is a
+     * little larger than that and the trim keeps it honest. */
+    static char prompt[2048];
+    /*
+     * The instruction does the other half of the grounding.
+     *
+     * "Answer the question using the context" leaves answering from
+     * memory open, and a model that half-remembers something will take
+     * that opening every time -- which is how "what berries are
+     * poisonous" came back as a sentence about poison that named no
+     * berry. Naming the failure case explicitly, and giving it exact
+     * words to say, is what makes a small model decline instead of
+     * inventing.
+     */
     static const char sys_part[] =
-        "<|im_start|>system\nAnswer the question using the"
-        " context. Be brief.<|im_end|>\n<|im_start|>user\n";
+        "<|im_start|>system\nYou answer only from the Context below."
+        " Do not use any other knowledge. Quote the relevant fact from"
+        " the Context. If the Context does not contain the answer, reply"
+        " exactly: Not in the archive."
+        " Be brief.<|im_end|>\n<|im_start|>user\n";
     static const char tail_part[] = "<|im_end|>\n<|im_start|>assistant\n";
 
     prompt[0] = '\0';
@@ -2237,6 +2607,16 @@ static void wiki_submit(void) {
     serial_put_dec((uint32_t)wiki_ntok);
     serial_puts(" tokens, context from ");
     serial_puts(wiki_source[0] ? wiki_source : "(nothing found)");
+    serial_putc('\n');
+    /*
+     * The opening of what the model was actually given. Judging a
+     * grounded answer means seeing the grounding: without this, a wrong
+     * answer could be the retrieval's fault or the model's and there is
+     * no way to tell them apart from a log.
+     */
+    serial_puts("[wiki] context: ");
+    for (int i = 0; i < 220 && wiki_context[i]; i++)
+        serial_putc(wiki_context[i] == '\n' ? ' ' : wiki_context[i]);
     serial_putc('\n');
 
     wiki_im_end = llm_token_id("<|im_end|>");
@@ -2292,6 +2672,9 @@ static int wiki_ask(const char *question) {
     wiki_input_len = 0;
     while (wiki_input[wiki_input_len]) wiki_input_len++;
     wiki_mode = 1;                     /* show the chat, not the search */
+    /* The shell says "the answer appears in Wikipedia", so put it where
+     * that sentence promises. */
+    wm_open(WK_WIKI);
     wiki_submit();
     return wiki_busy != 0;
 }
@@ -2489,7 +2872,8 @@ static void wiki_draw(uint32_t *buf, uint32_t w, uint32_t h,
                       int32_t cx, int32_t cy, int32_t cw, int32_t chh,
                       uint32_t tick, int focused) {
     wiki_autoopen();
-    wiki_gen_poll();
+    /* wiki_gen_poll() is driven from the frame loop, not from here --
+     * see desktop_render. An answer must not depend on being watched. */
     gfx_rect(buf, w, h, cx, cy, cw, chh, C_WIN_BG);
 
     /* header */

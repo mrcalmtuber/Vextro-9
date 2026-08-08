@@ -3392,6 +3392,17 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     store_poll();
     ai_poll();
     wiki_poll();
+    /*
+     * Generation is background work and belongs in the frame loop, not
+     * in a window's paint routine. It used to be driven from wiki_draw,
+     * so an answer only advanced while the Wikipedia window was actually
+     * being painted: ask from the shell and the window is never opened,
+     * minimise it and the window stops being drawn, and either way the
+     * question sat on "reading the question" forever with the desktop
+     * idling at 60 fps beside it. Nothing about producing an answer
+     * depends on it being on screen.
+     */
+    wiki_gen_poll();
 
     /* ---- the opt-in, while it is unanswered ---- */
     if (ai_enabled < 0) {

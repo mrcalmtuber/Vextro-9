@@ -615,6 +615,23 @@ static void ai_autoload_start(void) {
     ai_state = AI_PARSE;
 }
 
+/*
+ * Loading says so, on the serial line.
+ *
+ * "[ai] loading" was the only thing this ever printed. Success was
+ * silent, failure was silent, and progress was silent -- so a load that
+ * had finished, one that had died on a read error, and one that was
+ * simply slow all looked identical from outside, and the only symptom
+ * anyone could report was that the chat panel would not answer. Every
+ * outcome is announced now, and the tenths are announced as they pass so
+ * that "slow" and "stuck" can be told apart.
+ */
+static uint64_t ai_t0 = 0;
+static int      ai_last_decile = -1;
+
+/* Defined below, next to ai_busy; needed here to report the tenths. */
+static int ai_progress(void);
+
 static void ai_poll(void) {
     const char *err = "?";
 
@@ -622,10 +639,14 @@ static void ai_poll(void) {
     case AI_PARSE:
         /* One shot: the tensor table has to be whole before anything
          * can be bound, and it is a small fraction of the file. */
+        ai_t0 = cycle_now();
         if (llm_load(llm_read_thunk, &ai_file, ai_file.size, &err) != 0 ||
             llm_load_begin(&err) != 0) {
             ai_err = err;
             ai_state = AI_FAILED;
+            serial_puts("[ai] load failed while parsing: ");
+            serial_puts(err);
+            serial_putc('\n');
             return;
         }
         ai_state = AI_WEIGHTS;
@@ -649,9 +670,32 @@ static void ai_poll(void) {
         uint64_t start = cycle_now();
         do {
             int r = llm_load_step(&err);
-            if (r < 0) { ai_err = err; ai_state = AI_FAILED; return; }
-            if (r == 1) { ai_state = AI_READY; return; }
+            if (r < 0) {
+                ai_err = err;
+                ai_state = AI_FAILED;
+                serial_puts("[ai] load failed: ");
+                serial_puts(err);
+                serial_putc('\n');
+                return;
+            }
+            if (r == 1) {
+                ai_state = AI_READY;
+                serial_puts("[ai] model ready in ");
+                serial_put_dec(cycles_to_ms(cycle_now() - ai_t0));
+                serial_puts(" ms\n");
+                return;
+            }
         } while (!budget_expired_ms(start, 6));
+
+        {
+            const int d = ai_progress() / 10;
+            if (d != ai_last_decile) {
+                ai_last_decile = d;
+                serial_puts("[ai] ");
+                serial_put_dec((uint32_t)ai_progress());
+                serial_puts("%\n");
+            }
+        }
         return;
     }
 
@@ -676,7 +720,11 @@ static int ai_progress(void) {
 static void term_exec(char *cmdline);
 
 /* The chat engine lives in apps.h, which is included after this file;
- * the `ask` command reaches it through this. */
+ * the `ask` command reaches it through this. The question buffer's size
+ * is stated here rather than there because `ask` has to build one before
+ * apps.h exists; apps.h declares wiki_input with the same macro so the
+ * two cannot drift. */
+#define WIKI_INPUT_MAX 160
 static int  wiki_ask(const char *question);
 
 /*
@@ -1625,9 +1673,22 @@ static void term_exec(char *cmdline) {
          * desktop for exactly as long as the answer takes.
          */
         if (argc < 2) { term_print_c("usage: ask <question>\n", 2); return; }
-        const char *q = cmdline;
-        while (*q && *q != ' ') q++;
-        while (*q == ' ') q++;
+        /*
+         * Rebuilt from argv, not read off cmdline.
+         *
+         * term_split tokenises in place: by the time this runs, cmdline
+         * is "ask\0what\0berries\0are\0poisonous", so walking past the
+         * first word landed on the NUL that ended it and every question
+         * arrived empty. wiki_ask refuses an empty question, so `ask`
+         * answered "could not start" for every input it was ever given
+         * -- the command could not work at all.
+         */
+        char q[WIKI_INPUT_MAX];
+        q[0] = '\0';
+        for (int i = 1; i < argc; i++) {
+            if (i > 1) str_append(q, " ", sizeof(q));
+            str_append(q, argv[i], sizeof(q));
+        }
         if (wiki_ask(q))
             term_print_c("thinking - the answer appears in Wikipedia\n", 3);
         else
