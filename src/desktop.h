@@ -90,11 +90,29 @@ static dock_config_t dock_cfg = {
     .edge = DOCK_EDGE_BOTTOM,
 };
 
+/*
+ * The icon size actually used, which is what Settings asked for shrunk
+ * until the row fits the screen.
+ *
+ * Sixteen launchers at 40 px need 928 px of bar. The x86 default mode is
+ * 1280 wide and never noticed; the ARM port's is 800, where the row ran
+ * off both ends and the launchers at each end could not be clicked at
+ * all. Fitting is computed rather than assumed, so it stays correct at
+ * any mode and any number of installed apps.
+ */
+static int32_t dock_eff_isz = 40;
+
 static void dock_recalc(uint32_t scr_w, uint32_t scr_h) {
-    (void)scr_w;
-    dock_cfg.bar_h = dock_cfg.icon_sz + 12;
-    dock_cfg.bar_w = dock_item_count * (dock_cfg.icon_sz + 16) + 14
-                     + DOCK_SHOWDESK_W;
+    const int32_t along = (dock_cfg.edge == DOCK_EDGE_BOTTOM)
+                          ? (int32_t)scr_w : (int32_t)scr_h;
+    int32_t isz = dock_cfg.icon_sz;
+    while (isz > 18 &&
+           dock_item_count * (isz + 16) + 14 + DOCK_SHOWDESK_W > along - 16)
+        isz -= 2;
+
+    dock_eff_isz = isz;
+    dock_cfg.bar_h = isz + 12;
+    dock_cfg.bar_w = dock_item_count * (isz + 16) + 14 + DOCK_SHOWDESK_W;
     if (dock_cfg.edge == DOCK_EDGE_BOTTOM)
         dock_cfg.bar_y = (int32_t)scr_h - dock_cfg.bar_h - 4;
     else
@@ -2451,7 +2469,7 @@ static void dock_icon_rect(uint32_t scr_w, int idx,
                            int32_t *ow, int32_t *oh) {
     int32_t rx, ry, rw, rh;
     dock_bar_rect(scr_w, &rx, &ry, &rw, &rh);
-    int32_t isz = dock_cfg.icon_sz;
+    int32_t isz = dock_eff_isz;
     int32_t cell = isz + 16;
 
     if (dock_cfg.edge == DOCK_EDGE_BOTTOM) {

@@ -180,16 +180,32 @@ stays one sentence. Internal links resolve back into the archive, and Back
 restores your reading position.</td>
 </tr>
 <tr>
-<td><img src="docs/store.png" alt="Agora app store"></td>
+<td><img src="docs/store.png" alt="Ingot app store"></td>
 <td><img src="docs/store-app.png" alt="An installed app running"></td>
 </tr>
 <tr>
-<td><b>Agora</b> — a package store. Install writes a validated payload to
-the system volume and records it in a registry, so installed apps survive
-a reboot.</td>
+<td><b>Ingot</b> — the app store. It lists every application on the
+machine, built-in and installable alike, so the storefront answers "what
+is on this machine" and not merely "what else could be". Install writes a
+validated payload to the system volume and records it in a registry, so
+installed apps survive a reboot.</td>
 <td><b>…and they run.</b> Installed apps join the dock and open in their own
 window. This Mandelbrot is 16.16 fixed point — the kernel is compiled with
 no FPU at all.</td>
+</tr>
+<tr>
+<td><img src="docs/solid.png" alt="Solid, shading through the g3d API"></td>
+<td><img src="docs/chamber.png" alt="Chamber, a guest running under AMD-V"></td>
+</tr>
+<tr>
+<td><b>Solid</b> — 3D through <code>g3d</code>. The panel is the API
+reporting on itself: which backend is live, how many triangles survived
+culling, how many fragments were shaded, and the compiled size of the
+shader running them.</td>
+<td><b>Chamber</b> — a guest on AMD-V. The green line was written by
+guest code storing to <code>0xB8000</code>, translated by nested page
+tables; every exit in the log is a real VMEXIT at an address that matches
+the disassembly.</td>
 </tr>
 <tr>
 <td><img src="docs/photos.png" alt="Photos"></td>
@@ -215,9 +231,12 @@ password melts the screen.</td>
 <td width="50%"><img src="docs/snap.png" alt="A window snapped to half the screen"></td>
 </tr>
 <tr>
-<td><b>Peek and previews</b> — hovering the taskbar fades every window
-towards what is behind it and leaves its outline. The preview above the
-button is the window itself, captured out of the compositor.</td>
+<td><b>Peek and previews</b> — click the Show Desktop tab at the end of
+the taskbar and every window fades towards what is behind it, leaving its
+outline; click again, or click any window, to bring the stack back. It is
+a latch, not a hover, so crossing the taskbar never dissolves your work.
+The preview above a button is the window itself, captured out of the
+compositor.</td>
 <td><b>Snap</b> — drag a window to an edge and it takes half the work
 area; drag it to the top and it fills it. The target is previewed while
 the button is held, so the gesture can be abandoned.</td>
@@ -345,9 +364,9 @@ most often assumed to be present:
 
 | | Why not |
 |---|---|
-| **A 3D graphics *API*** | There is a software rasteriser (`src/v3d.h`, and the **Solid** app) — integer 16.16, z-buffered, backface-culled, flat-shaded from real face normals. What does not exist is an *API* over a GPU: no shader compiler, no command-buffer scheduler, and `src/igpu.h` remains a 2D blitter. |
-| **H.264, AAC, DivX** | Still no compressed-media decoder of any kind — each is months of work. The **Media Player** handles uncompressed PCM in a RIFF/WAVE container, which is what `src/ac97.h` can now actually play. |
-| **A virtualised legacy environment** | There is no hypervisor, and there will not be one. What exists instead is a real *emulator* for a real legacy machine: `src/chip8.h` interprets all thirty-five CHIP-8 instructions in software, with a ROM written in-tree. Interpreting a 4 KB machine honestly beats emulating x86 badly. |
+| **Hardware-rasterised 3D** | There *is* a 3D API now — `src/g3d.h`: pipelines, buffers, matrices, a command buffer, and a shader language with a real compiler (see below). What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work and the backend dispatches only clears to the GPU. Solid reports which backend is live. |
+| **H.264, AAC, DivX** | Compressed *audio* is here — FLAC, IMA ADPCM and G.711, in `src/flac.h` and `src/adpcm.h`. Compressed *video* is not: H.264 alone is months of work, and there is no video container, no frame scheduler and no colour-space conversion to hang it on. |
+| **A hypervisor on ARM64** | x86 has one — `src/hyper.h` runs a guest on AMD-V with nested paging. The ARM64 port does not: it reaches EL2 only under TCG emulation with a VHE-capable core (HVF refuses to provide EL2 at all, and Limine panics on an ARMv8.0 one). The prerequisite is measured and reported rather than assumed; the hypervisor itself is not written. |
 | **Enterprise networking** | `src/netstack.h` is ARP, IPv4, ICMP, UDP, DHCP, DNS and one TCP connection at a time. No VPN, no branch caching, no directory services. |
 | **TLS** | No cryptographic transport, so `https://` is refused rather than faked. |
 | **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
@@ -397,13 +416,94 @@ build under full emulation was still consuming the prompt five minutes
 later.
 
 The model loads **by itself, in the background**, while the desktop stays
-live — there is nothing to type and nothing to wait for. Q4_K
-dequantisation is checked against a reference implementation rather than
-eyeballed, and `llm probe` compares intermediate tensors to the digit.
+live — there is nothing to type and nothing to wait for. Dequantisation is
+checked against an independently written reference decoder for every type
+the model uses, and `llm probe` compares intermediate tensors to the digit.
+
+That check exists because of a bug worth recording. The model answered
+fluent nonsense for a long time, and the suspicion was on K-quant
+dequantisation — which this model does not use at all. Three of its
+tensors are **Q5_1**, `quant_block` knew the type so the file loaded
+cleanly, and `dequant_block` had no case for it, so every such block
+returned −1 and the matmul quietly returned zero. All three are
+`ffn_down`, in layers 0, 1 and 10. Layer 0 corrupts the residual stream
+before anything else runs, which is exactly how you get logits that carry
+no signal. Two tables disagreeing about which formats exist was the whole
+defect; they agree now, and a type that is missing fails loudly at load
+rather than silently at inference.
 
 It is the one translation unit in the build allowed to touch the FPU.
 Everything else is compiled `-mno-sse -mno-80387`, so no interrupt handler
 can quietly acquire a floating-point dependency.
+
+### A shader language, compiled at run time
+
+`src/g3d.h` is the 3D API — pipelines, vertex and index buffers, matrices,
+uniforms, a command buffer recorded and submitted as a frame — and the part
+that makes it an API rather than a renderer is **G3SL**: a small language
+with a real compiler. A tokeniser, a recursive-descent parser with operator
+precedence, static type checking over scalars and `vec3`, and a stack
+machine to run the result.
+
+```
+# a lambert term, and a rim light on the silhouette
+d   = sat(dot(n, l));
+rim = sat(1.0 - dot(n, e));
+color = base * (0.18 + 0.82 * d) + gold * (rim * rim * 0.55);
+```
+
+Type errors are compile errors with a line number — `dot` of two scalars,
+a `vec3` where a scalar belongs, a variable changing type — and the Solid
+window prints the message rather than drawing something strange. Programs
+compile from text at run time, so switching shaders visibly changes the
+picture. Every value inside is 16.16 fixed point, because a float would
+fail to link.
+
+### A guest that runs on the processor
+
+`src/hyper.h` is a type-1 hypervisor on AMD-V. Not an interpreter: the
+guest's instructions execute natively and only what the host intercepts
+traps back — CPUID, I/O, MSR access, HLT and the hypercall.
+
+AMD-V rather than VT-x for a checkable reason. QEMU's TCG interpreter
+implements SVM with nested paging and does not implement VMX at all:
+
+```
+query-cpu-model-expansion max  ->  svm = True, npt = True, vmx = False
+```
+
+so the AMD path is the one that can actually be run here, and the Intel
+path would be code nobody could execute. The guest is 32-bit protected
+mode with paging off — under nested paging it needs no page tables of its
+own — and it gets one megabyte of guest-physical that the nested page
+table maps and nothing else. It writes to a text screen at `0xB8000`,
+makes hypercalls, reads the hypervisor CPUID leaf, and does an I/O write.
+
+Every exit address in Chamber's log matches the disassembly: `VMMCALL` at
+`0x1023`, `CPUID` at `0x1030`, `IOIO` at `0x104F` carrying port `0x3F8` in
+`EXITINFO1`. NRIP-save is absent under TCG, so exits advance the
+instruction pointer by known lengths and use the processor's next-RIP
+where it provides one.
+
+### A decoder you can check exactly
+
+`src/flac.h` decodes FLAC: constant, verbatim, fixed and LPC subframes,
+Rice partitions with both parameter widths and the raw escape, all four
+channel decorrelations, 8/16/24 bits, with CRC-8 on each frame header and
+CRC-16 on each frame. It is integer from end to end, which is why a
+machine with no FPU can have it at all.
+
+Lossless is the point. A lossy decoder can only be judged by ear; this one
+is compressed with the reference encoder at its densest setting and the
+samples must come back **identical**. Nine signals chosen to reach
+different parts of the decoder — silence for constant subframes, a ramp
+for the fixed predictors, noise for the Rice escape, correlated channels
+for mid/side — all exact.
+
+That caught a real bug: the Rice partitioning is defined over the whole
+block, not over the residual. Sizing it over the residual is invisible at
+partition order 0, which is what short frames use, and only appears once
+an encoder picks a real partition order.
 
 ### Wikipedia, offline, from the raw archive
 
@@ -567,8 +667,11 @@ sine table, which are data rather than logic.)
 
 | | |
 |---|---|
-| **Desktop** | Window manager with minimize, maximize, snap-to-edge, shake-to-clear and a peek that fades the stack; taskbar with live window previews and jump lists; desktop gadgets; start-menu search over apps, recent items and the volume; Action Center; five wallpaper themes with an optional slideshow; idle dimming |
-| **Applications** | Terminal with 38 Unix commands, browser, file manager, offline Wikipedia reader, image viewer, paint, system monitor, package store, calculator, settings |
+| **Desktop** | Window manager with minimize, maximize, snap-to-edge, shake-to-clear and a latched Show Desktop peek; taskbar with live window previews and jump lists; desktop gadgets; start-menu search over apps, recent items and the volume; Action Center; five wallpaper themes with an optional slideshow; idle dimming |
+| **Applications** | Terminal with 38 Unix commands, browser, file manager, offline Wikipedia reader, image viewer, paint, system monitor, app store, calculator, media player, 3D viewer, CHIP-8, hypervisor console, settings |
+| **Audio** | AC97 bus-mastering playback; FLAC, IMA ADPCM and G.711 decoders, all integer |
+| **3D** | `g3d`: pipelines, vertex and index buffers, matrices, a command buffer, and G3SL — a shader language with a tokeniser, precedence parser, type checker and stack machine |
+| **Virtualisation** | AMD-V hypervisor on x86: VMCB, nested paging, and a 32-bit guest that runs on the processor |
 | **Filesystem** | Read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO — behind one 512-byte sector view |
 | **Network** | IPv4, ICMP, UDP, DNS, TCP, async HTTP/1.0 with redirects; Intel e1000 driver |
@@ -593,12 +696,18 @@ src/
   term.h        Terminal: commands, history, scrollback, redirection
   browser.h     HTML renderer, navigation, links
   apps.h        Files / Settings / Photos / Wikipedia + chat / About
-  store.h       Agora: catalog, installer, registry, storefront
+  store.h       Ingot: catalog, installer, registry, storefront
   llm.h llm.c   Transformer inference (the one FPU translation unit)
   zim.h         ZIM archive reader (offline Wikipedia)
   zstd.h        Zstandard decompressor
   lzma.h        LZMA / LZMA2 / xz decompressor
   sci.h         Compressed image format + decoder
+  flac.h        FLAC decoder     adpcm.h  IMA ADPCM + G.711
+  ac97.h        AC97 codec + bus-master playback
+  media.h       Media Player: track list, transport, decode dispatch
+  g3d.h         3D API + G3SL shader compiler   solid.h  its client app
+  hyper.h       AMD-V hypervisor  chamber.h  the window onto it
+  chip8.h       CHIP-8 interpreter
   ttf.h         TrueType rasteriser        gfx.h  Drawing primitives
   netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
   e1000.h       Intel NIC driver

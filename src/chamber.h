@@ -51,11 +51,17 @@ static void chamber_draw(uint32_t *buf, uint32_t w, uint32_t h,
                     hv.supported ? C_TEXT : 0xC08050u, 12);
     y += 18;
 
+    /*
+     * The line above already carries the specific reason, measured on
+     * this machine, so what follows is only the general shape of it.
+     * Kept identical across both trees: hyper.h is what differs, and
+     * this window reports whatever it found.
+     */
     if (!hv.supported) {
         const char *why =
-            "This build runs the guest on AMD-V. QEMU exposes it with";
+            "A guest needs hardware virtualisation the host can reach.";
         const char *why2 =
-            "-cpu max; an Intel processor reports no SVM and stops here.";
+            "On x86 that is AMD-V, which QEMU exposes with -cpu max.";
         ttf_draw_string(buf, (int)w, (int)h, cx + 14, y, why, C_TEXT_DIM, 11);
         ttf_draw_string(buf, (int)w, (int)h, cx + 14, y + 14, why2,
                         C_TEXT_DIM, 11);
