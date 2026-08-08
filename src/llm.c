@@ -76,6 +76,23 @@ const char *llm_quant_name(uint32_t t) {
 /* Elements per block and bytes per block, per quantisation type.  Only
  * what this model actually contains is filled in; anything else is
  * rejected rather than guessed at. */
+/*
+ * Block geometry per quantisation type.
+ *
+ * This table and dequant_block() must list exactly the same types. They
+ * did not: Q5_1 was here and not there, so the loader accepted a model
+ * it could not actually read and three tensors silently decoded to
+ * zero. Anything named here is now decoded there, and anything that is
+ * not is refused at load with a message. A type that is merely absent
+ * fails loudly; a type that is present but undecodable fails silently,
+ * which is much worse.
+ *
+ * Q8_1 (type 9) is deliberately absent. It is an activation format
+ * rather than a storage one, it does not appear in model files, and the
+ * 40 bytes recorded for it here were wrong -- the block is 36. A wrong
+ * stride reads every subsequent block from the wrong offset, so being
+ * unable to load such a file beats mis-loading it.
+ */
 static int quant_block(uint32_t t, uint32_t *elems, uint32_t *bytes) {
     switch (t) {
     case 0:  *elems = 1;  *bytes = 4;   return 0;   /* F32  */
@@ -85,7 +102,6 @@ static int quant_block(uint32_t t, uint32_t *elems, uint32_t *bytes) {
     case 6:  *elems = 32; *bytes = 22;  return 0;   /* Q5_0: d, qh + nibbles */
     case 7:  *elems = 32; *bytes = 24;  return 0;   /* Q5_1: d, m, qh + qs   */
     case 8:  *elems = 32; *bytes = 34;  return 0;   /* Q8_0 */
-    case 9:  *elems = 32; *bytes = 40;  return 0;   /* Q8_1 */
     case 12: *elems = 256; *bytes = 144; return 0;  /* Q4_K */
     case 13: *elems = 256; *bytes = 176; return 0;  /* Q5_K */
     case 14: *elems = 256; *bytes = 210; return 0;  /* Q6_K */
@@ -834,6 +850,26 @@ static int dequant_block(uint32_t type, const uint8_t *b, float *out) {
         out[0] = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
         return 1;
 
+    case 2: {                                   /* Q4_0: 32 elements */
+        float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        const uint8_t *qs = b + 2;
+        for (int j = 0; j < 16; j++) {
+            out[j]      = (float)((int)(qs[j] & 0x0F) - 8) * d;
+            out[j + 16] = (float)((int)(qs[j] >> 4)   - 8) * d;
+        }
+        return 32;
+    }
+    case 3: {                                   /* Q4_1: 32 elements */
+        float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        float m = fp16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+        const uint8_t *qs = b + 4;
+        for (int j = 0; j < 16; j++) {
+            out[j]      = (float)(qs[j] & 0x0F) * d + m;
+            out[j + 16] = (float)(qs[j] >> 4)   * d + m;
+        }
+        return 32;
+    }
+
     case 6: {                                   /* Q5_0: 32 elements */
         float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
         uint32_t qh = (uint32_t)b[2] | ((uint32_t)b[3] << 8) |
@@ -847,6 +883,35 @@ static int dequant_block(uint32_t type, const uint8_t *b, float *out) {
         }
         return 32;
     }
+    /*
+     * Q5_1: 32 elements, and the reason this model produced noise.
+     *
+     * quant_block knew the type (32 elements, 24 bytes) so the loader
+     * accepted the file, but there was no case for it here, so every
+     * such block fell to `default: return -1`. The callers read that as
+     * "stop", broke out of the loop, and returned the sum they had --
+     * zero. Three tensors are Q5_1 in qwen2-0.5b, and all three are
+     * ffn_down: layers 0, 1 and 10 had their entire feed-forward output
+     * replaced with zeros. Layer 0 corrupts the residual stream before
+     * anything else runs, which is why the logits carried no signal.
+     *
+     * Unsigned, unlike Q5_0: the offset is the stored minimum, not -16.
+     */
+    case 7: {                                   /* Q5_1: 32 elements */
+        float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        float m = fp16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+        uint32_t qh = (uint32_t)b[4] | ((uint32_t)b[5] << 8) |
+                      ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+        const uint8_t *qs = b + 8;
+        for (int j = 0; j < 16; j++) {
+            uint8_t h0 = (uint8_t)(((qh >> (j + 0)) << 4) & 0x10);
+            uint8_t h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
+            out[j]      = (float)((qs[j] & 0x0F) | h0) * d + m;
+            out[j + 16] = (float)((qs[j] >> 4)   | h1) * d + m;
+        }
+        return 32;
+    }
+
     case 8: {                                   /* Q8_0: 32 elements */
         float d = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
         const int8_t *qs = (const int8_t *)(b + 2);
@@ -871,6 +936,33 @@ static int dequant_block(uint32_t type, const uint8_t *b, float *out) {
             for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4)  - off2;
             q += 32;
             is += 2;
+        }
+        return 256;
+    }
+
+    case 13: {                                  /* Q5_K: 256 elements */
+        float d    = fp16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+        float dmin = fp16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+        const uint8_t *sc = b + 4;
+        const uint8_t *qh = b + 16;
+        const uint8_t *ql = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        float *y = out;
+        for (int n = 0; n < 256; n += 64) {
+            uint8_t s1, m1, s2, m2;
+            k4_scale_min(is + 0, sc, &s1, &m1);
+            k4_scale_min(is + 1, sc, &s2, &m2);
+            float d1 = d * (float)s1, off1 = dmin * (float)m1;
+            float d2 = d * (float)s2, off2 = dmin * (float)m2;
+            for (int l = 0; l < 32; l++)
+                *y++ = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - off1;
+            for (int l = 0; l < 32; l++)
+                *y++ = d2 * (float)((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - off2;
+            ql += 32;
+            is += 2;
+            u1 = (uint8_t)(u1 << 2);
+            u2 = (uint8_t)(u2 << 2);
         }
         return 256;
     }
@@ -990,11 +1082,24 @@ static float k_sin(float x) {
 
 static float k_cos(float x) { return k_sin(x + K_PI * 0.5f); }
 
+/*
+ * The kernel target is x86_64 with SSE2 on for this file alone, so the
+ * square root is one instruction. The guard is for the host: the
+ * dequantisation test compiles this same file natively, and an Apple
+ * Silicon host cannot assemble sqrtss. Newton-Raphson from a decent
+ * seed converges to float32 in four steps and is only ever used there.
+ */
 static float k_sqrt(float x) {
     if (x <= 0.0f) return 0.0f;
+#if defined(__x86_64__)
     float r;
     __asm__ volatile("sqrtss %1, %0" : "=x"(r) : "x"(x));
     return r;
+#else
+    float r = x > 1.0f ? x * 0.5f : x;
+    for (int i = 0; i < 24; i++) r = 0.5f * (r + x / r);
+    return r;
+#endif
 }
 
 /* ---- weights in memory ---- */
@@ -1206,7 +1311,7 @@ static int llm_bind_all(const char **err) {
 /* Expand row `row` of a weight tensor into `out` (ne0 elements). */
 static void deq_row(const wt_t *w, uint32_t row, float *out) {
     uint32_t be, bb;
-    quant_block(w->type, &be, &bb);
+    if (quant_block(w->type, &be, &bb) != 0) return;
     uint64_t first = (uint64_t)row * w->ne0;
     const uint8_t *p = w->data + (first / be) * bb;
     static float blk[256];
@@ -1237,7 +1342,7 @@ static void deq_row(const wt_t *w, uint32_t row, float *out) {
  */
 static float dot_row(const wt_t *w, uint32_t row, const float *x) {
     uint32_t be, bb;
-    quant_block(w->type, &be, &bb);
+    if (quant_block(w->type, &be, &bb) != 0) return 0.0f;
     uint64_t first = (uint64_t)row * w->ne0;
     const uint8_t *p = w->data + (first / be) * bb;
 
@@ -1459,7 +1564,7 @@ static void matmul_batch(float *out, uint32_t out_stride,
                          const float *x, uint32_t x_stride,
                          int nb, const wt_t *w) {
     uint32_t be, bb;
-    quant_block(w->type, &be, &bb);
+    if (quant_block(w->type, &be, &bb) != 0) return;
 
     for (uint32_t j = 0; j < w->ne1; j++) {
         const uint8_t *p = w->data + ((uint64_t)j * w->ne0 / be) * bb;
