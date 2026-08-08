@@ -15,6 +15,21 @@
  * measured coming out of the emulator, not assumed.
  */
 
+/*
+ * Not every port has a sound device. Where there is none the player still
+ * lists tracks and still parses them -- so the file handling is exercised
+ * and the reason for the silence is stated -- but it cannot play, and it
+ * says so instead of pretending.
+ */
+#ifndef VEXTRO_HAVE_AUDIO
+static int  ac97_found = 0;
+static int  ac97_play(const int16_t *p, uint32_t n, uint32_t r) {
+    (void)p; (void)n; (void)r; return -1;
+}
+static void ac97_stop(void) { }
+static int  ac97_busy(void) { return 0; }
+#endif
+
 #define MEDIA_MAX_SAMPLES (1u << 20)     /* 2 MB: ~11 s of 48 kHz stereo */
 #define MEDIA_MAX_TRACKS  32
 #define MEDIA_NAME_MAX    64

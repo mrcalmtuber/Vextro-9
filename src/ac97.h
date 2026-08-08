@@ -155,6 +155,10 @@ static void ac97_init(void) {
 }
 
 
+/* This port has an audio device; media.h checks for the definition
+ * rather than assuming one exists on every architecture. */
+#define VEXTRO_HAVE_AUDIO 1
+
 /* ===== PCM PLAYBACK =====
  *
  * Everything above brings the codec up. None of it makes a sound: the
