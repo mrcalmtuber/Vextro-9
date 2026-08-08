@@ -65,7 +65,7 @@ static uint64_t system_total_memory_mb = 0;
 #define DOCK_EDGE_RIGHT  2
 
 /* Built-in launchers, plus one slot per app installed from the store. */
-#define DOCK_BASE_COUNT 13
+#define DOCK_BASE_COUNT 14
 #define DOCK_MAX_ITEMS  25
 
 static int dock_item_count = DOCK_BASE_COUNT;
@@ -112,6 +112,7 @@ enum {
     WK_SETTINGS,
     WK_CALC,
     WK_MEDIA,
+    WK_SOLID,
     WK_ABOUT,
     WK_COUNT
 };
@@ -162,6 +163,7 @@ static const wk_meta_t wk_meta[WK_COUNT] = {
     { "Settings",          UI_SNAP(470), UI_SNAP(560) },
     { "Calculator",        UI_SNAP(330), UI_SNAP(500) },
     { "Media Player",      UI_SNAP(560), UI_SNAP(420) },
+    { "Solid",             UI_SNAP(520), UI_SNAP(440) },
     { "About Vextro",      UI_SNAP(380), UI_SNAP(270) },
 };
 
@@ -1045,6 +1047,7 @@ static int execute_bin(const char *filepath) {
 #include "calc.h"
 /* After calc.h; needs ac97_play from the driver kernel.c pulls in. */
 #include "media.h"
+#include "v3d.h"
 
 /* Canvas app (WK_HELLO) content drawer */
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
@@ -1415,6 +1418,9 @@ static void wm_draw_content(uint32_t *buf, uint32_t w, uint32_t h, int kind) {
     case WK_MEDIA:
         media_draw(buf, w, h, cx, cy, cw, chh, mouse_x, mouse_y);
         break;
+    case WK_SOLID:
+        v3d_app_draw(buf, w, h, cx, cy, cw, chh, mouse_x, mouse_y);
+        break;
     case WK_SETTINGS:
         settings_draw(buf, w, h, cx, cy, cw, chh, desktop_tick, focused);
         break;
@@ -1596,6 +1602,9 @@ static void wm_update(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
             break;
         case WK_MEDIA:
             media_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
+            break;
+        case WK_SOLID:
+            v3d_app_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh);
             break;
         case WK_PAINT:
             paint_mouse(mx, my, eff_lmb, prev_lmb, cx, cy, cw, chh,
@@ -1906,6 +1915,7 @@ static void menu_rebuild(void) {
     n = menu_add(n, "Wikipedia", WK_WIKI);
     n = menu_add(n, "Calculator", WK_CALC);
     n = menu_add(n, "Media Player", WK_MEDIA);
+    n = menu_add(n, "Solid", WK_SOLID);
     const int after_docs = n;
     n = menu_add(n, "Goldsmith", WK_PAINT);
     n = menu_add(n, "Monolith",  WK_SYSMON);
@@ -2351,7 +2361,7 @@ typedef struct {
 
 static const int dock_base_kinds[DOCK_BASE_COUNT] = {
     WK_TERM, WK_BROWSER, WK_FILES, WK_STORE, WK_IMAGE, WK_WIKI, WK_PAINT,
-    WK_SYSMON, WK_MATRIX, WK_HELLO, WK_CALC, WK_MEDIA, WK_SETTINGS,
+    WK_SYSMON, WK_MATRIX, WK_HELLO, WK_CALC, WK_MEDIA, WK_SOLID, WK_SETTINGS,
 };
 
 static dock_item_t dock_items[DOCK_MAX_ITEMS];
@@ -2425,6 +2435,15 @@ static void dock_draw_glyph(uint32_t *buf, uint32_t w, uint32_t h,
     int32_t q = sz / 4;
 
     switch (kind) {
+    case WK_SOLID: {
+        /* a wireframe cube in two-point projection */
+        const int32_t o = q / 2;
+        gfx_rect_outline(buf, w, h, cx - q, cy - q + o, q * 2 - o, q * 2 - o, C_GOLD);
+        gfx_rect_outline(buf, w, h, cx - q + o, cy - q, q * 2 - o, q * 2 - o, C_GOLD_DIM);
+        gfx_line(buf, w, h, cx - q, cy - q + o, cx - q + o, cy - q, 1, C_GOLD_DIM);
+        gfx_line(buf, w, h, cx + q - o, cy + q, cx + q, cy + q - o, 1, C_GOLD_DIM);
+        break;
+    }
     case WK_MEDIA: {
         /* a speaker: box, cone, and two arcs of sound */
         gfx_rect(buf, w, h, cx - q - 2, cy - q / 2, q, q, C_GOLD);
@@ -3008,6 +3027,7 @@ static void desktop_key_input(char ch) {
         return;
     }
     if (wm_focus == WK_MEDIA) { media_key(ch); return; }
+    if (wm_focus == WK_SOLID) { v3d_app_key(ch); return; }
     if (wm_focus == WK_CALC) {
         /* The keypad and the keyboard are the same machine, so the
          * calculator takes the raw character and decides itself. */
