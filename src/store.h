@@ -2,10 +2,14 @@
 #define STORE_H
 
 /*
- * Agora — the Vextro 9 app store.
+ * Ingot — the Vextro 9 app store.
  *
- * Two package sources feed one catalog:
+ * Three sources feed one catalog:
  *
+ *   0. the built-in applications, which are part of the kernel image and
+ *      cannot be installed or removed — they are listed so that the
+ *      storefront answers "what is on this machine", not merely "what
+ *      else could be";
  *   1. the shipped repository cached on disk at /store/pkg (indexed by
  *      the table compiled in below, so the storefront exists even on a
  *      volume that was never seeded), and
@@ -21,7 +25,9 @@
  * HTTP client and needs brw_loading / term_async to arbitrate for it.
  */
 
-#define STORE_MAX_PKGS   24
+/* Every built-in kind, the shipped payloads, and room for a repository
+ * on top. The built-ins alone are most of WK_COUNT. */
+#define STORE_MAX_PKGS   48
 #define STORE_MAX_INST   16
 
 #define STORE_ID_MAX     12      /* 8.3 base name + NUL          */
@@ -39,6 +45,7 @@ enum {
     SI_ORBIT,
     SI_GRID,
     SI_WAVE,
+    SI_APP,        /* a built-in: a window, not a parcel */
 };
 
 typedef struct {
@@ -52,6 +59,7 @@ typedef struct {
     uint8_t  icon;
     uint8_t  remote;
     uint8_t  avail;                /* payload reachable right now */
+    int8_t   builtin;              /* window kind, or -1 for a package */
 } store_pkg_t;
 
 typedef struct {
@@ -88,6 +96,60 @@ static const store_shipped_t store_shipped[] = {
 
 #define STORE_SHIPPED_COUNT \
     ((int)(sizeof(store_shipped) / sizeof(store_shipped[0])))
+
+/* ===== BUILT-IN CATALOG =====
+ *
+ * The applications compiled into the kernel. They have no payload, no
+ * version of their own and no install step -- their version is the
+ * system's, and the only action is to open them.
+ *
+ * Ingot itself is not in this list. A storefront that offers to open the
+ * storefront you are reading is a row that can only disappoint; every
+ * other window kind is here.
+ */
+
+typedef struct {
+    int         kind;
+    const char *id, *name, *cat, *desc;
+} store_builtin_t;
+
+static const store_builtin_t store_builtins[] = {
+    { WK_TERM, "term", "Terminal", "System",
+      "The shell: files, network, disks, and the machine's own internals." },
+    { WK_BROWSER, "browser", "Vextro Browser", "Internet",
+      "HTTP/1.1 over the in-kernel TCP stack, with an HTML layout engine." },
+    { WK_FILES, "files", "Files", "System",
+      "Browse, open, rename and delete across FAT32 and exFAT volumes." },
+    { WK_PAINT, "goldsmith", "Goldsmith", "Graphics",
+      "Bitmap paint: brushes, shapes, flood fill, saved to the volume." },
+    { WK_SYSMON, "monolith", "Monolith", "System",
+      "Live memory, CPU, PCI and network counters sampled every frame." },
+    { WK_MATRIX, "matrix", "Matrix", "Graphics",
+      "Falling glyphs, composited straight into the frame buffer." },
+    { WK_HELLO, "hello", "hello", "Development",
+      "The worked example: a .vx program whose source ships in apps/." },
+    { WK_IMAGE, "photos", "Photos", "Graphics",
+      "Views SCI images with zoom, pan and a thumbnail strip." },
+    { WK_WIKI, "wiki", "Wikipedia", "Reference",
+      "Offline ZIM search and an article reader with its own typesetter." },
+    { WK_SETTINGS, "settings", "Settings", "System",
+      "Wallpaper, dock, accounts, and the security policy the loader reads." },
+    { WK_CALC, "calc", "Calculator", "Utilities",
+      "Fixed-point arithmetic, evaluated without an FPU." },
+    { WK_MEDIA, "media", "Media Player", "Media",
+      "Plays PCM, FLAC, ADPCM and G.711 through the AC97 codec." },
+    { WK_SOLID, "solid", "Solid", "Graphics",
+      "3D through the g3d API: z-buffered, culled, shaded from real normals." },
+    { WK_CHIP8, "chip8", "CHIP-8", "Emulation",
+      "All thirty-five instructions of a 4 KB machine, interpreted." },
+    { WK_CHAMBER, "chamber", "Chamber", "Emulation",
+      "A guest OS on AMD-V: nested paging, hypercalls, real VMEXITs." },
+    { WK_ABOUT, "about", "About Vextro", "System",
+      "Build identity, licence, and what this system does not claim to do." },
+};
+
+#define STORE_BUILTIN_COUNT \
+    ((int)(sizeof(store_builtins) / sizeof(store_builtins[0])))
 
 /* ===== STATE ===== */
 
@@ -290,7 +352,27 @@ static void store_registry_load(void) {
 
 static void store_catalog_local(void) {
     store_pkg_count = 0;
-    for (int i = 0; i < STORE_SHIPPED_COUNT && i < STORE_MAX_PKGS; i++) {
+
+    /* Built-ins first: they are always present, always available, and
+     * never move, so they are the stable head of the list. */
+    for (int i = 0; i < STORE_BUILTIN_COUNT && i < STORE_MAX_PKGS; i++) {
+        const store_builtin_t *b = &store_builtins[i];
+        store_pkg_t *p = &store_pkgs[store_pkg_count++];
+        str_copy(p->id, b->id, STORE_ID_MAX);
+        str_copy(p->name, b->name, STORE_NAME_MAX);
+        str_copy(p->ver, "9.0", STORE_VER_MAX);
+        str_copy(p->cat, b->cat, STORE_CAT_MAX);
+        str_copy(p->desc, b->desc, STORE_DESC_MAX);
+        p->src[0] = '\0';
+        p->icon = SI_APP;
+        p->remote = 0;
+        p->size = 0;
+        p->avail = 1;
+        p->builtin = (int8_t)b->kind;
+    }
+
+    for (int i = 0; i < STORE_SHIPPED_COUNT &&
+                    store_pkg_count < STORE_MAX_PKGS; i++) {
         const store_shipped_t *s = &store_shipped[i];
         store_pkg_t *p = &store_pkgs[store_pkg_count++];
         str_copy(p->id, s->id, STORE_ID_MAX);
@@ -303,6 +385,7 @@ static void store_catalog_local(void) {
         p->remote = 0;
         p->size = 0;
         p->avail = (uint8_t)store_stat(p->src, &p->size);
+        p->builtin = -1;
     }
 }
 
@@ -310,7 +393,7 @@ static void store_catalog_local(void) {
  * network repository added to the catalog. */
 static void store_restat(void) {
     for (int i = 0; i < store_pkg_count; i++)
-        if (!store_pkgs[i].remote)
+        if (!store_pkgs[i].remote && store_pkgs[i].builtin < 0)
             store_pkgs[i].avail =
                 (uint8_t)store_stat(store_pkgs[i].src, &store_pkgs[i].size);
 }
@@ -376,10 +459,23 @@ static int store_parse_index(const uint8_t *data, int len) {
             cur = 0;
             if (!store_id_ok(val) || store_pkg_count >= STORE_MAX_PKGS)
                 continue;
-            /* a remote entry with a shipped id updates that entry */
+            /*
+             * A remote entry with a shipped id updates that entry -- but
+             * never a built-in one. The index arrives over plain HTTP,
+             * so letting it claim the id of an application compiled into
+             * the kernel would let a repository turn the row that opens
+             * Terminal into a row that downloads and runs a payload. A
+             * built-in id is reserved: the block is dropped whole.
+             */
             store_pkg_t *slot = 0;
+            int reserved = 0;
             for (int k = 0; k < store_pkg_count; k++)
-                if (str_eq(store_pkgs[k].id, val)) { slot = &store_pkgs[k]; break; }
+                if (str_eq(store_pkgs[k].id, val)) {
+                    if (store_pkgs[k].builtin >= 0) reserved = 1;
+                    else slot = &store_pkgs[k];
+                    break;
+                }
+            if (reserved) continue;
             if (!slot) {
                 slot = &store_pkgs[store_pkg_count++];
                 str_copy(slot->name, val, STORE_NAME_MAX);
@@ -388,6 +484,7 @@ static int store_parse_index(const uint8_t *data, int len) {
                 slot->desc[0] = '\0';
                 slot->icon = SI_PKG;
                 slot->size = 0;
+                slot->builtin = -1;
                 added++;
             }
             str_copy(slot->id, val, STORE_ID_MAX);
@@ -764,6 +861,18 @@ static void store_icon_glyph(uint32_t *buf, uint32_t w, uint32_t h,
                 prev_y = yy;
             }
         }
+    } else if (kind == SI_APP) {
+        /* a window: title bar, two buttons, a body. What a built-in is. */
+        const int32_t bw = 2 * q + q / 2, bh = 2 * q;
+        const int32_t bx = cx - bw / 2, by = cy - bh / 2;
+        gfx_rect(buf, w, h, bx, by, bw, bh, 0x2C3244u);
+        gfx_rect(buf, w, h, bx, by, bw, 6, C_GOLD_DIM);
+        gfx_rect_outline(buf, w, h, bx, by, bw, bh, C_GOLD);
+        gfx_rect(buf, w, h, bx + bw - 5, by + 2, 3, 3, 0x11141Cu);
+        gfx_rect(buf, w, h, bx + bw - 10, by + 2, 3, 3, 0x11141Cu);
+        for (int r = 0; r < 3; r++)
+            gfx_rect(buf, w, h, bx + 4, by + 11 + r * 4,
+                     bw - 8 - (r == 2 ? bw / 3 : 0), 2, 0x555F78u);
     } else {
         /* generic parcel */
         gfx_rect(buf, w, h, cx - q - 2, cy - q, 2 * q + 4, 2 * q, 0x2C3244u);
@@ -827,6 +936,12 @@ static void store_btn_rect(int32_t cx, int32_t cw, int32_t card_y, int which,
 
 static void store_primary(int idx) {
     if (idx < 0 || idx >= store_pkg_count) return;
+    /* A built-in has nothing to fetch: the only verb it answers to is
+     * Open, and the window is already compiled in. */
+    if (store_pkgs[idx].builtin >= 0) {
+        wm_open(store_pkgs[idx].builtin);
+        return;
+    }
     int inst = store_find_inst(store_pkgs[idx].id);
     if (inst >= 0) store_launch_inst(inst);
     else if (store_pkgs[idx].avail) store_install(idx);
@@ -853,8 +968,13 @@ static void store_key(char ch) {
     } else if (ch == '\n') {
         store_primary(store_sel);
     } else if (ch == KEY_DEL) {
-        if (store_sel >= 0 && store_sel < store_pkg_count)
-            store_remove(store_pkgs[store_sel].id);
+        if (store_sel >= 0 && store_sel < store_pkg_count) {
+            if (store_pkgs[store_sel].builtin >= 0)
+                store_say2(store_pkgs[store_sel].name,
+                           " is built in and cannot be removed.", 1);
+            else
+                store_remove(store_pkgs[store_sel].id);
+        }
     } else if (ch == 'r' || ch == 'R') {
         store_refresh();
     } else if (ch == 27) {
@@ -996,13 +1116,22 @@ static void store_draw(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_tri(buf, w, h, lx, ly - 11, lx - 9, ly, lx, ly + 11, C_GOLD);
         gfx_tri(buf, w, h, lx, ly - 11, lx + 9, ly, lx, ly + 11, C_GOLD_DIM);
     }
-    ttf_draw_string(buf, (int)w, (int)h, cx + 46, cy + 10, "Agora", C_GOLD, 21);
+    ttf_draw_string(buf, (int)w, (int)h, cx + 46, cy + 10, "Ingot", C_GOLD, 21);
     ttf_draw_string(buf, (int)w, (int)h, cx + 46, cy + 36,
-                    "Agora App Store", C_TEXT_DIM, 12);
+                    "The Vextro app store", C_TEXT_DIM, 12);
     {
-        char sum[48], nb[12];
-        uint_to_str((uint32_t)store_pkg_count, nb);
+        /* Counted, not assumed: the built-in block is the head of the
+         * catalog, so everything after it is a package. */
+        int nbuilt = 0;
+        for (int i = 0; i < store_pkg_count; i++)
+            if (store_pkgs[i].builtin >= 0) nbuilt++;
+
+        char sum[64], nb[12];
+        uint_to_str((uint32_t)nbuilt, nb);
         str_copy(sum, nb, sizeof(sum));
+        str_append(sum, " built in, ", sizeof(sum));
+        uint_to_str((uint32_t)(store_pkg_count - nbuilt), nb);
+        str_append(sum, nb, sizeof(sum));
         str_append(sum, " packages, ", sizeof(sum));
         uint_to_str((uint32_t)store_inst_count, nb);
         str_append(sum, nb, sizeof(sum));
@@ -1096,8 +1225,10 @@ static void store_draw(uint32_t *buf, uint32_t w, uint32_t h,
             ttf_draw_string(buf, (int)w, (int)h, cx + 92, card_y + 12, nm,
                             0x1A1E28u, 15);
 
-            /* installed / unavailable badge sits beside the name */
-            if (inst >= 0)
+            /* built-in / installed / unavailable badge sits beside the name */
+            if (p->builtin >= 0)
+                gfx_circle(buf, w, h, cx + 84, card_y + 20, 3, C_GOLD);
+            else if (inst >= 0)
                 gfx_circle(buf, w, h, cx + 84, card_y + 20, 3, 0x2E7D4Fu);
             else if (!p->avail)
                 gfx_circle(buf, w, h, cx + 84, card_y + 20, 3, 0xC06060u);
@@ -1111,9 +1242,14 @@ static void store_draw(uint32_t *buf, uint32_t w, uint32_t h,
             str_append(meta, "   ", sizeof(meta));
             str_append(meta, p->cat, sizeof(meta));
             str_append(meta, "   ", sizeof(meta));
-            store_size_str(p->size, sz);
-            str_append(meta, sz, sizeof(meta));
-            str_append(meta, p->remote ? "   network" : "   local", sizeof(meta));
+            if (p->builtin >= 0) {
+                str_append(meta, "in kernel", sizeof(meta));
+            } else {
+                store_size_str(p->size, sz);
+                str_append(meta, sz, sizeof(meta));
+                str_append(meta, p->remote ? "   network" : "   local",
+                           sizeof(meta));
+            }
             char fit[72];
             store_fit(fit, sizeof(fit), meta, list_w - 300, 11);
             ttf_draw_string(buf, (int)w, (int)h, cx + 92, card_y + 33, fit,
@@ -1130,7 +1266,7 @@ static void store_draw(uint32_t *buf, uint32_t w, uint32_t h,
         int32_t bx, by, bw, bh;
         store_btn_rect(cx, cw, card_y, 0, &bx, &by, &bw, &bh);
         if (STORE_FITS(by, bh)) {
-            if (inst >= 0)
+            if (p->builtin >= 0 || inst >= 0)
                 store_button(buf, w, h, bx, by, bw, bh, "Open", 0);
             else if (p->avail)
                 store_button(buf, w, h, bx, by, bw, bh, "Install", 0);
@@ -1187,7 +1323,8 @@ static void store_cmd(int argc, char **argv) {
             term_print_c(p->cat, 3);
             pad = 13 - str_len(p->cat);
             for (int j = 0; j < pad; j++) term_putc(' ');
-            if (inst >= 0)        term_print_c("installed\n", 4);
+            if (p->builtin >= 0)  term_print_c("built in\n", 1);
+            else if (inst >= 0)   term_print_c("installed\n", 4);
             else if (!p->avail)   term_print_c("unavailable\n", 2);
             else if (p->remote) { store_size_str(p->size, nb);
                                   term_print_c("network\n", 5); }

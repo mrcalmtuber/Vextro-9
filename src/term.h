@@ -517,7 +517,7 @@ static void term_cmd_help(void) {
     term_print("  vault seal|open <..>             encrypted containers\n");
     term_print("  backup | restore <f> <pass>      this account's home directory\n");
     term_print("  store [list|install <id>|remove <id>|run <id>|refresh]\n");
-    term_print("                    the Agora app store\n");
+    term_print("                    the Ingot app store\n");
     term_print("  gpu [test|error|decode <hex>]  iGPU status / hang report\n");
     term_print("  open <app>        terminal browser files settings\n");
     term_print("                    paint sysmon matrix about\n");
@@ -1766,7 +1766,7 @@ static void term_exec(char *cmdline) {
     } else if (str_eq(cmd, "vault"))   { cmd_vault(argc, argv);
     } else if (str_eq(cmd, "backup"))  { cmd_backup(argc, argv);
     } else if (str_eq(cmd, "restore")) { cmd_restore(argc, argv);
-    } else if (str_eq(cmd, "store") || str_eq(cmd, "agora")) {
+    } else if (str_eq(cmd, "store") || str_eq(cmd, "ingot")) {
         store_cmd(argc, argv);
     } else if (str_eq(cmd, "open")) {
         if (argc < 2) { term_print_c("usage: open <app>\n", 2); return; }

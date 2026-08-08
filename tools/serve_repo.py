@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage and serve a Vextro 9 package repository over HTTP.
 
-The Agora app store in the OS fetches an index of key:value blocks and
+The Ingot app store in the OS fetches an index of key:value blocks and
 then downloads each payload with its own HTTP GET.  This script builds
 that layout out of the compiled apps and serves it:
 

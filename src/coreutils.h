@@ -5,7 +5,7 @@
  * The Unix toolset.
  *
  * The shell had about fifty commands, most of them specific to this
- * machine — `zim`, `llm`, `gpu`, `agora`. What it did not have was the
+ * machine — `zim`, `llm`, `gpu`, `ingot`. What it did not have was the
  * ordinary vocabulary: no `grep`, no `wc`, no `head`, no `sort`. This is
  * that vocabulary, written against the filesystem and string helpers the
  * rest of the system already uses.
