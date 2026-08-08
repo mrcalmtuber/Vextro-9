@@ -254,7 +254,7 @@ static void media_draw(uint32_t *buf, uint32_t w, uint32_t h,
     ttf_draw_string(buf, (int)w, (int)h, cx + 14, cy + 10, "Media Player",
                     C_GOLD, 15);
     ttf_draw_string(buf, (int)w, (int)h, cx + cw - 118, cy + 14,
-                    "PCM / WAVE only", C_TEXT_DIM, 10);
+                    "PCM  FLAC  ADPCM  G.711", C_TEXT_DIM, 10);
     gfx_rect(buf, w, h, cx + 14, cy + 34, cw - 28, 1, 0x2A3142u);
 
     /* transport */
