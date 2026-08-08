@@ -1850,6 +1850,8 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
 #define WIKI_LOG_MAX   1600
 
 static char  wiki_input[WIKI_INPUT_MAX];
+/* The model's answer before verification, for the log. */
+static char  wiki_draft[WIKI_ANS_MAX];
 static int   wiki_input_len;
 static char  wiki_log[WIKI_LOG_MAX];
 static char  wiki_context[WIKI_CTX_CHARS + 8];
@@ -2105,6 +2107,10 @@ static void wiki_singular(const char *w, char *out, int max) {
     }
 }
 
+/* Does the question ask what something *is*? Set while parsing it,
+ * and read by the passage scoring below. */
+static int wiki_definitional;
+
 /*
  * Does this text contain the question's word, allowing for endings?
  *
@@ -2128,6 +2134,36 @@ static int wiki_stem_in(const char *hay, const char *word) {
         if (k == stem) return 1;
     }
     return 0;
+}
+
+/*
+ * Drop the title where the markup repeats it before the prose starts.
+ *
+ * A ZIM article carries its name in a header and again in the first
+ * heading, so the stripped text opens "Volcano Volcano A volcano is a
+ * mountain..." -- which reads as a stutter in a quotation and wastes
+ * characters of a budgeted context on nothing.
+ */
+static void wiki_strip_title_runs(char *text, const char *title) {
+    int tl = 0;
+    while (title[tl]) tl++;
+    if (tl < 2) return;
+
+    int at = 0;
+    for (;;) {
+        while (text[at] == ' ') at++;
+        int k = 0;
+        while (k < tl && text[at + k] &&
+               wiki_fold(text[at + k]) == wiki_fold(title[k])) k++;
+        if (k < tl || wiki_is_word(text[at + k])) break;
+        at += k;
+    }
+    while (text[at] == ' ') at++;
+    if (at == 0 || !text[at]) return;
+
+    int w = 0;
+    while (text[at + w]) { text[w] = text[at + w]; w++; }
+    text[w] = '\0';
 }
 
 /*
@@ -2177,7 +2213,7 @@ static void wiki_pick_passage(const char *text, char words[][32], int nwords,
                 while (words[w][k] && i + k < end &&
                        wiki_fold(text[i + k]) == wiki_fold(words[w][k])) k++;
                 if (!words[w][k] && !wiki_is_word(text[i + k])) {
-                    score += 4;
+                    score += 10;
                     /*
                      * A definition beats a mention.
                      *
@@ -2204,6 +2240,50 @@ static void wiki_pick_passage(const char *text, char words[][32], int nwords,
                 }
             }
         }
+        /*
+         * The opening is where a subject is defined, so it starts well
+         * ahead -- enough to outweigh a copula found further down.
+         *
+         * Simple English writes "Gravity, or gravitation, is a natural
+         * phenomenon", so the lead does not match "<subject> is" at all,
+         * while a paragraph about gravitons further down says "gravity
+         * is caused by" and does. The article was quoted from the
+         * gravitons, which define nothing. Position has to count for
+         * more than sentence shape; matching the question's words still
+         * counts for more than either.
+         */
+        /*
+         * "What is X" asks for a definition, and an encyclopedia puts
+         * the definition first. Other questions are about some
+         * particular fact, which can be anywhere, so the preference for
+         * the opening is only strong when the question asked for one.
+         */
+        if (st < 300)      score += wiki_definitional ? 14 : 5;
+        else if (st < 900) score += wiki_definitional ? 4 : 2;
+
+        /*
+         * Prefer prose, wherever it is.
+         *
+         * Position alone is not enough: the Moon article opens with a
+         * hatnote and an infobox -- "DesignationsAlternative
+         * namesLunaAdjectiveslunar" -- which is where the subject is
+         * named most often and defined never. Sentences have full stops
+         * and are mostly lower case; a table of fields has neither. So
+         * the window is judged on whether it reads like writing, and
+         * that outweighs being first.
+         */
+        {
+            int stops = 0, caps = 0, letters = 0;
+            for (int k = st; k < end; k++) {
+                if (text[k] == '.' && (k + 1 >= end || text[k + 1] == ' '))
+                    stops++;
+                if (text[k] >= 'A' && text[k] <= 'Z') caps++;
+                if (wiki_is_word(text[k])) letters++;
+            }
+            if (stops >= 2) score += 8;
+            if (letters > 0 && caps * 100 > letters * 18) score -= 12;
+        }
+
         if (score > best_score) { best_score = score; best = st; }
         if (end == len) break;
     }
@@ -2289,6 +2369,7 @@ static void wiki_consider(const char *key, char words[][32], int nwords,
 static char wiki_words[8][32];
 static int  wiki_nwords;
 
+
 static int wiki_retrieve(const char *question) {
     wiki_context[0] = '\0';
     wiki_source[0] = '\0';
@@ -2309,6 +2390,16 @@ static int wiki_retrieve(const char *question) {
         nwords++;
     }
     wiki_nwords = nwords;
+    wiki_definitional = 0;
+    if (nwords >= 2) {
+        const char *w0 = words[0], *w1 = words[1];
+        const int what = (w0[0] | 32) == 'w' &&
+                         (str_eq(w0, "what") || str_eq(w0, "What") ||
+                          str_eq(w0, "who")  || str_eq(w0, "Who"));
+        const int isare = str_eq(w1, "is") || str_eq(w1, "are") ||
+                          str_eq(w1, "was") || str_eq(w1, "were");
+        wiki_definitional = what && isare;
+    }
     if (nwords == 0) return 0;
 
     char key[72], sing[32];
@@ -2397,14 +2488,40 @@ static int wiki_retrieve(const char *question) {
             if (str_eq(taken_titles[t], got.title)) { dup = 1; break; }
         if (dup) { pass--; continue; }
 
-        /* Share the budget between passages, and label each one so the
-         * model can tell which article a fact came from. */
-        const int room = (WIKI_CTX_CHARS - used) /
-                         (WIKI_PASSAGES - pass > 0 ? WIKI_PASSAGES - pass : 1);
+        /*
+         * Share the budget between the passages that actually exist,
+         * not the three there might have been.
+         *
+         * Dividing by WIKI_PASSAGES regardless gave a lone passage a
+         * third of the context and threw the rest away -- so the model
+         * was answering from 366 characters when 1100 were available,
+         * and the verifier then rejected perfectly good answers for
+         * using wording that had been trimmed off.
+         */
+        int left = 0;
+        for (int c = 0; c < wiki_ncand; c++)
+            if (wiki_cands[c].score > -1000) left++;
+        left++;                              /* this one, already claimed */
+        if (left > WIKI_PASSAGES - pass) left = WIKI_PASSAGES - pass;
+        if (left < 1) left = 1;
+        int room = (WIKI_CTX_CHARS - used) / left;
+
+        /*
+         * Capped, and the cap is the point.
+         *
+         * Handing a lone passage the whole budget was tried and made
+         * things worse: 1100 characters of the Moon article is mostly
+         * hatnote and infobox, the prompt hit the 512-token ceiling, and
+         * the model answered from the furniture. A passage chosen for
+         * matching the question beats a longer one that happens to
+         * contain it.
+         */
+        if (room > 500) room = 500;
         if (room < 80) break;
 
         /* Read well past the lead, then choose the part that matches. */
         wiki_html_text(d, n < 60000 ? n : 60000, wiki_article, WIKI_ART_CHARS);
+        wiki_strip_title_runs(wiki_article, got.title);
         char one[WIKI_CTX_CHARS + 8];
         wiki_pick_passage(wiki_article, words, nwords, room - 4,
                           one, (int)sizeof(one));
@@ -2790,6 +2907,186 @@ static int wiki_scan_begin(char words[][32], int nwords) {
     return 1;
 }
 
+/* =====================================================================
+ * Verifying what the model wrote
+ *
+ * The model is the least trustworthy part of this pipeline and the only
+ * part that can invent. Everything upstream -- the archive, the
+ * retrieval, the passage selection -- deals in text that exists; the
+ * model is where text that does not exist can appear. So its draft is
+ * checked against the evidence before anyone sees it, sentence by
+ * sentence, and what cannot be traced is dropped.
+ *
+ * This is a *deterministic* check, not a second opinion from a second
+ * model. A small model asked to judge a small model produces another
+ * guess, and two guesses do not make a verification. "Every content
+ * word in this sentence appears in the source" is a claim that can be
+ * decided, shown, and disagreed with.
+ *
+ * It catches the three failures seen in practice:
+ *
+ *   invention   a claim built from words the source never used
+ *   collage     "Blackberries Rubus BlackBerry", which is not a sentence
+ *   echo        "Poison", the title handed back as an answer
+ *
+ * What it cannot catch is a false *relation* between words that are all
+ * present -- "raspberries are poisonous" drawn from a page listing
+ * raspberries and a page about poison. That one is prevented upstream
+ * instead, by requiring a single passage to carry the whole question.
+ * ===================================================================== */
+
+/* A word worth checking: long enough to carry meaning, not a stopword. */
+static int wiki_checkable(const char *w) {
+    int n = 0;
+    while (w[n]) n++;
+    if (n < 4) return 0;                 /* function words and numbers */
+    return !wiki_is_stopword(w);
+}
+
+/*
+ * Keep the sentences the evidence supports; drop the rest.
+ *
+ * Returns the number of sentences kept, and reports how many were
+ * dropped so the answer can say so out loud.
+ */
+static int wiki_verify_answer(char *ans, int *dropped) {
+    char kept[WIKI_ANS_MAX];
+    kept[0] = '\0';
+    *dropped = 0;
+
+    int i = 0, nkept = 0;
+    while (ans[i]) {
+        while (ans[i] == ' ' || ans[i] == '\n') i++;
+        if (!ans[i]) break;
+
+        const int st = i;
+        while (ans[i] && !(ans[i] == '.' &&
+                           (ans[i + 1] == ' ' || ans[i + 1] == '\0')))
+            i++;
+        if (ans[i] == '.') i++;
+        const int en = i;
+        if (en <= st) break;
+
+        /* every checkable word in this sentence, against the evidence */
+        int bad = 0, words = 0;
+        int j = st;
+        while (j < en) {
+            while (j < en && !wiki_is_word(ans[j])) j++;
+            if (j >= en) break;
+            char w[32];
+            int n = 0;
+            while (j < en && wiki_is_word(ans[j]) && n < 31) w[n++] = ans[j++];
+            w[n] = '\0';
+            if (!wiki_checkable(w)) continue;
+            words++;
+            char sg[32];
+            wiki_singular(w, sg, sizeof(sg));
+            if (!wiki_stem_in(wiki_context, w) &&
+                !wiki_stem_in(wiki_context, sg)) bad++;
+        }
+
+        /*
+         * One stray word is tolerated; a quarter of them is not.
+         *
+         * Strict zero rejected a faithful answer -- "a magma chamber
+         * under the Earth's surface" -- because the HTML stripper had
+         * lost "ground," from that very sentence, so "surface" appeared
+         * unsupported when the entry does support it. Meanwhile the
+         * answer this check exists to stop, "the force that keeps
+         * objects in orbit around a planet", has five unsupported words
+         * out of eight -- well past a third -- and is refused either
+         * way. A third is the line: paraphrase adds a word or two,
+         * invention adds most of them.
+         */
+        if (words == 0 || bad > 3 || bad * 3 > words) { (*dropped)++; continue; }
+
+        if (kept[0]) str_append(kept, " ", sizeof(kept));
+        for (int k = st; k < en && str_len(kept) < WIKI_ANS_MAX - 2; k++) {
+            const int l = str_len(kept);
+            kept[l] = ans[k];
+            kept[l + 1] = '\0';
+        }
+        nkept++;
+    }
+
+    if (nkept == 0) { ans[0] = '\0'; return 0; }
+
+    /* A surviving fragment still has to read as an answer: four words,
+     * and not a run of capitalised link text. */
+    int words = 0, capped = 0, k = 0;
+    while (kept[k]) {
+        while (kept[k] && !wiki_is_word(kept[k])) k++;
+        if (!kept[k]) break;
+        if (kept[k] >= 'A' && kept[k] <= 'Z') capped++;
+        words++;
+        while (kept[k] && wiki_is_word(kept[k])) k++;
+    }
+    if (words < 4 || capped * 10 >= words * 6) { ans[0] = '\0'; return 0; }
+
+    str_copy(ans, kept, WIKI_ANS_MAX);
+    return nkept;
+}
+
+/*
+ * The sentence in the evidence that best answers the question, for when
+ * the model's draft does not survive. Falling back to the source is
+ * always available, because the source is what the answer was supposed
+ * to be made of.
+ */
+static void wiki_evidence_line(char *out, int max) {
+    out[0] = '\0';
+    int best_score = -1, best_st = 0, best_en = 0;
+    int i = 0;
+    while (wiki_context[i]) {
+        while (wiki_context[i] == ' ' || wiki_context[i] == '\n') i++;
+        if (!wiki_context[i]) break;
+        const int st = i;
+        while (wiki_context[i] &&
+               !(wiki_context[i] == '.' && (wiki_context[i + 1] == ' ' ||
+                                            wiki_context[i + 1] == '\0')) &&
+               wiki_context[i] != '\n')
+            i++;
+        if (wiki_context[i] == '.') i++;
+        const int en = i;
+
+        char sentence[400];
+        int n = 0;
+        for (int k = st; k < en && n < (int)sizeof(sentence) - 1; k++)
+            sentence[n++] = wiki_context[k];
+        sentence[n] = '\0';
+
+        int score = 0;
+        for (int w = 0; w < wiki_nwords; w++) {
+            if (wiki_is_stopword(wiki_words[w])) continue;
+            char sg[32];
+            wiki_singular(wiki_words[w], sg, sizeof(sg));
+            if (wiki_stem_in(sentence, wiki_words[w]) ||
+                wiki_stem_in(sentence, sg)) score++;
+        }
+        if (score > best_score) { best_score = score; best_st = st; best_en = en; }
+    }
+    if (best_score <= 0) return;
+
+    /* Skip the "[Title] " label the passage was stored under: the
+     * caller already names the source, and repeating it inside the
+     * quotation makes it look like part of the sentence. */
+    if (wiki_context[best_st] == '[') {
+        int k = best_st;
+        while (wiki_context[k] && wiki_context[k] != ']') k++;
+        if (wiki_context[k] == ']') {
+            k++;
+            while (wiki_context[k] == ' ') k++;
+            if (k < best_en) best_st = k;
+        }
+    }
+
+    int n = 0;
+    for (int k = best_st; k < best_en && n < max - 1; k++)
+        out[n++] = wiki_context[k];
+    while (n > 0 && out[n - 1] == ' ') n--;
+    out[n] = '\0';
+}
+
 static void wiki_begin_generation(void);
 
 static void wiki_submit(void) {
@@ -3089,6 +3386,8 @@ static void wiki_gen_poll(void) {
                         wiki_log_add(wiki_scan_quote[k]);
                         wiki_log_add("\n");
                     }
+                    wiki_log_add("Why: these are the entries' own words. "
+                                 "Nothing here was written by the model.\n");
                 } else {
                     wiki_busy = 0;
                     wiki_log_add("AI: I read ");
@@ -3154,9 +3453,64 @@ static void wiki_gen_poll(void) {
 
         int next = llm_argmax_penalized(wiki_recent, wiki_recent_n);
         if (next == wiki_im_end || wiki_gen_n >= 48 || wiki_pos + 1 >= LLM_CTX_MAX) {
-            wiki_log_add("AI: ");
-            wiki_log_add(wiki_answer);
-            wiki_log_add("\n");
+            /*
+             * Check the draft before anyone reads it. What survives is
+             * traceable to the entry; what does not is dropped, and if
+             * nothing survives the entry answers in its own words.
+             */
+            {
+                /* Keep the draft for the log: the serial line should show
+                 * what the model actually wrote, not what survived the
+                 * check, or a rejected answer reads as an empty one. */
+                str_copy(wiki_draft, wiki_answer, sizeof(wiki_draft));
+
+                int dropped = 0;
+                const int kept = wiki_verify_answer(wiki_answer, &dropped);
+
+                wiki_log_add("AI: ");
+                if (kept > 0) {
+                    wiki_log_add(wiki_answer);
+                    wiki_log_add("\n");
+                    wiki_log_add("Why: every claim above is stated in the "
+                                 "entry for ");
+                    wiki_log_add(wiki_source);
+                    wiki_log_add(".");
+                    if (dropped > 0) {
+                        char nb[12];
+                        uint_to_str((uint32_t)dropped, nb);
+                        wiki_log_add(" I dropped ");
+                        wiki_log_add(nb);
+                        wiki_log_add(dropped == 1 ? " sentence the entry did"
+                                                    " not support."
+                                                  : " sentences the entry did"
+                                                    " not support.");
+                    }
+                    wiki_log_add("\n");
+                } else {
+                    char line[400];
+                    wiki_evidence_line(line, sizeof(line));
+                    if (line[0]) {
+                        wiki_log_add("I could not verify a written answer "
+                                     "against the entry, so here is what it "
+                                     "says:\n  ");
+                        wiki_log_add(wiki_source);
+                        wiki_log_add(" - ");
+                        wiki_log_add(line);
+                        wiki_log_add("\nWhy: the draft answer used wording "
+                                     "the entry does not, so it was "
+                                     "discarded and the entry quoted "
+                                     "instead.\n");
+                    } else {
+                        wiki_log_add("The entry does not answer that, and I "
+                                     "will not answer from memory.\n");
+                    }
+                }
+                serial_puts("[wiki] verify: kept ");
+                serial_put_dec((uint32_t)kept);
+                serial_puts(", dropped ");
+                serial_put_dec((uint32_t)dropped);
+                serial_putc('\n');
+            }
             wiki_busy = 0;
 
             serial_puts("[wiki] answered in ");
@@ -3165,8 +3519,8 @@ static void wiki_gen_poll(void) {
             serial_put_dec((uint32_t)wiki_ntok);
             serial_puts(" prompt + ");
             serial_put_dec((uint32_t)wiki_gen_n);
-            serial_puts(" generated tokens\n[wiki] ");
-            serial_puts(wiki_answer);
+            serial_puts(" generated tokens\n[wiki] draft: ");
+            serial_puts(wiki_draft);
             serial_putc('\n');
             if (wiki_answer_len == 0 && wiki_gen_n > 0) {
                 serial_puts("[wiki] answer decoded empty; first ids:");
