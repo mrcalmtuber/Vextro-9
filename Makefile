@@ -223,15 +223,21 @@ endif
 	done > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
-# Sample audio for the media player. Uncompressed PCM, because that is
-# what this system decodes; short, because they live on the volume.
-MUSIC_NAMES := chime sweep
+# Sample audio for the media player: one track per format it decodes,
+# so what ships exercises every decoder and not only the easy one. Short,
+# because they live on the volume.
+#   chime, sweep  uncompressed PCM
+#   voice         IMA ADPCM
+#   dial          G.711 mu-law
+#   bell.flac     FLAC, if the reference encoder is installed
+MUSIC_NAMES := chime sweep voice dial
 MUSIC_WAV   := $(foreach t,$(MUSIC_NAMES),build/music/$(t).wav)
+MUSIC_FLAC  := build/music/bell.flac
 
-$(MUSIC_WAV): tools/mkwav.py
+$(MUSIC_WAV) $(MUSIC_FLAC): tools/mkwav.py
 	@python3 tools/mkwav.py build/music
 
-disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV)
+disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -243,7 +249,9 @@ disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV)
 		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
 		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci) \
-		$(foreach t,$(MUSIC_NAMES),build/music/$(t).wav:music/$(t).wav)"; \
+		$(foreach t,$(MUSIC_NAMES),build/music/$(t).wav:music/$(t).wav) \
+		$$(test -f build/music/bell.flac && \
+		   echo build/music/bell.flac:music/bell.flac)"; \
 	echo "$$cmd"; \
 	$$cmd
 
@@ -397,6 +405,11 @@ os.iso: build/limine-tool $(ISO)/boot/kernel $(ISO)/boot/initrd.tar $(ISO)/boot/
 # pass sub-options the chosen backend actually accepts (grab-mod is
 # SDL-only, and QEMU rejects the whole option if it does not know it).
 #
+# -cpu max is not cosmetic: it is what exposes AMD-V (svm) and nested
+# paging (npt) to the guest, which the hypervisor in src/hyper.h needs.
+# The default qemu64 model advertises neither, and Chamber then correctly
+# reports that the processor has no virtualisation support.
+#
 # zoom-to-fit matters more than it sounds: without it, Cocoa and GTK draw
 # the guest at 1:1 in the middle of the full-screen window and surround it
 # with black, which looks exactly like a desktop that refuses to resize.
@@ -433,6 +446,7 @@ run: os.iso disk.img
 		-cdrom os.iso \
 		-drive file=disk.img,format=raw,index=0,media=disk \
 		-m 2048M \
+		-cpu max \
 		$(QEMU_VGA) \
 		-display $(QEMU_DISPLAY) \
 		-full-screen \

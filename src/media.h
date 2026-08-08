@@ -4,16 +4,26 @@
 /*
  * src/media.h — the media player.
  *
- * It plays what this system can actually decode, which is uncompressed
- * PCM in a RIFF/WAVE container, and it says so on its own face rather
- * than failing mysteriously on anything else. There is no MP3, no AAC and
- * no video here: a decoder for any of those is months of work and the
- * README lists them as absent.
+ * Four formats, all decoded here:
+ *
+ *   .flac            lossless, LPC and Rice coded          (src/flac.h)
+ *   .wav  PCM        uncompressed 16-bit
+ *   .wav  IMA ADPCM  4 bits per sample                    (src/adpcm.h)
+ *   .wav  A/mu-law   G.711 companding                     (src/adpcm.h)
+ *
+ * It says on its own face what it can read, rather than failing
+ * mysteriously on anything else. MP3, AAC and every video codec are
+ * still absent -- those are months of work each and the README says so.
  *
  * What it does do is real end to end -- the file is parsed here, the
  * samples go to the AC97 driver's bus-master path, and the sound was
- * measured coming out of the emulator, not assumed.
+ * measured coming out of the emulator, not assumed. The FLAC decoder is
+ * checked against the reference encoder for bit-exact output, which a
+ * lossless format makes possible and a lossy one does not.
  */
+
+#include "flac.h"
+#include "adpcm.h"
 
 /*
  * Not every port has a sound device. Where there is none the player still
@@ -78,7 +88,7 @@ static const char *media_parse_wav(const uint8_t *d, uint64_t n) {
 
     uint64_t off = 12;
     int have_fmt = 0;
-    uint16_t fmt = 0, ch = 2, bits = 16;
+    uint16_t fmt = 0, ch = 2, bits = 16, align = 0;
     uint32_t rate = 48000;
 
     while (off + 8 <= n) {
@@ -88,34 +98,49 @@ static const char *media_parse_wav(const uint8_t *d, uint64_t n) {
         if (sz > n - body) break;            /* declared past the end */
 
         if (media_tag(hdr, "fmt ") && sz >= 16) {
-            fmt  = media_rd16(d + body);
-            ch   = media_rd16(d + body + 2);
-            rate = media_rd32(d + body + 4);
-            bits = media_rd16(d + body + 14);
+            fmt   = media_rd16(d + body);
+            ch    = media_rd16(d + body + 2);
+            rate  = media_rd32(d + body + 4);
+            align = media_rd16(d + body + 12);
+            bits  = media_rd16(d + body + 14);
             have_fmt = 1;
         } else if (media_tag(hdr, "data") && have_fmt) {
-            if (fmt != 1)    return "only uncompressed PCM is supported";
-            if (bits != 16)  return "only 16-bit samples are supported";
             if (ch != 1 && ch != 2) return "only mono or stereo";
             if (rate < 4000 || rate > 96000) return "unusual sample rate";
 
-            const uint32_t in_samples = sz / 2;
             const uint8_t *src = d + body;
-
             uint32_t out = 0;
-            if (ch == 2) {
-                for (uint32_t i = 0; i < in_samples && out < MEDIA_MAX_SAMPLES; i++)
-                    media_pcm[out++] = (int16_t)media_rd16(src + i * 2);
-            } else {
-                /* Mono is duplicated into both channels here rather than
-                 * asking the codec to do it: the BDL carries interleaved
-                 * stereo and nothing downstream knows about mono. */
-                for (uint32_t i = 0; i < in_samples && out + 1 < MEDIA_MAX_SAMPLES; i++) {
-                    const int16_t v = (int16_t)media_rd16(src + i * 2);
-                    media_pcm[out++] = v;
-                    media_pcm[out++] = v;
+
+            if (fmt == 1) {                       /* uncompressed PCM */
+                if (bits != 16) return "only 16-bit PCM is supported";
+                const uint32_t in_samples = sz / 2;
+                if (ch == 2) {
+                    for (uint32_t i = 0; i < in_samples && out < MEDIA_MAX_SAMPLES; i++)
+                        media_pcm[out++] = (int16_t)media_rd16(src + i * 2);
+                } else {
+                    /* Mono is duplicated into both channels here rather
+                     * than asking the codec to do it: the BDL carries
+                     * interleaved stereo and nothing downstream knows
+                     * about mono. */
+                    for (uint32_t i = 0; i < in_samples && out + 1 < MEDIA_MAX_SAMPLES; i++) {
+                        const int16_t v = (int16_t)media_rd16(src + i * 2);
+                        media_pcm[out++] = v;
+                        media_pcm[out++] = v;
+                    }
                 }
+            } else if (fmt == 0x11) {             /* IMA ADPCM */
+                if (bits != 4) return "IMA ADPCM must be 4 bits per sample";
+                out = adpcm_decode_ima(src, sz, align, ch,
+                                       media_pcm, MEDIA_MAX_SAMPLES);
+                if (!out) return "malformed IMA ADPCM blocks";
+            } else if (fmt == 6 || fmt == 7) {    /* G.711 A-law / mu-law */
+                if (bits != 8) return "G.711 must be 8 bits per sample";
+                out = g711_decode(src, sz, ch, fmt == 6,
+                                  media_pcm, MEDIA_MAX_SAMPLES);
+            } else {
+                return "unsupported WAVE codec";
             }
+
             media_nsamples = out;
             media_rate = rate;
             media_channels = 2;
@@ -126,13 +151,27 @@ static const char *media_parse_wav(const uint8_t *d, uint64_t n) {
     return have_fmt ? "no data chunk" : "no format chunk";
 }
 
+/* Does `name` end with `ext`, either case? The volume is FAT32, which
+ * stores short names upper-case, so both spellings turn up on one disk. */
+static int media_ext_is(const char *name, const char *ext) {
+    const int n = str_len(name), e = str_len(ext);
+    if (n <= e) return 0;
+    const char *p = name + n - e;
+    for (int i = 0; i < e; i++) {
+        char a = p[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (a != ext[i]) return 0;
+    }
+    return 1;
+}
+
 static void media_scan_cb(const char *name, uint32_t size, int is_dir) {
     (void)size;
     if (is_dir || name[0] == '.') return;
     if (media_track_n >= MEDIA_MAX_TRACKS) return;
-    const int n = str_len(name);
-    if (n < 5) return;
-    if (!(str_eq(name + n - 4, ".wav") || str_eq(name + n - 4, ".WAV"))) return;
+    if (!media_ext_is(name, ".wav") && !media_ext_is(name, ".flac") &&
+        !media_ext_is(name, ".fla"))
+        return;
     str_copy(media_tracks[media_track_n++], name, MEDIA_NAME_MAX);
 }
 
@@ -141,7 +180,8 @@ static void media_scan(void) {
     fs_list(MEDIA_DIR, media_scan_cb);
     if (media_sel >= media_track_n) media_sel = 0;
     if (media_track_n == 0)
-        str_copy(media_status, "no .wav files in " MEDIA_DIR, sizeof(media_status));
+        str_copy(media_status, "no .wav or .flac files in " MEDIA_DIR,
+                 sizeof(media_status));
 }
 
 static void media_play_selected(void) {
@@ -160,7 +200,21 @@ static void media_play_selected(void) {
         return;
     }
 
-    const char *bad = media_parse_wav((const uint8_t *)d, n);
+    /*
+     * Which decoder, decided by what the file actually starts with
+     * rather than by its name. An extension is a hint from whoever wrote
+     * the file; the magic is the file itself.
+     */
+    const uint8_t *bytes = (const uint8_t *)d;
+    const char *bad;
+    if (n >= 4 && bytes[0] == 'f' && bytes[1] == 'L' &&
+        bytes[2] == 'a' && bytes[3] == 'C') {
+        bad = flac_decode(bytes, n, media_pcm, MEDIA_MAX_SAMPLES,
+                          &media_nsamples, &media_rate);
+        media_channels = 2;
+    } else {
+        bad = media_parse_wav(bytes, n);
+    }
     if (bad) {
         str_copy(media_status, bad, sizeof(media_status));
         media_status_err = 1;
