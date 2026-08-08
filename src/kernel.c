@@ -965,6 +965,18 @@ void kmain(void) {
             igpu_init(fb_phys, w, h, pitch_px);
     }
 
+    /*
+     * AMD-V. This has to run after the HHDM offset is known, because
+     * every structure the processor is handed -- the VMCB, the host
+     * save area, the nested page tables -- is given to it as a physical
+     * address, and kern_virt_to_phys is what produces one. On a machine
+     * without SVM this probes, records why, and changes nothing.
+     */
+    hv_init();
+    serial_puts("[hv] ");
+    serial_puts(hv.status);
+    serial_puts("\n");
+
     /* Initialize Tarfs from Limine boot module (initrd.tar) — read-only
      * fallback for ISO-only boots without a hard disk */
     if (mod_request.response != NULL &&
