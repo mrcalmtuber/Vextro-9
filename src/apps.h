@@ -2284,13 +2284,18 @@ static void wiki_consider(const char *key, char words[][32], int nwords,
  *
  * Returns the number of passages placed in wiki_context.
  */
+/* The question's words, kept so a survey can reuse them without
+ * parsing the sentence a second time. */
+static char wiki_words[8][32];
+static int  wiki_nwords;
+
 static int wiki_retrieve(const char *question) {
     wiki_context[0] = '\0';
     wiki_source[0] = '\0';
     wiki_ncand = 0;
     if (!zim.open) return 0;
 
-    char words[8][32];
+    char (*words)[32] = wiki_words;
     int  nwords = 0, i = 0;
     while (question[i] && nwords < 8) {
         while (question[i] && !wiki_is_word(question[i])) i++;
@@ -2303,6 +2308,7 @@ static int wiki_retrieve(const char *question) {
         words[nwords][ln] = '\0';
         nwords++;
     }
+    wiki_nwords = nwords;
     if (nwords == 0) return 0;
 
     char key[72], sing[32];
@@ -2461,6 +2467,331 @@ static int wiki_retrieve(const char *question) {
     return taken;
 }
 
+/* =====================================================================
+ * Surveying a category
+ *
+ * Some questions are not about one article. "What berries are poisonous"
+ * is a question about the *set* of berries, and no single page answers
+ * it: the archive knows the answer, but it is spread across Deadly
+ * nightshade, Pokeweed and their neighbours, one fact per article.
+ *
+ * Retrieval that returns passages cannot answer that, and a model handed
+ * two unrelated passages will bridge them into a falsehood -- which is
+ * exactly how raspberries were once reported as poisonous. So a question
+ * of this shape is answered by *surveying*: take the article that names
+ * the category, follow its links, read each one, and keep the entries
+ * that actually say the thing being asked about.
+ *
+ * The whole archive cannot be scanned -- 281,219 entries, two reads
+ * each, and the titles are sorted so that "Blueberry" does not sit
+ * anywhere near "Berry". The category article's own links are the
+ * curated list of its members, which is both far smaller and better
+ * chosen than anything a substring search would produce.
+ *
+ * Paced across frames like every other long job here, and reported, so
+ * a survey in progress never looks like a hang.
+ * ===================================================================== */
+
+#define WIKI_SCAN_MAX   96      /* candidate links to consider   */
+#define WIKI_SCAN_HITS  10      /* entries quoted in the answer  */
+
+static char     wiki_scan_path[WIKI_SCAN_MAX][WIKI_PATH_MAX];
+static int      wiki_scan_n, wiki_scan_at, wiki_scan_hits;
+static char     wiki_scan_subj[32], wiki_scan_qual[32];
+static char     wiki_scan_names[WIKI_SCAN_HITS][64];
+static char     wiki_scan_quote[WIKI_SCAN_HITS][200];
+
+/* Percent-decode in place, enough for the paths a ZIM link carries. */
+static void wiki_unescape(char *s) {
+    int r = 0, w = 0;
+    while (s[r]) {
+        if (s[r] == '%' && s[r + 1] && s[r + 2]) {
+            int hi = -1, lo = -1;
+            const char a = s[r + 1], b = s[r + 2];
+            if (a >= '0' && a <= '9') hi = a - '0';
+            else if ((a | 32) >= 'a' && (a | 32) <= 'f') hi = (a | 32) - 'a' + 10;
+            if (b >= '0' && b <= '9') lo = b - '0';
+            else if ((b | 32) >= 'a' && (b | 32) <= 'f') lo = (b | 32) - 'a' + 10;
+            if (hi >= 0 && lo >= 0) {
+                s[w++] = (char)((hi << 4) | lo);
+                r += 3;
+                continue;
+            }
+        }
+        s[w++] = s[r++];
+    }
+    s[w] = '\0';
+}
+
+/*
+ * Every internal link in an article, as archive paths.
+ *
+ * Skips anything with a scheme (an outside link), anchors, and the
+ * namespaces that are not articles. What remains is the last path
+ * component, which is what the 'C' namespace is keyed by.
+ */
+static void wiki_collect_links(const uint8_t *html, uint32_t len) {
+    wiki_scan_n = 0;
+    for (uint32_t i = 0; i + 6 < len && wiki_scan_n < WIKI_SCAN_MAX; i++) {
+        if (!(html[i] == 'h' && html[i+1] == 'r' && html[i+2] == 'e' &&
+              html[i+3] == 'f' && html[i+4] == '='))
+            continue;
+        uint32_t j = i + 5;
+        const char quote = (char)html[j];
+        if (quote != '"' && quote != '\'') continue;
+        j++;
+
+        char path[WIKI_PATH_MAX];
+        int n = 0;
+        while (j < len && (char)html[j] != quote && n < WIKI_PATH_MAX - 1) {
+            const char c = (char)html[j];
+            if (c == '#' || c == '?') break;      /* fragment, query */
+            path[n++] = c;
+            j++;
+        }
+        path[n] = '\0';
+        i = j;
+        if (n == 0) continue;
+
+        /* an outside link: scheme, or protocol-relative */
+        int has_scheme = 0;
+        for (int k = 0; path[k] && path[k] != '/'; k++)
+            if (path[k] == ':') { has_scheme = 1; break; }
+        if (has_scheme || (path[0] == '/' && path[1] == '/')) continue;
+
+        /* keep the last component: "../A/Blueberry" -> "Blueberry" */
+        int last = 0;
+        for (int k = 0; path[k]; k++) if (path[k] == '/') last = k + 1;
+        const char *tail = path + last;
+        if (!tail[0] || tail[0] == '.') continue;
+
+        char clean[WIKI_PATH_MAX];
+        str_copy(clean, tail, sizeof(clean));
+        wiki_unescape(clean);
+        if (!clean[0]) continue;
+
+        int dup = 0;
+        for (int k = 0; k < wiki_scan_n; k++)
+            if (str_eq(wiki_scan_path[k], clean)) { dup = 1; break; }
+        if (dup) continue;
+
+        str_copy(wiki_scan_path[wiki_scan_n++], clean, WIKI_PATH_MAX);
+    }
+}
+
+/*
+ * The sentence around the first mention of `word`, for quoting.
+ * A fact is worth more with the sentence that states it attached, and
+ * far more than a bare title.
+ */
+static void wiki_quote_around(const char *text, const char *word,
+                              char *out, int max) {
+    out[0] = '\0';
+    int n = 0;
+    while (text[n]) n++;
+
+    int at = -1, wl = 0;
+    while (word[wl]) wl++;
+    int stem = wl - 3;
+    if (stem < 4) stem = 4;
+    if (stem > wl) stem = wl;
+
+    for (int i = 0; i < n && at < 0; i++) {
+        if (i && wiki_is_word(text[i - 1])) continue;
+        int k = 0;
+        while (k < stem && text[i + k] &&
+               wiki_fold(text[i + k]) == wiki_fold(word[k])) k++;
+        if (k == stem) at = i;
+    }
+    if (at < 0) return;
+
+    int st = at;
+    while (st > 0 && !(text[st - 1] == '.' && text[st] == ' ')) st--;
+    while (text[st] == ' ') st++;
+    int en = at;
+    while (text[en] && !(text[en] == '.' &&
+                         (text[en + 1] == ' ' || !text[en + 1]))) en++;
+    if (text[en] == '.') en++;
+
+    /*
+     * Keep the match inside the quote.
+     *
+     * A navigation strip has no full stops in it, so the search for a
+     * sentence boundary runs to the top of the article and the quote is
+     * then truncated long before reaching the word it was supposed to be
+     * showing -- the Stone fruit entry quoted a list of links and never
+     * displayed "poisonous" at all. Centring on the match means the
+     * evidence is always visible, whatever the surrounding text is.
+     */
+    if (at - st > (max - 1) / 2) {
+        st = at - (max - 1) / 2;
+        while (st > 0 && wiki_is_word(text[st])) st--;
+        while (text[st] == ' ') st++;
+    }
+    if (en - st > max - 1) {
+        en = st + max - 1;
+        /* end on a word boundary rather than mid-word */
+        while (en > at && wiki_is_word(text[en - 1]) && wiki_is_word(text[en]))
+            en--;
+    }
+
+    int w = 0;
+    for (int i = st; i < en && w < max - 1; i++) out[w++] = text[i];
+    while (w > 0 && out[w - 1] == ' ') w--;
+    out[w] = '\0';
+}
+
+/*
+ * Is this a sentence, or a strip of links flattened into text?
+ *
+ * An article's navigation furniture -- "see also" rows, disambiguation
+ * lists, category strips -- survives the HTML stripper as a long run of
+ * Title Case words with no verbs and no full stops. One such run
+ * contained the word "poison" in "poison dates in Raiders of the Lost
+ * Ark", which matched perfectly and told the reader nothing.
+ *
+ * Prose is mostly lower case. A run where nearly every word is
+ * capitalised is a list, whatever it happens to contain.
+ */
+static int wiki_looks_like_prose(const char *t) {
+    int words = 0, capped = 0, i = 0;
+    while (t[i]) {
+        while (t[i] && !wiki_is_word(t[i])) i++;
+        if (!t[i]) break;
+        if (t[i] >= 'A' && t[i] <= 'Z') capped++;
+        words++;
+        while (t[i] && wiki_is_word(t[i])) i++;
+    }
+    if (words < 6) return 0;
+    if (capped * 10 >= words * 4) return 0;   /* 40%+ capitalised: a list */
+
+    /*
+     * And it has to contain a sentence boundary. Capitalisation alone
+     * let one strip through -- a run naming Practical Magic, Harry
+     * Nilsson and Raiders of the Lost Ark came to 36% and passed, while
+     * being no kind of sentence. A full stop is what separates a
+     * quotation from a row of link captions.
+     */
+    for (int k = 0; t[k]; k++)
+        if (t[k] == '.') return 1;
+    return 0;
+}
+
+/* One candidate per call, so the caller can spend a frame's slice. */
+static int wiki_scan_one(void) {
+    if (wiki_scan_at >= wiki_scan_n) return 1;
+    const char *path = wiki_scan_path[wiki_scan_at++];
+
+    uint32_t idx;
+    if (!zim_find('C', path, &idx)) return 0;
+
+    const uint8_t *d;
+    uint32_t n;
+    zim_dirent_t got;
+    if (zim_content(idx, &d, &n, &got) != 0) return 0;
+
+    wiki_html_text(d, n < 60000 ? n : 60000, wiki_article, WIKI_ART_CHARS);
+
+    /* It has to be a member of the category *and* say the thing asked
+     * about; either alone is how an unrelated article gets quoted. */
+    if (!wiki_stem_in(wiki_article, wiki_scan_subj) &&
+        !wiki_stem_in(got.title, wiki_scan_subj)) return 0;
+    if (!wiki_stem_in(wiki_article, wiki_scan_qual)) return 0;
+
+    for (int k = 0; k < wiki_scan_hits; k++)
+        if (str_eq(wiki_scan_names[k], got.title)) return 0;
+
+    char quote[200];
+    wiki_quote_around(wiki_article, wiki_scan_qual, quote, sizeof(quote));
+    if (!quote[0]) return 0;
+    if (!wiki_looks_like_prose(quote)) return 0;
+
+    int used = 0;
+    while (wiki_context[used]) used++;
+    if (used + (int)str_len(quote) + 80 > WIKI_CTX_CHARS) {
+        wiki_scan_at = wiki_scan_n;            /* full; stop early */
+        return 1;
+    }
+
+    if (used) str_append(wiki_context, "\n", sizeof(wiki_context));
+    str_append(wiki_context, "[", sizeof(wiki_context));
+    str_append(wiki_context, got.title, sizeof(wiki_context));
+    str_append(wiki_context, "] ", sizeof(wiki_context));
+    str_append(wiki_context, quote, sizeof(wiki_context));
+
+    if (wiki_scan_hits < WIKI_SCAN_HITS) {
+        str_copy(wiki_scan_names[wiki_scan_hits], got.title,
+                 sizeof(wiki_scan_names[0]));
+        str_copy(wiki_scan_quote[wiki_scan_hits], quote,
+                 sizeof(wiki_scan_quote[0]));
+        wiki_scan_hits++;
+    }
+    if (wiki_scan_hits >= WIKI_SCAN_HITS) return 1;
+    return 0;
+}
+
+/*
+ * Set a survey going, if the question looks like one.
+ *
+ * It has to name a category the archive has an article for, and a
+ * property to test its members against. Returns 1 if a survey started.
+ */
+static int wiki_scan_begin(char words[][32], int nwords) {
+    wiki_scan_n = wiki_scan_at = wiki_scan_hits = 0;
+    wiki_scan_subj[0] = wiki_scan_qual[0] = '\0';
+
+    /* The subject is the content word with an article of its own; the
+     * property is the other one. */
+    char subj[32] = "", qual[32] = "";
+    uint32_t subj_idx = 0;
+    int have_subj = 0;
+
+    for (int w = 0; w < nwords; w++) {
+        if (wiki_is_stopword(words[w])) continue;
+        char sg[32], key[72];
+        wiki_singular(words[w], sg, sizeof(sg));
+        str_copy(key, sg, sizeof(key));
+        if (key[0] >= 'a' && key[0] <= 'z') key[0] = (char)(key[0] - 32);
+
+        uint32_t idx = zim_lower_bound('C', key);
+        zim_dirent_t e;
+        if (!have_subj && idx < zim.article_count &&
+            zim_dirent(idx, &e) == 0 && e.ns == 'C' &&
+            wiki_title_starts(e.title, key)) {
+            str_copy(subj, sg, sizeof(subj));
+            subj_idx = idx;
+            have_subj = 1;
+        } else if (!qual[0]) {
+            str_copy(qual, words[w], sizeof(qual));
+        }
+    }
+    if (!have_subj || !qual[0]) return 0;
+
+    const uint8_t *d;
+    uint32_t n;
+    zim_dirent_t got;
+    if (zim_content(subj_idx, &d, &n, &got) != 0) return 0;
+
+    wiki_collect_links(d, n);
+    if (wiki_scan_n == 0) return 0;
+
+    str_copy(wiki_scan_subj, subj, sizeof(wiki_scan_subj));
+    str_copy(wiki_scan_qual, qual, sizeof(wiki_scan_qual));
+    str_copy(wiki_source, got.title, sizeof(wiki_source));
+    wiki_context[0] = '\0';
+
+    serial_puts("[wiki] surveying ");
+    serial_put_dec((uint32_t)wiki_scan_n);
+    serial_puts(" entries linked from ");
+    serial_puts(got.title);
+    serial_puts(" for \"");
+    serial_puts(qual);
+    serial_puts("\"\n");
+    return 1;
+}
+
+static void wiki_begin_generation(void);
+
 static void wiki_submit(void) {
     if (wiki_busy) return;
     if (wiki_input_len == 0) return;
@@ -2526,12 +2857,36 @@ static void wiki_submit(void) {
      */
     const int passages = wiki_retrieve(wiki_input);
     if (passages == 0 || !wiki_context[0]) {
+        /*
+         * No one article answers it -- so try surveying a category
+         * instead. This is the path that answers "what berries are
+         * poisonous": there is no page by that name, but there is a page
+         * that lists berries, and the answer is in which of them say so.
+         */
+        if (wiki_scan_begin(wiki_words, wiki_nwords)) {
+            wiki_busy = 4;
+            wiki_log_add("[surveying entries linked from ");
+            wiki_log_add(wiki_source);
+            wiki_log_add("]\n");
+            return;
+        }
         serial_puts("[wiki] no article matched; refusing to answer\n");
         wiki_log_add("AI: The archive does not have an article that answers "
                      "that, so I have nothing to answer from. I only answer "
                      "from Wikipedia, never from memory.\n");
         return;
     }
+    wiki_begin_generation();
+}
+
+/*
+ * Build the prompt from whatever is in wiki_context and start the model.
+ *
+ * Split out of wiki_submit because there are two ways to arrive here now
+ * -- a passage retrieved directly, or a survey that assembled one out of
+ * many entries -- and both need exactly the same prompt and prefill.
+ */
+static void wiki_begin_generation(void) {
     wiki_log_add("[context: ");
     wiki_log_add(wiki_source);
     wiki_log_add("]\n");
@@ -2684,6 +3039,73 @@ static void wiki_gen_poll(void) {
     if (!wiki_busy) return;
 
     /*
+     * A survey in progress: read one linked entry per turn, within the
+     * frame's slice, until the list is exhausted or enough of it has
+     * answered. Only then is the model given anything.
+     */
+    if (wiki_busy == 4) {
+        uint64_t scan_start = cycle_now();
+        do {
+            if (wiki_scan_one()) {
+                serial_puts("[wiki] survey read ");
+                serial_put_dec((uint32_t)wiki_scan_at);
+                serial_puts(" entries, ");
+                serial_put_dec((uint32_t)wiki_scan_hits);
+                serial_puts(" matched\n");
+                if (wiki_scan_hits > 0) {
+                    /*
+                     * The survey's result is quoted archive text, and it
+                     * is reported as such rather than paraphrased.
+                     *
+                     * Handing these findings to the model destroyed them:
+                     * given three correct quotations it replied
+                     * "Blackberries Rubus BlackBerry". A 0.5B model adds
+                     * nothing to a list of facts already in the right
+                     * order, and can only subtract from it. So the answer
+                     * is the evidence, with the article each line came
+                     * from, and the reader can weigh a sentence like
+                     * Tomato's -- "wrongly thought that they were
+                     * poisonous" -- for themselves, which a summary would
+                     * have flattened.
+                     */
+                    char nb[12];
+                    wiki_busy = 0;
+                    wiki_log_add("AI: I read ");
+                    uint_to_str((uint32_t)wiki_scan_at, nb);
+                    wiki_log_add(nb);
+                    wiki_log_add(" entries linked from ");
+                    wiki_log_add(wiki_source);
+                    wiki_log_add(". ");
+                    uint_to_str((uint32_t)wiki_scan_hits, nb);
+                    wiki_log_add(nb);
+                    wiki_log_add(wiki_scan_hits == 1 ? " mentions \""
+                                                     : " mention \"");
+                    wiki_log_add(wiki_scan_qual);
+                    wiki_log_add("\":\n");
+                    for (int k = 0; k < wiki_scan_hits; k++) {
+                        wiki_log_add("  ");
+                        wiki_log_add(wiki_scan_names[k]);
+                        wiki_log_add(" - ");
+                        wiki_log_add(wiki_scan_quote[k]);
+                        wiki_log_add("\n");
+                    }
+                } else {
+                    wiki_busy = 0;
+                    wiki_log_add("AI: I read ");
+                    uint_to_str((uint32_t)wiki_scan_at, (char *)wiki_answer);
+                    wiki_log_add(wiki_answer);
+                    wiki_log_add(" entries from the archive and none of them "
+                                 "says that, so I have nothing to answer "
+                                 "from.\n");
+                    wiki_answer[0] = '\0';
+                }
+                return;
+            }
+        } while (!budget_expired_ms(scan_start, 8));
+        return;
+    }
+
+    /*
      * As much of the frame as can be spared, rather than two layers.
      *
      * A fixed two steps per frame was catastrophic in the other direction
@@ -2830,7 +3252,9 @@ static void wiki_chat_draw(uint32_t *buf, uint32_t w, uint32_t h,
     if (wiki_busy) {
         int pct = llm_eval_progress();
         char st[64], nb[12];
-        str_copy(st, wiki_busy == 1 ? "reading the question " : "thinking ", sizeof(st));
+        str_copy(st, wiki_busy == 4 ? "surveying the archive " :
+                 wiki_busy == 1 ? "reading the question " : "thinking ",
+                 sizeof(st));
         uint_to_str((uint32_t)(wiki_busy == 1
                     ? wiki_tokidx * 100 / (wiki_ntok ? wiki_ntok : 1) : pct), nb);
         str_append(st, nb, sizeof(st));
