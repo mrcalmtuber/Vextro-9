@@ -512,6 +512,7 @@ static void term_cmd_help(void) {
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
     term_print("  llm load <f> | weights | tok <t> | eval <tok> | probe | gen <t>\n");
+    term_print("  beep [hz]                        play a tone through AC97\n");
     term_print("  policy | allow | scan            security policy and scanning\n");
     term_print("  vault seal|open <..>             encrypted containers\n");
     term_print("  backup | restore <f> <pass>      this account's home directory\n");
@@ -894,6 +895,59 @@ static void cmd_restore(int argc, char **argv) {
     char nb[12]; uint_to_str(files, nb);
     term_print_c("  restored ", 3); term_print(nb);
     term_print(" file(s) to "); term_print(home); term_print("\n");
+}
+
+
+/* ===== audio =====
+ *
+ * A tone is generated rather than loaded so that "does the sound path
+ * work" can be answered without a file on the volume: the integer sine
+ * table drives it, since there is no FPU here.
+ */
+#define TONE_RATE     48000u
+#define TONE_SAMPLES  (TONE_RATE / 2u * 2u)   /* half a second, stereo */
+static int16_t tone_buf[TONE_SAMPLES];
+
+static void cmd_beep(int argc, char **argv) {
+    if (!ac97_found) {
+        term_print_c("no AC97 device on this machine\n", 2);
+        return;
+    }
+    uint32_t hz = 440;
+    if (argc >= 2) {
+        hz = 0;
+        for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
+            hz = hz * 10 + (uint32_t)(*p - '0');
+        if (hz < 20 || hz > 12000) { term_print_c("pick 20..12000 Hz\n", 2); return; }
+    }
+
+    /*
+     * A square-ish wave built from the integer sine table. The phase is
+     * carried in whole degrees scaled by 1024 so it never drifts: a
+     * per-sample increment of hz*360/rate would round away and the pitch
+     * would come out wrong at anything but round frequencies.
+     */
+    uint32_t phase = 0;
+    const uint32_t inc = (hz * 360u * 1024u) / TONE_RATE;
+    for (uint32_t i = 0; i < TONE_SAMPLES; i += 2) {
+        const int32_t deg = (int32_t)((phase >> 10) % 360u);
+        int32_t v = int_sin[deg] * 8;            /* 1024 -> ~8192, quiet */
+        /* fade the last eighth so it does not end on a click */
+        const uint32_t tail = TONE_SAMPLES / 8;
+        if (i > TONE_SAMPLES - tail)
+            v = v * (int32_t)(TONE_SAMPLES - i) / (int32_t)tail;
+        tone_buf[i]     = (int16_t)v;            /* left  */
+        tone_buf[i + 1] = (int16_t)v;            /* right */
+        phase += inc;
+    }
+
+    if (ac97_play(tone_buf, TONE_SAMPLES, TONE_RATE) != 0) {
+        term_print_c("the device refused the buffer\n", 2);
+        return;
+    }
+    char nb[12];
+    uint_to_str(hz, nb);
+    term_print("  playing "); term_print(nb); term_print(" Hz for 0.5 s\n");
 }
 
 static void term_run_command(void) {
@@ -1696,6 +1750,7 @@ static void term_exec(char *cmdline) {
         term_print_c(img_status(), 4);
         term_putc('\n');
         wm_open(WK_IMAGE);
+    } else if (str_eq(cmd, "beep"))    { cmd_beep(argc, argv);
     } else if (str_eq(cmd, "policy"))  { cmd_policy(argc, argv);
     } else if (str_eq(cmd, "allow"))   { cmd_allow(argc, argv);
     } else if (str_eq(cmd, "scan"))    { cmd_scan(argc, argv);
