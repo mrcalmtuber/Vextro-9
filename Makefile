@@ -223,7 +223,15 @@ endif
 	done > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
-disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI)
+# Sample audio for the media player. Uncompressed PCM, because that is
+# what this system decodes; short, because they live on the volume.
+MUSIC_NAMES := chime sweep
+MUSIC_WAV   := $(foreach t,$(MUSIC_NAMES),build/music/$(t).wav)
+
+$(MUSIC_WAV): tools/mkwav.py
+	@python3 tools/mkwav.py build/music
+
+disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV)
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -234,7 +242,8 @@ disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI)
 		apps/welcome.txt:docs/welcome.txt \
 		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
-		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci)"; \
+		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci) \
+		$(foreach t,$(MUSIC_NAMES),build/music/$(t).wav:music/$(t).wav)"; \
 	echo "$$cmd"; \
 	$$cmd
 
