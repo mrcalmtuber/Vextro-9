@@ -613,6 +613,16 @@ static const char *ai_err   = "";
 static fs_file_t   ai_file;
 static char        ai_model[40] = AI_MODEL_ALT;
 
+/*
+ * Which slot is being filled, and what goes in each.
+ *
+ * Slot 0 answers; slot 1 is the second opinion. Both stay resident, so a
+ * question can be put to each without either being reloaded -- see
+ * LLM_SLOTS in llm.h for why that is an index rather than a reload.
+ */
+static int         ai_loading_slot = 0;
+static char        ai_slot_path[LLM_SLOTS][40];
+
 /* Load progress reporting: when it started, and the last tenth
  * announced. Declared here because a model switch resets them. */
 static uint64_t    ai_t0 = 0;
@@ -635,6 +645,11 @@ static void ai_autoload_start(void) {
      * otherwise. A machine with neither simply has no chat. */
     if (fs_stat(AI_MODEL_ALT, 0, 0)) str_copy(ai_model, AI_MODEL_ALT, sizeof(ai_model));
     else                             str_copy(ai_model, AI_MODEL_PATH, sizeof(ai_model));
+
+    ai_loading_slot = 0;
+    llm_slot_select(0);
+    str_copy(ai_slot_path[0], ai_model, sizeof(ai_slot_path[0]));
+    ai_slot_path[1][0] = '\0';
 
     if (fs_open(ai_model, &ai_file) != 0) {
         /* Not an error — a machine with no model simply has no chat. But
@@ -734,10 +749,38 @@ static void ai_poll(void) {
                 return;
             }
             if (r == 1) {
-                ai_state = AI_READY;
-                serial_puts("[ai] model ready in ");
+                serial_puts("[ai] slot ");
+                serial_put_dec((uint32_t)ai_loading_slot);
+                serial_puts(" ready in ");
                 serial_put_dec(cycles_to_ms(cycle_now() - ai_t0));
-                serial_puts(" ms\n");
+                serial_puts(" ms: ");
+                serial_puts(ai_slot_path[ai_loading_slot]);
+                serial_putc('\n');
+
+                /*
+                 * The second model, if the volume has it. Loading it
+                 * does not disturb the first: the arena is a bump
+                 * allocator shared by both, so this continues where the
+                 * last one stopped rather than overwriting it.
+                 */
+                const char *other = str_eq(ai_slot_path[0], AI_MODEL_ALT)
+                                  ? AI_MODEL_PATH : AI_MODEL_ALT;
+                if (ai_loading_slot == 0 && fs_stat(other, 0, 0) &&
+                    fs_open(other, &ai_file) == 0) {
+                    ai_loading_slot = 1;
+                    llm_slot_select(1);
+                    str_copy(ai_slot_path[1], other, sizeof(ai_slot_path[1]));
+                    ai_last_decile = -1;
+                    ai_t0 = cycle_now();
+                    ai_state = AI_PARSE;
+                    serial_puts("[ai] loading ");
+                    serial_puts(other);
+                    serial_puts(" as the second opinion\n");
+                    return;
+                }
+
+                llm_slot_select(0);      /* answers come from slot 0 */
+                ai_state = AI_READY;
                 return;
             }
         } while (!budget_expired_ms(start, 6));
@@ -781,6 +824,11 @@ static void term_exec(char *cmdline);
  * two cannot drift. */
 #define WIKI_INPUT_MAX 160
 static int  wiki_ask(const char *question);
+
+/* Whether a question also goes to the second model. Defined here rather
+ * than in apps.h because `llm check` reaches it, and term.h is included
+ * first. */
+static int  wiki_xcheck = 1;
 
 /*
  * The prompt now names who is at the keyboard, because more than one
@@ -1479,6 +1527,18 @@ static void term_exec(char *cmdline) {
             uint_to_str(cycles_to_us(o), nb); term_print(nb); term_print(" us\n");
             term_print("  as the model runs ");
             uint_to_str(cycles_to_us(b), nb); term_print(nb); term_print(" us\n");
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "check")) {
+            if (argc >= 3) wiki_xcheck = !str_eq(argv[2], "off");
+            term_print("  cross-check ");
+            term_print_c(wiki_xcheck ? "on" : "off", wiki_xcheck ? 4 : 3);
+            term_print("\n  slot 0 ");
+            term_print(ai_slot_path[0][0] ? ai_slot_path[0] : "(empty)");
+            term_print(llm_slot_loaded(0) ? "  resident\n" : "  loading\n");
+            term_print("  slot 1 ");
+            term_print(ai_slot_path[1][0] ? ai_slot_path[1] : "(none)");
+            term_print(llm_slot_loaded(1) ? "  resident\n" : "  not loaded\n");
             return;
         }
         if (argc >= 2 && str_eq(argv[1], "use")) {

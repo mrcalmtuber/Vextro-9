@@ -26,6 +26,18 @@
 typedef int (*llm_read_fn)(void *ctx, uint64_t off, void *buf,
                            uint32_t len, uint32_t *got);
 
+/* ---- two models at once ----
+ *
+ * Both sets of weights live in the arena together and a slot is selected
+ * by index, so a question can be put to each of them without either
+ * being reloaded. Every call below acts on the selected slot.
+ */
+#define LLM_SLOTS 2
+
+int llm_slot_select(int i);
+int llm_slot_current(void);
+int llm_slot_loaded(int i);
+
 /* ---- arena ---- */
 void        llm_arena_init(void *base, uint64_t size);
 uint64_t    llm_arena_total(void);

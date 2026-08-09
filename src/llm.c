@@ -50,6 +50,200 @@ static void *arena_need(uint64_t n) {
     return p;
 }
 
+
+/* =====================================================================
+ * Two models, resident at once
+ *
+ * Everything that belongs to *a* model -- its tokenizer, its tensor
+ * table, its weights, its activations, its evaluation cursor -- lives in
+ * one struct, and there are two of them. Switching is an index, not a
+ * reload: both sets of weights sit in the arena together, so the answer
+ * from one model and the answer from the other cost nothing but the
+ * forward passes themselves.
+ *
+ * The names are then aliased back to what the rest of this file already
+ * calls them. That is deliberate: the inference code is long, it is
+ * correct, and it has been checked against a reference implementation
+ * logit by logit. Threading a context pointer through all of it would
+ * touch every line and risk all of that to gain nothing a macro does not
+ * already give.
+ *
+ * The arena is *not* per model. It is a bump allocator shared by both,
+ * which is what lets the second load continue where the first stopped
+ * instead of overwriting it.
+ * ===================================================================== */
+
+#define LLM_TENSOR_MAX 512
+
+typedef struct {
+    char     name[LLM_NAME_MAX];
+    uint32_t type;
+    uint64_t offset;        /* relative to the data section */
+    uint64_t elems;
+    uint32_t ne0, ne1;      /* ne0 is the contiguous (input) dimension */
+} tensor_t;
+
+typedef struct {
+    const uint8_t *data;
+    uint32_t type;
+    uint32_t ne0, ne1;
+} wt_t;
+
+typedef struct {
+    wt_t attn_norm, wq, bq, wk, bk, wv, bv, wo;
+    wt_t ffn_norm, w_gate, w_up, w_down;
+} layer_t;
+
+#define LLM_BATCH 1
+
+typedef struct {
+    /* tokenizer */
+    char     *tok_blob;
+    uint32_t *tok_off;
+    uint32_t  tok_n;
+    int32_t  *tok_hash;
+    uint32_t  tok_hash_mask;
+    uint64_t *mrg_key;
+    uint32_t *mrg_rank;
+    uint32_t  mrg_hash_mask;
+    uint32_t  mrg_n;
+    uint16_t  byte_to_uni[256];
+    int16_t   uni_to_byte[512];
+
+    /* the file and what it says */
+    tensor_t    tensors[LLM_TENSOR_MAX];
+    int         tensor_n;
+    uint64_t    data_start;
+    llm_read_fn model_rd;
+    void       *model_ctx;
+    llm_info_t  info;
+    int         rope_interleaved;
+
+    /* weights */
+    uint8_t *weights_blob;
+    uint64_t weights_len;
+    int      weights_ok;
+    wt_t     w_tok_embd, w_out_norm;
+    layer_t  w_layers[32];
+    int      head_dim, kv_dim, n_ctx;
+
+    /* activations */
+    float *a_x, *a_xb, *a_xb2, *a_q, *a_k, *a_v, *a_att, *a_hb, *a_hb2;
+    float *b_x, *b_xb, *b_xb2, *b_q, *b_k, *b_v, *b_hb, *b_hb2;
+    float *a_logits, *kv_k, *kv_v;
+    float *p_embd, *p_xb0, *p_q0;
+
+    /* streaming load */
+    uint64_t load_done;
+    int      load_active;
+
+    /* evaluation cursor */
+    int32_t  ev_token;
+    int      ev_pos;
+    uint32_t ev_layer;
+    int      ev_stage;
+    uint32_t ev_logit_row;
+    int      ev_active;
+    int      ev_want_logits;
+
+    /* prefill cursor */
+    int      pf_active;
+    int      pf_pos, pf_left, pf_nb;
+    uint32_t pf_layer;
+    const int32_t *pf_toks;
+} llm_model_t;
+
+static llm_model_t llm_slot[LLM_SLOTS];
+static int         llm_cur = 0;
+
+#define M (llm_slot[llm_cur])
+
+#define tok_blob       M.tok_blob
+#define tok_off        M.tok_off
+#define tok_n          M.tok_n
+#define tok_hash       M.tok_hash
+#define tok_hash_mask  M.tok_hash_mask
+#define mrg_key        M.mrg_key
+#define mrg_rank       M.mrg_rank
+#define mrg_hash_mask  M.mrg_hash_mask
+#define mrg_n          M.mrg_n
+#define byte_to_uni    M.byte_to_uni
+#define uni_to_byte    M.uni_to_byte
+#define tensors        M.tensors
+#define tensor_n       M.tensor_n
+#define data_start     M.data_start
+#define model_rd       M.model_rd
+#define model_ctx      M.model_ctx
+#define info           M.info
+#define rope_interleaved M.rope_interleaved
+#define weights_blob   M.weights_blob
+#define weights_len    M.weights_len
+#define weights_ok     M.weights_ok
+#define w_tok_embd     M.w_tok_embd
+#define w_out_norm     M.w_out_norm
+#define w_layers       M.w_layers
+#define head_dim       M.head_dim
+#define kv_dim         M.kv_dim
+#define n_ctx          M.n_ctx
+#define a_x            M.a_x
+#define a_xb           M.a_xb
+#define a_xb2          M.a_xb2
+#define a_q            M.a_q
+#define a_k            M.a_k
+#define a_v            M.a_v
+#define a_att          M.a_att
+#define a_hb           M.a_hb
+#define a_hb2          M.a_hb2
+#define b_x            M.b_x
+#define b_xb           M.b_xb
+#define b_xb2          M.b_xb2
+#define b_q            M.b_q
+#define b_k            M.b_k
+#define b_v            M.b_v
+#define b_hb           M.b_hb
+#define b_hb2          M.b_hb2
+#define a_logits       M.a_logits
+#define kv_k           M.kv_k
+#define kv_v           M.kv_v
+#define p_embd         M.p_embd
+#define p_xb0          M.p_xb0
+#define p_q0           M.p_q0
+#define load_done      M.load_done
+#define load_active    M.load_active
+#define ev_token       M.ev_token
+#define ev_pos         M.ev_pos
+#define ev_layer       M.ev_layer
+#define ev_stage       M.ev_stage
+#define ev_logit_row   M.ev_logit_row
+#define ev_active      M.ev_active
+#define ev_want_logits M.ev_want_logits
+#define pf_active      M.pf_active
+#define pf_pos         M.pf_pos
+#define pf_left        M.pf_left
+#define pf_nb          M.pf_nb
+#define pf_layer       M.pf_layer
+#define pf_toks        M.pf_toks
+
+/* Which model the calls below act on. */
+int llm_slot_select(int i) {
+    if (i < 0 || i >= LLM_SLOTS) return -1;
+    llm_cur = i;
+    return 0;
+}
+
+int llm_slot_current(void) { return llm_cur; }
+
+int llm_slot_loaded(int i) {
+    if (i < 0 || i >= LLM_SLOTS) return 0;
+    /* Through the alias, not the field: every name in the struct is a
+     * macro now, so llm_slot[i].weights_ok would expand into nonsense. */
+    const int save = llm_cur;
+    llm_cur = i;
+    const int ok = weights_ok;
+    llm_cur = save;
+    return ok;
+}
+
 /* ---- GGUF ---- */
 
 #define GGUF_MAGIC 0x46554747u      /* "GGUF" little-endian */
@@ -109,36 +303,12 @@ static int quant_block(uint32_t t, uint32_t *elems, uint32_t *bytes) {
     }
 }
 
-static char     *tok_blob;         /* all token text, NUL separated */
-static uint32_t *tok_off;          /* id -> offset into tok_blob    */
-static uint32_t  tok_n;
-static int32_t  *tok_hash;         /* hash -> id, -1 empty          */
-static uint32_t  tok_hash_mask;
-static uint64_t *mrg_key;          /* (a<<32)|b, +1 so 0 means empty */
-static uint32_t *mrg_rank;
-static uint32_t  mrg_hash_mask;
-static uint32_t  mrg_n;
 
 static void build_byte_map(void);
 static void tok_hash_put(uint32_t id);
 static int  tok_find(const char *s, int len);
 static void mrg_put(uint32_t a, uint32_t b, uint32_t rank);
 
-#define LLM_TENSOR_MAX 512
-
-typedef struct {
-    char     name[LLM_NAME_MAX];
-    uint32_t type;
-    uint64_t offset;        /* relative to the data section */
-    uint64_t elems;
-    uint32_t ne0, ne1;      /* ne0 is the contiguous (input) dimension */
-} tensor_t;
-
-static tensor_t tensors[LLM_TENSOR_MAX];
-static int      tensor_n;
-static uint64_t data_start;      /* file offset of the tensor payload */
-static llm_read_fn model_rd;
-static void       *model_ctx;
 
 /* half-precision to float; GGUF stores every scale this way */
 static float fp16_to_f32(uint16_t h) {
@@ -160,7 +330,6 @@ static float fp16_to_f32(uint16_t h) {
     return o.f;
 }
 
-static llm_info_t info;
 
 /*
  * Which rotary convention this file uses: interleaved pairs (llama) or
@@ -168,7 +337,6 @@ static llm_info_t info;
  * rope() far below -- see the comment there for why the two are not
  * interchangeable.
  */
-static int rope_interleaved;
 
 const llm_info_t *llm_get_info(void) { return &info; }
 
@@ -570,8 +738,6 @@ int llm_fpu_selftest(uint32_t *scaled) {
  * ===================================================================== */
 
 /* byte <-> printable codepoint, the GPT-2 mapping */
-static uint16_t byte_to_uni[256];
-static int16_t  uni_to_byte[512];
 
 static void build_byte_map(void) {
     for (int i = 0; i < 512; i++) uni_to_byte[i] = -1;
@@ -1140,38 +1306,17 @@ static float k_sqrt(float x) {
 
 /* ---- weights in memory ---- */
 
-typedef struct {
-    const uint8_t *data;
-    uint32_t type;
-    uint32_t ne0, ne1;
-} wt_t;
 
-typedef struct {
-    wt_t attn_norm, wq, bq, wk, bk, wv, bv, wo;
-    wt_t ffn_norm, w_gate, w_up, w_down;
-} layer_t;
 
-static uint8_t *weights_blob;
-static uint64_t weights_len;
-static int      weights_ok;
-
-static wt_t     w_tok_embd, w_out_norm;
-static layer_t  w_layers[32];
-
-static int      head_dim, kv_dim, n_ctx;
 
 /* activations */
-static float *a_x, *a_xb, *a_xb2, *a_q, *a_k, *a_v, *a_att, *a_hb, *a_hb2;
 
 /* The same activations, for a batch of prefill positions. See the
  * prefill kernel below for why the batch is one. */
 #define LLM_BATCH 1
-static float *b_x, *b_xb, *b_xb2, *b_q, *b_k, *b_v, *b_hb, *b_hb2;
-static float *a_logits, *kv_k, *kv_v;
 
 /* snapshots of the first layer, kept only so a reference forward pass
  * can be compared against step by step */
-static float *p_embd, *p_xb0, *p_q0;
 
 int llm_weights_loaded(void) { return weights_ok; }
 
@@ -1223,8 +1368,6 @@ static int bind_tensor(wt_t *w, const char *name, const char **err) {
  * begin/step so a caller can advance it from its frame loop and stay
  * alive, exactly as evaluation already does.
  */
-static uint64_t load_done = 0;
-static int      load_active = 0;
 
 static int llm_bind_all(const char **err);
 
@@ -1482,12 +1625,6 @@ static void rope(float *vec, int n_heads, int pos) {
  * whole desktop for that long, so the work is handed out a layer at a
  * time and the caller redraws in between.
  */
-static int32_t  ev_token;
-static int      ev_pos;
-static uint32_t ev_layer;
-static int      ev_stage;      /* 0 layers, 1 logits, 2 done */
-static uint32_t ev_logit_row;
-static int      ev_active;
 
 #define EV_LOGIT_CHUNK 8192
 
@@ -1586,7 +1723,6 @@ static void eval_layer(uint32_t l, int pos) {
  * platform is the difference between a usable chat panel and one nobody
  * waits for.
  */
-static int ev_want_logits = 1;
 
 static int eval_begin_common(int32_t token, int pos, int want_logits) {
     if (!weights_ok) return -1;
@@ -1772,10 +1908,6 @@ static void eval_layer_batch(uint32_t l, int p0, int nb) {
 }
 
 /* ---- steppable prefill, one layer of one batch per step ---- */
-static int      pf_active = 0;
-static int      pf_pos = 0, pf_left = 0, pf_nb = 0;
-static uint32_t pf_layer = 0;
-static const int32_t *pf_toks = 0;
 
 int llm_prefill_begin(const int32_t *toks, int n, int start_pos) {
     if (!weights_ok || n <= 0) return -1;

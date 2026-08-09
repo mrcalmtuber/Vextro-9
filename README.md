@@ -510,6 +510,40 @@ implementation to three decimals.
   <img src="docs/explainer.png" width="88%" alt="The fine-tuned model answering from the archive">
 </p>
 
+### Both models, at once, checking each other
+
+The two models are resident together — `llm.c` keeps everything that
+belongs to *a* model in one struct and there are two of them, so
+switching is an index rather than a reload. They share the arena, which
+is what lets the second load continue where the first stopped instead of
+overwriting it.
+
+A question goes to both. The tuned model answers; the 0.5B answers the
+same prompt, re-encoded, because its tokenizer is a different vocabulary
+entirely. Then the deterministic verifier checks each against the entry,
+and the transcript reports how much of the same ground they covered:
+
+```
+AI: Gravity, or gravitation is one of the fundamental forces of the
+    universe. It is an attraction, or pull, between any two objects
+    with mass.
+Why: every claim above is stated in the entry for Gravity. I dropped
+    1 sentence the entry did not support.
+Cross-check: /explain.gguf and /qwen2.gguf agree (58% of the same facts).
+```
+
+That run is a fair illustration of what the check is worth. The 0.5B
+wrote "it keeps planets in orbit around their stars" — plausible, absent
+from the passage, and dropped by the verifier rather than by the other
+model. Agreement is not proof, because both can be wrong about the same
+passage; **disagreement is the useful signal**, and it is reported rather
+than resolved silently. `llm check off` turns it off; the answer then
+comes from one model in half the time.
+
+<p align="center">
+  <img src="docs/crosscheck.png" width="88%" alt="Two models answering and being compared">
+</p>
+
 ### A guest that runs on the processor
 
 `src/hyper.h` is a type-1 hypervisor on AMD-V. Not an interpreter: the

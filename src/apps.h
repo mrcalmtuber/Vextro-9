@@ -1852,6 +1852,18 @@ static void wiki_mouse(int32_t mx, int32_t my, uint8_t lmb, uint8_t prev_lmb,
 static char  wiki_input[WIKI_INPUT_MAX];
 /* The model's answer before verification, for the log. */
 static char  wiki_draft[WIKI_ANS_MAX];
+
+/*
+ * The prompt, kept whole, and the first model's answer.
+ *
+ * Cross-checking means asking the same question of both models, and the
+ * second one has its own tokenizer -- a different vocabulary entirely --
+ * so it cannot reuse the first one's token ids. It re-encodes this text.
+ */
+static char  wiki_prompt[2048];
+static char  wiki_draft_a[WIKI_ANS_MAX];
+static char  wiki_model_a[40], wiki_model_b[40];
+static int   wiki_pass;            /* 0 first model, 1 second opinion */
 static int   wiki_input_len;
 static char  wiki_log[WIKI_LOG_MAX];
 static char  wiki_context[WIKI_CTX_CHARS + 8];
@@ -3050,6 +3062,53 @@ static int wiki_verify_answer(char *ans, int *dropped) {
 }
 
 /*
+ * How much two answers agree, as a percentage of their content words.
+ *
+ * Not string equality: two models reading the same passage will phrase
+ * it differently and still be saying the same thing. What matters is
+ * whether they drew on the same facts, so this is the overlap of the
+ * words that carry meaning -- an F1, symmetric, so neither a terse
+ * answer nor a verbose one is unfairly favoured.
+ */
+static int wiki_agreement(const char *a, const char *b) {
+    char wa[24][32], wb[24][32];
+    int na = 0, nb = 0;
+
+    for (int pass = 0; pass < 2; pass++) {
+        const char *t = pass ? b : a;
+        int *n = pass ? &nb : &na;
+        char (*w)[32] = pass ? wb : wa;
+        int i = 0;
+        while (t[i] && *n < 24) {
+            while (t[i] && !wiki_is_word(t[i])) i++;
+            if (!t[i]) break;
+            int k = 0;
+            char buf[32];
+            while (t[i] && wiki_is_word(t[i]) && k < 31) buf[k++] = t[i++];
+            buf[k] = '\0';
+            if (!wiki_checkable(buf)) continue;
+            int dup = 0;
+            for (int j = 0; j < *n; j++) if (str_eq(w[j], buf)) { dup = 1; break; }
+            if (!dup) str_copy(w[(*n)++], buf, 32);
+        }
+    }
+    if (na == 0 || nb == 0) return 0;
+
+    int common = 0;
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j < nb; j++)
+            if (wiki_stem_in(wb[j], wa[i]) || wiki_stem_in(wa[i], wb[j])) {
+                common++;
+                break;
+            }
+    /* F1 as a percentage */
+    const int prec = common * 100 / na;
+    const int rec = common * 100 / nb;
+    if (prec + rec == 0) return 0;
+    return 2 * prec * rec / (prec + rec);
+}
+
+/*
  * The sentence in the evidence that best answers the question, for when
  * the model's draft does not survive. Falling back to the source is
  * always available, because the source is what the answer was supposed
@@ -3110,6 +3169,7 @@ static void wiki_evidence_line(char *out, int max) {
 }
 
 static void wiki_begin_generation(void);
+static void wiki_start_pass(void);
 
 static void wiki_submit(void) {
     if (wiki_busy) return;
@@ -3209,6 +3269,8 @@ static void wiki_begin_generation(void) {
     wiki_log_add("[context: ");
     wiki_log_add(wiki_source);
     wiki_log_add("]\n");
+    wiki_pass = 0;
+    wiki_draft_a[0] = '\0';
 
     /*
      * Qwen2's chat format, with the retrieved passage as the grounding.
@@ -3224,7 +3286,10 @@ static void wiki_begin_generation(void) {
      * question. The token budget below is the real limit: 512 prompt
      * tokens is about two thousand characters, so this buffer is a
      * little larger than that and the trim keeps it honest. */
-    static char prompt[2048];
+    /* An alias, not a buffer: the size below has to be the array's,
+     * because sizeof on this pointer is eight and every append would
+     * truncate the prompt to seven characters. */
+    char *const prompt = wiki_prompt;
     /*
      * The instruction does the other half of the grounding.
      *
@@ -3251,28 +3316,43 @@ static void wiki_begin_generation(void) {
     static const char tail_part[] = "<|im_end|>\n<|im_start|>assistant\n";
 
     prompt[0] = '\0';
-    str_append(prompt, sys_part, sizeof(prompt));
+    str_append(prompt, sys_part, sizeof(wiki_prompt));
 
     if (wiki_context[0]) {
         int used = (int)sizeof(sys_part) - 1 + 9 /* "Context: " */ + 1
                  + 10 /* "Question: " */ + wiki_input_len
                  + (int)sizeof(tail_part) - 1;
-        int room = (int)sizeof(prompt) - 1 - used;
+        int room = (int)sizeof(wiki_prompt) - 1 - used;
         if (room > 64) {
             char save = 0;
             int clen = 0;
             while (wiki_context[clen] && clen < room) clen++;
             save = wiki_context[clen];
             wiki_context[clen] = '\0';
-            str_append(prompt, "Context: ", sizeof(prompt));
-            str_append(prompt, wiki_context, sizeof(prompt));
-            str_append(prompt, "\n", sizeof(prompt));
+            str_append(prompt, "Context: ", sizeof(wiki_prompt));
+            str_append(prompt, wiki_context, sizeof(wiki_prompt));
+            str_append(prompt, "\n", sizeof(wiki_prompt));
             wiki_context[clen] = save;
         }
     }
-    str_append(prompt, "Question: ", sizeof(prompt));
-    str_append(prompt, wiki_input, sizeof(prompt));
-    str_append(prompt, tail_part, sizeof(prompt));
+    str_append(prompt, "Question: ", sizeof(wiki_prompt));
+    str_append(prompt, wiki_input, sizeof(wiki_prompt));
+    str_append(prompt, tail_part, sizeof(wiki_prompt));
+
+    wiki_start_pass();
+}
+
+/*
+ * Feed wiki_prompt to whichever model is selected and start it running.
+ *
+ * Split out because the second opinion repeats exactly this with a
+ * different slot chosen -- same text, its own tokenizer, its own cache.
+ */
+static void wiki_start_pass(void) {
+    /* An alias, not a buffer: the size below has to be the array's,
+     * because sizeof on this pointer is eight and every append would
+     * truncate the prompt to seven characters. */
+    char *const prompt = wiki_prompt;
 
     wiki_ntok = llm_encode(prompt, wiki_toks, WIKI_MAX_PROMPT_TOKS);
     if (wiki_ntok <= 0) {
@@ -3495,8 +3575,55 @@ static void wiki_gen_poll(void) {
                 int dropped = 0;
                 const int kept = wiki_verify_answer(wiki_answer, &dropped);
 
+                /*
+                 * Put the same question to the other model before
+                 * saying anything. Its tokenizer is not this one's, so
+                 * the prompt is re-encoded from the text rather than
+                 * reusing token ids.
+                 */
+                if (wiki_pass == 0 && wiki_xcheck && llm_slot_loaded(1)) {
+                    str_copy(wiki_draft_a, kept > 0 ? wiki_answer : "",
+                             sizeof(wiki_draft_a));
+                    str_copy(wiki_model_a, ai_slot_path[0], sizeof(wiki_model_a));
+                    str_copy(wiki_model_b, ai_slot_path[1], sizeof(wiki_model_b));
+                    wiki_pass = 1;
+                    llm_slot_select(1);
+                    serial_puts("[wiki] second opinion from ");
+                    serial_puts(wiki_model_b);
+                    serial_putc('\n');
+                    wiki_start_pass();
+                    return;
+                }
+
+                /*
+                 * Two answers now, and the honest thing is to say when
+                 * they part company. Agreement is not proof -- both can
+                 * be wrong about the same passage -- but disagreement is
+                 * a real signal, and it is the reader's to weigh rather
+                 * than mine to hide.
+                 */
+                int agree = -1;
+                if (wiki_pass == 1) {
+                    llm_slot_select(0);        /* back to the answerer */
+                    if (wiki_draft_a[0] && kept > 0)
+                        agree = wiki_agreement(wiki_draft_a, wiki_answer);
+                    serial_puts("[wiki] cross-check: ");
+                    if (agree >= 0) {
+                        serial_put_dec((uint32_t)agree);
+                        serial_puts("% agreement\n");
+                    } else {
+                        serial_puts("only one model produced a verified "
+                                    "answer\n");
+                    }
+                    /* The trained model answers; the other one checks.
+                     * If only the second survived verification, it is
+                     * the one with something to say. */
+                    if (wiki_draft_a[0]) str_copy(wiki_answer, wiki_draft_a,
+                                                  sizeof(wiki_answer));
+                }
+
                 wiki_log_add("AI: ");
-                if (kept > 0) {
+                if (kept > 0 || (wiki_pass == 1 && wiki_draft_a[0])) {
                     wiki_log_add(wiki_answer);
                     wiki_log_add("\n");
                     wiki_log_add("Why: every claim above is stated in the "
@@ -3512,6 +3639,23 @@ static void wiki_gen_poll(void) {
                                                     " not support."
                                                   : " sentences the entry did"
                                                     " not support.");
+                    }
+                    if (agree >= 0) {
+                        char nb2[12];
+                        uint_to_str((uint32_t)agree, nb2);
+                        wiki_log_add("\nCross-check: ");
+                        wiki_log_add(wiki_model_a);
+                        wiki_log_add(" and ");
+                        wiki_log_add(wiki_model_b);
+                        wiki_log_add(agree >= 50 ? " agree (" : " disagree (");
+                        wiki_log_add(nb2);
+                        wiki_log_add("% of the same facts).");
+                        if (agree < 50)
+                            wiki_log_add(" Treat this one with care.");
+                    } else if (wiki_pass == 1) {
+                        wiki_log_add("\nCross-check: only one of the two "
+                                     "models produced an answer the entry "
+                                     "supports.");
                     }
                     wiki_log_add("\n");
                 } else {
