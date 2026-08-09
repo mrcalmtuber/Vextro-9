@@ -591,11 +591,36 @@ static int llm_read_thunk(void *ctx, uint64_t off, void *buf,
 #define AI_READY    3
 #define AI_FAILED   4
 
+/*
+ * Two models can answer here, and which one is a choice.
+ *
+ *   /explain.gguf   135M, fine-tuned in this repository on passages from
+ *                   the archive, to answer from the passage and to
+ *                   refuse when the passage does not answer
+ *   /qwen2.gguf     0.5B, general purpose, knows a great deal that is
+ *                   not in the archive -- which is the problem
+ *
+ * The smaller one is preferred when it is present: it was trained for
+ * exactly this task, it is four times faster, and being ignorant of
+ * everything outside the passage is a feature here rather than a
+ * limitation. `llm use <name>` switches at run time.
+ */
 #define AI_MODEL_PATH "/qwen2.gguf"
+#define AI_MODEL_ALT  "/explain.gguf"
 
 static int         ai_state = AI_IDLE;
 static const char *ai_err   = "";
 static fs_file_t   ai_file;
+static char        ai_model[40] = AI_MODEL_ALT;
+
+/* Load progress reporting: when it started, and the last tenth
+ * announced. Declared here because a model switch resets them. */
+static uint64_t    ai_t0 = 0;
+static int         ai_last_decile = -1;
+
+/* The arena the weights live in, remembered so a switch can reset it. */
+static void       *ai_arena_base = 0;
+static uint64_t    ai_arena_size = 0;
 
 /* Begin, if the model is actually there.  Missing is not a failure — a
  * machine without one simply has no chat. */
@@ -604,15 +629,46 @@ static void ai_autoload_start(void) {
     /* Declined, or not yet asked. Loading 380 MB on the strength of an
      * answer nobody has given would be the wrong default. */
     if (ai_enabled != 1) return;
-    if (fs_open(AI_MODEL_PATH, &ai_file) != 0) {
+
+    /* The task-trained model if the volume carries it, the general one
+     * otherwise. A machine with neither simply has no chat. */
+    if (fs_stat(AI_MODEL_ALT, 0, 0)) str_copy(ai_model, AI_MODEL_ALT, sizeof(ai_model));
+    else                             str_copy(ai_model, AI_MODEL_PATH, sizeof(ai_model));
+
+    if (fs_open(ai_model, &ai_file) != 0) {
         /* Not an error — a machine with no model simply has no chat. But
          * silence here is why "the chat panel does nothing" took so long
          * to trace on the ARM tree, where this was never even called. */
-        serial_puts("[ai] no model at " AI_MODEL_PATH "\n");
+        serial_puts("[ai] no model at ");
+        serial_puts(ai_model);
+        serial_putc('\n');
         return;
     }
-    serial_puts("[ai] loading " AI_MODEL_PATH "\n");
+    serial_puts("[ai] loading ");
+    serial_puts(ai_model);
+    serial_putc('\n');
     ai_state = AI_PARSE;
+}
+
+/*
+ * Load a different model, without rebooting.
+ *
+ * The arena is a bump allocator that never frees, so a second model
+ * cannot simply be loaded on top of the first -- it is reset instead,
+ * which is safe precisely because nothing outside llm.c holds a pointer
+ * into it and every tensor is rebound by the load that follows.
+ */
+static int ai_switch(const char *path) {
+    if (!ai_arena_base) return -1;
+    if (fs_open(path, &ai_file) != 0) return -1;
+    llm_arena_init(ai_arena_base, ai_arena_size);
+    str_copy(ai_model, path, sizeof(ai_model));
+    ai_last_decile = -1;
+    ai_state = AI_PARSE;
+    serial_puts("[ai] switching to ");
+    serial_puts(path);
+    serial_putc('\n');
+    return 0;
 }
 
 /*
@@ -626,8 +682,6 @@ static void ai_autoload_start(void) {
  * outcome is announced now, and the tenths are announced as they pass so
  * that "slow" and "stuck" can be told apart.
  */
-static uint64_t ai_t0 = 0;
-static int      ai_last_decile = -1;
 
 /* Defined below, next to ai_busy; needed here to report the tenths. */
 static int ai_progress(void);
@@ -1424,6 +1478,27 @@ static void term_exec(char *cmdline) {
             uint_to_str(cycles_to_us(o), nb); term_print(nb); term_print(" us\n");
             term_print("  as the model runs ");
             uint_to_str(cycles_to_us(b), nb); term_print(nb); term_print(" us\n");
+            return;
+        }
+        if (argc >= 2 && str_eq(argv[1], "use")) {
+            if (argc < 3) {
+                term_print("  in use: ");
+                term_print_c(ai_model, 1);
+                term_print("\n  usage: llm use explain|qwen2|<path>\n");
+                return;
+            }
+            const char *path = argv[2];
+            if (str_eq(path, "explain")) path = AI_MODEL_ALT;
+            else if (str_eq(path, "qwen2")) path = AI_MODEL_PATH;
+            if (ai_switch(path) != 0) {
+                term_print_c("cannot open ", 2);
+                term_print_c(path, 2);
+                term_putc('\n');
+            } else {
+                term_print_c("loading ", 3);
+                term_print_c(path, 3);
+                term_print_c(" - ask again once it is resident\n", 3);
+            }
             return;
         }
         if (argc >= 2 && str_eq(argv[1], "weights")) {

@@ -1146,9 +1146,16 @@ void kmain(void) {
                 if (e->type != LIMINE_MEMMAP_USABLE) continue;
                 if (e->length > best_len) { best_len = e->length; best_base = e->base; }
             }
-            if (best_len > (16ull << 20))
-                llm_arena_init((void *)(uintptr_t)(hhdm_request.response->offset
-                                                   + best_base), best_len);
+            if (best_len > (16ull << 20)) {
+                void *arena = (void *)(uintptr_t)(hhdm_request.response->offset
+                                                  + best_base);
+                llm_arena_init(arena, best_len);
+                /* Remembered so a different model can be loaded later
+                 * without rebooting: switching resets the arena, which
+                 * needs the region it was carved from. */
+                ai_arena_base = arena;
+                ai_arena_size = best_len;
+            }
         }
     }
 

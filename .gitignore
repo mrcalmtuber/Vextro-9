@@ -37,3 +37,19 @@ vxfmt/fuzz/out/
 vxfmt/fuzz/harness
 vxfmt/fuzz/harness-repl
 vxfmt/fuzz/*.dSYM/
+
+# Model training: the venv, the base model, the dataset and the
+# intermediate GGUFs are all reproducible from tools/ and are far too
+# large to track. assets/explain.gguf ships via a release, like the
+# encyclopedia and the 0.5B model.
+build/venv/
+build/smol-base/
+build/llama.cpp/
+build/explainer*
+build/dataset.jsonl
+build/probe*.gguf
+build/train.log
+
+# Python bytecode from the host-side tools
+__pycache__/
+*.pyc

@@ -162,6 +162,14 @@ static float fp16_to_f32(uint16_t h) {
 
 static llm_info_t info;
 
+/*
+ * Which rotary convention this file uses: interleaved pairs (llama) or
+ * half-split (qwen2). Set when the architecture is read, and consumed by
+ * rope() far below -- see the comment there for why the two are not
+ * interchangeable.
+ */
+static int rope_interleaved;
+
 const llm_info_t *llm_get_info(void) { return &info; }
 
 /* ---- a streaming reader over the callback ---- */
@@ -342,16 +350,34 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
             g_str(&g, info.name, sizeof(info.name));
         } else if (type == GT_U32 || type == GT_I32) {
             uint32_t v = g_u32(&g);
-            if      (str_same(key, "qwen2.block_count"))            info.n_layer = v;
-            else if (str_same(key, "qwen2.embedding_length"))       info.n_embd = v;
-            else if (str_same(key, "qwen2.attention.head_count"))   info.n_head = v;
-            else if (str_same(key, "qwen2.attention.head_count_kv")) info.n_head_kv = v;
-            else if (str_same(key, "qwen2.feed_forward_length"))    info.n_ff = v;
-            else if (str_same(key, "qwen2.context_length"))         info.n_ctx_train = v;
+            /*
+             * Matched on the suffix, not the whole key.
+             *
+             * GGUF prefixes these with the architecture name, so a
+             * llama model spells them "llama.block_count" and a qwen2
+             * one "qwen2.block_count". Comparing the part after the
+             * first dot reads both without a table per architecture,
+             * and the suffixes are distinctive enough not to collide
+             * with anything else in the file.
+             */
+            const char *sfx = key;
+            while (*sfx && *sfx != '.') sfx++;
+            if (*sfx == '.') sfx++;
+
+            if      (str_same(sfx, "block_count"))            info.n_layer = v;
+            else if (str_same(sfx, "embedding_length"))        info.n_embd = v;
+            else if (str_same(sfx, "attention.head_count"))    info.n_head = v;
+            else if (str_same(sfx, "attention.head_count_kv")) info.n_head_kv = v;
+            else if (str_same(sfx, "feed_forward_length"))     info.n_ff = v;
+            else if (str_same(sfx, "context_length"))          info.n_ctx_train = v;
         } else if (type == GT_F32) {
             float v = g_f32(&g);
-            if      (str_same(key, "qwen2.rope.freq_base"))                 info.rope_freq_base = v;
-            else if (str_same(key, "qwen2.attention.layer_norm_rms_epsilon")) info.rms_eps = v;
+            const char *sfx = key;
+            while (*sfx && *sfx != '.') sfx++;
+            if (*sfx == '.') sfx++;
+
+            if      (str_same(sfx, "rope.freq_base"))                 info.rope_freq_base = v;
+            else if (str_same(sfx, "attention.layer_norm_rms_epsilon")) info.rms_eps = v;
         } else if (type == GT_ARRAY) {
             uint32_t et = g_u32(&g);
             uint64_t n = g_u64(&g);
@@ -441,8 +467,18 @@ int llm_load(llm_read_fn rd, void *ctx, uint64_t file_size, const char **err) {
     }
     if (g.failed) { *err = "truncated GGUF metadata"; return -1; }
 
-    if (!str_same(info.arch, "qwen2")) {
-        *err = "only the qwen2 architecture is implemented";
+    /*
+     * Two architectures, and they differ in exactly one thing that
+     * matters here: qwen2 puts a bias on the q, k and v projections and
+     * llama does not. Everything else -- RMSNorm, SiLU, grouped-query
+     * attention, rotary embeddings, tied output weights -- is shared,
+     * so supporting llama is a matter of letting those biases be
+     * absent rather than a second implementation.
+     */
+    rope_interleaved = str_same(info.arch, "llama");
+
+    if (!str_same(info.arch, "qwen2") && !str_same(info.arch, "llama")) {
+        *err = "only the qwen2 and llama architectures are implemented";
         return -1;
     }
     if (info.n_layer == 0 || info.n_embd == 0 || info.n_head == 0) {
@@ -1155,6 +1191,18 @@ static void mkname(char *out, const char *pre, int idx, const char *post) {
     out[o] = '\0';
 }
 
+/* Bind if present, leave null if not. A null weight is a weight the
+ * architecture does not have, which the forward pass then skips. */
+static int bind_optional(wt_t *w, const char *name) {
+    int i = llm_tensor_find(name);
+    if (i < 0) { w->data = 0; w->ne0 = w->ne1 = 0; return 0; }
+    w->data = weights_blob + tensors[i].offset;
+    w->type = tensors[i].type;
+    w->ne0  = tensors[i].ne0;
+    w->ne1  = tensors[i].ne1 ? tensors[i].ne1 : 1;
+    return 1;
+}
+
 static int bind_tensor(wt_t *w, const char *name, const char **err) {
     int i = llm_tensor_find(name);
     if (i < 0) { *err = "a tensor the model needs is missing"; return -1; }
@@ -1261,11 +1309,11 @@ static int llm_bind_all(const char **err) {
         layer_t *L = &w_layers[l];
         mkname(nm, "blk.", (int)l, ".attn_norm.weight");   if (bind_tensor(&L->attn_norm, nm, err)) return -1;
         mkname(nm, "blk.", (int)l, ".attn_q.weight");      if (bind_tensor(&L->wq, nm, err)) return -1;
-        mkname(nm, "blk.", (int)l, ".attn_q.bias");        if (bind_tensor(&L->bq, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_q.bias");        bind_optional(&L->bq, nm);
         mkname(nm, "blk.", (int)l, ".attn_k.weight");      if (bind_tensor(&L->wk, nm, err)) return -1;
-        mkname(nm, "blk.", (int)l, ".attn_k.bias");        if (bind_tensor(&L->bk, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_k.bias");        bind_optional(&L->bk, nm);
         mkname(nm, "blk.", (int)l, ".attn_v.weight");      if (bind_tensor(&L->wv, nm, err)) return -1;
-        mkname(nm, "blk.", (int)l, ".attn_v.bias");        if (bind_tensor(&L->bv, nm, err)) return -1;
+        mkname(nm, "blk.", (int)l, ".attn_v.bias");        bind_optional(&L->bv, nm);
         mkname(nm, "blk.", (int)l, ".attn_output.weight"); if (bind_tensor(&L->wo, nm, err)) return -1;
         mkname(nm, "blk.", (int)l, ".ffn_norm.weight");    if (bind_tensor(&L->ffn_norm, nm, err)) return -1;
         mkname(nm, "blk.", (int)l, ".ffn_gate.weight");    if (bind_tensor(&L->w_gate, nm, err)) return -1;
@@ -1392,6 +1440,24 @@ static void softmax(float *x, int n) {
  * yields fluent-looking output that is subtly wrong, so it is worth
  * being explicit about.
  */
+/*
+ * Rotary embeddings, in whichever of the two conventions the file uses.
+ *
+ * The rotation pairs each dimension with a partner, and there are two
+ * incompatible choices of partner:
+ *
+ *   half-split   i pairs with i + head_dim/2   (qwen2 in GGUF)
+ *   interleaved  2i pairs with 2i+1            (llama in GGUF)
+ *
+ * They are not interchangeable, and picking the wrong one is close to
+ * invisible: attention still works, the model still produces fluent
+ * text, and the logits are merely wrong. It showed up here only by
+ * comparing the q projection against a reference implementation, where
+ * the kernel's output turned out to be the reference's values at every
+ * other position -- the signature of the permutation llama.cpp applies
+ * to llama q and k weights so that the interleaved form is the one the
+ * file wants.
+ */
 static void rope(float *vec, int n_heads, int pos) {
     float base_log = k_log(info.rope_freq_base);
     int half = head_dim / 2;
@@ -1401,9 +1467,11 @@ static void rope(float *vec, int n_heads, int pos) {
             float freq = k_exp(-base_log * (2.0f * (float)i) / (float)head_dim);
             float th = (float)pos * freq;
             float c = k_cos(th), s = k_sin(th);
-            float x0 = p[i], x1 = p[i + half];
-            p[i]        = x0 * c - x1 * s;
-            p[i + half] = x0 * s + x1 * c;
+            const int a = rope_interleaved ? 2 * i     : i;
+            const int b = rope_interleaved ? 2 * i + 1 : i + half;
+            float x0 = p[a], x1 = p[b];
+            p[a] = x0 * c - x1 * s;
+            p[b] = x0 * s + x1 * c;
         }
     }
 }
@@ -1433,14 +1501,21 @@ static void eval_layer(uint32_t l, int pos) {
     matmul(a_k, a_xb, &L->wk);
     matmul(a_v, a_xb, &L->wv);
 
-    /* Qwen2 puts a bias on the q, k and v projections */
+    /* Qwen2 puts a bias on the q, k and v projections; llama does not,
+     * and there the bound weights are null. */
     static float bias[8192];
-    deq_row(&L->bq, 0, bias);
-    for (uint32_t i = 0; i < E; i++) a_q[i] += bias[i];
-    deq_row(&L->bk, 0, bias);
-    for (int i = 0; i < kv_dim; i++) a_k[i] += bias[i];
-    deq_row(&L->bv, 0, bias);
-    for (int i = 0; i < kv_dim; i++) a_v[i] += bias[i];
+    if (L->bq.data) {
+        deq_row(&L->bq, 0, bias);
+        for (uint32_t i = 0; i < E; i++) a_q[i] += bias[i];
+    }
+    if (L->bk.data) {
+        deq_row(&L->bk, 0, bias);
+        for (int i = 0; i < kv_dim; i++) a_k[i] += bias[i];
+    }
+    if (L->bv.data) {
+        deq_row(&L->bv, 0, bias);
+        for (int i = 0; i < kv_dim; i++) a_v[i] += bias[i];
+    }
 
     if (l == 0) {
         for (uint32_t i = 0; i < E; i++) { p_xb0[i] = a_xb[i]; p_q0[i] = a_q[i]; }
@@ -1594,6 +1669,7 @@ static void matmul_batch(float *out, uint32_t out_stride,
 }
 
 static void add_bias(float *v, const wt_t *w, uint32_t n) {
+    if (!w->data) return;              /* llama has no projection bias */
     static float bias[8192];
     deq_row(w, 0, bias);
     for (uint32_t i = 0; i < n; i++) v[i] += bias[i];

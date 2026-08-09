@@ -183,7 +183,12 @@ DISK_MB ?= 8192
 # which is what CI wants.
 ASSETS ?= ask
 
-ASSET_FILES := assets/wiki.zim assets/qwen2.gguf
+# assets/explain.gguf is the model fine-tuned in this repository (see
+# tools/train_explainer.py). It is listed like the others so that a tree
+# without it still builds -- the disk rule skips assets that are absent,
+# and the kernel falls back to qwen2.gguf when the volume has no
+# explain.gguf on it.
+ASSET_FILES := assets/wiki.zim assets/qwen2.gguf assets/explain.gguf
 ASSET_LIST  := build/assets.list
 
 .PHONY: assets
