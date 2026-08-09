@@ -527,16 +527,22 @@ and the transcript reports how much of the same ground they covered:
 AI: Gravity, or gravitation is one of the fundamental forces of the
     universe. It is an attraction, or pull, between any two objects
     with mass.
-Why: every claim above is stated in the entry for Gravity. I dropped
-    1 sentence the entry did not support.
+(1 unsupported sentence dropped)
 Checked twice: a second reading of the same entry agreed on 58% of
     the same facts.
 ```
 
-The models are not named there on purpose. The source is the
-encyclopedia entry; a model is the thing that read it, and citing two
-weight files reads as though they were authorities on gravity. Which
-files produced the two readings goes in the log.
+The answer stands on its own. Nothing cites the entry it came from and
+nothing names the models, because where an answer came from is a
+property of how it was produced rather than part of what was said — and
+a citation on every line turned two clauses into a paragraph of
+provenance. The grounding is untouched: retrieval, the single-passage
+rule and the verifier still decide whether there is an answer at all,
+and every source is on the serial log for anyone auditing it.
+
+What survives on screen is what the reader is owed regardless: that part
+of the draft was discarded, and that a second reading did or did not
+reach the same facts.
 
 That run is a fair illustration of what the check is worth. The 0.5B
 wrote "it keeps planets in orbit around their stars" — plausible, absent

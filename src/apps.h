@@ -3266,9 +3266,15 @@ static void wiki_submit(void) {
  * many entries -- and both need exactly the same prompt and prefill.
  */
 static void wiki_begin_generation(void) {
-    wiki_log_add("[context: ");
-    wiki_log_add(wiki_source);
-    wiki_log_add("]\n");
+    /*
+     * The transcript does not cite. Where the answer came from is a
+     * property of how it was produced, not part of what was said, and
+     * naming the entry on every line turned a short answer into a
+     * paragraph of provenance. The grounding itself is unchanged --
+     * retrieval, the single-passage rule and the verifier all still
+     * decide whether there is an answer at all -- and every source is
+     * still on the serial log for anyone auditing it.
+     */
     wiki_pass = 0;
     wiki_draft_a[0] = '\0';
 
@@ -3494,8 +3500,7 @@ static void wiki_gen_poll(void) {
                         wiki_log_add(wiki_scan_quote[k]);
                         wiki_log_add("\n");
                     }
-                    wiki_log_add("Why: these are the entries' own words. "
-                                 "Nothing here was written by the model.\n");
+
                 } else {
                     wiki_busy = 0;
                     wiki_log_add("AI: I read ");
@@ -3625,20 +3630,17 @@ static void wiki_gen_poll(void) {
                 wiki_log_add("AI: ");
                 if (kept > 0 || (wiki_pass == 1 && wiki_draft_a[0])) {
                     wiki_log_add(wiki_answer);
-                    wiki_log_add("\n");
-                    wiki_log_add("Why: every claim above is stated in the "
-                                 "entry for ");
-                    wiki_log_add(wiki_source);
-                    wiki_log_add(".");
                     if (dropped > 0) {
+                        /* Not a citation -- a warning that part of the
+                         * draft was thrown away, which the reader is
+                         * owed whatever the answer is attributed to. */
                         char nb[12];
                         uint_to_str((uint32_t)dropped, nb);
-                        wiki_log_add(" I dropped ");
+                        wiki_log_add("\n(");
                         wiki_log_add(nb);
-                        wiki_log_add(dropped == 1 ? " sentence the entry did"
-                                                    " not support."
-                                                  : " sentences the entry did"
-                                                    " not support.");
+                        wiki_log_add(dropped == 1
+                            ? " unsupported sentence dropped)"
+                            : " unsupported sentences dropped)");
                     }
                     if (agree >= 0) {
                         /*
@@ -3673,16 +3675,8 @@ static void wiki_gen_poll(void) {
                     char line[400];
                     wiki_evidence_line(line, sizeof(line));
                     if (line[0]) {
-                        wiki_log_add("I could not verify a written answer "
-                                     "against the entry, so here is what it "
-                                     "says:\n  ");
-                        wiki_log_add(wiki_source);
-                        wiki_log_add(" - ");
                         wiki_log_add(line);
-                        wiki_log_add("\nWhy: the draft answer used wording "
-                                     "the entry does not, so it was "
-                                     "discarded and the entry quoted "
-                                     "instead.\n");
+                        wiki_log_add("\n");
                     } else {
                         wiki_log_add("The entry does not answer that, and I "
                                      "will not answer from memory.\n");
