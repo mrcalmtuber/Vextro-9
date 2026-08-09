@@ -589,7 +589,8 @@ static int fs_list(const char *path, fs_list_cb cb) {
 /*
  * Whether this account wants the language model at all.
  *
- * Not everyone does: the weights are 380 MB, loading them costs real time
+ * Not everyone does: the weights are hundreds of megabytes, loading
+ * them costs real time
  * on every boot, and a machine used as a desktop has no need of them. So
  * the choice is asked once, on the first login of each account, and kept.
  *
@@ -3295,7 +3296,7 @@ static void ai_dialog_draw(uint32_t *buf, uint32_t w, uint32_t h,
                     "answer questions from the offline encyclopedia.",
                     C_TEXT_DIM, 13);
     ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 102,
-                    "It loads 380 MB at every boot. You can leave it off.",
+                    "It loads a model from the volume at every boot. You can leave it off.",
                     0x707888u, 12);
 
     for (int i = 0; i < 2; i++) {

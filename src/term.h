@@ -626,8 +626,9 @@ static uint64_t    ai_arena_size = 0;
  * machine without one simply has no chat. */
 static void ai_autoload_start(void) {
     if (ai_state != AI_IDLE) return;
-    /* Declined, or not yet asked. Loading 380 MB on the strength of an
-     * answer nobody has given would be the wrong default. */
+    /* Declined, or not yet asked. Loading hundreds of megabytes on the
+     * strength of an answer nobody has given would be the wrong
+     * default. */
     if (ai_enabled != 1) return;
 
     /* The task-trained model if the volume carries it, the general one

@@ -1967,6 +1967,13 @@ static void wiki_html_text(const uint8_t *src, uint32_t len, char *out, int max)
             while (i < len && src[i] != ';' && src[i] != ' ') i++;
             c = ' ';
         }
+        /* A reference marker -- "[1]", "[12]" -- is apparatus, not text.
+         * Left in, it ends up quoted back as part of a sentence. */
+        if (c == '[') {
+            uint32_t j = i + 1;
+            while (j < len && src[j] >= '0' && src[j] <= '9') j++;
+            if (j > i + 1 && j < len && src[j] == ']') { i = j; continue; }
+        }
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
         if (c == ' ') {
             if (space) continue;
@@ -2149,14 +2156,29 @@ static void wiki_strip_title_runs(char *text, const char *title) {
     while (title[tl]) tl++;
     if (tl < 2) return;
 
+    /*
+     * Keep the last copy. The markup repeats the title, but the final
+     * one usually opens the first sentence -- "Gravity, or gravitation
+     * is one of..." -- so removing every copy decapitates the definition
+     * into ", or gravitation is one of...", which is exactly what the
+     * model then faithfully quoted back.
+     */
     int at = 0;
     for (;;) {
-        while (text[at] == ' ') at++;
+        int a2 = at;
+        while (text[a2] == ' ') a2++;
         int k = 0;
-        while (k < tl && text[at + k] &&
-               wiki_fold(text[at + k]) == wiki_fold(title[k])) k++;
-        if (k < tl || wiki_is_word(text[at + k])) break;
-        at += k;
+        while (k < tl && text[a2 + k] &&
+               wiki_fold(text[a2 + k]) == wiki_fold(title[k])) k++;
+        if (k < tl || wiki_is_word(text[a2 + k])) break;   /* none here */
+
+        int b = a2 + k;
+        while (text[b] == ' ') b++;
+        int j = 0;
+        while (j < tl && text[b + j] &&
+               wiki_fold(text[b + j]) == wiki_fold(title[j])) j++;
+        if (j < tl || wiki_is_word(text[b + j])) break;    /* the last one */
+        at = a2 + k;
     }
     while (text[at] == ' ') at++;
     if (at == 0 || !text[at]) return;
@@ -3214,11 +3236,17 @@ static void wiki_begin_generation(void) {
      * words to say, is what makes a small model decline instead of
      * inventing.
      */
+    /*
+     * Word for word the instruction explain.gguf was fine-tuned on --
+     * see tools/train_explainer.py. A model trained to follow one
+     * sentence and shown a slightly different one at inference is being
+     * asked a question it was not taught, and the drift shows. Qwen2
+     * reads the same instruction; it is a reasonable one either way.
+     */
     static const char sys_part[] =
-        "<|im_start|>system\nYou answer only from the Context below."
-        " Do not use any other knowledge. Quote the relevant fact from"
-        " the Context. If the Context does not contain the answer, reply"
-        " exactly: Not in the archive."
+        "<|im_start|>system\nYou answer only from the Context."
+        " Do not use any other knowledge. If the Context does not"
+        " contain the answer, reply exactly: Not in the archive."
         " Be brief.<|im_end|>\n<|im_start|>user\n";
     static const char tail_part[] = "<|im_end|>\n<|im_start|>assistant\n";
 
