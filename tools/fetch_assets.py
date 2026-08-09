@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Fetch the encyclopedia and the language model.
+Fetch the encyclopedia and the two language models.
 
-These two files are what make the machine interesting, and they are the
-two things a clone of this repository cannot contain. wiki.zim is about
+These are what make the machine interesting, and they are what a clone of
+this repository cannot contain. wiki.zim is about
 980 MB and qwen2.gguf about 380 MB; GitHub refuses any blob over 100 MB
 and Git stores no delta worth having for compressed data, so committing
 them would break the repository rather than furnish it. Git LFS moves the
@@ -17,11 +17,16 @@ Both are optional. The system boots and runs without either: the
 Wikipedia window says there is no archive, and the AI prompt after login
 declines itself. Skipping is a supported outcome, not a broken install.
 
+explain.gguf is the 135M model fine-tuned in this repository -- see
+tools/train_explainer.py, which reproduces it from the archive in about
+three hours. It is published with each release rather than rebuilt,
+because nobody should need PyTorch to build an operating system.
+
 Usage:
-    tools/fetch_assets.py [--dest DIR] [--only zim|model] [--yes]
+    tools/fetch_assets.py [--dest DIR] [--only zim|model|explain] [--yes]
 
 Environment overrides, for a mirror or a different model:
-    VEXTRO_ZIM_URL, VEXTRO_MODEL_URL
+    VEXTRO_ZIM_URL, VEXTRO_MODEL_URL, VEXTRO_EXPLAIN_URL
 """
 import argparse
 import os
@@ -65,11 +70,23 @@ MODEL_URL = os.environ.get(
     "qwen2-0_5b-instruct-q5_0.gguf",
 )
 
+# The model trained in this repository, published with each release.
+# "latest" rather than a pinned tag, so a clone gets the model that goes
+# with the current source instead of one from whenever this line was
+# written.
+EXPLAIN_URL = os.environ.get(
+    "VEXTRO_EXPLAIN_URL",
+    "https://github.com/mrcalmtuber/Vextro-9/releases/latest/download/"
+    "explain.gguf",
+)
+
 # What is wanted, and the smallest size that could plausibly be the real
 # thing rather than an error page served with a 200.
 WANTED = [
-    ("wiki.zim",   200 * 1024 * 1024, "Simple English Wikipedia (~980 MB)"),
-    ("qwen2.gguf", 100 * 1024 * 1024, "Qwen2 0.5B Instruct, Q5_0 (~380 MB)"),
+    ("wiki.zim",     200 * 1024 * 1024, "Simple English Wikipedia (~980 MB)"),
+    ("qwen2.gguf",   100 * 1024 * 1024, "Qwen2 0.5B Instruct, Q5_0 (~380 MB)"),
+    ("explain.gguf",  50 * 1024 * 1024,
+     "Vextro's own grounded-answer model, 135M, Q8_0 (~145 MB)"),
 ]
 
 
@@ -83,6 +100,8 @@ def source(name):
     """
     if name == "wiki.zim":
         return ZIM_URL or newest_zim()
+    if name == "explain.gguf":
+        return EXPLAIN_URL
     return MODEL_URL
 
 
@@ -145,7 +164,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dest", default="assets",
                     help="where to put the files (default: assets/)")
-    ap.add_argument("--only", choices=["zim", "model"],
+    ap.add_argument("--only", choices=["zim", "model", "explain"],
                     help="fetch just one of them")
     ap.add_argument("--yes", action="store_true",
                     help="do not ask before downloading over a gigabyte")
@@ -168,6 +187,8 @@ def main():
         want = [a for a in want if a[0] == "wiki.zim"]
     elif args.only == "model":
         want = [a for a in want if a[0] == "qwen2.gguf"]
+    elif args.only == "explain":
+        want = [a for a in want if a[0] == "explain.gguf"]
 
     # Decided from the filesystem alone, before any URL is resolved.
     todo = []

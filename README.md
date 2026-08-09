@@ -529,8 +529,14 @@ AI: Gravity, or gravitation is one of the fundamental forces of the
     with mass.
 Why: every claim above is stated in the entry for Gravity. I dropped
     1 sentence the entry did not support.
-Cross-check: /explain.gguf and /qwen2.gguf agree (58% of the same facts).
+Checked twice: a second reading of the same entry agreed on 58% of
+    the same facts.
 ```
+
+The models are not named there on purpose. The source is the
+encyclopedia entry; a model is the thing that read it, and citing two
+weight files reads as though they were authorities on gravity. Which
+files produced the two readings goes in the log.
 
 That run is a fair illustration of what the check is worth. The 0.5B
 wrote "it keeps planets in orbit around their stars" — plausible, absent
@@ -538,7 +544,7 @@ from the passage, and dropped by the verifier rather than by the other
 model. Agreement is not proof, because both can be wrong about the same
 passage; **disagreement is the useful signal**, and it is reported rather
 than resolved silently. `llm check off` turns it off; the answer then
-comes from one model in half the time.
+comes from one reading in half the time.
 
 <p align="center">
   <img src="docs/crosscheck.png" width="88%" alt="Two models answering and being compared">

@@ -3641,20 +3641,31 @@ static void wiki_gen_poll(void) {
                                                     " not support.");
                     }
                     if (agree >= 0) {
+                        /*
+                         * The models are not cited. The source is the
+                         * encyclopedia entry named above; a model is the
+                         * thing that read it, and naming two weight
+                         * files here reads as though they were
+                         * authorities on the subject. The agreement
+                         * figure is still worth showing -- it says how
+                         * much of the same ground two readings covered
+                         * -- but which files produced it belongs in the
+                         * log, not in a citation.
+                         */
                         char nb2[12];
                         uint_to_str((uint32_t)agree, nb2);
-                        wiki_log_add("\nCross-check: ");
-                        wiki_log_add(wiki_model_a);
-                        wiki_log_add(" and ");
-                        wiki_log_add(wiki_model_b);
-                        wiki_log_add(agree >= 50 ? " agree (" : " disagree (");
+                        wiki_log_add(agree >= 50
+                            ? "\nChecked twice: a second reading of the same"
+                              " entry agreed on "
+                            : "\nChecked twice: a second reading of the same"
+                              " entry agreed on only ");
                         wiki_log_add(nb2);
-                        wiki_log_add("% of the same facts).");
+                        wiki_log_add("% of the same facts.");
                         if (agree < 50)
                             wiki_log_add(" Treat this one with care.");
                     } else if (wiki_pass == 1) {
-                        wiki_log_add("\nCross-check: only one of the two "
-                                     "models produced an answer the entry "
+                        wiki_log_add("\nChecked twice: only one of the two "
+                                     "readings produced an answer the entry "
                                      "supports.");
                     }
                     wiki_log_add("\n");
