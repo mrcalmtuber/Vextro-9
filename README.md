@@ -459,6 +459,57 @@ compile from text at run time, so switching shaders visibly changes the
 picture. Every value inside is 16.16 fixed point, because a float would
 fail to link.
 
+### A model trained here, to answer only from the archive
+
+`assets/explain.gguf` is 135M parameters, fine-tuned in this repository
+on 42,495 examples built out of the encyclopedia itself. Nothing in the
+target text is invented, by construction — a dataset written by a larger
+model would teach this one to sound like that model, including when it
+is wrong.
+
+Not trained from scratch, and the arithmetic is why. A 200M model wants
+roughly four billion tokens to be worth its size; Simple English
+Wikipedia is about three hundred million, and a properly-fed run is days
+of compute. That produces a model *weaker* than the 0.5B it was meant to
+improve on. Fine-tuning a well-trained small base on the exact task is
+the version of this that works.
+
+A fifth of the set is **refusals** — a question whose passage does not
+answer it, with "Not in the archive." as the target. Without them a small
+model learns that an answer is always available and produces one from
+nowhere.
+
+Measured on held-out examples:
+
+| | grounded | refusal correct | token-F1 |
+|---|---:|---:|---:|
+| SmolLM2-135M, as downloaded | 35.0% | 26.1% | 0.318 |
+| **fine-tuned here** | **77.0%** | **100.0%** | **0.993** |
+
+The difference is the one that matters:
+
+> **base** — "Don Sandburg was an American television writer, actor and producer. *He died at the age of 87.*" — the death invented
+>
+> **tuned** — "Don Sandburg (1930 – October 6, 2018) was an American television writer, actor, and producer."
+
+In the kernel it answers in 20 seconds against the 0.5B's 43, at a
+quarter the size. `llm use qwen2` switches back.
+
+Running it needed one real fix. Rotary embeddings pair each dimension
+with a partner, and there are two incompatible conventions: half-split
+(`i` with `i + head_dim/2`, which qwen2 uses in GGUF) and interleaved
+(`2i` with `2i+1`, which llama uses, because llama.cpp permutes the q and
+k weights for it). Choosing wrong leaves attention working and the text
+fluent while the numbers are wrong. It surfaced by running the kernel's
+own transformer on the host — `tools/llm_infer_test.c` — and finding the
+q projection to be the reference's values at every other position. With
+the convention selected by architecture, every logit matches a reference
+implementation to three decimals.
+
+<p align="center">
+  <img src="docs/explainer.png" width="88%" alt="The fine-tuned model answering from the archive">
+</p>
+
 ### A guest that runs on the processor
 
 `src/hyper.h` is a type-1 hypervisor on AMD-V. Not an interpreter: the
@@ -698,6 +749,7 @@ src/
   apps.h        Files / Settings / Photos / Wikipedia + chat / About
   store.h       Ingot: catalog, installer, registry, storefront
   llm.h llm.c   Transformer inference (the one FPU translation unit)
+                qwen2 and llama architectures, both rotary conventions
   zim.h         ZIM archive reader (offline Wikipedia)
   zstd.h        Zstandard decompressor
   lzma.h        LZMA / LZMA2 / xz decompressor
