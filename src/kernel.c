@@ -2,6 +2,13 @@
 #include <stddef.h>
 #include "limine.h"
 #include "idt.h"
+#include "pmm.h"
+#include "gdt.h"
+#include "vmm.h"
+#include "kheap.h"
+#include "syscall.h"
+#include "sched.h"
+#include "trap.h"
 #include "mouse.h"
 #include "keyboard.h"
 #include "xhci.h"
@@ -14,99 +21,6 @@
 #include "llm.h"
 #include "desktop.h"
 #include "bootanim.h"
-
-/*
- * Raw int 0x80 ISR stub — saves caller registers, forwards to C dispatch.
- * Stack after CPU push: [SS, RSP, RFLAGS, CS, RIP] (40 bytes above our SP).
- * We push 10 GPRs (80 bytes), align the stack, call syscall_dispatch, restore.
- */
-__asm__(
-    ".pushsection .text, \"ax\", @progbits\n"
-    ".align 16\n"
-    ".globl int80_stub\n"
-    ".type int80_stub, @function\n"
-    "int80_stub:\n"
-    "  push %rax\n"
-    "  push %rcx\n"
-    "  push %rdx\n"
-    "  push %rsi\n"
-    "  push %rdi\n"
-    "  push %r8\n"
-    "  push %r9\n"
-    "  push %r10\n"
-    "  push %r11\n"
-    "  push %rbp\n"
-    "  mov  %rsp, %rbp\n"
-    "  and  $-16, %rsp\n"
-    "  mov  72(%rbp), %rdi\n"    /* rax  = syscall number  → arg 1 */
-    "  mov  40(%rbp), %rsi\n"    /* rdi  = user arg0       → arg 2 */
-    "  mov  48(%rbp), %rdx\n"    /* rsi  = user arg1       → arg 3 */
-    "  mov  56(%rbp), %rcx\n"    /* rdx  = user arg2       → arg 4 */
-    "  call syscall_dispatch\n"
-    "  mov  %rbp, %rsp\n"
-    "  pop  %rbp\n"
-    "  pop  %r11\n"
-    "  pop  %r10\n"
-    "  pop  %r9\n"
-    "  pop  %r8\n"
-    "  pop  %rdi\n"
-    "  pop  %rsi\n"
-    "  pop  %rdx\n"
-    "  pop  %rcx\n"
-    "  pop  %rax\n"
-    "  iretq\n"
-    ".popsection\n"
-);
-
-extern void int80_stub(void);
-
-/*
- * 64-bit SYSCALL entry stub — target of IA32_LSTAR MSR.
- * On SYSCALL: CPU saves RIP→RCX, RFLAGS→R11, masks RFLAGS via SFMASK.
- * RSP is NOT switched (ring-0 → ring-0), so we run on the caller's stack.
- * We avoid SYSRETQ (forces CPL 3) and return via POPFQ + JMP *%RCX.
- */
-__asm__(
-    ".pushsection .text, \"ax\", @progbits\n"
-    ".align 16\n"
-    ".globl syscall_entry\n"
-    ".type syscall_entry, @function\n"
-    "syscall_entry:\n"
-    "  push %rax\n"
-    "  push %rcx\n"          /* return RIP (saved by CPU) */
-    "  push %rdx\n"
-    "  push %rsi\n"
-    "  push %rdi\n"
-    "  push %r8\n"
-    "  push %r9\n"
-    "  push %r10\n"
-    "  push %r11\n"          /* return RFLAGS (saved by CPU) */
-    "  push %rbp\n"
-    "  mov  %rsp, %rbp\n"
-    "  and  $-16, %rsp\n"
-    "  mov  72(%rbp), %rdi\n"   /* rax  = syscall number → arg 1 */
-    "  mov  40(%rbp), %rsi\n"   /* rdi  = arg0          → arg 2 */
-    "  mov  48(%rbp), %rdx\n"   /* rsi  = arg1          → arg 3 */
-    "  mov  56(%rbp), %rcx\n"   /* rdx  = arg2          → arg 4 */
-    "  call syscall_dispatch\n"
-    "  mov  %rbp, %rsp\n"
-    "  pop  %rbp\n"
-    "  pop  %r11\n"
-    "  pop  %r10\n"
-    "  pop  %r9\n"
-    "  pop  %r8\n"
-    "  pop  %rdi\n"
-    "  pop  %rsi\n"
-    "  pop  %rdx\n"
-    "  pop  %rcx\n"
-    "  pop  %rax\n"
-    "  push %r11\n"
-    "  popfq\n"              /* restore RFLAGS (including IF) from R11 */
-    "  jmp  *%rcx\n"         /* return to caller via saved RIP */
-    ".popsection\n"
-);
-
-extern void syscall_entry(void);
 
 /* Freestanding C runtime helpers — GCC may emit calls to these */
 void *memset(void *d, int c, size_t n) {
@@ -374,6 +288,10 @@ __attribute__((interrupt))
 static void irq0_handler(interrupt_frame_t *f) {
     (void)f;
     sys_ticks++;
+    /* This is the frame clock, and the compositor sleeps on it. Waking
+     * it here rather than letting it poll is what keeps the interface
+     * locked to 60 Hz while the scheduler runs at a thousand. */
+    sched_frame_pulse();
     outb(PIC1_CMD, PIC_EOI);
 }
 
@@ -499,6 +417,25 @@ static void frame_report(void) {
  *   CR4.OSFXSR    - FXSAVE/FXRSTOR available, SSE instructions legal
  *   CR4.OSXMMEXCPT- unmasked SSE exceptions raise #XF rather than #UD
  */
+/*
+ * Sleep out the rest of the frame, and let everything else run while we
+ * do.
+ *
+ * This was a bare HLT, which is still what parks the processor. What is
+ * new either side of it is the preemption count: the compositor holds it
+ * raised for the whole of a frame so that no application thread can
+ * reach the interface's shared state halfway through a redraw, and drops
+ * it here, which is the one moment in the frame when nothing is
+ * half-updated. An application therefore runs in the gap between the
+ * last pixel of one frame and the first of the next — on this machine,
+ * most of every frame.
+ */
+static inline void frame_idle(void) {
+    preempt_enable();
+    sched_wait_frame();
+    preempt_disable();
+}
+
 static void fpu_init(void) {
     uint64_t cr0, cr4;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -906,32 +843,48 @@ void kmain(void) {
     /* The animation is centred on the real panel, not the back buffer */
     display_boot_animation(vram, panel_w, panel_h, pitch_px);
 
-    /* Read the kernel code segment selector */
-    uint16_t cs;
-    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+    /*
+     * ---- the machine's own descriptors ----
+     *
+     * Everything up to here has been running on the tables Limine left
+     * behind. They are correct and they are not sufficient: no user
+     * descriptors, no task state segment, and therefore no way down to
+     * ring 3 and no way back. From this call onward the kernel code
+     * selector is GDT_KCODE and not whatever the bootloader chose, which
+     * is why the IDT is built after it and not before.
+     */
+    gdt_init();
+    const uint16_t cs = GDT_KCODE;
 
     /* Floating point, before anything that might use it */
     fpu_init();
 
-    /* Build IDT: remap PIC, fill all 256 gates with no-op stubs */
+    /* Build IDT: remap PIC, install fault handlers, fill the rest with
+     * no-op stubs */
     idt_init(cs);
-
-    /* Register int 0x80 syscall gateway for native hybrid apps */
-    idt_set_gate(0x80,
-                 (void (*)(interrupt_frame_t *))(uintptr_t)int80_stub, cs);
-
+    trap_install();
     idt_load();
 
-    /* ---- Initialize 64-bit SYSCALL/SYSRET MSRs ----
-     * IA32_EFER.SCE  — enable the SYSCALL instruction
-     * IA32_STAR       — kernel CS/SS selectors for privilege transition
-     * IA32_LSTAR      — 64-bit syscall entry point (our assembly stub)
-     * IA32_FMASK      — RFLAGS bits cleared on SYSCALL entry (mask IF)
+    /*
+     * ---- physical and virtual memory ----
+     *
+     * The frame allocator has to exist before the address-space code can
+     * ask it for a page table, and both have to exist before anything
+     * calls kmalloc. They are also the first things in this function
+     * that can fail on a machine rather than in the abstract, so they go
+     * as early as the firmware's own data allows.
      */
-    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);         /* set SCE bit          */
-    wrmsr(MSR_STAR, (uint64_t)cs << 32);           /* kernel CS in [47:32] */
-    wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)syscall_entry);
-    wrmsr(MSR_SFMASK, 0x200);                      /* mask IF on entry     */
+    if (memmap_request.response != NULL && hhdm_request.response != NULL) {
+        pmm_init(memmap_request.response, hhdm_request.response->offset);
+        pmm_install_mmio_hook();
+        vmm_init();
+    } else {
+        serial_puts("[vextro] no memory map: paging and heap unavailable\n");
+    }
+
+    /* SYSCALL/SYSRET, the int 0x80 gate at DPL 3, and EFER.NXE */
+    syscall_init();
+    kernel_exports_init();
 
     /* HAL: safely probe and initialize PS/2 devices */
     hal_init_devices(cs, (int32_t)w, (int32_t)h);
@@ -944,6 +897,23 @@ void kmain(void) {
      * competing for the machine. Everything that paces itself by time
      * rather than by a fixed count depends on this. */
     tsc_calibrate();
+
+    /*
+     * ---- threads ----
+     *
+     * The local APIC's timer is the scheduler's clock, at a millisecond,
+     * and the PIT stays where it was at 60 Hz because that is the frame
+     * clock. Two timers because they are answering two different
+     * questions; sharing one would mean either a scheduler that reacts a
+     * frame late or an animation that ticks a thousand times a second.
+     *
+     * The context this is called from becomes thread 1 — the compositor
+     * — because it is already running and cannot be created.
+     */
+    lapic_init(1000);
+    sched_init();
+    sched_reap_hook = app_reaped;
+    sched_start();
 
     /* Initialize Intel e1000 NIC via PCI discovery */
     if (hhdm_request.response != NULL) {
@@ -1009,7 +979,7 @@ void kmain(void) {
      * headless harness can do; this makes import resolution testable.
      */
     serial_puts("[vextro] app selftest: running /hello\n");
-    execute_bin_internal("/hello", 0);
+    execute_bin_blocking("/hello", 0);
     serial_puts("[vextro] app selftest: done\n");
 #endif
 
@@ -1137,24 +1107,41 @@ void kmain(void) {
         }
         system_total_memory_mb = total_bytes / (1024 * 1024);
 
-        /* The model is far larger than any static buffer, so give the
-         * inference arena the biggest usable region Limine reports. */
-        if (hhdm_request.response != NULL) {
-            uint64_t best_base = 0, best_len = 0;
-            for (uint64_t i = 0; i < memmap_request.response->entry_count; i++) {
-                struct limine_memmap_entry *e = memmap_request.response->entries[i];
-                if (e->type != LIMINE_MEMMAP_USABLE) continue;
-                if (e->length > best_len) { best_len = e->length; best_base = e->base; }
-            }
-            if (best_len > (16ull << 20)) {
-                void *arena = (void *)(uintptr_t)(hhdm_request.response->offset
-                                                  + best_base);
-                llm_arena_init(arena, best_len);
+        /*
+         * The model is far larger than any static buffer, so the
+         * inference arena is still most of the machine — but it is now
+         * *allocated* rather than assumed.
+         *
+         * It used to take the largest usable region straight out of the
+         * firmware map, which was correct while nothing else owned
+         * physical memory. It is not correct any more: the frame
+         * allocator hands out that same region for page tables, kernel
+         * stacks and process images, and two owners of one region is
+         * silent corruption that would show up as a model that answers
+         * nonsense after a program has run. So it asks for a contiguous
+         * run instead, and leaves the kernel enough to work with.
+         */
+        if (pmm_ready) {
+            const uint64_t keep  = (64ull << 20) / PAGE_SIZE;   /* 64 MB */
+            const uint64_t floor = (16ull << 20) / PAGE_SIZE;   /* 16 MB */
+            uint64_t frames = 0;
+            uint64_t phys = pmm_alloc_largest(keep, floor, &frames);
+            if (phys) {
+                void *arena = (void *)(uintptr_t)phys_to_virt(phys);
+                llm_arena_init(arena, frames * PAGE_SIZE);
                 /* Remembered so a different model can be loaded later
                  * without rebooting: switching resets the arena, which
                  * needs the region it was carved from. */
                 ai_arena_base = arena;
-                ai_arena_size = best_len;
+                ai_arena_size = frames * PAGE_SIZE;
+                serial_puts("[vextro] inference arena ");
+                serial_put_dec((uint32_t)(frames * 4 / 1024));
+                serial_puts(" MB, ");
+                serial_put_dec((uint32_t)(pmm_free_frames * 4 / 1024));
+                serial_puts(" MB left for the kernel\n");
+            } else {
+                serial_puts("[vextro] no contiguous run for the "
+                            "inference arena\n");
             }
         }
     }
@@ -1162,8 +1149,24 @@ void kmain(void) {
     /* Unmask hardware interrupts */
     __asm__ volatile("sti" ::: "memory");
 
+    /*
+     * The compositor is a thread now, and the frame is its critical
+     * section.
+     *
+     * Everything it touches between waking and sleeping — the window
+     * list, the terminal ring, the notification queue, the back buffer —
+     * is reachable from a syscall made by an application thread, and
+     * locking each of those separately would be a great deal of code to
+     * protect a machine with one processor. Raising the preemption count
+     * instead says the whole frame is indivisible; frame_idle() drops it
+     * for exactly as long as this thread is asleep, which is when
+     * applications run. On this hardware that is most of every frame.
+     */
+    preempt_disable();
+
     /* Render loop — wakes on each interrupt, redraws, sleeps again */
     while (1) {
+        sched_reap();
         net_poll();
 #ifdef ENABLE_XHCI
         xhci_poll();
@@ -1197,7 +1200,7 @@ void kmain(void) {
             }
 
             vga_flip(vram, w, h, pitch_px);
-            __asm__ volatile("hlt");
+            frame_idle();
             continue;
         }
 
@@ -1220,7 +1223,7 @@ void kmain(void) {
             }
 
             vga_flip(vram, w, h, pitch_px);
-            __asm__ volatile("hlt");
+            frame_idle();
             continue;
         }
 
@@ -1324,7 +1327,7 @@ void kmain(void) {
             login_msg[0] = '\0';
             for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
             vga_flip(vram, w, h, pitch_px);
-            __asm__ volatile("hlt");
+            frame_idle();
             continue;
         }
 
@@ -1365,7 +1368,7 @@ void kmain(void) {
              * it does not spend are what the System gadget reports as
              * idle.
              */
-            __asm__ volatile("hlt");
+            frame_idle();
             uint64_t t3 = cycle_now();
             frame_idle_cy += t3 - t2;
 
@@ -1473,7 +1476,7 @@ void kmain(void) {
                     melt_active = 1;
                     melt_tick = 0;
                     vga_flip(vram, w, h, pitch_px);
-                    __asm__ volatile("hlt");
+                    frame_idle();
                     continue;
                 }
                 typed_len = 0;
@@ -1599,11 +1602,11 @@ void kmain(void) {
                     notify_push(NOTE_GOOD, note);
                 }
                 vga_flip(vram, w, h, pitch_px);
-                __asm__ volatile("hlt");
+                frame_idle();
                 continue;
             }
             vga_flip(vram, w, h, pitch_px);
-            __asm__ volatile("hlt");
+            frame_idle();
             continue;
         }
 
@@ -1660,6 +1663,6 @@ void kmain(void) {
 
         vga_flip(vram, w, h, pitch_px);
 
-        __asm__ volatile("hlt");  /* sleep until next IRQ */
+        frame_idle();  /* sleep until next IRQ */
     }
 }

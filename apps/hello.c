@@ -14,7 +14,17 @@
  * and fold the calls away — the addresses are written by something it
  * cannot see.
  */
-#define IMPORT_MAGIC 0x53524D50495F4253ULL
+/*
+ * "VX_IMPRS", little endian — the tag vx_format.h defines and the loader
+ * searches for.
+ *
+ * It used to read 0x53524D50495F4253, which spells "SB_IMPRS": the name
+ * the format had before the machine was called Vextro. The loader was
+ * renamed with everything else and this constant was not, so this
+ * program has been quietly failing to resolve a single import ever
+ * since — visible only as the line it prints saying so.
+ */
+#define IMPORT_MAGIC 0x5352504D495F5856ULL
 
 static volatile struct {
     unsigned long long magic;

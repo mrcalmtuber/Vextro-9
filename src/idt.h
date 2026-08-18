@@ -112,15 +112,36 @@ typedef struct {
 #define IDT_SIZE 256
 static idt_entry_t idt_table[IDT_SIZE];
 
-static void idt_set_gate(int vec, void (*fn)(interrupt_frame_t *), uint16_t sel) {
+/*
+ * The general form. Two fields beyond the address matter once ring 3
+ * exists:
+ *
+ *   dpl  — the privilege a caller needs to reach the vector through INT.
+ *          Every hardware vector stays at 0, because a user program that
+ *          can forge a page fault can convince the kernel it faulted on
+ *          an address it never touched. The syscall gate is the sole
+ *          exception and must be 3, or `int 0x80` from user space raises
+ *          #GP instead of entering the kernel.
+ *
+ *   ist  — an index, 1-7, into the TSS's interrupt stack table, or 0 for
+ *          "keep using whatever stack we are on". Used for the double
+ *          fault, where the stack in hand is exactly what cannot be
+ *          trusted.
+ */
+static void idt_set_gate_ex(int vec, void *fn, uint16_t sel,
+                            uint8_t ist, uint8_t dpl) {
     uint64_t addr = (uint64_t)(uintptr_t)fn;
     idt_table[vec].offset_lo  = (uint16_t)(addr & 0xFFFF);
     idt_table[vec].offset_mid = (uint16_t)((addr >> 16) & 0xFFFF);
     idt_table[vec].offset_hi  = (uint32_t)(addr >> 32);
     idt_table[vec].selector   = sel;
-    idt_table[vec].ist        = 0;
-    idt_table[vec].type_attr  = 0x8E;
+    idt_table[vec].ist        = (uint8_t)(ist & 7);
+    idt_table[vec].type_attr  = (uint8_t)(0x8E | ((dpl & 3) << 5));
     idt_table[vec].reserved   = 0;
+}
+
+static void idt_set_gate(int vec, void (*fn)(interrupt_frame_t *), uint16_t sel) {
+    idt_set_gate_ex(vec, (void *)(uintptr_t)fn, sel, 0, 0);
 }
 
 /* ---- 8259 PIC constants ---- */

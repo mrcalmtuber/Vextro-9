@@ -340,7 +340,23 @@ static int dma_split(const void *buf, uint32_t len, dma_run_t *runs, int max) {
 static uint8_t mmio_pool[MMIO_POOL_PAGES][4096] __attribute__((aligned(4096)));
 static int mmio_pool_idx = 0;
 
+/*
+ * Where page-table pages come from once there is a frame allocator.
+ *
+ * This file is included long before pmm.h — every driver needs it — so
+ * it cannot call the allocator by name. The allocator installs itself
+ * here instead, and until it does the static pool below is the whole
+ * supply. That pool is thirty-two pages, which is enough for a few tens
+ * of megabytes of device registers and was the real reason a machine
+ * with several large BARs could find one of them unmapped.
+ */
+static uint64_t (*mmio_frame_alloc)(void) = 0;
+
 static uint64_t mmio_alloc_page_phys(void) {
+    if (mmio_frame_alloc) {
+        uint64_t p = mmio_frame_alloc();
+        if (p) return p;
+    }
     if (mmio_pool_idx >= MMIO_POOL_PAGES) return 0;
     void *p = &mmio_pool[mmio_pool_idx++][0];
     for (int i = 0; i < 4096; i++) ((uint8_t *)p)[i] = 0;

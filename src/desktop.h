@@ -632,50 +632,261 @@ static const char *img_status(void);
 
 /*
  * Syscall ABI (see apps/vextro.h):
- *   RAX = number, RDI = arg0, RSI = arg1, RDX = arg2, via int 0x80
- *   1 = print string    2 = draw pixel on app canvas    3 = mouse state
+ *   RAX = number, RDI = arg0, RSI = arg1, RDX = arg2, R10/R8/R9 = arg3-5
+ *   reached by `int 0x80` or by SYSCALL; both arrive here.
+ *
+ * Everything below runs on a kernel stack with interrupts masked, with
+ * the calling process's page tables still loaded — which is what makes a
+ * user pointer dereferenceable at all, and exactly why every one of them
+ * is checked first. `user_range_mapped` asks two questions that both
+ * matter: is this address in the half of the space a program is allowed
+ * to name, and is it actually mapped to that program with the access the
+ * call is about to perform. A pointer that fails either is a refusal,
+ * not a fault.
  */
 
 #define APP_CANVAS_W 598
 #define APP_CANVAS_H 402
 
-static uint32_t app_canvas[APP_CANVAS_W * APP_CANVAS_H];
+/* Page-aligned because it is mapped into every application's address
+ * space, and a mapping is made of whole pages. */
+static uint32_t app_canvas[APP_CANVAS_W * APP_CANVAS_H]
+    __attribute__((aligned(4096)));
 static char     app_win_title[64] = "hello";
 static int      silent_launch = 0;
 
-__attribute__((noinline, used))
-void syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
+/* Set while a user thread is running so a refusal can name it. */
+static char     app_fault_note[96];
+
+static void app_refuse(const char *what) {
+    str_copy(app_fault_note, what, sizeof(app_fault_note));
+    serial_puts("[syscall] refused: ");
+    serial_puts(what);
+    serial_puts("\n");
+}
+
+/* A string a program handed us, brought across the boundary before
+ * anything reads it twice. Nothing below ever walks user memory
+ * directly: a length checked and then re-read is a length that can
+ * change, and here it cannot, because the copy is what gets used. */
+static int sys_copy_string(uint64_t uptr, char *dst, int cap) {
+    if (!vmm_current) {
+        /* A kernel-mode caller — the boot self-test, or an app running
+         * before address spaces were available. Its pointers are the
+         * kernel's own and are trusted as such. */
+        const char *s = (const char *)(uintptr_t)uptr;
+        if (!s) return -1;
+        int i = 0;
+        for (; s[i] && i < cap - 1; i++) dst[i] = s[i];
+        dst[i] = '\0';
+        return i;
+    }
+    return user_strncpy_in(vmm_current, dst, uptr, cap);
+}
+
+/* The eight-word argument block the trampolines build for the two calls
+ * that have more parameters than registers. */
+static int sys_read_args(uint64_t uptr, uint64_t *out, int n) {
+    if (!vmm_current) {
+        const uint64_t *p = (const uint64_t *)(uintptr_t)uptr;
+        if (!p) return -1;
+        for (int i = 0; i < n; i++) out[i] = p[i];
+        return 0;
+    }
+    if (!user_range_mapped(vmm_current, uptr, (uint64_t)n * 8, 0)) return -1;
+    const uint64_t *p = (const uint64_t *)(uintptr_t)uptr;
+    for (int i = 0; i < n; i++) out[i] = p[i];
+    return 0;
+}
+
+/* Is `buf` a pixel buffer of bw x bh that the caller may write? */
+static int sys_canvas_ok(uint64_t buf, int64_t bw, int64_t bh) {
+    if (bw <= 0 || bh <= 0 || bw > 8192 || bh > 8192) return 0;
+    uint64_t bytes = (uint64_t)bw * (uint64_t)bh * 4u;
+    if (!vmm_current) return buf != 0;
+    return user_range_mapped(vmm_current, buf, bytes, 1);
+}
+
+static uint64_t sys_sbrk(int64_t delta);
+
+static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
+                                uint64_t a2, uint64_t a3, uint64_t a4,
+                                uint64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+
     switch (num) {
-    case 1: {
-        const char *str = (const char *)(uintptr_t)a0;
-        if (str && !silent_launch) term_print(str);
+    case SYS_PRINT: {
+        char buf[256];
+        if (sys_copy_string(a0, buf, sizeof(buf)) < 0) {
+            app_refuse("print: unreadable string");
+            return (uint64_t)-1;
+        }
+        if (!silent_launch) term_print(buf);
 #ifdef APP_SELFTEST
         /* The terminal is a framebuffer window; a headless harness cannot
          * read it. Mirror to serial so what the app says is checkable. */
-        if (str) { serial_puts("[app] "); serial_puts(str); }
+        serial_puts("[app] "); serial_puts(buf);
 #endif
-        break;
+        return 0;
     }
-    case 2: {
+
+    case SYS_DRAW_PIXEL: {
         int32_t px = (int32_t)a0;
         int32_t py = (int32_t)a1;
         if (px >= 0 && px < APP_CANVAS_W && py >= 0 && py < APP_CANVAS_H)
             app_canvas[py * APP_CANVAS_W + px] = (uint32_t)a2;
-        break;
+        return 0;
     }
-    case 3: {
-        int32_t *out = (int32_t *)(uintptr_t)a0;
-        if (out) {
-            out[0] = mouse_x;
-            out[1] = mouse_y;
-            out[2] = (int32_t)mouse_buttons;
-            out[3] = 0;
+
+    case SYS_GET_MOUSE: {
+        if (vmm_current && !user_range_mapped(vmm_current, a0, 16, 1)) {
+            app_refuse("mouse: unwritable buffer");
+            return (uint64_t)-1;
         }
-        break;
+        int32_t *out = (int32_t *)(uintptr_t)a0;
+        if (!out) return (uint64_t)-1;
+        out[0] = mouse_x;
+        out[1] = mouse_y;
+        out[2] = (int32_t)mouse_buttons;
+        out[3] = 0;
+        return 0;
     }
+
+    case SYS_EXIT:
+        sched_exit((int)a0);
+        return 0;                       /* never reached */
+
+    case SYS_SBRK:
+        return sys_sbrk((int64_t)a0);
+
+    case SYS_WRITE: {
+        /* fd 1 and 2 both land in the terminal; there is one console. */
+        if (a0 != 1 && a0 != 2) return (uint64_t)-1;
+        uint64_t len = a2 > 255 ? 255 : a2;
+        if (vmm_current && !user_range_mapped(vmm_current, a1, len, 0)) {
+            app_refuse("write: unreadable buffer");
+            return (uint64_t)-1;
+        }
+        char buf[256];
+        const char *src = (const char *)(uintptr_t)a1;
+        uint64_t i = 0;
+        for (; i < len; i++) buf[i] = src[i];
+        buf[i] = '\0';
+        if (!silent_launch) term_print(buf);
+#ifdef APP_SELFTEST
+        serial_puts("[app] "); serial_puts(buf);
+#endif
+        return len;
+    }
+
+    case SYS_YIELD:
+        sched_yield();
+        return 0;
+
+    case SYS_TICKS:
+        return sched_ticks;
+
+    case SYS_CANVAS: {
+        /* Where the window's pixels are, so a program can write them
+         * itself instead of paying a syscall per pixel. */
+        if (vmm_current && !user_range_mapped(vmm_current, a0, 24, 1)) {
+            app_refuse("canvas: unwritable buffer");
+            return (uint64_t)-1;
+        }
+        uint64_t *out = (uint64_t *)(uintptr_t)a0;
+        if (!out) return (uint64_t)-1;
+        out[0] = vmm_current ? USER_CANVAS_VA
+                             : (uint64_t)(uintptr_t)app_canvas;
+        out[1] = APP_CANVAS_W;
+        out[2] = APP_CANVAS_H;
+        return 0;
+    }
+
+    case SYS_TTF_TEXT_WIDTH: {
+        char s[192];
+        if (sys_copy_string(a0, s, sizeof(s)) < 0) return 0;
+        return (uint64_t)(int64_t)ttf_text_width(s, (int)a1);
+    }
+
+    case SYS_TTF_DRAW_STRING: {
+        uint64_t v[8];
+        if (sys_read_args(a0, v, 8) != 0) {
+            app_refuse("ttf_draw_string: unreadable arguments");
+            return (uint64_t)-1;
+        }
+        if (!sys_canvas_ok(v[0], (int64_t)(int32_t)v[1],
+                                 (int64_t)(int32_t)v[2])) {
+            app_refuse("ttf_draw_string: buffer outside the caller");
+            return (uint64_t)-1;
+        }
+        char s[192];
+        if (sys_copy_string(v[5], s, sizeof(s)) < 0) return (uint64_t)-1;
+        ttf_draw_string((uint32_t *)(uintptr_t)v[0], (int)v[1], (int)v[2],
+                        (int)v[3], (int)v[4], s,
+                        (uint32_t)v[6], (int)v[7]);
+        return 0;
+    }
+
+    case SYS_GFX_RECT: {
+        uint64_t v[8];
+        if (sys_read_args(a0, v, 8) != 0) {
+            app_refuse("gfx_rect: unreadable arguments");
+            return (uint64_t)-1;
+        }
+        if (!sys_canvas_ok(v[0], (int64_t)(uint32_t)v[1],
+                                 (int64_t)(uint32_t)v[2])) {
+            app_refuse("gfx_rect: buffer outside the caller");
+            return (uint64_t)-1;
+        }
+        gfx_rect((uint32_t *)(uintptr_t)v[0], (uint32_t)v[1], (uint32_t)v[2],
+                 (int32_t)v[3], (int32_t)v[4], (int32_t)v[5], (int32_t)v[6],
+                 (uint32_t)v[7]);
+        return 0;
+    }
+
     default:
-        break;
+        return (uint64_t)-1;
     }
+}
+
+/*
+ * The break.
+ *
+ * malloc() in the user-space C library is built on this and nothing
+ * else: ask for more address space, get the old end back, and the pages
+ * appear underneath. Shrinking moves the break but does not unmap —
+ * returning pages a program has just decided it does not want, only to
+ * fault them back in when it changes its mind, is a poor trade at this
+ * scale, and the address space goes away wholesale when the process
+ * does.
+ */
+static uint64_t sys_sbrk(int64_t delta) {
+    addr_space_t *as = vmm_current;
+    if (!as || !as->live) return (uint64_t)-1;
+
+    uint64_t old = as->brk;
+    if (delta == 0) return old;
+
+    if (delta < 0) {
+        uint64_t back = (uint64_t)(-delta);
+        uint64_t want = back > old - USER_HEAP_BASE ? USER_HEAP_BASE
+                                                    : old - back;
+        as->brk = want;
+        return old;
+    }
+
+    uint64_t want = old + (uint64_t)delta;
+    if (want < old || want > USER_HEAP_MAX) return (uint64_t)-1;
+    if (want > as->brk_top) {
+        uint64_t top  = PAGE_ALIGN_UP(want);
+        uint64_t need = top - as->brk_top;
+        if (vmm_alloc_range(as, as->brk_top, need,
+                            PTE_USER | PTE_WRITE | PTE_NX) != need)
+            return (uint64_t)-1;
+        as->brk_top = top;
+    }
+    as->brk = want;
+    return old;
 }
 
 typedef struct {
@@ -708,20 +919,46 @@ typedef struct {
 
 #define ELF_PT_LOAD 1
 
-#define APP_MEM_SIZE (256 * 1024)
-static uint8_t app_memory[APP_MEM_SIZE] __attribute__((aligned(4096)));
-static uint8_t app_stack[8192] __attribute__((aligned(16)));
+/*
+ * The staging arena.
+ *
+ * An image is assembled here first and only then copied into the address
+ * space that will run it. Doing it in two steps rather than writing
+ * straight into the process's pages buys two things worth the copy: the
+ * import table can be found and patched while the whole image is
+ * contiguous and writable, and a malformed header is rejected before any
+ * page of the new address space has been touched.
+ */
+#define APP_MEM_SIZE (4 * 1024 * 1024)
+#define APP_MAX_PAGES (APP_MEM_SIZE / 4096)
+static uint8_t *app_memory = 0;               /* kmalloc'd on first use */
+
+/* What each staged page will be mapped as. Written by whichever loader
+ * ran, read once when the pages are handed to the process. */
+#define APROT_READ  1
+#define APROT_WRITE 2
+#define APROT_EXEC  4
+static uint8_t app_page_prot[APP_MAX_PAGES];
+
+static int app_arena_ready(void) {
+    if (app_memory) return 1;
+    app_memory = (uint8_t *)kmalloc(APP_MEM_SIZE);
+    return app_memory != 0;
+}
 
 /*
- * Two loaders share one app arena.  Both lay the image out at
+ * Two loaders share that arena. Both lay the image out at
  * app_memory + (vaddr - base_vaddr), so images have to be position
- * independent — neither loader processes relocations.
+ * independent — neither loader processes relocations — and both are then
+ * mapped at the address they were linked for, which makes the
+ * independence a belt rather than the only thing holding it up.
  *
- * Note that the kernel runs apps in ring 0 out of a static buffer, so it
- * cannot enforce W^X the way the host-side loader in vxfmt/vx_run.c
- * does; the .vx page alignment is still honoured, and is what would let
- * a future paging-aware loader mark the text arena NX-clear and the data
- * arena NX-set without touching the format.
+ * W^X is real now. The .vx format has always put .data on its own page
+ * precisely so that the two segments could carry different protections;
+ * until there were page tables there was nothing to carry them with. A
+ * text page is mapped read and execute, a data page read, write and
+ * no-execute, and nothing an application maps is ever both writable and
+ * executable.
  */
 
 /* ===== imported symbols =====
@@ -729,16 +966,25 @@ static uint8_t app_stack[8192] __attribute__((aligned(16)));
  * What the kernel lends to applications. See vxfmt/vx_format.h for why
  * the table lives in the image rather than in the header.
  *
- * Unlike the aarch64 tree, this needs no deferred setter: ttf.h and gfx.h
- * are both included before this file, so the addresses are available here
- * and the table can simply be a constant.
+ * The names are unchanged and every image that used them still works,
+ * but what they resolve to is not a kernel address any more — a ring-3
+ * program calling one of those would fault on the first instruction.
+ * Each name now resolves to a stub on the trampoline page mapped into
+ * the calling process, which turns the call into a syscall. Filled in
+ * once at boot, after the trampoline's own address is known.
  */
-static const vx_export_t kernel_exports[] = {
-    { "ttf_draw_string", (uint64_t)(uintptr_t)ttf_draw_string },
-    { "ttf_text_width",  (uint64_t)(uintptr_t)ttf_text_width  },
-    { "gfx_rect",        (uint64_t)(uintptr_t)gfx_rect        },
+static vx_export_t kernel_exports[] = {
+    { "ttf_draw_string", 0 },
+    { "ttf_text_width",  0 },
+    { "gfx_rect",        0 },
     { 0, 0 }
 };
+
+static void kernel_exports_init(void) {
+    kernel_exports[0].addr = utramp_user_addr(utramp_ttf_draw_string);
+    kernel_exports[1].addr = utramp_user_addr(utramp_ttf_text_width);
+    kernel_exports[2].addr = utramp_user_addr(utramp_gfx_rect);
+}
 
 static int vx_name_eq(const char *a, const char *b) {
     for (int i = 0; i < VX_IMPORT_NAMELEN; i++) {
@@ -801,9 +1047,20 @@ static int vx_resolve_imports(uint8_t *data, uint64_t len) {
     return 0;                       /* no table: an ordinary image */
 }
 
+/* Record what a run of staged bytes may be used for. Called once per
+ * segment; the union across overlapping segments is deliberate, because
+ * a page shared by two segments has to satisfy both. */
+static void app_mark_prot(uint64_t off, uint64_t len, uint8_t prot) {
+    uint64_t p0 = off / 4096;
+    uint64_t p1 = (off + len + 4095) / 4096;
+    for (uint64_t p = p0; p < p1 && p < APP_MAX_PAGES; p++)
+        app_page_prot[p] |= prot;
+}
+
 /* Load an ELF64 image (used by `hello` and `run <elf>`). */
 static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
-                          uint64_t *out_entry) {
+                          uint64_t *out_entry, uint64_t *out_base,
+                          uint64_t *out_span) {
     if (fsize < sizeof(Elf64_Ehdr)) {
         if (verbose) term_print_c("run: file too small for an ELF64\n", 2);
         return -1;
@@ -811,6 +1068,10 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)file;
     if (ehdr->e_ident[4] != 2) {
         if (verbose) term_print_c("run: not a 64-bit ELF\n", 2);
+        return -1;
+    }
+    if (!app_arena_ready()) {
+        if (verbose) term_print_c("run: no memory for the load arena\n", 2);
         return -1;
     }
 
@@ -828,6 +1089,8 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
 
     for (uint32_t i = 0; i < APP_MEM_SIZE; i++)
         app_memory[i] = 0;
+    for (uint32_t i = 0; i < APP_MAX_PAGES; i++)
+        app_page_prot[i] = 0;
 
     uint64_t span = 0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -844,6 +1107,11 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
         for (uint64_t j = 0; j < ph->p_filesz; j++)
             dst[j] = src[j];
         if (offset + ph->p_memsz > span) span = offset + ph->p_memsz;
+
+        uint8_t prot = APROT_READ;
+        if (ph->p_flags & 2) prot |= APROT_WRITE;   /* PF_W */
+        if (ph->p_flags & 1) prot |= APROT_EXEC;    /* PF_X */
+        app_mark_prot(offset, ph->p_memsz, prot);
     }
 
     /* Imports are a property of the image, not of the container it arrived
@@ -861,14 +1129,16 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
     }
 
     if (verbose) term_print_c("loading ELF64: ", 3);
-    *out_entry = (uint64_t)(uintptr_t)(app_memory +
-                                       (ehdr->e_entry - base_vaddr));
+    *out_entry = ehdr->e_entry;
+    *out_base  = base_vaddr;
+    *out_span  = span;
     return 0;
 }
 
 /* Load a .vx image — the format every app store package uses. */
 static int load_vx_image(const uint8_t *file, uint64_t fsize, int verbose,
-                          uint64_t *out_entry) {
+                          uint64_t *out_entry, uint64_t *out_base,
+                          uint64_t *out_span) {
     /* Copy the header out byte-wise: the filesystem cache hands back a
      * plain byte buffer and we do not want to assume its alignment. */
     vx_header_t h;
@@ -892,21 +1162,34 @@ static int load_vx_image(const uint8_t *file, uint64_t fsize, int verbose,
         if (verbose) term_print_c("run: image too large for the app arena\n", 2);
         return -1;
     }
+    if (!app_arena_ready()) {
+        if (verbose) term_print_c("run: no memory for the load arena\n", 2);
+        return -1;
+    }
 
     for (uint32_t i = 0; i < APP_MEM_SIZE; i++)
         app_memory[i] = 0;
+    for (uint32_t i = 0; i < APP_MAX_PAGES; i++)
+        app_page_prot[i] = 0;
 
     uint64_t base = h.text_vaddr;
     uint8_t *dst = app_memory + (h.text_vaddr - base);
     for (uint64_t i = 0; i < h.text_size; i++)
         dst[i] = file[h.text_off + i];
+    app_mark_prot(h.text_vaddr - base, h.text_size, APROT_READ | APROT_EXEC);
 
     if (h.data_size) {
         dst = app_memory + (h.data_vaddr - base);
         for (uint64_t i = 0; i < h.data_size; i++)
             dst[i] = file[h.data_off + i];
     }
-    /* .bss needs no work: the arena was just zeroed. */
+    /* .bss needs no work: the arena was just zeroed. But it does need a
+     * mapping, so the data segment's protection covers memsz and not
+     * just the bytes that came from the file. */
+    if (h.data_vaddr >= base)
+        app_mark_prot(h.data_vaddr - base,
+                      vx_image_span(&h) - (h.data_vaddr - base),
+                      APROT_READ | APROT_WRITE);
 
     /* Lend the image whatever kernel functions it asked for, before it can
      * run and call through them. */
@@ -922,8 +1205,155 @@ static int load_vx_image(const uint8_t *file, uint64_t fsize, int verbose,
     }
 
     if (verbose) term_print_c("loading .vx: ", 3);
-    *out_entry = (uint64_t)(uintptr_t)(app_memory + (h.entry - base));
+    *out_entry = h.entry;
+    *out_base  = base;
+    *out_span  = vx_image_span(&h);
     return 0;
+}
+
+/* ===== from a staged image to a running process ===== */
+
+/* Copy into an address space that is not the current one, a page at a
+ * time, through the direct map. Switching CR3 to do it would be simpler
+ * to read and would mean the kernel briefly ran with a half-built set of
+ * page tables loaded. */
+static int as_write(addr_space_t *as, uint64_t va, const void *src,
+                    uint64_t len) {
+    const uint8_t *s = (const uint8_t *)src;
+    while (len) {
+        uint64_t phys = vmm_resolve(as, va);
+        if (!phys) return -1;
+        uint64_t chunk = 4096 - (va & 0xFFF);
+        if (chunk > len) chunk = len;
+        uint8_t *dst = (uint8_t *)(uintptr_t)phys_to_virt(phys);
+        for (uint64_t i = 0; i < chunk; i++) dst[i] = s[i];
+        va  += chunk;
+        s   += chunk;
+        len -= chunk;
+    }
+    return 0;
+}
+
+static int as_poke64(addr_space_t *as, uint64_t va, uint64_t val) {
+    return as_write(as, va, &val, 8);
+}
+
+/*
+ * Build the address space, map what a program is entitled to see, and
+ * hand it to the scheduler.
+ *
+ * What it is entitled to see is a short list, and the shortness is the
+ * point: its own image, its own stack, its own heap once it asks, one
+ * page of trampolines, and the pixels of its own window. Everything else
+ * in the machine — the kernel, the framebuffer, the disk cache, every
+ * other process — is either in the half of the address space its
+ * descriptors forbid or is not mapped at all.
+ */
+static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
+                           uint64_t entry_va, int verbose) {
+    if (!vmm_ready) {
+        if (verbose) term_print_c("run: no virtual memory manager\n", 2);
+        return 0;
+    }
+    if (base_va < USER_MIN || base_va + span > USER_IMAGE_MAX) {
+        if (verbose) term_print_c("run: image links outside user space\n", 2);
+        return 0;
+    }
+
+    addr_space_t *as = (addr_space_t *)kmalloc(sizeof(addr_space_t));
+    if (!as) return 0;
+    for (uint64_t i = 0; i < sizeof(addr_space_t); i++) ((uint8_t *)as)[i] = 0;
+    if (vmm_create(as) != 0) { kfree(as); return 0; }
+
+    /* The image, one page at a time, each with the protection its
+     * segment asked for. A page that no segment claimed is not mapped
+     * at all rather than mapped and empty. */
+    uint64_t pages = (span + 4095) / 4096;
+    for (uint64_t p = 0; p < pages; p++) {
+        uint8_t prot = app_page_prot[p];
+        if (!prot) prot = APROT_READ;              /* padding inside a span */
+        uint64_t flags = PTE_USER;
+        if (prot & APROT_WRITE) flags |= PTE_WRITE;
+        if (!(prot & APROT_EXEC)) flags |= PTE_NX;
+
+        uint64_t phys = pmm_alloc();
+        if (!phys) goto fail;
+        if (vmm_map(as, base_va + p * 4096, phys, flags) != 0) {
+            pmm_free(phys);
+            goto fail;
+        }
+        uint8_t *dst = (uint8_t *)(uintptr_t)phys_to_virt(phys);
+        for (int i = 0; i < 4096; i++) dst[i] = app_memory[p * 4096 + i];
+    }
+
+    /* Stack: writable, never executable. */
+    if (vmm_alloc_range(as, USER_STACK_TOP - USER_STACK_SIZE,
+                        USER_STACK_SIZE,
+                        PTE_USER | PTE_WRITE | PTE_NX) != USER_STACK_SIZE)
+        goto fail;
+
+    /* The trampolines: readable and executable, and writable by nobody.
+     * They are the same physical page in every process. */
+    if (vmm_map_shared(as, USER_TRAMP_VA, utramp_start,
+                       (uint64_t)(utramp_end - utramp_start),
+                       PTE_USER) != 0)
+        goto fail;
+
+    /* The window's pixels, so a program can draw without a syscall per
+     * pixel. No-execute, because a canvas full of attacker-chosen bytes
+     * that the program can also jump to is the whole of the exploit. */
+    if (vmm_map_shared(as, USER_CANVAS_VA, app_canvas, sizeof(app_canvas),
+                       PTE_USER | PTE_WRITE | PTE_NX) != 0)
+        goto fail;
+
+    /*
+     * The return address.
+     *
+     * Every app in this system is a `void _start(void)` that simply
+     * returns when it is done, which used to work because the kernel had
+     * called it. Nothing calls it now, so the value it returns *to* has
+     * to be put there by hand: the address of a stub that asks to exit.
+     * Placing it at STACK_TOP-8 also leaves the stack pointer where the
+     * ABI says it is at function entry — eight past a sixteen-byte
+     * boundary — which matters now that applications may use SSE.
+     */
+    uint64_t sp = USER_STACK_TOP - 8;
+    if (as_poke64(as, sp, utramp_user_addr(utramp_exit)) != 0) goto fail;
+
+    thread_t *t = sched_spawn_user(as, entry_va, sp, name, PRIO_NORMAL);
+    if (!t) goto fail;
+
+    serial_puts("[exec] ");
+    serial_puts(name);
+    serial_puts(" -> pid ");
+    serial_put_dec(t->pid);
+    serial_puts(", ring 3, ");
+    serial_put_dec((uint32_t)pages);
+    serial_puts(" image pages\n");
+    return t;
+
+fail:
+    vmm_destroy(as);
+    kfree(as);
+    if (verbose) term_print_c("run: could not build the address space\n", 2);
+    return 0;
+}
+
+/*
+ * What to say when a program ends.
+ *
+ * It used to need saying because a program that had ended was a program
+ * whose CALL had returned, and the machine was visibly frozen until it
+ * did. Now that they run alongside the interface there is nothing to
+ * notice, so the Action Center is told.
+ */
+static void app_reaped(thread_t *t) {
+    if (silent_launch) return;
+    char note[NOTIFY_TEXT];
+    str_copy(note, t->name, sizeof(note));
+    str_append(note, t->exit_code ? " stopped with an error" : " finished",
+               sizeof(note));
+    notify_push(t->exit_code ? NOTE_WARN : NOTE_GOOD, note);
 }
 
 /*
@@ -948,7 +1378,8 @@ static void policy_short_name(const char *path, char *out, int cap) {
  * Center. A program that simply does not start, with no reason given,
  * is indistinguishable from a broken one.
  */
-static int execute_bin_internal(const char *filepath, int verbose) {
+static int execute_bin_full(const char *filepath, int verbose,
+                            int wait_for_exit) {
     uint64_t fsize = 0;
     const void *fdata = fs_read_file(filepath, &fsize);
     if (!fdata || fsize < 8) {
@@ -1004,15 +1435,15 @@ static int execute_bin_internal(const char *filepath, int verbose) {
     }
 
     const uint8_t *file = (const uint8_t *)fdata;
-    uint64_t entry_addr = 0;
+    uint64_t entry_va = 0, base_va = 0, span = 0;
     int rc;
 
     if (file[0] == (uint8_t)VX_MAGIC0 && file[1] == (uint8_t)VX_MAGIC1 &&
         file[2] == (uint8_t)VX_MAGIC2 && file[3] == (uint8_t)VX_MAGIC3) {
-        rc = load_vx_image(file, fsize, verbose, &entry_addr);
+        rc = load_vx_image(file, fsize, verbose, &entry_va, &base_va, &span);
     } else if (file[0] == 0x7F && file[1] == 'E' && file[2] == 'L' &&
                file[3] == 'F') {
-        rc = load_elf_image(file, fsize, verbose, &entry_addr);
+        rc = load_elf_image(file, fsize, verbose, &entry_va, &base_va, &span);
     } else {
         if (verbose)
             term_print_c("run: not a .vx or ELF64 executable\n", 2);
@@ -1025,8 +1456,6 @@ static int execute_bin_internal(const char *filepath, int verbose) {
         term_print("\n");
     }
 
-    uint64_t stack_top = (uint64_t)(uintptr_t)(app_stack + sizeof(app_stack));
-
     for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++)
         app_canvas[i] = 0;
 
@@ -1038,21 +1467,33 @@ static int execute_bin_internal(const char *filepath, int verbose) {
         app_win_title[ti] = '\0';
     }
 
-    uint64_t saved_rsp;
-    __asm__ volatile(
-        "mov %%rsp, %[save]\n\t"
-        "mov %[stk], %%rsp\n\t"
-        "call *%[entry]\n\t"
-        "mov %[save], %%rsp\n\t"
-        : [save] "=&r"(saved_rsp)
-        : [stk] "r"(stack_top),
-          [entry] "r"(entry_addr)
-        : "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11",
-          "rax", "memory", "cc"
-    );
-
+    /* The window opens before the program does. It used to be the other
+     * way round because there was nothing to look at until the program
+     * had finished — it ran to completion inside this call, with the
+     * whole machine stopped. Now it is a thread, and an empty window
+     * filling in as the work happens is the honest picture of that. */
     wm_open(WK_HELLO);
+
+    thread_t *t = app_spawn(shortname, base_va, span, entry_va, verbose);
+    if (!t) return -1;
+
+    if (wait_for_exit) {
+        int code = sched_join(t, 30000);
+        if (code < 0 && verbose)
+            term_print_c("run: the program did not finish in time\n", 2);
+    }
     return 0;
+}
+
+/* Launch and return; the program runs as a thread from here on. */
+static int execute_bin_internal(const char *filepath, int verbose) {
+    return execute_bin_full(filepath, verbose, 0);
+}
+
+/* Launch and wait. Only for callers that have nothing to draw while they
+ * wait — the boot self-test — because it stops the compositor thread. */
+static int execute_bin_blocking(const char *filepath, int verbose) {
+    return execute_bin_full(filepath, verbose, 1);
 }
 
 static int execute_bin(const char *filepath) {

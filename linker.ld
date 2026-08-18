@@ -20,6 +20,25 @@ SECTIONS {
 
     . = ALIGN(4096);
 
+    /*
+     * The syscall trampolines, on pages of their own.
+     *
+     * This is the only part of the kernel image that is mapped into a
+     * user address space, so it has to be separable at page granularity
+     * — hence its own output section rather than a corner of .text. It
+     * contains code and nothing else: no literals, no relocations, no
+     * references outside itself, so the same physical pages can appear
+     * at whatever virtual address each process is given.
+     */
+    .utext : ALIGN(4096) {
+        __utext_start = .;
+        KEEP(*(.utext))
+        . = ALIGN(4096);
+        __utext_end = .;
+    } :text
+
+    . = ALIGN(4096);
+
     /* Read-only data, including Limine request sections */
     .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
