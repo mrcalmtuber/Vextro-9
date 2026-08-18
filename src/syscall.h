@@ -328,8 +328,10 @@ __asm__(
     "  pushq %rsi\n"              /* arg2: bw    */
     "  pushq %rdi\n"              /* arg1: buf   */
     "  movq %rsp, %rdi\n"
+    "  MSABI_SAVE_XMM\n"
     "  movl $21, %eax\n"
     "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
     "  addq $64, %rsp\n"
     "  ret\n"
 
@@ -347,8 +349,10 @@ __asm__(
     "  pushq %rsi\n"              /* arg2: bw    */
     "  pushq %rdi\n"              /* arg1: buf   */
     "  movq %rsp, %rdi\n"
+    "  MSABI_SAVE_XMM\n"
     "  movl $22, %eax\n"
     "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
     "  addq $64, %rsp\n"
     "  ret\n"
 
@@ -375,10 +379,219 @@ __asm__(
     "1:\n"
     "  jmp 1b\n"
 
+    /*
+     * ---- the Microsoft calling convention ----
+     *
+     * A PE image is compiled for a different ABI: its first four
+     * arguments arrive in RCX, RDX, R8 and R9, where everything else in
+     * this system uses RDI, RSI, RDX and RCX. The stubs below are the
+     * translation, and they are why a Windows executable can call into
+     * this kernel at all.
+     *
+     * The order of the moves is load-bearing: RSI must be filled from
+     * RDX before RDX is overwritten from R8, or the second argument
+     * becomes the third.
+     */
+    ".macro MSABI_SHUFFLE\n"
+    "  movq %rcx, %rdi\n"
+    "  movq %rdx, %rsi\n"
+    "  movq %r8,  %rdx\n"
+    "  movq %r9,  %r10\n"
+    ".endm\n"
+
+    /*
+     * ---- and the registers Windows expects back ----
+     *
+     * The two conventions disagree about who owns the vector registers.
+     * System V says every XMM register is the caller's problem and may
+     * be destroyed by any call. Microsoft says XMM6 through XMM15
+     * belong to the *caller* and a callee must put them back.
+     *
+     * This kernel is System V throughout, so a syscall destroys all
+     * sixteen -- which is correct for everything else here and silently
+     * wrong for a PE image. GCC targeting Windows keeps loop constants
+     * in XMM6 upwards precisely because it has been promised they
+     * survive calls, so the first call inside a loop corrupts the
+     * arithmetic of every iteration after it.
+     *
+     * That is not a theoretical hazard: it is what the first PE this
+     * ever ran did, and the fault it produced was a write through an
+     * address that had been a floating-point constant.
+     *
+     * 168 bytes rather than 160 because the stack arrives eight past a
+     * sixteen-byte boundary and MOVAPS faults on anything else.
+     */
+    ".macro MSABI_SAVE_XMM\n"
+    "  subq $168, %rsp\n"
+    "  movaps %xmm6,    0(%rsp)\n"
+    "  movaps %xmm7,   16(%rsp)\n"
+    "  movaps %xmm8,   32(%rsp)\n"
+    "  movaps %xmm9,   48(%rsp)\n"
+    "  movaps %xmm10,  64(%rsp)\n"
+    "  movaps %xmm11,  80(%rsp)\n"
+    "  movaps %xmm12,  96(%rsp)\n"
+    "  movaps %xmm13, 112(%rsp)\n"
+    "  movaps %xmm14, 128(%rsp)\n"
+    "  movaps %xmm15, 144(%rsp)\n"
+    ".endm\n"
+
+    ".macro MSABI_LOAD_XMM\n"
+    "  movaps   0(%rsp), %xmm6\n"
+    "  movaps  16(%rsp), %xmm7\n"
+    "  movaps  32(%rsp), %xmm8\n"
+    "  movaps  48(%rsp), %xmm9\n"
+    "  movaps  64(%rsp), %xmm10\n"
+    "  movaps  80(%rsp), %xmm11\n"
+    "  movaps  96(%rsp), %xmm12\n"
+    "  movaps 112(%rsp), %xmm13\n"
+    "  movaps 128(%rsp), %xmm14\n"
+    "  movaps 144(%rsp), %xmm15\n"
+    "  addq $168, %rsp\n"
+    ".endm\n"
+
+    ".align 16\n"
+    ".globl petramp_print\n"
+    "petramp_print:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $1, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_exit\n"
+    "petramp_exit:\n"
+    "  MSABI_SHUFFLE\n"
+    "  movl $4, %eax\n"
+    "  syscall\n"
+    "1:\n"
+    "  jmp 1b\n"
+
+    ".align 16\n"
+    ".globl petramp_pixel\n"
+    "petramp_pixel:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $2, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_mouse\n"
+    "petramp_mouse:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $3, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_yield\n"
+    "petramp_yield:\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $7, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_canvas\n"
+    "petramp_canvas:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $9, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_ticks\n"
+    "petramp_ticks:\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $8, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_textw\n"
+    "petramp_textw:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $20, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_sbrk\n"
+    "petramp_sbrk:\n"
+    "  MSABI_SHUFFLE\n"
+    "  MSABI_SAVE_XMM\n"
+    "  movl $5, %eax\n"
+    "  syscall\n"
+    "  MSABI_LOAD_XMM\n"
+    "  ret\n"
+
+    /*
+     * The two eight-argument calls, in the Microsoft convention: four
+     * in registers and the rest on the stack at [rsp+40] onwards, past
+     * the thirty-two bytes of shadow space the caller must reserve.
+     */
+    ".align 16\n"
+    ".globl petramp_drawstr\n"
+    "petramp_drawstr:\n"
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"                 /* arg8 */
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"                 /* arg7 */
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"                 /* arg6 */
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"                 /* arg5 */
+    "  pushq %r9\n"
+    "  pushq %r8\n"
+    "  pushq %rdx\n"
+    "  pushq %rcx\n"
+    "  movq %rsp, %rdi\n"
+    "  movl $21, %eax\n"
+    "  syscall\n"
+    "  addq $64, %rsp\n"
+    "  ret\n"
+
+    ".align 16\n"
+    ".globl petramp_fillrect\n"
+    "petramp_fillrect:\n"
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"
+    "  movq 64(%rsp), %rax\n"
+    "  pushq %rax\n"
+    "  pushq %r9\n"
+    "  pushq %r8\n"
+    "  pushq %rdx\n"
+    "  pushq %rcx\n"
+    "  movq %rsp, %rdi\n"
+    "  movl $22, %eax\n"
+    "  syscall\n"
+    "  addq $64, %rsp\n"
+    "  ret\n"
+
     ".globl utramp_end\n"
     "utramp_end:\n"
     ".popsection\n"
 );
+
+extern uint8_t petramp_print[], petramp_exit[], petramp_pixel[],
+               petramp_mouse[], petramp_yield[], petramp_canvas[],
+               petramp_ticks[], petramp_textw[], petramp_sbrk[],
+               petramp_drawstr[], petramp_fillrect[];
 
 extern uint8_t utramp_start[], utramp_end[];
 extern uint8_t utramp_ttf_text_width[], utramp_ttf_draw_string[],

@@ -1067,6 +1067,25 @@ void kmain(void) {
 #endif
     fs_mount();
 
+    /* Settings, in one tree with an atomic commit. Everything that
+     * follows can read and write it. */
+    reg_load();
+    {
+        /* A first boot leaves its mark, so a later one can tell how long
+         * this installation has existed and how many times it has come
+         * up -- which is the smallest useful thing a registry can be
+         * asked to remember. */
+        reg_begin();
+        uint32_t boots = reg_get_dword("Software\\Vextro\\System", "BootCount", 0);
+        reg_set_dword("Software\\Vextro\\System", "BootCount", boots + 1);
+        reg_set_string("Software\\Vextro\\System", "Version", "9.0");
+        reg_set_string("Software\\Vextro\\System", "Arch", "x86_64");
+        reg_commit();
+        serial_puts("[registry] boot ");
+        serial_put_dec(boots + 1);
+        serial_puts(" of this installation\n");
+    }
+
     /* App store: load the shipped catalog and the installed-app registry
      * so the dock and the Apps menu already know about installed apps */
     store_init();
@@ -1091,6 +1110,12 @@ void kmain(void) {
      * should appear below is a page fault report naming address zero,
      * the thread dying, and this function carrying on to the desktop.
      */
+#ifdef PE_SELFTEST
+    serial_puts("[vextro] PE selftest: running /winhello.exe\n");
+    execute_bin_blocking("/winhello.exe", 0);
+    serial_puts("[vextro] PE selftest: done\n");
+#endif
+
     serial_puts("[vextro] fault selftest: running /faulter\n");
     {
         int frc = execute_bin_blocking("/faulter", 0);

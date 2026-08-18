@@ -102,6 +102,12 @@
 #define KSTACK_VA_BASE    0xFFFFA00000000000ULL
 #define KSTACK_VA_SPAN    (256ULL * 1024 * 1024)
 
+/* What a staged image's page is allowed to be used for. Shared by every
+ * loader — ELF, .vx and PE all describe the same three things. */
+#define APROT_READ  1
+#define APROT_WRITE 2
+#define APROT_EXEC  4
+
 typedef struct {
     uint64_t  pml4_phys;
     uint64_t *pml4;          /* through the HHDM */

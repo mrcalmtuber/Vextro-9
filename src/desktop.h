@@ -7,6 +7,8 @@
 #include "fat32.h"
 #include "exfat.h"
 #include "vx_format.h"
+#include "pe.h"
+#include "registry.h"
 #include "sci.h"
 
 /*
@@ -628,6 +630,107 @@ static void store_fit(char *dst, int dst_max, const char *src,
 static int  img_open_path(const char *path);
 static const char *img_status(void);
 
+/* ===== 3b. THE REGISTRY, ON DISK =====
+ *
+ * The hive is written whole and to a temporary name first, then the old
+ * one is replaced. That is the cheapest correct commit available on a
+ * filesystem with no rename-is-atomic guarantee: the window in which
+ * neither file is complete is one write of a small file, and the log
+ * says which state to expect if the machine stops inside it.
+ */
+#define REG_HIVE_PATH "/etc/registry.hive"
+#define REG_LOG_PATH  "/etc/registry.log"
+
+static int reg_flush(void) {
+    if (!reg_nodes || !reg_dirty) return 0;
+
+    uint64_t bytes = sizeof(reg_header_t) +
+                     (uint64_t)reg_count * sizeof(reg_node_t);
+    uint8_t *buf = (uint8_t *)kmalloc(bytes);
+    if (!buf) return -1;
+
+    reg_header_t *h = (reg_header_t *)buf;
+    h->magic      = REG_MAGIC;
+    h->version    = REG_VERSION;
+    h->node_count = reg_count;
+    h->sequence   = ++reg_sequence;
+    h->checksum   = reg_checksum(reg_nodes, reg_count);
+    h->reserved[0] = h->reserved[1] = h->reserved[2] = 0;
+
+    for (uint64_t i = 0; i < (uint64_t)reg_count * sizeof(reg_node_t); i++)
+        buf[sizeof(reg_header_t) + i] = ((const uint8_t *)reg_nodes)[i];
+
+    /* The intent, first. A hive found with a log whose sequence is
+     * ahead of the hive's own was interrupted mid-write. */
+    uint32_t log[2] = { REG_MAGIC, h->sequence };
+    fs_write_file(REG_LOG_PATH, (const char *)log, sizeof(log));
+
+    int rc = fs_write_file(REG_HIVE_PATH, (const char *)buf, (uint32_t)bytes);
+    kfree(buf);
+    if (rc >= 0) {
+        reg_dirty = 0;
+        /* Intent discharged. */
+        uint32_t done[2] = { REG_MAGIC, 0 };
+        fs_write_file(REG_LOG_PATH, (const char *)done, sizeof(done));
+    }
+    return rc >= 0 ? 0 : -1;
+}
+
+static void reg_load(void) {
+    if (!reg_ready()) return;
+
+    uint64_t sz = 0;
+    const void *d = fs_read_file(REG_HIVE_PATH, &sz);
+    if (!d || sz < sizeof(reg_header_t)) {
+        serial_puts("[registry] no hive - starting a new one\n");
+        reg_dirty = 1;
+        return;
+    }
+    const reg_header_t *h = (const reg_header_t *)d;
+    if (h->magic != REG_MAGIC || h->version != REG_VERSION ||
+        h->node_count == 0 || h->node_count > REG_MAX_NODES) {
+        serial_puts("[registry] hive header rejected - starting a new one\n");
+        return;
+    }
+    uint64_t need = sizeof(reg_header_t) +
+                    (uint64_t)h->node_count * sizeof(reg_node_t);
+    if (sz < need) {
+        serial_puts("[registry] hive is short - starting a new one\n");
+        return;
+    }
+
+    const reg_node_t *src =
+        (const reg_node_t *)((const uint8_t *)d + sizeof(reg_header_t));
+    if (reg_checksum(src, h->node_count) != h->checksum) {
+        serial_puts("[registry] hive checksum failed - starting a new one\n");
+        return;
+    }
+
+    for (uint64_t i = 0; i < (uint64_t)h->node_count * sizeof(reg_node_t); i++)
+        ((uint8_t *)reg_nodes)[i] = ((const uint8_t *)src)[i];
+    reg_count = h->node_count;
+    reg_sequence = h->sequence;
+    reg_dirty = 0;
+
+    /* Was the last write interrupted? The log says what sequence was
+     * being written; a hive older than that never landed. */
+    uint64_t lsz = 0;
+    const void *ld = fs_read_file(REG_LOG_PATH, &lsz);
+    if (ld && lsz >= 8) {
+        const uint32_t *log = (const uint32_t *)ld;
+        if (log[0] == REG_MAGIC && log[1] && log[1] > h->sequence) {
+            serial_puts("[registry] a commit was interrupted - the hive is "
+                        "the state before it\n");
+        }
+    }
+
+    serial_puts("[registry] hive loaded: ");
+    serial_put_dec(reg_count);
+    serial_puts(" nodes, sequence ");
+    serial_put_dec(reg_sequence);
+    serial_puts("\n");
+}
+
 /* ===== 4. SYSCALL GATEWAY + ELF64 LOADER ===== */
 
 /*
@@ -838,7 +941,10 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                              : (uint64_t)(uintptr_t)app_canvas;
         out[1] = APP_CANVAS_W;
         out[2] = APP_CANVAS_H;
-        return 0;
+        /* The address in RAX as well, so a caller that treats this as a
+         * function returning a pointer -- which is the natural way to
+         * write it -- gets one without also reading the buffer. */
+        return out[0];
     }
 
     case SYS_TTF_TEXT_WIDTH: {
@@ -974,9 +1080,6 @@ static uint8_t *app_memory = 0;               /* kmalloc'd on first use */
 
 /* What each staged page will be mapped as. Written by whichever loader
  * ran, read once when the pages are handed to the process. */
-#define APROT_READ  1
-#define APROT_WRITE 2
-#define APROT_EXEC  4
 static uint8_t app_page_prot[APP_MAX_PAGES];
 
 static int app_arena_ready(void) {
@@ -1028,6 +1131,31 @@ static vx_export_t kernel_exports[] = {
  * against that process's own base, immediately before the staged image
  * is copied into its pages.
  */
+/* The Windows-facing half of the same table. Same trampoline page, same
+ * per-process base; different calling convention on the way in. */
+static void pe_exports_for(uint64_t tramp_base) {
+    const struct { const char *n; const uint8_t *s; } map[] = {
+        { "VxPrint",      petramp_print },
+        { "VxExit",       petramp_exit },
+        { "VxDrawPixel",  petramp_pixel },
+        { "VxGetMouse",   petramp_mouse },
+        { "VxYield",      petramp_yield },
+        { "VxCanvas",     petramp_canvas },
+        { "VxTicks",      petramp_ticks },
+        { "VxTextWidth",  petramp_textw },
+        { "VxDrawString", petramp_drawstr },
+        { "VxFillRect",   petramp_fillrect },
+        { "VxAlloc",      petramp_sbrk },
+    };
+    for (int i = 0; pe_exports[i].name; i++) {
+        pe_exports[i].stub = 0;
+        for (int k = 0; k < (int)(sizeof(map) / sizeof(map[0])); k++)
+            if (str_eq(pe_exports[i].name, map[k].n))
+                pe_exports[i].stub =
+                    tramp_base + (uint64_t)(map[k].s - utramp_start);
+    }
+}
+
 static void kernel_exports_for(uint64_t tramp_base) {
     kernel_exports[0].addr = tramp_base +
         (uint64_t)(utramp_ttf_draw_string - utramp_start);
@@ -1037,7 +1165,10 @@ static void kernel_exports_for(uint64_t tramp_base) {
         (uint64_t)(utramp_gfx_rect        - utramp_start);
 }
 
-static void kernel_exports_init(void) { kernel_exports_for(USER_TRAMP_VA); }
+static void kernel_exports_init(void) {
+    kernel_exports_for(USER_TRAMP_VA);
+    pe_exports_for(USER_TRAMP_VA);
+}
 
 static int vx_name_eq(const char *a, const char *b) {
     for (int i = 0; i < VX_IMPORT_NAMELEN; i++) {
@@ -1278,6 +1409,31 @@ static int load_vx_image(const uint8_t *file, uint64_t fsize, int verbose,
 
 /* ===== from a staged image to a running process ===== */
 
+/*
+ * Where a process's movable pieces go this time.
+ *
+ * Chosen once and passed to both the loader and the spawner, because the
+ * two need the same answer and the loader needs it *first*: a PE's
+ * imports are written into the image at link time, against the address
+ * the trampoline page will actually have. Picking it afterwards linked
+ * one process's imports against another's page, which faults on an
+ * instruction fetch at an address that looks almost right.
+ */
+typedef struct {
+    uint64_t stack_top;
+    uint64_t tramp_va;
+    uint64_t canvas_va;
+    uint64_t heap_base;
+} app_layout_t;
+
+static void app_layout_pick(app_layout_t *l) {
+    l->stack_top = USER_STACK_TOP - aslr_offset(256);
+    l->tramp_va  = USER_TRAMP_VA  + aslr_offset(1024);
+    l->canvas_va = USER_CANVAS_VA + aslr_offset(1024);
+    l->heap_base = USER_HEAP_BASE + aslr_offset(4096);
+}
+
+
 /* Copy into an address space that is not the current one, a page at a
  * time, through the direct map. Switching CR3 to do it would be simpler
  * to read and would mean the kernel briefly ran with a half-built set of
@@ -1315,7 +1471,8 @@ static int as_poke64(addr_space_t *as, uint64_t va, uint64_t val) {
  * descriptors forbid or is not mapped at all.
  */
 static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
-                           uint64_t entry_va, int verbose) {
+                           uint64_t entry_va, const app_layout_t *lay,
+                           int verbose) {
     if (!vmm_ready) {
         if (verbose) term_print_c("run: no virtual memory manager\n", 2);
         return 0;
@@ -1360,10 +1517,10 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
      * processes relocations: an image has to land where it was linked.
      * That is the honest limit of this.
      */
-    const uint64_t stack_top = USER_STACK_TOP - aslr_offset(256);
-    const uint64_t tramp_va  = USER_TRAMP_VA  + aslr_offset(1024);
-    const uint64_t canvas_va = USER_CANVAS_VA + aslr_offset(1024);
-    as->brk = as->brk_top = USER_HEAP_BASE + aslr_offset(4096);
+    const uint64_t stack_top = lay->stack_top;
+    const uint64_t tramp_va  = lay->tramp_va;
+    const uint64_t canvas_va = lay->canvas_va;
+    as->brk = as->brk_top = lay->heap_base;
 
     /* Now that this process's trampoline address is known, resolve the
      * staged image's imports against it. Doing it here rather than in
@@ -1454,6 +1611,87 @@ fail:
     serial_puts("[exec] could not map ");
     serial_puts(name);
     serial_puts(" into its address space\n");
+    return 0;
+}
+
+/*
+ * A PE image, into an address space.
+ *
+ * Almost the same as app_spawn and deliberately not shared with it: the
+ * staging buffer is different, the base is chosen rather than dictated,
+ * and the page protections come from section characteristics instead of
+ * program headers. What is identical is everything that matters for
+ * safety -- the same four mappings, the same W^X, the same stack with a
+ * guard page and an exit address on it.
+ */
+static thread_t *pe_spawn(const char *name, pe_image_t *img,
+                          const app_layout_t *lay, int verbose) {
+    if (!vmm_ready || !sched_running) return 0;
+
+    addr_space_t *as = (addr_space_t *)kmalloc(sizeof(addr_space_t));
+    if (!as) return 0;
+    for (uint64_t i = 0; i < sizeof(addr_space_t); i++) ((uint8_t *)as)[i] = 0;
+    if (vmm_create(as) != 0) { kfree(as); return 0; }
+
+    const uint64_t stack_top = lay->stack_top;
+    const uint64_t tramp_va  = lay->tramp_va;
+    const uint64_t canvas_va = lay->canvas_va;
+    as->brk = as->brk_top = lay->heap_base;
+    uint64_t pages = (img->image_size + 4095) / 4096;
+    for (uint64_t p = 0; p < pages; p++) {
+        uint8_t prot = pe_page_prot[p];
+        if (!prot) prot = APROT_READ;
+        uint64_t flags = PTE_USER;
+        if (prot & APROT_WRITE) flags |= PTE_WRITE;
+        if (!(prot & APROT_EXEC)) flags |= PTE_NX;
+
+        uint64_t phys = pmm_alloc();
+        if (!phys) goto fail;
+        if (vmm_map(as, img->base + p * 4096, phys, flags) != 0) {
+            pmm_free(phys);
+            goto fail;
+        }
+        uint8_t *dst = (uint8_t *)(uintptr_t)phys_to_virt(phys);
+        for (int i = 0; i < 4096; i++) dst[i] = pe_stage[p * 4096 + i];
+    }
+
+    if (vmm_alloc_range(as, stack_top - USER_STACK_SIZE, USER_STACK_SIZE,
+                        PTE_USER | PTE_WRITE | PTE_NX) != USER_STACK_SIZE)
+        goto fail;
+    {
+        uint64_t *g = vmm_walk(as, stack_top - USER_STACK_SIZE - PAGE_SIZE, 1);
+        if (g) *g = PTE_GUARD;
+    }
+    if (vmm_map_shared(as, tramp_va, utramp_start,
+                       (uint64_t)(utramp_end - utramp_start), PTE_USER) != 0)
+        goto fail;
+    if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
+                       PTE_USER | PTE_WRITE | PTE_NX) != 0)
+        goto fail;
+    as->canvas_va = canvas_va;
+    as->tramp_va  = tramp_va;
+
+    /*
+     * The Microsoft convention wants thirty-two bytes of shadow space
+     * below the return address before the first call, so the entry
+     * point is given a stack that already has it. Getting this wrong
+     * corrupts the caller's frame on the callee's first spill, which is
+     * not a fault -- it is wrong data, later.
+     */
+    uint64_t sp = (stack_top - 64) & ~15ULL;
+    sp -= 8;
+    if (as_poke64(as, sp, tramp_va + (uint64_t)(petramp_exit - utramp_start))
+        != 0) goto fail;
+
+    thread_t *t = sched_spawn_user(as, img->entry, sp, name, PRIO_NORMAL);
+    if (!t) goto fail;
+    return t;
+
+fail:
+    vmm_destroy(as);
+    kfree(as);
+    if (verbose) term_print_c("run: could not map the PE image\n", 2);
+    serial_puts("[exec] could not map the PE image\n");
     return 0;
 }
 
@@ -1562,6 +1800,68 @@ static int execute_bin_full(const char *filepath, int verbose,
     uint64_t entry_va = 0, base_va = 0, span = 0;
     int rc;
 
+    /*
+     * A Windows executable takes a different road entirely: it is
+     * relocated rather than fixed, its imports are written into a table
+     * rather than patched into code, and its sections carry their own
+     * protections. pe_load does all three into its own staging buffer,
+     * so the rest of this function only has to hand over pages.
+     */
+    if (file[0] == 'M' && file[1] == 'Z') {
+        app_layout_t lay;
+        app_layout_pick(&lay);
+        /* Before the image is linked, so its import table is written
+         * against the page this process will actually have. */
+        kernel_exports_for(lay.tramp_va);
+        pe_exports_for(lay.tramp_va);
+
+        uint64_t pe_base = 0x0000000000400000ULL + aslr_offset(2048);
+        pe_image_t img;
+        int prc = pe_load(file, fsize, pe_base, &img);
+        if (prc != 0) {
+            serial_puts("[exec] ");
+            serial_puts(pe_error(prc));
+            if (img.missing[0]) {
+                serial_puts(": wanted ");
+                serial_puts(img.missing);
+            }
+            serial_puts("\n");
+            if (verbose) {
+                term_print_c("run: ", 2);
+                term_print_c(pe_error(prc), 2);
+                if (img.missing[0]) {
+                    term_print_c(" - wanted ", 2);
+                    term_print_c(img.missing, 2);
+                }
+                term_print("\n");
+            }
+            return -1;
+        }
+        for (int i = 0; i < APP_CANVAS_W * APP_CANVAS_H; i++) app_canvas[i] = 0;
+        {
+            int ti = 0;
+            const char *pp = filepath;
+            while (*pp && ti < 60) app_win_title[ti++] = *pp++;
+            app_win_title[ti] = '\0';
+        }
+        wm_open(WK_HELLO);
+
+        serial_puts("[exec] PE64 ");
+        serial_puts(shortname);
+        serial_puts(": ");
+        serial_put_dec((uint32_t)img.sections);
+        serial_puts(" sections, ");
+        serial_put_dec((uint32_t)img.relocations);
+        serial_puts(" relocations, ");
+        serial_put_dec((uint32_t)img.imports_resolved);
+        serial_puts(" imports\n");
+
+        thread_t *pt = pe_spawn(shortname, &img, &lay, verbose);
+        if (!pt) return -1;
+        if (wait_for_exit) sched_join(pt, 30000);
+        return 0;
+    }
+
     if (file[0] == (uint8_t)VX_MAGIC0 && file[1] == (uint8_t)VX_MAGIC1 &&
         file[2] == (uint8_t)VX_MAGIC2 && file[3] == (uint8_t)VX_MAGIC3) {
         rc = load_vx_image(file, fsize, verbose, &entry_va, &base_va, &span);
@@ -1606,7 +1906,9 @@ static int execute_bin_full(const char *filepath, int verbose,
      * filling in as the work happens is the honest picture of that. */
     wm_open(WK_HELLO);
 
-    thread_t *t = app_spawn(shortname, base_va, span, entry_va, verbose);
+    app_layout_t lay;
+    app_layout_pick(&lay);
+    thread_t *t = app_spawn(shortname, base_va, span, entry_va, &lay, verbose);
     if (!t) return -1;
 
     if (wait_for_exit) {

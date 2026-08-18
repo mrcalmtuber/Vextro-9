@@ -1,0 +1,13 @@
+LIBRARY vextro.dll
+EXPORTS
+VxPrint
+VxExit
+VxDrawPixel
+VxGetMouse
+VxYield
+VxCanvas
+VxTicks
+VxTextWidth
+VxDrawString
+VxFillRect
+VxAlloc

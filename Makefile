@@ -292,7 +292,7 @@ MUSIC_FLAC  := build/music/bell.flac
 $(MUSIC_WAV) $(MUSIC_FLAC): tools/mkwav.py
 	@python3 tools/mkwav.py build/music
 
-disk.img: $(ASSET_LIST) | build/hello build/faulter $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
+disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -300,6 +300,7 @@ disk.img: $(ASSET_LIST) | build/hello build/faulter $(STORE_BINS) $(PIC_SCI) $(M
 	done; \
 	cmd="python3 tools/mkexfat.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello build/faulter \
+		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \
 		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
@@ -345,6 +346,41 @@ build/hello: build/hello.o apps/app.ld $(LIBC)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		build/hello.o $(LIBC) -o $@
 
+# --- Windows executable ---
+#
+# A genuine PE64, built by a genuine Windows toolchain, so the loader in
+# src/pe.h is tested against what it actually claims to read rather than
+# against a file this repository wrote to suit it.
+#
+# --dynamicbase is what produces the relocation table, which is the whole
+# reason a PE can be loaded anywhere: without it the image can only go to
+# the address in its own header. The import library is generated from a
+# .def file, so the .exe names vextro.dll and its functions exactly the
+# way any Windows program names the libraries it needs.
+#
+# Optional. A machine without mingw-w64 builds everything else and skips
+# this; the loader is still there and still refuses malformed images.
+MINGW := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
+ifneq ($(MINGW),)
+WINAPPS := build/win/winhello.exe
+else
+WINAPPS :=
+endif
+
+build/win/libvextro.a: apps/win/vextro.def
+	@mkdir -p build/win
+	x86_64-w64-mingw32-dlltool -d $< -l $@
+
+build/win/winhello.exe: apps/win/winhello.c build/win/libvextro.a
+	@mkdir -p build/win
+	x86_64-w64-mingw32-gcc -O2 -Wall -ffreestanding -fno-stack-protector \
+		-c $< -o build/win/winhello.o
+	x86_64-w64-mingw32-gcc -nostdlib -nostartfiles -Wl,-e,PeMain \
+		-Wl,--dynamicbase -o $@ build/win/winhello.o build/win/libvextro.a
+
+.PHONY: winapps
+winapps: $(WINAPPS)
+
 # --- User app: faulter ---
 # A program that writes through a null pointer, so that the containment
 # can be tested rather than assumed. Runs under `make iso
@@ -386,10 +422,11 @@ build/pics/%.sci: apps/pics/%.png tools/mkimg.py
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
 # The store payloads ride along here too, so the storefront still has
 # something to install on an ISO-only boot with no disk attached.
-build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(STORE_BINS)
+build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(WINAPPS) $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
 	cp build/hello build/faulter build/initrd_staging/
+	$(foreach w,$(WINAPPS),cp $(w) build/initrd_staging/;)
 	$(foreach a,$(STORE_APPS),cp build/store/$(a).vx build/initrd_staging/store/pkg/$(a).vx;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
