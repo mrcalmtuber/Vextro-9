@@ -1615,15 +1615,85 @@ static int wm_focus = -1;
 static int wm_drag = -1;
 static int32_t wm_drag_ox = 0, wm_drag_oy = 0;
 
-/* spawn animation (dock icon -> window) */
-static struct {
-    int active;
-    int tick;
-    int kind;
-    int32_t src_x, src_y;
-} spawn_anim = {0, 0, -1, 0, 0};
+/*
+ * ---- window motion ----
+ *
+ * There used to be one animation in this system: a gold outline growing
+ * from a dock icon to a new window over twelve frames, linearly. Opening
+ * was the only thing that moved. Minimising a window made it vanish;
+ * maximising made it jump; a shake made four windows disappear at once
+ * with nothing to say where they had gone.
+ *
+ * Now every geometry change a window makes is a flight from one
+ * rectangle to another, driven by the spring in gfx.h. What is drawn
+ * during the flight is a ghost -- the window's outline and title bar,
+ * scaled and faded -- rather than the window's real contents, which
+ * keeps the whole thing independent of what any application happens to
+ * be drawing and costs a few hundred blended pixels a frame.
+ *
+ * One record per window kind, because a shake starts four of them at
+ * once and they all have to run.
+ */
+typedef struct {
+    int      active;
+    int      hide;                 /* window is not drawn while flying */
+    spring_t t;                    /* progress, 0 -> 1                 */
+    float    x0, y0, w0, h0;
+    float    x1, y1, w1, h1;
+    float    a0, a1;               /* alpha at each end                */
+} wm_anim_t;
 
-#define SPAWN_ANIM_FRAMES 12
+static wm_anim_t wm_anim[WK_COUNT];
+
+/* Needed to aim a minimise at the dock icon it collapses into; both are
+ * defined much further down, with the dock. */
+static void dock_bar_rect(uint32_t scr_w, int32_t *rx, int32_t *ry,
+                          int32_t *rw, int32_t *rh);
+static void dock_icon_rect(uint32_t scr_w, int idx,
+                           int32_t *ix, int32_t *iy, int32_t *iw, int32_t *ih);
+static int  dock_running_kind(int idx);
+
+static void wm_anim_start(int kind,
+                          float x0, float y0, float w0, float h0,
+                          float x1, float y1, float w1, float h1,
+                          float a0, float a1, int hide) {
+    if (kind < 0 || kind >= WK_COUNT) return;
+    wm_anim_t *a = &wm_anim[kind];
+    a->active = 1;
+    a->hide   = hide;
+    a->t.p    = 0.0f;
+    a->t.v    = 0.0f;
+    a->x0 = x0; a->y0 = y0; a->w0 = w0; a->h0 = h0;
+    a->x1 = x1; a->y1 = y1; a->w1 = w1; a->h1 = h1;
+    a->a0 = a0; a->a1 = a1;
+}
+
+static int wm_anim_hides(int kind) {
+    return kind >= 0 && kind < WK_COUNT &&
+           wm_anim[kind].active && wm_anim[kind].hide;
+}
+
+/*
+ * Where a window goes when it is minimised: the middle of its own dock
+ * icon, if it has one. Falling back to the middle of the dock is not
+ * merely a default -- a window whose program is not pinned genuinely has
+ * nowhere more specific to go.
+ */
+static void wm_dock_target(int kind, float *tx, float *ty) {
+    int32_t rx, ry, rw, rh;
+    dock_bar_rect(scr_w_cache, &rx, &ry, &rw, &rh);
+    *tx = (float)(rx + rw / 2);
+    *ty = (float)(ry + rh / 2);
+
+    for (int i = 0; i < dock_item_count; i++) {
+        if (dock_running_kind(i) != kind) continue;
+        int32_t ix, iy, iw, ih;
+        dock_icon_rect(scr_w_cache, i, &ix, &iy, &iw, &ih);
+        *tx = (float)(ix + iw / 2);
+        *ty = (float)(iy + ih / 2);
+        return;
+    }
+}
 
 static int wm_is_open(int kind) {
     return wins[kind].open;
@@ -1686,6 +1756,12 @@ static void wm_open(int kind) {
 
 static void wm_close(int kind) {
     if (!wins[kind].open) return;
+    /* Cancel anything in flight. A window closed mid-animation would
+     * otherwise leave a ghost finishing its journey to somewhere no
+     * window exists any more -- which the old spawn animation avoided by
+     * checking `open` on every frame, and which this has to do here
+     * instead because several can be running at once. */
+    wm_anim[kind].active = 0;
     wins[kind].open = 0;
     wm_stack_remove(kind);
     if (wm_drag == kind) wm_drag = -1;
@@ -1717,17 +1793,34 @@ static void wm_save_rect(int kind) {
     win->have_rest = 1;
 }
 
+/* A window that changes shape does it visibly. The ghost flies from
+ * where it was to where it now is, at full opacity, and the window
+ * itself is held back until it lands -- so a maximise reads as the
+ * window growing rather than as one window replacing another. */
+static void wm_anim_reshape(int kind, int32_t ox, int32_t oy,
+                            int32_t ow, int32_t oh) {
+    win_t *win = &wins[kind];
+    if (win->x == ox && win->y == oy && win->w == ow && win->h == oh) return;
+    wm_anim_start(kind, (float)ox, (float)oy, (float)ow, (float)oh,
+                  (float)win->x, (float)win->y,
+                  (float)win->w, (float)win->h,
+                  235.0f, 235.0f, 1);
+}
+
 static void wm_restore_rect(int kind) {
     win_t *win = &wins[kind];
     if (!win->have_rest) return;
+    int32_t ox = win->x, oy = win->y, ow = win->w, oh = win->h;
     win->x = win->rx; win->y = win->ry;
     win->w = win->rw; win->h = win->rh;
     win->snap = SNAP_NONE;
+    wm_anim_reshape(kind, ox, oy, ow, oh);
 }
 
 static void wm_snap_to(int kind, int where) {
     win_t *win = &wins[kind];
     if (where == SNAP_NONE) { wm_restore_rect(kind); return; }
+    const int32_t ox = win->x, oy = win->y, ow = win->w, oh = win->h;
     int32_t ax, ay, aw, ah;
     wm_work_area(&ax, &ay, &aw, &ah);
     wm_save_rect(kind);
@@ -1739,10 +1832,24 @@ static void wm_snap_to(int kind, int where) {
     else                          { win->x = ax + aw / 2;     win->w = aw - aw / 2; }
     if (win->w < WIN_MIN_W) win->w = WIN_MIN_W;
     if (win->h < WIN_MIN_H) win->h = WIN_MIN_H;
+    wm_anim_reshape(kind, ox, oy, ow, oh);
 }
 
 static void wm_minimize(int kind) {
     if (!wins[kind].open || wins[kind].min) return;
+
+    /* Collapse into the dock icon it will reappear from. The window is
+     * marked minimised immediately -- the animation is a picture of what
+     * has already happened, not the thing itself, so a click that lands
+     * mid-flight is answered by the new state and not the old. */
+    float tx, ty;
+    wm_dock_target(kind, &tx, &ty);
+    wm_anim_start(kind,
+                  (float)wins[kind].x, (float)wins[kind].y,
+                  (float)wins[kind].w, (float)wins[kind].h,
+                  tx - 8.0f, ty - 8.0f, 16.0f, 16.0f,
+                  235.0f, 0.0f, 0);
+
     wins[kind].min = 1;
     if (wm_focus == kind) {
         wm_focus = -1;
@@ -1753,6 +1860,15 @@ static void wm_minimize(int kind) {
 
 static void wm_unminimize(int kind) {
     if (!wins[kind].open) return;
+    if (wins[kind].min) {
+        float tx, ty;
+        wm_dock_target(kind, &tx, &ty);
+        wm_anim_start(kind,
+                      tx - 8.0f, ty - 8.0f, 16.0f, 16.0f,
+                      (float)wins[kind].x, (float)wins[kind].y,
+                      (float)wins[kind].w, (float)wins[kind].h,
+                      0.0f, 235.0f, 1);
+    }
     wins[kind].min = 0;
     wm_raise(kind);
 }
@@ -1770,7 +1886,8 @@ static int wm_any_minimized(void) {
 }
 
 static void wm_unminimize_all(void) {
-    for (int i = 0; i < wm_stack_n; i++) wins[wm_stack[i]].min = 0;
+    for (int i = 0; i < wm_stack_n; i++)
+        if (wins[wm_stack[i]].min) wm_unminimize(wm_stack[i]);
 }
 
 static void wm_content_rect(int kind, int32_t *cx, int32_t *cy,
@@ -2203,7 +2320,7 @@ static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
     for (int i = 0; i < wm_stack_n; i++) {
         int kind = wm_stack[i];
         if (wins[kind].min) continue;              /* it is on the taskbar */
-        if (spawn_anim.active && spawn_anim.kind == kind)
+        if (wm_anim_hides(kind))
             continue;   /* revealed when the animation lands */
         const win_t *win = &wins[kind];
         gfx_shadow(buf, w, h, win->x, win->y, win->w, win->h);
@@ -2213,42 +2330,72 @@ static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
     }
 }
 
-/* --- spawn animation --- */
+/* --- window motion, drawn --- */
 
-static void spawn_anim_start(int kind, int32_t icon_cx, int32_t icon_cy) {
-    spawn_anim.active = 1;
-    spawn_anim.tick = 0;
-    spawn_anim.kind = kind;
-    spawn_anim.src_x = icon_cx;
-    spawn_anim.src_y = icon_cy;
+/*
+ * One ghost per running animation.
+ *
+ * The spring is stepped once per frame here rather than at the moment
+ * something is clicked, which is what keeps the motion tied to the
+ * display's clock: the compositor sleeps on the 60 Hz frame pulse, so
+ * this runs exactly sixty times a second whatever else the machine is
+ * doing.
+ *
+ * What is drawn is deliberately not the window. Scaling a live window's
+ * contents would mean resampling whatever the application last painted,
+ * every frame, for every window in flight; the outline and the title bar
+ * carry the motion perfectly well and cost a few hundred blended pixels.
+ */
+static void wm_anim_draw(uint32_t *buf, uint32_t w, uint32_t h) {
+    for (int kind = 0; kind < WK_COUNT; kind++) {
+        wm_anim_t *a = &wm_anim[kind];
+        if (!a->active) continue;
+
+        spring_step(&a->t, 1.0f);
+        if (spring_settled(&a->t, 1.0f)) { a->active = 0; continue; }
+
+        float t = a->t.p;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        int32_t x = (int32_t)gfx_lerp(a->x0, a->x1, t);
+        int32_t y = (int32_t)gfx_lerp(a->y0, a->y1, t);
+        int32_t cw = (int32_t)gfx_lerp(a->w0, a->w1, t);
+        int32_t ch = (int32_t)gfx_lerp(a->h0, a->h1, t);
+        uint32_t al = (uint32_t)gfx_lerp(a->a0, a->a1, t);
+        if (cw < 2 || ch < 2 || al == 0) continue;
+        if (al > 255) al = 255;
+
+        /* Its shadow shrinks with it, or the ghost looks like a
+         * cardboard cutout sliding over the desktop. */
+        int sr = (int)(GFX_SHADOW_R * (cw > 240 ? 1.0f : (float)cw / 240.0f));
+        if (sr > 1)
+            gfx_shadow_rect(buf, w, h, x, y, cw, ch, sr,
+                            (int)(GFX_SHADOW_A * al / 255u),
+                            GFX_SHADOW_DX, GFX_SHADOW_DY);
+
+        int32_t th = WIN_TITLE_H;
+        if (th > ch) th = ch;
+        gfx_rect_blend(buf, w, h, x, y, cw, th, C_TITLE_FOC, al);
+        if (ch > th)
+            gfx_rect_blend(buf, w, h, x, y + th, cw, ch - th, C_WIN_BG,
+                           al * 3u / 4u);
+        gfx_rect_blend(buf, w, h, x, y, cw, 1, C_GOLD, al);
+        gfx_rect_blend(buf, w, h, x, y + ch - 1, cw, 1, C_GOLD, al);
+        gfx_rect_blend(buf, w, h, x, y, 1, ch, C_GOLD, al);
+        gfx_rect_blend(buf, w, h, x + cw - 1, y, 1, ch, C_GOLD, al);
+    }
 }
 
-static void spawn_anim_draw(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!spawn_anim.active) return;
-    int kind = spawn_anim.kind;
-    if (kind < 0 || !wins[kind].open) {
-        spawn_anim.active = 0;
-        return;
-    }
-    spawn_anim.tick++;
-    int t = spawn_anim.tick;
-    if (t >= SPAWN_ANIM_FRAMES) {
-        spawn_anim.active = 0;
-        return;
-    }
-    win_t *win = &wins[kind];
-    int32_t cur_x = spawn_anim.src_x + (win->x - spawn_anim.src_x) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_y = spawn_anim.src_y + (win->y - spawn_anim.src_y) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_w = 6 + (win->w - 6) * t / SPAWN_ANIM_FRAMES;
-    int32_t cur_h = 6 + (win->h - 6) * t / SPAWN_ANIM_FRAMES;
-
-    uint32_t alpha = (uint32_t)t * 220u / SPAWN_ANIM_FRAMES;
-    gfx_rect_blend(buf, w, h, cur_x, cur_y, cur_w, 2, C_GOLD, alpha);
-    gfx_rect_blend(buf, w, h, cur_x, cur_y + cur_h - 2, cur_w, 2, C_GOLD, alpha);
-    gfx_rect_blend(buf, w, h, cur_x, cur_y, 2, cur_h, C_GOLD, alpha);
-    gfx_rect_blend(buf, w, h, cur_x + cur_w - 2, cur_y, 2, cur_h, C_GOLD, alpha);
-    gfx_rect_blend(buf, w, h, cur_x, cur_y, cur_w, WIN_TITLE_H * t / SPAWN_ANIM_FRAMES,
-                   C_TITLE_FOC, alpha);
+/* Opening a window from the dock is the same motion as restoring one,
+ * so it is the same code: a ghost growing out of the icon. */
+static void spawn_anim_start(int kind, int32_t icon_cx, int32_t icon_cy) {
+    if (kind < 0 || kind >= WK_COUNT) return;
+    wm_anim_start(kind,
+                  (float)icon_cx - 8.0f, (float)icon_cy - 8.0f, 16.0f, 16.0f,
+                  (float)wins[kind].x, (float)wins[kind].y,
+                  (float)wins[kind].w, (float)wins[kind].h,
+                  0.0f, 235.0f, 1);
 }
 
 /* ===== 7. WALLPAPER (cached, regenerated on theme/size change) ===== */
@@ -2696,7 +2843,7 @@ static void ac_draw_panel(uint32_t *buf, uint32_t w, uint32_t h) {
     const int32_t y = MENUBAR_H;
     const int32_t hgt = ac_height();
 
-    gfx_rect_blend(buf, w, h, x + 3, y + 3, AC_W, hgt, 0x000000u, 70);
+    gfx_shadow_popup(buf, w, h, x, y, AC_W, hgt);
     gfx_rect_blend(buf, w, h, x, y, AC_W, hgt, 0x12151Fu, 248);
     gfx_rect_outline(buf, w, h, x, y, AC_W, hgt, C_GOLD_DIM);
 
@@ -2846,7 +2993,10 @@ static void menu_dropdown_draw(uint32_t *buf, uint32_t w, uint32_t h,
     int32_t dh = head + n * MENU_ITEM_H;
     if (searchable && n == 0) dh = head + MENU_ITEM_H;
 
-    gfx_rect_blend(buf, w, h, x0 + 3, dy + 3, ddw, dh, 0x000000u, 70);
+    /* A menu is held above the desktop, not painted onto it. This
+     * used to be one offset rectangle at a flat alpha, which reads
+     * as a second menu behind the first rather than as a shadow. */
+    gfx_shadow_popup(buf, w, h, x0, dy, ddw, dh);
     gfx_rect(buf, w, h, x0, dy, ddw, dh, 0x1A1E2Au);
     gfx_rect_outline(buf, w, h, x0, dy, ddw, dh, C_GOLD_DIM);
 
@@ -3363,6 +3513,7 @@ static void jl_draw(uint32_t *buf, uint32_t w, uint32_t h,
     const int hot  = jl_row_at(jl_open, mx, my);
     if (kind < 0) return;
 
+    gfx_shadow_popup(buf, w, h, x, y, w2, h2);
     gfx_rect_blend(buf, w, h, x, y, w2, h2, 0x12151Fu, 246);
     gfx_rect_outline(buf, w, h, x, y, w2, h2, C_GOLD_DIM);
 
@@ -3421,7 +3572,9 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     int32_t rx, ry, rw, rh;
     dock_bar_rect(w, &rx, &ry, &rw, &rh);
 
-    /* translucent plate */
+    /* translucent plate, over a shadow of its own -- it floats above
+     * the wallpaper like everything else that is not the desktop. */
+    gfx_shadow_popup(buf, w, h, rx, ry, rw, rh);
     gfx_rect_blend(buf, w, h, rx, ry, rw, rh, C_BG_PANEL, 215);
     gfx_rect_outline(buf, w, h, rx, ry, rw, rh, 0x2E3444u);
     gfx_rect(buf, w, h, rx, ry, rw, 1, 0x3A4254u);
@@ -3997,7 +4150,7 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
     gadgets_draw(buf, w, h);          /* on the desktop, under everything */
     aero_snap_preview(buf, w, h);     /* under the windows: it is a target */
     wm_draw_all(buf, w, h);
-    spawn_anim_draw(buf, w, h);
+    wm_anim_draw(buf, w, h);
     aero_peek_draw(buf, w, h);        /* over the stack, under the chrome */
     menubar_draw(buf, w, h, mx, my);
     menu_dropdown_draw(buf, w, h, mx, my);

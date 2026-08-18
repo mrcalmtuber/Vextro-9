@@ -9,7 +9,7 @@
 <p align="center">
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
-  <img alt="no libc" src="https://img.shields.io/badge/libc-none-1f2430?style=flat-square">
+  <img alt="ring 3" src="https://img.shields.io/badge/userland-ring%203-d4af37?style=flat-square">
   <img alt="lines" src="https://img.shields.io/badge/kernel-32k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
@@ -190,8 +190,10 @@ is on this machine" and not merely "what else could be". Install writes a
 validated payload to the system volume and records it in a registry, so
 installed apps survive a reboot.</td>
 <td><b>…and they run.</b> Installed apps join the dock and open in their own
-window. This Mandelbrot is 16.16 fixed point — the kernel is compiled with
-no FPU at all.</td>
+window — in ring 3, in an address space of their own, on a thread the
+scheduler preempts a thousand times a second. This Mandelbrot is computed
+in double precision and written straight into the window's pixels, which
+are mapped into the process.</td>
 </tr>
 <tr>
 <td><img src="docs/solid.png" alt="Solid, shading through the g3d API"></td>
@@ -316,10 +318,46 @@ demonstrated without keeping a real sample on the disk; what it is
 genuinely good at is catching a binary altered since it was installed.
 
 **What none of this is.** It decides whether a program starts. It does
-not constrain one that is running, and it is not a kernel enforcement
-boundary. That sentence is in the source, in the `policy` command's own
-output, and here, because "login" and "scanner" are words that imply more
-than this system delivers.
+not constrain one that is running. That sentence used to end with "and it
+is not a kernel enforcement boundary", and stood for a long time, because
+applications ran with the kernel's own privileges out of a static buffer.
+That part is no longer true.
+
+### The boundary itself
+
+An application is a **thread in ring 3**, in page tables of its own. The
+lower half of its address space maps four things: its image, its stack,
+one page of syscall trampolines, and the pixels of its own window.
+Everything else in the machine — the kernel, the framebuffer, the disk
+cache, every other process — is either in the half its descriptors forbid
+or is not mapped at all. Text pages are read-and-execute, data pages are
+writable and never executable, and page zero is deliberately absent so a
+null dereference faults instead of reading whatever the image starts
+with.
+
+There are two doors in and they are not interchangeable. `int 0x80` is
+the old one, kept because binaries emitting it are installed on real
+disks, and it preserves **every** register including RAX — which is not a
+nicety: GCC compiles two `os_print`s in a row into one `mov eax, 1` and
+two interrupts, so a gate that returned a value in RAX would silently
+turn the second call into a no-op. That was found by a program appearing
+to skip a line. Anything that needs an answer back uses `SYSCALL`, which
+has no such history. Both land on a kernel stack, build one register
+frame, and check every pointer that crosses.
+
+A fault in ring 3 is an ordinary event. The handler prints the vector,
+the decoded error code, the faulting address and the thread, then kills
+that thread by rewriting its exception frame to return into the kernel —
+and the desktop keeps drawing. `/faulter` is on the volume and exists to
+prove it: it writes through a null pointer, on purpose, because the
+interesting property of a protected system is not that correct programs
+run.
+
+**What is still not here.** No `fork`, no signals, no file descriptors
+beyond the console, and one address space per program rather than per
+instance. Applications cannot reach each other's memory, but they share
+one window each and one canvas each, and the policy layer above is still
+policy.
 
 ---
 
@@ -432,9 +470,14 @@ no signal. Two tables disagreeing about which formats exist was the whole
 defect; they agree now, and a type that is missing fails loudly at load
 rather than silently at inference.
 
-It is the one translation unit in the build allowed to touch the FPU.
-Everything else is compiled `-mno-sse -mno-80387`, so no interrupt handler
-can quietly acquire a floating-point dependency.
+It used to be the one translation unit in the build allowed to touch the
+FPU, with everything else compiled `-mno-sse -mno-80387` so that no
+interrupt handler could quietly acquire a floating-point dependency. That
+ban is gone: threads carry 512 bytes of extended state through
+`fxsave64`/`fxrstor64` on every context switch, and handlers are compiled
+`general-regs-only` so they cannot disturb it. What has *not* changed is
+that `-ffast-math` stays banned here — reassociation was measured, bought
+nothing, and made the batched and unbatched paths disagree bit for bit.
 
 ### A shader language, compiled at run time
 
@@ -587,8 +630,9 @@ where it provides one.
 `src/flac.h` decodes FLAC: constant, verbatim, fixed and LPC subframes,
 Rice partitions with both parameter widths and the raw escape, all four
 channel decorrelations, 8/16/24 bits, with CRC-8 on each frame header and
-CRC-16 on each frame. It is integer from end to end, which is why a
-machine with no FPU can have it at all.
+CRC-16 on each frame. It is integer from end to end, which is what makes
+it exactly checkable — the samples that come back are the samples that
+went in, not the samples that went in to within a rounding error.
 
 Lossless is the point. A lossy decoder can only be judged by ear; this one
 is compressed with the reference encoder at its densest setting and the
@@ -634,12 +678,23 @@ Two details that are easy to skip and expensive to get wrong:
 
 ### Type, without a font library
 
-`src/ttf.h` is an integer-only TrueType rasteriser — glyph outlines, 8×8
-supersampled anti-aliasing, no floats and no GPU. Baselines and glyph
-origins snap to whole pixels (leave them fractional and a 13px baseline
-lands on a half-pixel and fringes every letter), and each glyph's coverage
-mask is cached per size rather than re-rasterised every frame, which is
-what makes the finer sampling affordable at 60 fps.
+`src/ttf.h` is a TrueType rasteriser with no font library under it —
+glyph outlines, quadratic Béziers, anti-aliasing, no GPU. Baselines and
+glyph origins snap to whole pixels (leave them fractional and a 13px
+baseline lands on a half-pixel and fringes every letter), and each
+glyph's coverage mask is cached per size rather than re-rasterised every
+frame.
+
+It was entirely fixed point until the FPU arrived, and that left two
+marks. Curves were flattened into exactly eight segments whatever size
+they were drawn at, because choosing a count from a curve's deviation
+needs a square root — generous at 13px, plainly faceted at 40. And
+horizontal coverage was counted in subpixel columns, eight per pixel, so
+a near-vertical diagonal stepped between eight shades. Both are gone:
+segments come from the curve's own deviation in device pixels, and
+coverage is the exact overlap between the filled span and the pixel,
+computed as a real number. None of it costs a frame, because a glyph is
+rasterised once per size and blitted thereafter.
 
 ### Its own executable format
 
@@ -758,8 +813,8 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-**32,146 lines of C**, no libc, compiled as a single translation unit plus
-one for inference. (35,092 counting the embedded typeface and the integer
+**34,000 lines of C**, compiled as a single translation unit plus one for
+inference, over a user-space C library of its own. (35,092 counting the embedded typeface and the integer
 sine table, which are data rather than logic.)
 
 | | |
@@ -772,15 +827,17 @@ sine table, which are data rather than logic.)
 | **Filesystem** | Read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO — behind one 512-byte sector view |
 | **Network** | IPv4, ICMP, UDP, DNS, TCP, async HTTP/1.0 with redirects; Intel e1000 driver |
-| **Graphics** | Integer TrueType rasteriser, Intel Gen9 blitter with hang capture, firmware framebuffer fallback |
+| **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage, alpha-blended drop shadows with radial corners, spring-driven window motion, Intel Gen9 blitter with batched command buffers and hang capture, firmware framebuffer fallback |
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
-| **Userland** | `.vx` container format, `int 0x80` syscall ABI, a package store, five shipped apps |
+| **Memory** | Bitmap frame allocator over the firmware map; per-process PML4 with the kernel half shared by reference; slab and page-run kernel heap; W^X on every loaded image |
+| **Processes** | Ring 3 with its own GDT and TSS, SYSCALL/SYSRET and a DPL-3 `int 0x80` gate, preemptive priority round-robin on the APIC timer at 1 kHz, per-thread FPU state, faults that kill a thread instead of the machine |
+| **Userland** | `.vx` container format, two syscall ABIs, a C library (string.h, stdio.h, malloc over sbrk), a package store, five shipped apps |
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
 | **Audio** | AC97 bus-master playback out of a descriptor list, verified by capturing the guest's output to a WAV on the host and measuring it — 438.3 Hz against 440 requested |
 | **3D** | Integer software rasteriser: 16.16 fixed point, perspective divide once per vertex, 1/z depth buffer, backface culling, flat shading from cross-product normals with a bit-by-bit integer square root |
 | **Emulation** | A complete CHIP-8 interpreter — all 35 opcodes, 4 KB address space masked on every access, collision flag on sprite XOR |
-| **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels — all policy, none of it isolation |
+| **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels. Isolation is no longer only policy: an application runs in ring 3, in page tables that map its own image, stack, heap, one trampoline page and its own window's pixels, and nothing else |
 | **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
 
 <details>

@@ -123,6 +123,20 @@ static const igpu_id_t igpu_known[] = {
 #define BLT_DEPTH_32           (3u << 24)
 #define BLT_ROP_PATCOPY        (0xF0u << 16)
 
+/*
+ * Surface-to-surface copy. Ten dwords on gen8+, because both addresses
+ * are 64-bit: command, BR13, destination rectangle, destination address,
+ * source origin, source pitch, source address.
+ *
+ * This is what makes the blitter useful for something other than
+ * clearing. A fill can only paint a colour; a copy can move an image
+ * that the processor has already composed, which is the expensive half
+ * of every frame this system draws.
+ */
+#define XY_SRC_COPY_BLT_CMD    ((0x2u << 29) | (0x53u << 22) | \
+                                (1u << 21) | (1u << 20) | 8)    /* 10 dw */
+#define BLT_ROP_SRCCOPY        (0xCCu << 16)
+
 /* ===== DRIVER STATE ===== */
 
 #define IGPU_RING_PAGES 4
@@ -490,20 +504,152 @@ static int igpu_exec(const uint32_t *cmds, int ndw) {
     return -1;
 }
 
-/* Fill a rectangle in a GGTT-addressed 32bpp surface */
+/*
+ * ===== COMMAND BUFFERS =====
+ *
+ * Every operation used to be its own submission: write the ring, ring
+ * the doorbell, then spin on a breadcrumb until the engine had finished.
+ * That round trip costs far more than the blit for anything small, and
+ * it is paid once per rectangle — so a compositor that wanted to hand
+ * the blitter fifty rectangles would wait fifty times, and be slower
+ * than doing the work on the processor.
+ *
+ * A command buffer is filled with as many operations as the caller has
+ * and submitted once. The engine executes them back to back and the
+ * breadcrumb lands after the last one, so fifty rectangles cost one
+ * wait. That is the whole of the idea and it is where nearly all of the
+ * available speed is.
+ *
+ * Overflow is recorded rather than wrapped: silently dropping the tail
+ * of a batch would produce a frame that is subtly wrong and never say
+ * so, which is much worse than a batch that refuses and falls back to
+ * the processor.
+ */
+#define IGPU_CB_DWORDS 512
+
+typedef struct {
+    uint32_t dw[IGPU_CB_DWORDS];
+    int      n;          /* dwords used   */
+    int      ops;        /* operations in */
+    int      overflow;
+} igpu_cb_t;
+
+static void igpu_cb_reset(igpu_cb_t *cb) {
+    cb->n = 0;
+    cb->ops = 0;
+    cb->overflow = 0;
+}
+
+static uint32_t *igpu_cb_room(igpu_cb_t *cb, int need) {
+    if (cb->overflow || cb->n + need > IGPU_CB_DWORDS) {
+        cb->overflow = 1;
+        return 0;
+    }
+    uint32_t *p = cb->dw + cb->n;
+    cb->n += need;
+    cb->ops++;
+    return p;
+}
+
+/* Fill a rectangle in a GGTT-addressed 32bpp surface. */
+static int igpu_cb_fill(igpu_cb_t *cb, uint32_t dst_gpu, uint32_t pitch_bytes,
+                        int x1, int y1, int x2, int y2, uint32_t color) {
+    uint32_t *p = igpu_cb_room(cb, 7);
+    if (!p) return -1;
+    p[0] = XY_COLOR_BLT_CMD;
+    p[1] = BLT_DEPTH_32 | BLT_ROP_PATCOPY | (pitch_bytes & 0xFFFF);
+    p[2] = ((uint32_t)y1 << 16) | (uint32_t)x1;
+    p[3] = ((uint32_t)y2 << 16) | (uint32_t)x2;
+    p[4] = dst_gpu;
+    p[5] = 0;
+    p[6] = color;
+    return 0;
+}
+
+/* Copy a rectangle from one GGTT-addressed 32bpp surface to another.
+ * The rectangle is given as a destination position and a size, with the
+ * source origin separate, which is how the hardware wants it. */
+static int igpu_cb_copy(igpu_cb_t *cb,
+                        uint32_t dst_gpu, uint32_t dst_pitch, int dx, int dy,
+                        uint32_t src_gpu, uint32_t src_pitch, int sx, int sy,
+                        int w, int h) {
+    if (w <= 0 || h <= 0) return -1;
+    uint32_t *p = igpu_cb_room(cb, 10);
+    if (!p) return -1;
+    p[0] = XY_SRC_COPY_BLT_CMD;
+    p[1] = BLT_DEPTH_32 | BLT_ROP_SRCCOPY | (dst_pitch & 0xFFFF);
+    p[2] = ((uint32_t)dy << 16) | (uint32_t)dx;
+    p[3] = ((uint32_t)(dy + h) << 16) | (uint32_t)(dx + w);
+    p[4] = dst_gpu;
+    p[5] = 0;
+    p[6] = ((uint32_t)sy << 16) | (uint32_t)sx;
+    p[7] = src_pitch & 0xFFFF;
+    p[8] = src_gpu;
+    p[9] = 0;
+    return 0;
+}
+
+static int igpu_cb_submit(igpu_cb_t *cb) {
+    if (cb->overflow) {
+        igpu_log("command buffer overflowed - batch refused");
+        return -1;
+    }
+    if (cb->n == 0) return 0;
+    return igpu_exec(cb->dw, cb->n);
+}
+
+/* One-shot fill, for the callers that only ever have one. */
 static int igpu_blt_fill(uint32_t dst_gpu, uint32_t pitch_bytes,
                          int x1, int y1, int x2, int y2, uint32_t color) {
-    uint32_t cmd[7] = {
-        XY_COLOR_BLT_CMD,
-        BLT_DEPTH_32 | BLT_ROP_PATCOPY | (pitch_bytes & 0xFFFF),
-        ((uint32_t)y1 << 16) | (uint32_t)x1,
-        ((uint32_t)y2 << 16) | (uint32_t)x2,
-        dst_gpu,
-        0,
-        color,
-    };
-    return igpu_exec(cmd, 7);
+    static igpu_cb_t cb;
+    igpu_cb_reset(&cb);
+    if (igpu_cb_fill(&cb, dst_gpu, pitch_bytes, x1, y1, x2, y2, color) != 0)
+        return -1;
+    return igpu_cb_submit(&cb);
 }
+
+/* ===== PUBLIC: batched work on the visible framebuffer ===== */
+
+static igpu_cb_t igpu_frame_cb;
+
+static void igpu_batch_begin(void) { igpu_cb_reset(&igpu_frame_cb); }
+
+static int igpu_batch_fill(int x, int y, int w, int h, uint32_t color) {
+    if (!igpu.active || !igpu.fb_blittable) return -1;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0) return -1;
+    if ((uint32_t)(x + w) > igpu.fb_w) w = (int)igpu.fb_w - x;
+    if ((uint32_t)(y + h) > igpu.fb_h) h = (int)igpu.fb_h - y;
+    if (w <= 0 || h <= 0) return -1;
+    return igpu_cb_fill(&igpu_frame_cb, igpu.fb_gpu_addr, igpu.fb_pitch_bytes,
+                        x, y, x + w, y + h, color);
+}
+
+/* Move a region of the screen. Scrolling a list and dragging a window
+ * are both this, and both are pure memory traffic the processor should
+ * not be doing. */
+static int igpu_batch_move(int sx, int sy, int dx, int dy, int w, int h) {
+    if (!igpu.active || !igpu.fb_blittable) return -1;
+    if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w <= 0 || h <= 0) return -1;
+    if ((uint32_t)(sx + w) > igpu.fb_w || (uint32_t)(dx + w) > igpu.fb_w)
+        return -1;
+    if ((uint32_t)(sy + h) > igpu.fb_h || (uint32_t)(dy + h) > igpu.fb_h)
+        return -1;
+    return igpu_cb_copy(&igpu_frame_cb,
+                        igpu.fb_gpu_addr, igpu.fb_pitch_bytes, dx, dy,
+                        igpu.fb_gpu_addr, igpu.fb_pitch_bytes, sx, sy, w, h);
+}
+
+static int igpu_batch_submit(void) {
+    if (!igpu.active) return -1;
+    if (igpu_frame_cb.n == 0) return 0;
+    if (igpu_forcewake_get() != 0) return -1;
+    int rc = igpu_cb_submit(&igpu_frame_cb);
+    igpu_forcewake_put();
+    igpu_cb_reset(&igpu_frame_cb);
+    return rc;
+}
+
+static int igpu_batch_ops(void) { return igpu_frame_cb.ops; }
 
 /* ===== PUBLIC: fill on the visible framebuffer (real hardware) ===== */
 
@@ -647,6 +793,66 @@ static void igpu_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h,
         }
     }
     igpu_log("self-test passed: XY_COLOR_BLT verified by CPU readback");
+
+    /*
+     * ---- second self-test: a batch, and a copy ----
+     *
+     * The point of the first test is that the engine runs at all. The
+     * point of this one is that it runs several commands from a single
+     * submission and that XY_SRC_COPY_BLT is encoded correctly -- which
+     * is a claim about ten dwords of bit layout that no amount of
+     * reading the specification settles as well as the hardware does.
+     *
+     * Four stripes are filled into the top half of the scratch surface
+     * in one batch, then the top half is copied over the bottom. Every
+     * pixel is checked, including that the stripes are in the right
+     * places: a copy that transposed its source and destination
+     * rectangles would still fill the surface, just wrongly.
+     */
+    {
+        static const uint32_t stripe[4] = {
+            0x00112233u, 0x00445566u, 0x00778899u, 0x00AABBCCu
+        };
+        for (int i = 0; i < IGPU_TEST_W * IGPU_TEST_H; i++)
+            igpu_target[i] = 0x11111111;
+        __asm__ volatile("mfence" ::: "memory");
+
+        igpu_cb_t cb;
+        igpu_cb_reset(&cb);
+        for (int i = 0; i < 4; i++)
+            igpu_cb_fill(&cb, igpu.target_gpu, IGPU_TEST_W * 4,
+                         0, i * 8, IGPU_TEST_W, i * 8 + 8, stripe[i]);
+        igpu_cb_copy(&cb,
+                     igpu.target_gpu, IGPU_TEST_W * 4, 0, 32,
+                     igpu.target_gpu, IGPU_TEST_W * 4, 0, 0,
+                     IGPU_TEST_W, 32);
+
+        if (igpu_cb_submit(&cb) != 0) {
+            igpu_fail("batch self-test: breadcrumb timeout");
+            return;
+        }
+
+        for (int off = 0; off < IGPU_TEST_W * IGPU_TEST_H * 4; off += 64)
+            __asm__ volatile("clflush (%0)" ::
+                             "r"((uint8_t *)igpu_target + off) : "memory");
+        __asm__ volatile("mfence" ::: "memory");
+
+        int bad = 0;
+        for (int y = 0; y < IGPU_TEST_H && !bad; y++) {
+            int band = (y % 32) / 8;
+            uint32_t want = (y < 32 || y >= 64) ? stripe[band]
+                          : (band < 4 ? stripe[band] : 0x11111111u);
+            if (y >= 32) want = stripe[(y - 32) / 8];
+            for (int x = 0; x < IGPU_TEST_W; x++)
+                if (igpu_target[y * IGPU_TEST_W + x] != want) { bad = 1; break; }
+        }
+        if (bad) {
+            igpu_fail("batch self-test: pixel mismatch");
+            return;
+        }
+        igpu_log("self-test passed: 5-command batch and XY_SRC_COPY_BLT "
+                 "verified by CPU readback");
+    }
 
     /* ---- can the blitter reach the visible framebuffer? ----
      * On Intel-scanout machines the GOP framebuffer lives in the GMADR

@@ -289,6 +289,123 @@ static void term_gpu_reg_row(const char *key, uint32_t val) {
     term_putc('\n');
 }
 
+/*
+ * `gpu bench` -- hand the blitter a real batch and time it.
+ *
+ * The boot self-test proves the command encodings against a scratch
+ * surface. This proves the thing the encodings exist for: that a batch
+ * of work submitted once is faster than the processor doing it, on the
+ * visible framebuffer, on whatever machine is actually running.
+ *
+ * It is a command rather than something the compositor does on its own,
+ * and that is deliberate. Routing every frame through the blitter is a
+ * claim about hardware, and the machine this was written on has no
+ * supported iGPU to test it against; wiring an unverified path into the
+ * one operation that puts pixels on the panel would be trading a
+ * measured 60 fps for an untested one. This is how someone with the
+ * hardware finds out first.
+ */
+static void term_cmd_gpu_bench(void) {
+    if (!igpu.active) {
+        term_print_c("gpu: blitter not active - ", 2);
+        term_print_c(igpu.status, 2);
+        term_putc('\n');
+        return;
+    }
+    if (!igpu.fb_blittable) {
+        term_print_c("gpu: the framebuffer is not GGTT-reachable on this "
+                     "machine, so there is nothing to blit to\n", 2);
+        return;
+    }
+
+    const int N = 64;
+    const int bw = 48, bh = 32;
+
+    /* What the processor costs for the same work, on the same memory --
+     * the framebuffer itself, reached through the direct map, which is
+     * what igpu.fb_phys is recorded for. */
+    volatile uint32_t *fb =
+        (volatile uint32_t *)(uintptr_t)phys_to_virt(igpu.fb_phys);
+    const uint32_t pitch_px = igpu.fb_pitch_bytes / 4;
+
+    uint64_t t0 = cycle_now();
+    for (int i = 0; i < N; i++) {
+        int x = (i * 37) % ((int)igpu.fb_w - bw);
+        int y = (i * 53) % ((int)igpu.fb_h - bh);
+        for (int r = 0; r < bh; r++)
+            for (int c = 0; c < bw; c++)
+                fb[(uint32_t)(y + r) * pitch_px + (uint32_t)(x + c)] = 0x101018u;
+    }
+    uint64_t t1 = cycle_now();
+
+    /* And what one batch costs. */
+    igpu_batch_begin();
+    for (int i = 0; i < N; i++) {
+        int x = (i * 37) % ((int)igpu.fb_w - bw);
+        int y = (i * 53) % ((int)igpu.fb_h - bh);
+        igpu_batch_fill(x, y, bw, bh, 0x101018u);
+    }
+    int ops = igpu_batch_ops();
+    uint64_t t2 = cycle_now();
+    int rc = igpu_batch_submit();
+    uint64_t t3 = cycle_now();
+
+    char nb[16];
+    term_print_c("gpu bench: ", 3);
+    uint_to_str((uint32_t)N, nb); term_print(nb);
+    term_print(" rectangles of ");
+    uint_to_str((uint32_t)bw, nb); term_print(nb);
+    term_print("x");
+    uint_to_str((uint32_t)bh, nb); term_print(nb);
+    term_putc('\n');
+
+    term_print("  cpu            ");
+    uint_to_str(cycles_to_us(t1 - t0), nb); term_print(nb);
+    term_print(" us\n");
+
+    term_print("  batch encode   ");
+    uint_to_str(cycles_to_us(t2 - t1), nb); term_print(nb);
+    term_print(" us (");
+    uint_to_str((uint32_t)ops, nb); term_print(nb);
+    term_print(" commands, one submission)\n");
+
+    term_print("  gpu execute    ");
+    uint_to_str(cycles_to_us(t3 - t2), nb); term_print(nb);
+    term_print(" us\n");
+
+    if (rc != 0)
+        term_print_c("  the batch did not complete - see `gpu error`\n", 2);
+
+    /*
+     * And the copy, which is the operation worth having. Moving a large
+     * region of the screen is what dragging a window and scrolling a
+     * list both are, and it is pure memory traffic -- the case where a
+     * blitter beats a processor by the widest margin.
+     */
+    {
+        int mw = (int)igpu.fb_w / 2, mh = (int)igpu.fb_h / 3;
+        if (mw > 8 && mh > 8) {
+            igpu_batch_begin();
+            igpu_batch_move(0, 0, mw, mh, mw, mh);
+            uint64_t m0 = cycle_now();
+            int mrc = igpu_batch_submit();
+            uint64_t m1 = cycle_now();
+
+            term_print("  gpu copy       ");
+            uint_to_str(cycles_to_us(m1 - m0), nb); term_print(nb);
+            term_print(" us for ");
+            uint_to_str((uint32_t)(mw * mh / 1000), nb); term_print(nb);
+            term_print("k pixels");
+            if (mrc != 0) term_print_c("  (failed)", 2);
+            term_putc('\n');
+        }
+    }
+
+    /* Both halves wrote straight to the panel, behind the compositor's
+     * back. The frame diff has no idea, so ask for one full repaint. */
+    gfx_force_full_flip = 1;
+}
+
 static void term_cmd_gpu_error(void) {
     if (!igpu_crash.valid) {
         term_print_c("no GPU errors recorded\n", 4);
@@ -1295,6 +1412,8 @@ static void term_exec(char *cmdline) {
     } else if (str_eq(cmd, "gpu")) {
         if (argc >= 2 && str_eq(argv[1], "error")) {
             term_cmd_gpu_error();
+        } else if (argc >= 2 && str_eq(argv[1], "bench")) {
+            term_cmd_gpu_bench();
         } else if (argc >= 2 && str_eq(argv[1], "decode")) {
             uint32_t dw;
             if (argc < 3 || !term_parse_hex(argv[2], &dw)) {

@@ -34,46 +34,185 @@
  * so a focused window and the thing behind it were the same distance
  * away. This is what puts them at different distances.
  *
- * The falloff is a shift and nothing else: ring d is drawn at
- * GFX_SHADOW_A >> d, so the alpha halves every pixel outward -- 52, 26,
- * 13, 6, 3, 1 -- which is the shape a real penumbra has anyway and costs
- * one shift per ring rather than a multiply per pixel.
+ * ---- the falloff ----
  *
- * Rings, not a filled rectangle. A filled shadow blends width x height
- * pixels of which the window then covers all but a thin L, so nearly all
- * of that work is thrown away; the rings cover exactly the band that
- * shows. The offset is larger downward than sideways, because a light
- * that is above casts further below.
+ * It used to be a shift: ring d at alpha >> d, which gives 104, 52, 26,
+ * 13, 6, 3, 1 and is gone to nothing three pixels out. That was not a
+ * judgement about how shadows look; it was the only smooth-ish curve
+ * available to a kernel with no floating point.
+ *
+ * A real penumbra is a blurred step edge, which is an error function,
+ * which to the eye is a smoothstep. That is what the table below holds,
+ * computed once on first use: 1 - (3t^2 - 2t^3) across the radius, so
+ * the shadow stays dark through its first third and then fades over the
+ * rest instead of collapsing immediately.
+ *
+ * ---- and the corners ----
+ *
+ * Drawing rings gives a shadow with square corners, which nothing in the
+ * world has: light wrapping past a corner is attenuated in two
+ * directions at once. The four corner blocks are therefore drawn per
+ * pixel with the distance taken radially, so the shadow is genuinely
+ * rounded. That is four times the radius squared of per-pixel work --
+ * a few hundred pixels -- against a frame of a million.
+ *
+ * The straight edges stay as strips, for the reason they always were:
+ * filling the whole rectangle would blend width x height pixels of which
+ * the window covers all but a thin band. The offset is larger downward
+ * than sideways, because a light that is above casts further below.
  */
-#define GFX_SHADOW_R  6      /* how far the penumbra reaches   */
-#define GFX_SHADOW_A  104    /* alpha at the shadow's own edge */
-#define GFX_SHADOW_DX 4      /* offset out                     */
-#define GFX_SHADOW_DY 6      /* and, further, down             */
+#define GFX_SHADOW_R  10     /* how far the penumbra reaches   */
+#define GFX_SHADOW_A  120    /* alpha at the shadow's own edge */
+#define GFX_SHADOW_DX 3      /* offset out                     */
+#define GFX_SHADOW_DY 8      /* and, further, down             */
+#define GFX_SHADOW_MAXR 24
 
 static void gfx_rect_blend(uint32_t *buf, uint32_t bw, uint32_t bh,
                            int32_t x, int32_t y, int32_t w, int32_t h,
                            uint32_t color, uint32_t alpha);
+static inline uint32_t gfx_mix(uint32_t a, uint32_t b, uint32_t alpha);
 
+/*
+ * gfx_fall[r][d] is the *profile* at distance d for a shadow of radius
+ * r: the falloff normalised to a peak of 255, filled in the first time
+ * that radius is asked for and scaled by the caller's own peak at use.
+ *
+ * Storing it already scaled would be one multiply cheaper and wrong. The
+ * animation code asks for the same radius at a peak that changes every
+ * frame as a window fades, and a table cached on radius alone would hand
+ * back whatever alpha the first caller happened to want -- a ghost that
+ * fades away while its shadow stays exactly as dark as it started.
+ */
+static uint8_t gfx_fall[GFX_SHADOW_MAXR + 1][GFX_SHADOW_MAXR + 2];
+static uint8_t gfx_fall_ready[GFX_SHADOW_MAXR + 1];
+
+static void gfx_shadow_table(int r) {
+    if (gfx_fall_ready[r]) return;
+    for (int d = 0; d <= r + 1; d++) {
+        float t = (float)d / (float)(r + 1);
+        if (t > 1.0f) t = 1.0f;
+        float s = 1.0f - (3.0f * t * t - 2.0f * t * t * t);
+        int   a = (int)(255.0f * s + 0.5f);
+        gfx_fall[r][d] = (uint8_t)(a < 0 ? 0 : (a > 255 ? 255 : a));
+    }
+    gfx_fall_ready[r] = 1;
+}
+
+/*
+ * A soft shadow under an arbitrary rectangle.
+ *
+ * Windows, menus, the dock, jump lists, the notification panel: anything
+ * that floats over something else. A menu drawn without one reads as
+ * painted onto the desktop rather than held above it, and until now
+ * every one of them was.
+ */
+static void gfx_shadow_rect(uint32_t *buf, uint32_t bw, uint32_t bh,
+                            int32_t x, int32_t y, int32_t w, int32_t h,
+                            int radius, int peak, int32_t dx, int32_t dy) {
+    if (w <= 0 || h <= 0) return;
+    if (radius < 1) radius = 1;
+    if (radius > GFX_SHADOW_MAXR) radius = GFX_SHADOW_MAXR;
+    if (peak < 0) peak = 0;
+    if (peak > 255) peak = 255;
+    gfx_shadow_table(radius);
+    const uint8_t *fall = gfx_fall[radius];
+
+    const int32_t sx = x + dx, sy = y + dy;
+    const int32_t rx = sx + w, ry = sy + h;      /* one past the edges */
+
+    /* Straight edges: one strip per distance, four sides. */
+    for (int d = 1; d <= radius; d++) {
+        uint32_t a = (uint32_t)fall[d] * (uint32_t)peak / 255u;
+        if (!a) continue;
+        gfx_rect_blend(buf, bw, bh, sx, sy - d,      w, 1, 0x000000u, a);
+        gfx_rect_blend(buf, bw, bh, sx, ry + d - 1,  w, 1, 0x000000u, a);
+        gfx_rect_blend(buf, bw, bh, sx - d,     sy,  1, h, 0x000000u, a);
+        gfx_rect_blend(buf, bw, bh, rx + d - 1, sy,  1, h, 0x000000u, a);
+    }
+
+    /*
+     * Corners, per pixel and radially. (cx, cy) is the corner the
+     * distance is measured from and (ox, oy) the direction the block
+     * extends in, so one loop covers all four.
+     */
+    const int32_t cx[4] = { sx,     rx - 1, sx,     rx - 1 };
+    const int32_t cy[4] = { sy,     sy,     ry - 1, ry - 1 };
+    const int32_t ox[4] = { -1,      1,     -1,      1 };
+    const int32_t oy[4] = { -1,     -1,      1,      1 };
+
+    for (int c = 0; c < 4; c++) {
+        for (int j = 1; j <= radius; j++) {
+            int32_t py = cy[c] + oy[c] * j;
+            if (py < 0 || py >= (int32_t)bh) continue;
+            uint32_t *row = buf + (uint32_t)py * bw;
+            for (int i = 1; i <= radius; i++) {
+                int d = (int)(__builtin_sqrtf((float)(i * i + j * j)) + 0.5f);
+                if (d > radius) continue;
+                uint32_t a = (uint32_t)fall[d] * (uint32_t)peak / 255u;
+                if (!a) continue;
+                int32_t px = cx[c] + ox[c] * i;
+                if (px < 0 || px >= (int32_t)bw) continue;
+                row[px] = gfx_mix(0x000000u, row[px], a);
+            }
+        }
+    }
+}
+
+/* What a window gets. */
 static void gfx_shadow(uint32_t *buf, uint32_t bw, uint32_t bh,
                        int32_t x, int32_t y, int32_t w, int32_t h) {
-    if (w <= 0 || h <= 0) return;
+    gfx_shadow_rect(buf, bw, bh, x, y, w, h,
+                    GFX_SHADOW_R, GFX_SHADOW_A, GFX_SHADOW_DX, GFX_SHADOW_DY);
+}
 
-    const int32_t sx = x + GFX_SHADOW_DX;
-    const int32_t sy = y + GFX_SHADOW_DY;
+/* Tighter and closer, for the things that hover just above the surface
+ * rather than well over it: menus, jump lists, the dock, popups. */
+static void gfx_shadow_popup(uint32_t *buf, uint32_t bw, uint32_t bh,
+                             int32_t x, int32_t y, int32_t w, int32_t h) {
+    gfx_shadow_rect(buf, bw, bh, x, y, w, h, 7, 100, 0, 3);
+}
 
-    for (int32_t d = GFX_SHADOW_R; d >= 0; d--) {
-        const uint32_t a = (uint32_t)GFX_SHADOW_A >> d;
-        if (!a) continue;
+/* ===== MOTION =====
+ *
+ * A critically damped spring, integrated one frame at a time.
+ *
+ * There was no motion here at all beyond a linear ramp over twelve
+ * frames, because a linear ramp is what integers can express. It reads
+ * as mechanical for a reason that is easy to state: real things do not
+ * start and stop instantly, and a constant velocity means infinite
+ * acceleration at both ends.
+ *
+ * This is not an easing curve looked up from a table — it is the
+ * differential equation, stepped. Position accelerates toward the target
+ * in proportion to the distance remaining and is damped in proportion to
+ * its own speed, at exactly the damping that reaches the target as fast
+ * as possible without going past it. The result is fast at first, slow
+ * at the end, and never overshoots.
+ *
+ * k is the stiffness. 220 settles in roughly a third of a second at
+ * 60 Hz, which is about as long as an interface can take before it
+ * feels slow and about as short as it can take before it feels abrupt.
+ */
+typedef struct { float p, v; } spring_t;
 
-        const int32_t rx = sx - d, ry = sy - d;
-        const int32_t rw = w + 2 * d, rh = h + 2 * d;
+#define SPRING_K   220.0f
+#define SPRING_DT  (1.0f / 60.0f)
 
-        /* The ring only, one pixel thick on each side. */
-        gfx_rect_blend(buf, bw, bh, rx, ry, rw, 1, 0x000000u, a);
-        gfx_rect_blend(buf, bw, bh, rx, ry + rh - 1, rw, 1, 0x000000u, a);
-        gfx_rect_blend(buf, bw, bh, rx, ry + 1, 1, rh - 2, 0x000000u, a);
-        gfx_rect_blend(buf, bw, bh, rx + rw - 1, ry + 1, 1, rh - 2, 0x000000u, a);
-    }
+static inline void spring_step(spring_t *s, float target) {
+    const float c = 2.0f * __builtin_sqrtf(SPRING_K);   /* critical */
+    float a = -SPRING_K * (s->p - target) - c * s->v;
+    s->v += a * SPRING_DT;
+    s->p += s->v * SPRING_DT;
+}
+
+static inline int spring_settled(const spring_t *s, float target) {
+    float d = s->p - target;  if (d < 0.0f) d = -d;
+    float v = s->v;           if (v < 0.0f) v = -v;
+    return d < 0.004f && v < 0.05f;
+}
+
+static inline float gfx_lerp(float a, float b, float t) {
+    return a + (b - a) * t;
 }
 
 /* ===== BASIC PRIMITIVES ===== */
