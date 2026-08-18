@@ -1,6 +1,8 @@
 #ifndef NETSTACK_H
 #define NETSTACK_H
 
+#include "tls.h"
+
 #include <stdint.h>
 
 /*

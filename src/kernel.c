@@ -1062,6 +1062,7 @@ void kmain(void) {
     blk_init();
     blk_cache_init();
     part_scan();
+    ntfs_mount();
 #ifdef STORAGE_SELFTEST
     blk_selftest();
 #endif

@@ -198,7 +198,7 @@ build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
 # The cipher is checked against the RFC's published vectors, not against
 # itself: an implementation that is merely self-consistent round-trips
 # perfectly and protects nothing.
-build/crypto_test: tools/crypto_test.c src/chacha20.h src/sha256.h
+build/crypto_test: tools/crypto_test.c src/chacha20.h src/sha256.h src/tls.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
 
