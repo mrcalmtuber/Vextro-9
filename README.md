@@ -824,9 +824,12 @@ sine table, which are data rather than logic.)
 | **Audio** | AC97 bus-mastering playback; FLAC, IMA ADPCM and G.711 decoders, all integer |
 | **3D** | `g3d`: pipelines, vertex and index buffers, matrices, a command buffer, and G3SL — a shader language with a tokeniser, precedence parser, type checker and stack machine |
 | **Virtualisation** | AMD-V hypervisor on x86: VMCB, nested paging, and a 32-bit guest that runs on the processor |
-| **Filesystem** | Read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
+| **Filesystem** | NTFS read-only: $MFT records, per-sector fixups, resident and non-resident data, signed run lists; GPT and MBR partition tables; case-insensitive matching, 8.3 short names, security identifiers and access control lists, open-handle share modes, directory change notification; read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO — behind one 512-byte sector view |
 | **Network** | IPv4, ICMP, UDP, DNS, TCP, async HTTP/1.0 with redirects; Intel e1000 driver |
+| **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology split into packages, cores and threads from CPUID leaf 0x0B; microcode revision read and updates applied if present |
+| **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
+| **Transport security** | TLS 1.3 with X25519, ChaCha20-Poly1305 and SHA-256, checked against RFC 7748, 8439 and 5869 — no certificate verification yet, and the browser says so |
 | **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage, alpha-blended drop shadows with radial corners, spring-driven window motion, Intel Gen9 blitter with batched command buffers and hang capture, firmware framebuffer fallback |
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
