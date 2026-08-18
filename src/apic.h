@@ -66,6 +66,7 @@ static inline void lapic_write(uint32_t reg, uint32_t val) {
  * that does not blocks every interrupt at or below its priority for
  * good — which presents as the machine freezing some seconds after
  * boot, with no fault and nothing on the wire. */
+__attribute__((always_inline, target("general-regs-only")))
 static inline void lapic_eoi(void) {
     if (lapic_present) lapic_write(APIC_REG_EOI, 0);
 }

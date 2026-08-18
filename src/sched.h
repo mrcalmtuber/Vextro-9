@@ -368,8 +368,26 @@ static void sched_idle_loop(void) {
 static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
                                     uint32_t prio);
 
+/*
+ * Start switching — but only if there is something to switch on.
+ *
+ * Every blocking point in this scheduler works by marking a thread as
+ * not-runnable and waiting for a timer to put it back. On a machine with
+ * no local APIC there is no such timer, so the compositor would stand
+ * down for the first frame and nothing would ever wake it: a desktop
+ * that draws one frame and stops. Better to keep the whole thing dormant
+ * and let the render loop run exactly as it did before threads existed.
+ */
 static void sched_start(void) {
+    if (!lapic_present) {
+        serial_puts("[sched] no APIC timer: staying single-threaded\n");
+        return;
+    }
     idle_thread = sched_spawn_kernel(sched_idle_loop, "idle", PRIO_IDLE);
+    if (!idle_thread) {
+        serial_puts("[sched] no memory for the idle thread\n");
+        return;
+    }
     sched_running = 1;
 }
 
@@ -508,6 +526,7 @@ static void sched_wait_frame(void) {
 /* Called from the 60 Hz timer. Anything waiting on a frame is now
  * runnable; the next scheduler tick, at most a millisecond away, will
  * pick the highest-priority one of them. */
+__attribute__((target("general-regs-only")))
 static void sched_frame_pulse(void) {
     for (int i = 0; i < SCHED_MAX_THREADS; i++) {
         thread_t *t = threads[i];
@@ -570,6 +589,9 @@ static void sched_reap(void) {
  */
 static int sched_join(thread_t *t, uint32_t timeout_ms) {
     if (!t) return -1;
+    /* Without a scheduler clock the deadline below never advances, so a
+     * wait would be forever rather than bounded. */
+    if (!sched_running) return -1;
     uint64_t deadline = sched_ticks + timeout_ms;
     __asm__ volatile("sti" ::: "memory");
     while (t->state != T_ZOMBIE && t->state != T_FREE) {

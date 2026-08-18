@@ -338,7 +338,11 @@ __asm__(
     ".align 16\n"
     ".globl utramp_exit\n"
     "utramp_exit:\n"
-    "  movl %eax, %edi\n"
+    /* Zero, not EAX. `_start` returns void, so nothing has put a status
+     * there — and the legacy gate preserves RAX, so what is actually in
+     * it is the number of the last syscall the program made. Passing
+     * that on made every clean exit report a failure. */
+    "  xorl %edi, %edi\n"
     "  movl $4, %eax\n"
     "  int $0x80\n"
     "1:\n"

@@ -166,37 +166,34 @@ static void pic_remap(void) {
     outb(PIC2_DATA, 0xFF);
 }
 
-/* ---- Catch-all: silently return from any unexpected vector ---- */
-__attribute__((interrupt))
+/*
+ * ---- Catch-all: silently return from any unexpected vector ----
+ *
+ * target("general-regs-only") on every handler in this kernel, and it is
+ * not optional now that the rest of it is compiled with SSE available.
+ * GCC's interrupt attribute saves and restores the general-purpose
+ * registers; it does not save XMM, so a handler that used one would hand
+ * the interrupted thread back a register it never wrote. Threads carry
+ * their own extended state through the scheduler — handlers simply do
+ * not get to touch it.
+ */
+__attribute__((interrupt, target("general-regs-only")))
 static void isr_noop(interrupt_frame_t *f) { (void)f; }
 
-/* Handler for exceptions that push an error code (vectors 8,10-14,17,21,29,30).
- * Without this, iretq pops the stale error code as RIP → cascade → triple fault. */
-__attribute__((interrupt))
-static void isr_noop_err(interrupt_frame_t *f, uint64_t err) {
-    (void)f; (void)err;
-    while (1) __asm__ volatile("hlt");
-}
-
-/* Remap PIC + fill all 256 gates with the no-op stub */
+/*
+ * Fill all 256 gates with the no-op stub, and remap the PIC.
+ *
+ * The first thirty-two vectors are overwritten immediately afterwards by
+ * trap_install() in trap.h, which is where the exceptions are actually
+ * handled — a page fault has to be diagnosed and a faulting thread has
+ * to be killed, and neither is something a no-op can do. What this
+ * leaves behind is the floor: every vector points somewhere valid, so an
+ * interrupt nothing claimed returns instead of triple-faulting.
+ */
 static void idt_init(uint16_t cs) {
     pic_remap();
     for (int i = 0; i < IDT_SIZE; i++)
         idt_set_gate(i, isr_noop, cs);
-
-    /* Override vectors that push an error code with the correct signature */
-    void (*eh)(interrupt_frame_t *) =
-        (void (*)(interrupt_frame_t *))(uintptr_t)isr_noop_err;
-    idt_set_gate(8,  eh, cs);   /* #DF Double Fault        */
-    idt_set_gate(10, eh, cs);   /* #TS Invalid TSS         */
-    idt_set_gate(11, eh, cs);   /* #NP Segment Not Present */
-    idt_set_gate(12, eh, cs);   /* #SS Stack-Segment Fault */
-    idt_set_gate(13, eh, cs);   /* #GP General Protection  */
-    idt_set_gate(14, eh, cs);   /* #PF Page Fault          */
-    idt_set_gate(17, eh, cs);   /* #AC Alignment Check     */
-    idt_set_gate(21, eh, cs);   /* #CP Control Protection  */
-    idt_set_gate(29, eh, cs);   /* #VC VMM Communication   */
-    idt_set_gate(30, eh, cs);   /* #SX Security Exception  */
 }
 
 static void idt_load(void) {

@@ -97,6 +97,7 @@ static int vmm_drain(void) {
 }
 
 /* ---- IRQ12 handler: one assembled PS/2 packet ---- */
+__attribute__((target("general-regs-only")))
 static void mouse_packet(void) {
     /*
      * An absolute pointer answers here first.  QEMU raises IRQ12 by
@@ -143,7 +144,7 @@ static void mouse_packet(void) {
         mouse_wheel -= (int32_t)(int8_t)mouse_buf[3];
 }
 
-__attribute__((interrupt))
+__attribute__((interrupt, target("general-regs-only")))
 static void irq12_handler(interrupt_frame_t *frame) {
     (void)frame;
 

@@ -47,6 +47,7 @@ static const char scancode_upper[128] = {
     0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+__attribute__((target("general-regs-only")))
 static void kb_push(char ch) {
     uint32_t next = (kb_head + 1) % KB_BUF_SIZE;
     if (next != kb_tail) {
@@ -55,7 +56,7 @@ static void kb_push(char ch) {
     }
 }
 
-__attribute__((interrupt))
+__attribute__((interrupt, target("general-regs-only")))
 static void irq1_handler(interrupt_frame_t *frame) {
     (void)frame;
 

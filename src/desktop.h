@@ -1075,12 +1075,24 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
         return -1;
     }
 
+    /*
+     * The lowest address any segment actually occupies.
+     *
+     * p_memsz == 0 is skipped, and that is not a refinement — it is a
+     * bug fix. A program with nothing in .data or .bss still gets a
+     * second PT_LOAD from the linker, empty, with a virtual address of
+     * zero, because there is nothing in it to give an address to. Count
+     * that and the image appears to be linked at zero: the whole thing
+     * shifts up by a page, and the loader's own bounds check then
+     * rejects it for living outside user space. It went unnoticed
+     * because every program that existed had a .data section.
+     */
     uint64_t base_vaddr = ~(uint64_t)0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
             (file + ehdr->e_phoff + i * ehdr->e_phentsize);
-        if (ph->p_type == ELF_PT_LOAD && ph->p_vaddr < base_vaddr)
-            base_vaddr = ph->p_vaddr;
+        if (ph->p_type != ELF_PT_LOAD || ph->p_memsz == 0) continue;
+        if (ph->p_vaddr < base_vaddr) base_vaddr = ph->p_vaddr;
     }
     if (base_vaddr == ~(uint64_t)0) {
         if (verbose) term_print_c("run: no loadable segments\n", 2);
@@ -1096,7 +1108,7 @@ static int load_elf_image(const uint8_t *file, uint64_t fsize, int verbose,
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)
             (file + ehdr->e_phoff + i * ehdr->e_phentsize);
-        if (ph->p_type != ELF_PT_LOAD) continue;
+        if (ph->p_type != ELF_PT_LOAD || ph->p_memsz == 0) continue;
         uint64_t offset = ph->p_vaddr - base_vaddr;
         if (offset + ph->p_memsz > APP_MEM_SIZE) {
             if (verbose) term_print_c("run: segment too large\n", 2);
@@ -1255,15 +1267,32 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
         if (verbose) term_print_c("run: no virtual memory manager\n", 2);
         return 0;
     }
+    if (!sched_running) {
+        /* A thread created here would be created and never picked. Say
+         * so rather than open a window that stays empty forever. */
+        if (verbose)
+            term_print_c("run: no scheduler on this machine "
+                         "(no APIC timer)\n", 2);
+        serial_puts("[exec] refused: the scheduler is not running\n");
+        return 0;
+    }
     if (base_va < USER_MIN || base_va + span > USER_IMAGE_MAX) {
         if (verbose) term_print_c("run: image links outside user space\n", 2);
+        serial_puts("[exec] image links outside user space\n");
         return 0;
     }
 
     addr_space_t *as = (addr_space_t *)kmalloc(sizeof(addr_space_t));
-    if (!as) return 0;
+    if (!as) {
+        serial_puts("[exec] no memory for an address space\n");
+        return 0;
+    }
     for (uint64_t i = 0; i < sizeof(addr_space_t); i++) ((uint8_t *)as)[i] = 0;
-    if (vmm_create(as) != 0) { kfree(as); return 0; }
+    if (vmm_create(as) != 0) {
+        serial_puts("[exec] could not create an address space\n");
+        kfree(as);
+        return 0;
+    }
 
     /* The image, one page at a time, each with the protection its
      * segment asked for. A page that no segment claimed is not mapped
@@ -1336,6 +1365,9 @@ fail:
     vmm_destroy(as);
     kfree(as);
     if (verbose) term_print_c("run: could not build the address space\n", 2);
+    serial_puts("[exec] could not map ");
+    serial_puts(name);
+    serial_puts(" into its address space\n");
     return 0;
 }
 
@@ -1388,6 +1420,12 @@ static int execute_bin_full(const char *filepath, int verbose,
             term_print_c(filepath, 2);
             term_print("\n");
         }
+        /* On serial too, and regardless of verbosity. A launch that fails
+         * silently is indistinguishable from one that never happened,
+         * which is exactly what a headless test cannot tell apart. */
+        serial_puts("[exec] cannot read ");
+        serial_puts(filepath);
+        serial_puts("\n");
         return -1;
     }
 
@@ -1447,9 +1485,17 @@ static int execute_bin_full(const char *filepath, int verbose,
     } else {
         if (verbose)
             term_print_c("run: not a .vx or ELF64 executable\n", 2);
+        serial_puts("[exec] not an executable: ");
+        serial_puts(filepath);
+        serial_puts("\n");
         return -1;
     }
-    if (rc != 0) return -1;
+    if (rc != 0) {
+        serial_puts("[exec] could not load ");
+        serial_puts(filepath);
+        serial_puts("\n");
+        return -1;
+    }
 
     if (verbose) {
         term_print_c(filepath, 3);

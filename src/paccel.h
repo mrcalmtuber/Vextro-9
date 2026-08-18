@@ -73,6 +73,7 @@ static uint32_t paccel_speed = 0;
  * Called with the raw counts from the device, and leaves the accelerated
  * ones in the same variables.
  */
+__attribute__((target("general-regs-only")))
 static void paccel_apply(int32_t *dx, int32_t *dy) {
     int32_t rx = *dx, ry = *dy;
 

@@ -6,6 +6,7 @@
 #include "gdt.h"
 #include "vmm.h"
 #include "kheap.h"
+#include "klibc.h"
 #include "syscall.h"
 #include "sched.h"
 #include "trap.h"
@@ -284,7 +285,7 @@ static void login_draw_notice(uint32_t *buf, uint32_t w, uint32_t h) {
 static int hal_ps2_present = 1;
 
 /* ---- PIT timer (IRQ0) — keeps render loop alive when mouse is idle ---- */
-__attribute__((interrupt))
+__attribute__((interrupt, target("general-regs-only")))
 static void irq0_handler(interrupt_frame_t *f) {
     (void)f;
     sys_ticks++;
@@ -436,18 +437,52 @@ static inline void frame_idle(void) {
     preempt_disable();
 }
 
+/*
+ * Bring up the x87/SSE unit — for the whole machine, now.
+ *
+ * This used to come with a caveat attached: the kernel was compiled
+ * -mno-sse and only the inference translation unit touched these
+ * registers, which was safe precisely because that code never runs
+ * inside an interrupt handler and so nothing could clobber XMM behind
+ * its back. The caveat is gone, and both halves of what replaced it live
+ * elsewhere — a scheduler that saves 512 bytes of extended state per
+ * thread, and handlers compiled general-regs-only so they cannot disturb
+ * what it is preserving. What is left here is switching the unit on.
+ *
+ *   CR0.EM clear   - do not trap SSE as "no coprocessor"
+ *   CR0.MP set     - WAIT/FWAIT honours TS
+ *   CR0.TS clear   - no lazy switching; the state is saved eagerly
+ *   CR4.OSFXSR     - FXSAVE/FXRSTOR available, SSE instructions legal
+ *   CR4.OSXMMEXCPT - unmasked SSE exceptions raise #XF rather than #UD
+ *   CR4.SMAP clear - the kernel reads user buffers directly, with the
+ *                    caller's page tables loaded and every pointer
+ *                    checked first; supervisor access prevention would
+ *                    fault on exactly the accesses that are meant to
+ *                    work. SMEP, which stops the kernel *executing* user
+ *                    pages, is left however the firmware set it: that
+ *                    one costs nothing here.
+ */
 static void fpu_init(void) {
     uint64_t cr0, cr4;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
     cr0 &= ~(1ULL << 2);          /* EM */
+    cr0 &= ~(1ULL << 3);          /* TS */
     cr0 |=  (1ULL << 1);          /* MP */
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
 
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-    cr4 |= (1ULL << 9) | (1ULL << 10);
+    cr4 |=  (1ULL << 9) | (1ULL << 10);
+    cr4 &= ~(1ULL << 21);         /* SMAP */
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
 
     __asm__ volatile("fninit");
+
+    /* FNINIT resets the x87 control word and says nothing about MXCSR.
+     * 0x1F80 is the architectural reset value — every SIMD exception
+     * masked, round to nearest — and setting it explicitly means the
+     * state does not depend on what the bootloader left behind. */
+    uint32_t mxcsr = 0x1F80;
+    __asm__ volatile("ldmxcsr %0" :: "m"(mxcsr));
 }
 
 static void pit_init(uint16_t cs) {
@@ -817,6 +852,25 @@ static void display_boot_animation(volatile uint32_t *vram,
 }
 
 void kmain(void) {
+    /*
+     * Floating point first, before anything at all.
+     *
+     * This used to sit further down, after the panel had been cleared
+     * and the boot animation had played, which was correct while the
+     * kernel was compiled -mno-sse: nothing before it could possibly
+     * have used the unit. With SSE available it is not correct for one
+     * frame longer. The loop that blanks the framebuffer is exactly the
+     * kind GCC vectorises, so the first instruction of the first
+     * statement of this function became an SSE instruction — executed
+     * with CR0.EM still set, raising #UD, with no IDT yet to catch it
+     * and therefore a triple fault and a reset before a single character
+     * reached the serial port.
+     *
+     * That is what it looks like when it goes wrong: not a crash, not a
+     * message, just a machine that reboots with nothing on the wire.
+     */
+    fpu_init();
+
     if (fb_request.response == NULL ||
         fb_request.response->framebuffer_count < 1)
         while (1) __asm__ volatile("hlt");
@@ -855,9 +909,6 @@ void kmain(void) {
      */
     gdt_init();
     const uint16_t cs = GDT_KCODE;
-
-    /* Floating point, before anything that might use it */
-    fpu_init();
 
     /* Build IDT: remap PIC, install fault handlers, fill the rest with
      * no-op stubs */
@@ -981,6 +1032,24 @@ void kmain(void) {
     serial_puts("[vextro] app selftest: running /hello\n");
     execute_bin_blocking("/hello", 0);
     serial_puts("[vextro] app selftest: done\n");
+#endif
+
+#ifdef FAULT_SELFTEST
+    /*
+     * And the other half of the same question. A protected system is not
+     * one where correct programs run — it is one where an incorrect
+     * program is contained. /faulter writes through a null pointer; what
+     * should appear below is a page fault report naming address zero,
+     * the thread dying, and this function carrying on to the desktop.
+     */
+    serial_puts("[vextro] fault selftest: running /faulter\n");
+    {
+        int frc = execute_bin_blocking("/faulter", 0);
+        serial_puts("[vextro] fault selftest: launch returned ");
+        serial_put_dec((uint32_t)(frc < 0 ? 1u : 0u));
+        serial_puts(frc < 0 ? " (refused)\n" : " (ran)\n");
+    }
+    serial_puts("[vextro] fault selftest: the kernel is still here\n");
 #endif
 
 #ifdef WIKI_SELFTEST

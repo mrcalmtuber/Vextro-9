@@ -1,10 +1,38 @@
 CC      := x86_64-elf-gcc
 LD      := x86_64-elf-ld
+AR      := x86_64-elf-ar
 HOSTCC  := cc
 
+# --- Kernel flags ---
+#
+# The floating-point bans are gone. They were there for a reason that no
+# longer holds: with no per-thread state to save, any use of an XMM
+# register anywhere in the kernel could be clobbered by an interrupt, so
+# the only safe rule was to forbid the registers outright and confine
+# them to llm.c, which never runs inside a handler.
+#
+# What replaced that rule is a scheduler that saves 512 bytes of extended
+# state on every context switch, and interrupt handlers compiled
+# general-regs-only so they cannot touch what it is preserving. With both
+# in place there is nothing left for the ban to protect.
+#
+# -mno-red-zone stays and always will: the 128 bytes below RSP that the
+# ABI promises a leaf function are not promises the processor keeps when
+# it pushes an interrupt frame there.
+#
+# -fno-math-errno is what makes sqrt() a single instruction. Without it
+# GCC has to assume the call might set errno, so it emits a call to
+# sqrtf() — a function that does not exist here — instead of the SQRTSS
+# the processor has had since 1999. There is no errno in this kernel, so
+# the guarantee it is preserving is one nothing can observe.
+#
+# Note what is *not* here: -ffast-math. It would let the compiler
+# reassociate floating-point sums, which was measured on the inference
+# path and found to buy nothing while making the batched and unbatched
+# routes through the same arithmetic disagree bit for bit.
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
-            -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
+            -msse -msse2 -mfpmath=sse -fno-math-errno -mno-red-zone \
             -Isrc -Ikernel/include -Ivxfmt $(EXTRA)
 
 # --- Preflight ---
@@ -90,11 +118,33 @@ $(shell mkdir -p build; \
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
 
-# -fno-tree-loop-distribute-patterns: without it GCC turns clear loops
-# into memset calls, and there is no libc to link them against.
+# --- User-space C library ---
+#
+# There is a libc now, so two flags that were only ever working around
+# its absence are gone.
+#
+# -fno-tree-loop-distribute-patterns was there because GCC turns a clear
+# loop into a memset call whether the source says so or not, and there
+# was nothing to link that call against. There is.
+#
+# The floating-point bans are gone for the reason the whole exercise
+# exists: user programs run in ring 3 with their own FPU state, saved
+# and restored on every context switch, so there is nothing left for
+# them to corrupt. `mandel` computing in doubles instead of 16.16 fixed
+# point is the visible half of that.
+#
+# -mno-red-zone stays, and deliberately. The trampoline stubs the loader
+# maps into every process push arguments onto the caller's stack, so the
+# 128 bytes below RSP that the ABI promises a leaf function are not
+# actually untouched here.
+LIBC_SRC  := libc/string.c libc/stdio.c libc/malloc.c
+LIBC_OBJ  := $(patsubst libc/%.c,build/libc/%.o,$(LIBC_SRC))
+LIBC      := build/libvextro.a
+
 APP_CFLAGS := -O2 -Wall -ffreestanding -fno-stack-protector \
-              -fno-stack-check -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
-              -mno-red-zone -fPIC -fno-tree-loop-distribute-patterns
+              -fno-stack-check -mno-red-zone -fPIC \
+              -msse -msse2 -mfpmath=sse -fno-math-errno \
+              -Ilibc/include -Iapps
 
 LIMINE  := limine-binary
 ISO     := iso_root
@@ -242,14 +292,14 @@ MUSIC_FLAC  := build/music/bell.flac
 $(MUSIC_WAV) $(MUSIC_FLAC): tools/mkwav.py
 	@python3 tools/mkwav.py build/music
 
-disk.img: $(ASSET_LIST) | build/hello $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
+disk.img: $(ASSET_LIST) | build/hello build/faulter $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
 	    if [ -f "$$f" ]; then big="$$big $$f"; fi; \
 	done; \
 	cmd="python3 tools/mkexfat.py disk.img $(DISK_MB) \
-		apps/about.txt apps/notes.txt build/hello \
+		apps/about.txt apps/notes.txt build/hello build/faulter \
 		apps/welcome.txt:docs/welcome.txt \
 		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
@@ -273,13 +323,39 @@ build/limine-tool: $(LIMINE)/limine.c
 	@mkdir -p build
 	$(HOSTCC) -O2 -o $@ $<
 
+# --- User-space C library ---
+build/libc/%.o: libc/%.c $(wildcard libc/include/*.h) $(wildcard libc/include/sys/*.h)
+	@mkdir -p build/libc
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+$(LIBC): $(LIBC_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $(LIBC_OBJ)
+
 # --- User app: hello ---
+# -z max-page-size=0x1000 so ld does not pad segments to its 2 MB
+# default: the kernel's loader maps an image page by page and gives each
+# page the protection its segment asked for, so the segments have to be
+# page-aligned and no coarser.
 build/hello.o: apps/hello.c apps/vextro.h
 	@mkdir -p build
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
-build/hello: build/hello.o apps/app.ld
-	$(LD) -nostdlib -static -T apps/app.ld build/hello.o -o $@
+build/hello: build/hello.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/hello.o $(LIBC) -o $@
+
+# --- User app: faulter ---
+# A program that writes through a null pointer, so that the containment
+# can be tested rather than assumed. Runs under `make iso
+# EXTRA=-DFAULT_SELFTEST`; otherwise it just sits on the volume.
+build/faulter.o: apps/faulter.c apps/vextro.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/faulter: build/faulter.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/faulter.o $(LIBC) -o $@
 
 # --- .vx toolchain (host) ---
 $(VX_MAKER): vxfmt/vx_maker.c vxfmt/vx_format.h
@@ -295,8 +371,9 @@ build/store/%.o: apps/store/%.c apps/vextro.h
 	@mkdir -p build/store
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
-build/store/%.elf: build/store/%.o vxfmt/vx.ld
-	$(LD) -nostdlib -static -z max-page-size=0x1000 -T vxfmt/vx.ld $< -o $@
+build/store/%.elf: build/store/%.o vxfmt/vx.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T vxfmt/vx.ld \
+		$< $(LIBC) -o $@
 
 build/store/%.vx: build/store/%.elf $(VX_MAKER)
 	$(VX_MAKER) -o $@ -e $<
@@ -309,10 +386,10 @@ build/pics/%.sci: apps/pics/%.png tools/mkimg.py
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
 # The store payloads ride along here too, so the storefront still has
 # something to install on an ISO-only boot with no disk attached.
-build/initrd.tar: $(wildcard apps/*.txt) build/hello $(STORE_BINS)
+build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
-	cp build/hello build/initrd_staging/
+	cp build/hello build/faulter build/initrd_staging/
 	$(foreach a,$(STORE_APPS),cp build/store/$(a).vx build/initrd_staging/store/pkg/$(a).vx;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
 	rm -rf build/initrd_staging
@@ -322,9 +399,10 @@ build/kernel.o: src/kernel.c $(wildcard src/*.h) build/res.stamp
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# The inference unit is the one place floats are allowed: a transformer
-# is float maths end to end, while the rest of the kernel stays integer
-# only so no interrupt handler can grow an FPU dependency.
+# The inference unit used to be the one place floats were allowed. It no
+# longer is — the whole kernel has them — so what is left here is the
+# optimisation level, and one flag that stays absent on purpose.
+#
 # -O3 for this translation unit, and deliberately *not* -ffast-math.
 #
 # Letting the compiler reassociate floating-point sums was tried, on the
@@ -339,8 +417,7 @@ build/kernel.o: src/kernel.c $(wildcard src/*.h) build/res.stamp
 # and unbatched paths through the same maths vectorise differently and
 # stop agreeing bit-for-bit, so which of the two ran changed the answer.
 # Paying determinism for nothing is a bad trade.
-LLM_CFLAGS := $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2 -O2,$(CFLAGS)) \
-              -msse -msse2 -mfpmath=sse -O3
+LLM_CFLAGS := $(filter-out -O2,$(CFLAGS)) -O3
 
 build/llm.o: src/llm.c src/llm.h
 	@mkdir -p build

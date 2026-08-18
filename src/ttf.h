@@ -2,15 +2,41 @@
 #define TTF_H
 
 /*
- * Minimal, freestanding, 100% fixed-point TrueType rasterizer.
+ * Freestanding TrueType rasterizer.
  *
- * Designed for a no-libc / no-SSE / no-float kernel: every coordinate is an
- * integer, all curve math is done in 64-bit integer arithmetic.  It parses the
- * embedded Comic Neue Regular face (see comicneue_ttf.h) and renders glyphs
- * into a 32-bit ARGB/XRGB backbuffer with anti-aliasing via 4x4 supersampling.
+ * It parses the embedded Comic Neue Regular face (see comicneue_ttf.h)
+ * and renders glyphs into a 32-bit ARGB/XRGB backbuffer.
  *
  * Supported: head, maxp, hhea, hmtx, cmap (format 4), loca (short & long),
  * glyf (simple + composite glyphs), quadratic Bezier outlines.
+ *
+ * ---- what changed when the FPU arrived ----
+ *
+ * This was entirely fixed point, because the kernel it lived in had no
+ * floating point at all. It worked, and it left two visible marks that
+ * integers were the reason for.
+ *
+ * The first was faceting. Every quadratic was flattened into exactly
+ * eight line segments regardless of how large it was drawn, because
+ * choosing a count from the curve's actual size needs a square root.
+ * Eight is generous at 13 px and plainly not enough at 40: the shoulder
+ * of an 'n' in a heading came out as a short run of straight lines with
+ * corners between them. Now the count comes from the curve's own
+ * deviation from its chord, measured in device pixels, so a glyph is
+ * flattened as finely as its size requires and no finer.
+ *
+ * The second was quantisation. Horizontal coverage was counted in
+ * subpixel columns — eight per pixel, so a vertical stem edge could only
+ * land on one of eight positions, and a near-vertical diagonal stepped
+ * between them. Coverage is now the exact overlap between the filled
+ * span and the pixel, computed as a real number, so the horizontal
+ * resolution is continuous. Vertically it is still eight samples per
+ * pixel row; that is where the remaining stair-stepping lives, and it is
+ * far below what the eye picks up at UI sizes.
+ *
+ * None of this costs a frame. Every glyph is rasterised once per size
+ * into a coverage mask and then blitted, so this runs when a character
+ * is seen for the first time and never again.
  */
 
 #include <stdint.h>
@@ -28,7 +54,22 @@
 #define TTF_MAXEDGES  4096     /* max device-space edges per glyph               */
 #define TTF_COVMAX    256      /* max glyph box side (pixels) for coverage buffer*/
 #define TTF_MAXCROSS  128      /* max edge crossings per scanline                */
-#define TTF_FLATTEN   8        /* line segments per quadratic Bezier             */
+
+/*
+ * Curve flattening.
+ *
+ * A quadratic is split until its deviation from a straight line is below
+ * TTF_FLATTEN_TOL device pixels. A twentieth of a pixel is far below
+ * what anti-aliasing can express, so what comes out is limited by the
+ * sampling rather than by the approximation — which is the point: it
+ * should be impossible to tell that these are line segments at all.
+ *
+ * The bound matters as much as the tolerance. A near-degenerate curve at
+ * an enormous size could ask for hundreds of segments and exhaust the
+ * edge list, and 64 is already past the point of visible difference.
+ */
+#define TTF_FLATTEN_TOL  0.05f
+#define TTF_FLATTEN_MAX  64
 
 /*
  * Letter tracking, as a fraction of each advance.
@@ -80,10 +121,19 @@ static int32_t  S_xs[TTF_MAXPTS], S_ys[TTF_MAXPTS];
 static int32_t  X_x[TTF_MAXPTS * 2], X_y[TTF_MAXPTS * 2];
 static uint8_t  X_on[TTF_MAXPTS * 2];
 
-static int32_t  C_x[TTF_MAXCROSS];
+/* Scanline crossings, as real numbers. They used to be integers in
+ * eighths of a pixel, which is where the horizontal quantisation came
+ * from: two edges a hundredth of a pixel apart produced the same
+ * crossing and therefore the same pixel. */
+static float    C_xf[TTF_MAXCROSS];
 static int      C_d[TTF_MAXCROSS];
 
 static uint8_t  COV[TTF_COVMAX * TTF_COVMAX];
+
+/* Where the exact areas accumulate before they are quantised into COV.
+ * A quarter of a megabyte, used by one glyph at a time and never
+ * touched again once the mask is cached. */
+static float    COVA[TTF_COVMAX * TTF_COVMAX];
 
 /* box the last rasterize produced, in whole pixels relative to the
  * canonical origin (pen on the baseline) */
@@ -106,10 +156,26 @@ static int      COV_w, COV_h, COV_ox, COV_oy;
 static uint8_t  COVCURVE[256];
 
 static void build_cov_curve(void) {
+    /*
+     * Coverage raised to the power 3/4 — a text gamma of 1.33, which is
+     * the value this kind of correction conventionally uses.
+     *
+     * What it replaces was the midpoint of two integer curves, chosen by
+     * eye because the arithmetic to do it properly was not available.
+     * The two land within a few levels of each other across the whole
+     * range, which is a compliment to the eye that picked the old one;
+     * the difference is that this one says what it is.
+     *
+     * x^(3/4) is x^(1/2) * x^(1/4), so it is two square roots and a
+     * multiply — no logarithm, no exponential, nothing that would need a
+     * maths library the kernel does not have.
+     */
     for (int a = 0; a < 256; a++) {
-        int inv = 255 - a;
-        int strong = 255 - (inv * inv) / 255;
-        COVCURVE[a] = (uint8_t)((a + strong) / 2);
+        float t  = (float)a / 255.0f;
+        float r2 = __builtin_sqrtf(t);
+        float v  = r2 * __builtin_sqrtf(r2);
+        int   c  = (int)(v * 255.0f + 0.5f);
+        COVCURVE[a] = (uint8_t)(c > 255 ? 255 : c);
     }
 }
 
@@ -244,16 +310,42 @@ static void push_edge(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
     nedges++;
 }
 
+/*
+ * Flatten a quadratic into as many segments as it actually needs.
+ *
+ * The old answer was eight, always, because picking a number from the
+ * curve's size needs a square root and there was no floating point to
+ * take one with. Eight is more than enough for body text and visibly
+ * too few for a heading: the shoulder of an 'n' at 40 px came out as a
+ * short run of straight lines with corners between them.
+ *
+ * A quadratic's greatest distance from the chord joining its endpoints
+ * is |P0 - 2P1 + P2| / 4, and subdividing into N pieces reduces that by
+ * N squared — so the count needed for a given tolerance is the square
+ * root of the ratio. Two square roots and a divide, once per curve, at
+ * glyph-cache fill time.
+ */
 static void flatten_quad(int32_t p0x, int32_t p0y, int32_t p1x, int32_t p1y,
                          int32_t p2x, int32_t p2y) {
-    int N = TTF_FLATTEN;
+    /* Deviation, in whole device pixels: the edge list is in units of
+     * 1/TTF_SS of a pixel. */
+    float dx = (float)(p0x - 2 * p1x + p2x) / (4.0f * (float)TTF_SS);
+    float dy = (float)(p0y - 2 * p1y + p2y) / (4.0f * (float)TTF_SS);
+    float dev = __builtin_sqrtf(dx * dx + dy * dy);
+
+    int N = 1;
+    if (dev > TTF_FLATTEN_TOL)
+        N = (int)(__builtin_sqrtf(dev / TTF_FLATTEN_TOL) + 0.999f);
+    if (N < 2) N = 2;
+    if (N > TTF_FLATTEN_MAX) N = TTF_FLATTEN_MAX;
+
     int32_t px = p0x, py = p0y;
+    const float inv = 1.0f / (float)N;
     for (int s = 1; s <= N; s++) {
-        int64_t a = (int64_t)(N - s) * (N - s);
-        int64_t b = (int64_t)2 * (N - s) * s;
-        int64_t c = (int64_t)s * s;
-        int32_t qx = (int32_t)((a * p0x + b * p1x + c * p2x) / (int64_t)(N * N));
-        int32_t qy = (int32_t)((a * p0y + b * p1y + c * p2y) / (int64_t)(N * N));
+        float t = (float)s * inv, u = 1.0f - t;
+        float a = u * u, b = 2.0f * u * t, c = t * t;
+        int32_t qx = (int32_t)(a * (float)p0x + b * (float)p1x + c * (float)p2x);
+        int32_t qy = (int32_t)(a * (float)p0y + b * (float)p1y + c * (float)p2y);
         push_edge(px, py, qx, qy);
         px = qx; py = qy;
     }
@@ -444,53 +536,91 @@ static int rasterize_glyph(void) {
     if (boxW > TTF_COVMAX) boxW = TTF_COVMAX;
     if (boxH > TTF_COVMAX) boxH = TTF_COVMAX;
 
-    for (int k = 0; k < boxW * boxH; k++) COV[k] = 0;
+    for (int k = 0; k < boxW * boxH; k++) COVA[k] = 0.0f;
+
+    /*
+     * One pass per subpixel scanline, sampled at the row's centre.
+     *
+     * The crossings are real numbers now, not integers rounded to the
+     * nearest eighth of a pixel, and what a span contributes to a pixel
+     * is the exact length of their overlap. Horizontal coverage is
+     * therefore continuous: a stem edge one hundredth of a pixel further
+     * right produces a pixel one hundredth darker, where before it
+     * produced an identical pixel until it crossed the next eighth.
+     *
+     * That is the whole of the difference, and it is most visible on
+     * near-vertical diagonals — the leg of a 'k', the stem of a 'y' —
+     * which used to step between eight discrete shades and now do not.
+     */
+    const float inv_ss  = 1.0f / (float)TTF_SS;
+    const float scanW   = inv_ss;          /* each scanline's share of a pixel */
 
     int ysTop = boxMinPy * TTF_SS;
     int ysBot = (boxMinPy + boxH) * TTF_SS;   /* exclusive */
     for (int ys = ysTop; ys < ysBot; ys++) {
+        float yc = (float)ys + 0.5f;
         int nc = 0;
         for (int e = 0; e < nedges; e++) {
-            int32_t y0 = E_y0[e], y1 = E_y1[e];
-            int ymin, ymax, dir;
+            float y0 = (float)E_y0[e], y1 = (float)E_y1[e];
+            float ymin, ymax; int dir;
             if (y0 < y1) { ymin = y0; ymax = y1; dir = 1; }
             else         { ymin = y1; ymax = y0; dir = -1; }
-            if (ys < ymin || ys >= ymax) continue;
-            int64_t xc = E_x0[e] +
-                (int64_t)(E_x1[e] - E_x0[e]) * (ys - E_y0[e]) / (E_y1[e] - E_y0[e]);
-            if (nc < TTF_MAXCROSS) { C_x[nc] = (int32_t)xc; C_d[nc] = dir; nc++; }
+            if (yc < ymin || yc >= ymax) continue;
+            float xc = (float)E_x0[e] +
+                ((float)E_x1[e] - (float)E_x0[e]) * (yc - y0) / (y1 - y0);
+            if (nc < TTF_MAXCROSS) { C_xf[nc] = xc; C_d[nc] = dir; nc++; }
         }
         /* insertion sort crossings by x */
         for (int a = 1; a < nc; a++) {
-            int32_t vx = C_x[a]; int vd = C_d[a]; int b = a - 1;
-            while (b >= 0 && C_x[b] > vx) { C_x[b + 1] = C_x[b]; C_d[b + 1] = C_d[b]; b--; }
-            C_x[b + 1] = vx; C_d[b + 1] = vd;
+            float vx = C_xf[a]; int vd = C_d[a]; int b = a - 1;
+            while (b >= 0 && C_xf[b] > vx) {
+                C_xf[b + 1] = C_xf[b]; C_d[b + 1] = C_d[b]; b--;
+            }
+            C_xf[b + 1] = vx; C_d[b + 1] = vd;
         }
+
         /* nonzero winding fill */
         int py = floordiv(ys, TTF_SS) - boxMinPy;
         if (py < 0 || py >= boxH) continue;
-        int w = 0, spanStart = 0;
+        float *row = COVA + (size_t)py * boxW;
+
+        int w = 0;
+        float spanStart = 0.0f;
         for (int k = 0; k < nc; k++) {
             int prev = w; w += C_d[k];
-            if (prev == 0 && w != 0) spanStart = C_x[k];
-            else if (prev != 0 && w == 0) {
-                for (int col = spanStart; col < C_x[k]; col++) {
-                    int px = floordiv(col, TTF_SS) - boxMinPx;
-                    if (px < 0 || px >= boxW) continue;
-                    int idx = py * boxW + px;
-                    if (COV[idx] < 255) COV[idx]++;
-                }
+            if (prev == 0 && w != 0) { spanStart = C_xf[k]; continue; }
+            if (prev == 0 || w != 0) continue;
+
+            /* Span, converted from subpixel units into pixels relative
+             * to the mask's own corner. */
+            float a = spanStart * inv_ss - (float)boxMinPx;
+            float b = C_xf[k]   * inv_ss - (float)boxMinPx;
+            if (b <= 0.0f || a >= (float)boxW) continue;
+            if (a < 0.0f) a = 0.0f;
+            if (b > (float)boxW) b = (float)boxW;
+            if (b <= a) continue;
+
+            int p0 = (int)a;
+            int p1 = (int)b;
+            if (p1 >= boxW) p1 = boxW - 1;
+
+            if (p0 == p1) {
+                row[p0] += (b - a) * scanW;
+            } else {
+                row[p0] += ((float)(p0 + 1) - a) * scanW;
+                for (int px = p0 + 1; px < p1; px++) row[px] += scanW;
+                row[p1] += (b - (float)p1) * scanW;
             }
         }
     }
 
-    /* Normalise the sample counts to 0..255 in place, then apply the
-     * coverage curve, so a cached mask is ready to blend as it stands. */
-    int maxc = TTF_SS * TTF_SS;
+    /* To eight bits, through the gamma curve, so a cached mask is ready
+     * to blend exactly as it stands. */
     for (int k = 0; k < boxW * boxH; k++) {
-        int c = COV[k];
-        if (c > maxc) c = maxc;
-        COV[k] = COVCURVE[(uint32_t)c * 255 / (uint32_t)maxc];
+        float c = COVA[k];
+        if (c < 0.0f) c = 0.0f;
+        if (c > 1.0f) c = 1.0f;
+        COV[k] = COVCURVE[(int)(c * 255.0f + 0.5f)];
     }
 
     COV_w = boxW; COV_h = boxH;
