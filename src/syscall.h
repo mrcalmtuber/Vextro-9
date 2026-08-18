@@ -328,10 +328,8 @@ __asm__(
     "  pushq %rsi\n"              /* arg2: bw    */
     "  pushq %rdi\n"              /* arg1: buf   */
     "  movq %rsp, %rdi\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $21, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
     "  addq $64, %rsp\n"
     "  ret\n"
 
@@ -349,10 +347,8 @@ __asm__(
     "  pushq %rsi\n"              /* arg2: bw    */
     "  pushq %rdi\n"              /* arg1: buf   */
     "  movq %rsp, %rdi\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $22, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
     "  addq $64, %rsp\n"
     "  ret\n"
 
@@ -392,13 +388,6 @@ __asm__(
      * RDX before RDX is overwritten from R8, or the second argument
      * becomes the third.
      */
-    ".macro MSABI_SHUFFLE\n"
-    "  movq %rcx, %rdi\n"
-    "  movq %rdx, %rsi\n"
-    "  movq %r8,  %rdx\n"
-    "  movq %r9,  %r10\n"
-    ".endm\n"
-
     /*
      * ---- and the registers Windows expects back ----
      *
@@ -421,8 +410,17 @@ __asm__(
      * 168 bytes rather than 160 because the stack arrives eight past a
      * sixteen-byte boundary and MOVAPS faults on anything else.
      */
-    ".macro MSABI_SAVE_XMM\n"
-    "  subq $168, %rsp\n"
+    /* RDI and RSI are callee-saved under Microsoft's convention and
+     * argument registers under System V, so the shuffle above destroys
+     * two registers the caller expects back. That is what a Windows
+     * compiler relies on when it keeps a pointer in RSI across a call --
+     * and it is what made the first working PE fault writing through a
+     * canvas pointer that had become a fragment of the previous call's
+     * arguments. Saved here, before anything touches them. */
+    ".macro MSABI_ENTER\n"
+    "  subq $184, %rsp\n"
+    "  movq %rdi, 160(%rsp)\n"
+    "  movq %rsi, 168(%rsp)\n"
     "  movaps %xmm6,    0(%rsp)\n"
     "  movaps %xmm7,   16(%rsp)\n"
     "  movaps %xmm8,   32(%rsp)\n"
@@ -435,7 +433,9 @@ __asm__(
     "  movaps %xmm15, 144(%rsp)\n"
     ".endm\n"
 
-    ".macro MSABI_LOAD_XMM\n"
+    ".macro MSABI_LEAVE\n"
+    "  movq 160(%rsp), %rdi\n"
+    "  movq 168(%rsp), %rsi\n"
     "  movaps   0(%rsp), %xmm6\n"
     "  movaps  16(%rsp), %xmm7\n"
     "  movaps  32(%rsp), %xmm8\n"
@@ -446,17 +446,24 @@ __asm__(
     "  movaps 112(%rsp), %xmm13\n"
     "  movaps 128(%rsp), %xmm14\n"
     "  movaps 144(%rsp), %xmm15\n"
-    "  addq $168, %rsp\n"
+    "  addq $184, %rsp\n"
     ".endm\n"
+    ".macro MSABI_SHUFFLE\n"
+    "  movq %rcx, %rdi\n"
+    "  movq %rdx, %rsi\n"
+    "  movq %r8,  %rdx\n"
+    "  movq %r9,  %r10\n"
+    ".endm\n"
+
 
     ".align 16\n"
     ".globl petramp_print\n"
     "petramp_print:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $1, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
@@ -471,69 +478,69 @@ __asm__(
     ".align 16\n"
     ".globl petramp_pixel\n"
     "petramp_pixel:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $2, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_mouse\n"
     "petramp_mouse:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $3, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_yield\n"
     "petramp_yield:\n"
-    "  MSABI_SAVE_XMM\n"
+    "  MSABI_ENTER\n"
     "  movl $7, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_canvas\n"
     "petramp_canvas:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $9, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_ticks\n"
     "petramp_ticks:\n"
-    "  MSABI_SAVE_XMM\n"
+    "  MSABI_ENTER\n"
     "  movl $8, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_textw\n"
     "petramp_textw:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $20, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_sbrk\n"
     "petramp_sbrk:\n"
+    "  MSABI_ENTER\n"
     "  MSABI_SHUFFLE\n"
-    "  MSABI_SAVE_XMM\n"
     "  movl $5, %eax\n"
     "  syscall\n"
-    "  MSABI_LOAD_XMM\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     /*
@@ -544,7 +551,8 @@ __asm__(
     ".align 16\n"
     ".globl petramp_drawstr\n"
     "petramp_drawstr:\n"
-    "  movq 64(%rsp), %rax\n"
+    "  MSABI_ENTER\n"
+    "  movq 248(%rsp), %rax\n"
     "  pushq %rax\n"                 /* arg8 */
     "  movq 64(%rsp), %rax\n"
     "  pushq %rax\n"                 /* arg7 */
@@ -557,15 +565,17 @@ __asm__(
     "  pushq %rdx\n"
     "  pushq %rcx\n"
     "  movq %rsp, %rdi\n"
-    "  movl $21, %eax\n"
+        "  movl $21, %eax\n"
     "  syscall\n"
     "  addq $64, %rsp\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".align 16\n"
     ".globl petramp_fillrect\n"
     "petramp_fillrect:\n"
-    "  movq 64(%rsp), %rax\n"
+    "  MSABI_ENTER\n"
+    "  movq 248(%rsp), %rax\n"
     "  pushq %rax\n"
     "  movq 64(%rsp), %rax\n"
     "  pushq %rax\n"
@@ -578,9 +588,10 @@ __asm__(
     "  pushq %rdx\n"
     "  pushq %rcx\n"
     "  movq %rsp, %rdi\n"
-    "  movl $22, %eax\n"
+        "  movl $22, %eax\n"
     "  syscall\n"
     "  addq $64, %rsp\n"
+    "  MSABI_LEAVE\n"
     "  ret\n"
 
     ".globl utramp_end\n"

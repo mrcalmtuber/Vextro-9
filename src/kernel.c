@@ -1102,6 +1102,12 @@ void kmain(void) {
     serial_puts("[vextro] app selftest: done\n");
 #endif
 
+#ifdef PE_SELFTEST
+    serial_puts("[vextro] PE selftest: running /winhello.exe\n");
+    execute_bin_blocking("/winhello.exe", 0);
+    serial_puts("[vextro] PE selftest: done\n");
+#endif
+
 #ifdef FAULT_SELFTEST
     /*
      * And the other half of the same question. A protected system is not
@@ -1110,12 +1116,6 @@ void kmain(void) {
      * should appear below is a page fault report naming address zero,
      * the thread dying, and this function carrying on to the desktop.
      */
-#ifdef PE_SELFTEST
-    serial_puts("[vextro] PE selftest: running /winhello.exe\n");
-    execute_bin_blocking("/winhello.exe", 0);
-    serial_puts("[vextro] PE selftest: done\n");
-#endif
-
     serial_puts("[vextro] fault selftest: running /faulter\n");
     {
         int frc = execute_bin_blocking("/faulter", 0);
