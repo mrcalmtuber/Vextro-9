@@ -5,7 +5,8 @@
 #include "pci.h"
 #include "ata.h"     /* legacy PIO, ports 0x1F0                          */
 #include "ahci.h"    /* SATA                                             */
-#include "nvme.h"    /* PCIe SSD                                         */
+#include "nvme.h"
+#include "kheap.h"    /* PCIe SSD                                         */
 
 /*
  * The block layer: one disk-shaped hole for three very different drivers
@@ -112,10 +113,46 @@ static const char *blk_bus_name(void) {
  * function pointer in .bss would be one more thing to get wrong in a
  * kernel that links with -static -pie.
  */
-static int blk_read(uint64_t lba, uint32_t count, void *buf) {
-    if (blk_cur < 0) return -1;
+/* ===== BAD BLOCK REMAPPING =====
+ *
+ * A disk that fails a read does not usually fail everywhere. One sector
+ * goes bad, and every access to the file containing it fails forever
+ * afterwards -- including, on a filesystem, accesses to the directory
+ * that names a hundred other files that are perfectly fine.
+ *
+ * A remap table is what turns that from fatal into merely lossy: the
+ * failing sector is recorded, a spare is assigned from a reserved area
+ * at the end of the volume, and every later access to the original goes
+ * to the spare instead. The data in the bad sector is gone -- nothing
+ * can bring it back -- but the sector itself works again, and a
+ * filesystem that rewrites it recovers completely.
+ *
+ * The table is in memory only. Persisting it needs a place on the disk
+ * to persist it to, and reserving one changes the volume layout, which
+ * is a bigger decision than this. What it does mean is that the damage
+ * is contained for as long as the machine is up and reported when it
+ * happens rather than presented as a read that simply failed.
+ */
+#define BLK_REMAP_MAX 256
+
+static struct {
+    uint64_t bad;                 /* the LBA that failed          */
+    uint64_t spare;               /* where it goes now            */
+    uint32_t failures;            /* how many times before we gave up */
+} blk_remap[BLK_REMAP_MAX];
+static int      blk_remap_count = 0;
+static uint64_t blk_spare_next = 0;
+static uint64_t blk_read_errors = 0;
+
+static uint64_t blk_remap_lookup(uint64_t lba) {
+    for (int i = 0; i < blk_remap_count; i++)
+        if (blk_remap[i].bad == lba) return blk_remap[i].spare;
+    return lba;
+}
+
+/* Raw access, below the remapping and the cache. */
+static int blk_read_raw(uint64_t lba, uint32_t count, void *buf) {
     const blk_dev_t *d = &blk_devs[blk_cur];
-    if (lba + count > d->sectors) return -1;
     switch (d->kind) {
         case BLK_NVME: return nvme_read(d->unit, lba, count, buf);
         case BLK_AHCI: return ahci_read(d->unit, lba, count, buf);
@@ -124,16 +161,193 @@ static int blk_read(uint64_t lba, uint32_t count, void *buf) {
     return -1;
 }
 
-static int blk_write(uint64_t lba, uint32_t count, const void *buf) {
-    if (blk_cur < 0) return -1;
+static int blk_write_raw(uint64_t lba, uint32_t count, const void *buf) {
     const blk_dev_t *d = &blk_devs[blk_cur];
-    if (lba + count > d->sectors) return -1;
     switch (d->kind) {
         case BLK_NVME: return nvme_write(d->unit, lba, count, buf);
         case BLK_AHCI: return ahci_write(d->unit, lba, count, buf);
         case BLK_ATA:  return ata_write(lba, count, buf);
     }
     return -1;
+}
+
+/*
+ * Retry a failed sector, then give up on it and assign a spare.
+ *
+ * Three attempts, because a marginal sector often reads on the second
+ * try and a disk that is merely busy always does. Only after that is the
+ * sector written off, and the caller still gets an error for *this*
+ * read: the data is gone. What changes is that the next read of the same
+ * sector goes somewhere that works.
+ */
+static int blk_retire_sector(uint64_t lba) {
+    static uint8_t scratch[512];
+    for (int attempt = 0; attempt < 3; attempt++)
+        if (blk_read_raw(lba, 1, scratch) == 0) return 0;
+
+    blk_read_errors++;
+    if (blk_remap_count >= BLK_REMAP_MAX) return -1;
+    if (!blk_spare_next) {
+        /* The last thousand sectors, which no filesystem here places
+         * anything in. */
+        uint64_t total = blk_devs[blk_cur].sectors;
+        if (total < 4096) return -1;
+        blk_spare_next = total - 1024;
+    }
+    blk_remap[blk_remap_count].bad      = lba;
+    blk_remap[blk_remap_count].spare    = blk_spare_next++;
+    blk_remap[blk_remap_count].failures = 3;
+    blk_remap_count++;
+
+    serial_puts("[blk] sector ");
+    serial_put_dec((uint32_t)lba);
+    serial_puts(" failed three reads - remapped to a spare; "
+                "its contents are lost\n");
+    return -1;
+}
+
+/* ===== READ-AHEAD CACHE =====
+ *
+ * Filesystems read in sectors and files are laid out in runs, so a read
+ * of sector n is very nearly a promise that n+1 is next. Fetching a
+ * whole cluster's worth on the first access and serving the rest from
+ * memory turns a sequence of single-sector commands -- each one a full
+ * round trip to the device -- into one command and a memory copy.
+ *
+ * The prediction is deliberately simple: a hit at the end of the cached
+ * run extends the run forward. Anything cleverer needs history the
+ * access pattern does not justify, and a wrong prediction costs a read
+ * that was not needed.
+ */
+#define BLK_CACHE_SECTORS 64
+#define BLK_CACHE_LINES   16
+
+typedef struct {
+    uint64_t base;                /* first LBA held, ~0 when empty */
+    uint32_t count;
+    uint64_t used;                /* for least-recently-used eviction */
+    uint8_t  data[BLK_CACHE_SECTORS * 512];
+} blk_cache_line_t;
+
+static blk_cache_line_t *blk_cache = 0;
+static uint64_t blk_cache_clock = 0;
+static uint64_t blk_cache_hits = 0, blk_cache_misses = 0, blk_readahead = 0;
+
+static void blk_cache_init(void) {
+    if (blk_cache) return;
+    blk_cache = (blk_cache_line_t *)kmalloc_paged(
+        sizeof(blk_cache_line_t) * BLK_CACHE_LINES);
+    if (!blk_cache) {
+        serial_puts("[blk] no memory for the read-ahead cache\n");
+        return;
+    }
+    for (int i = 0; i < BLK_CACHE_LINES; i++) {
+        blk_cache[i].base  = ~(uint64_t)0;
+        blk_cache[i].count = 0;
+        blk_cache[i].used  = 0;
+    }
+    serial_puts("[blk] read-ahead cache: ");
+    serial_put_dec(BLK_CACHE_LINES);
+    serial_puts(" lines of ");
+    serial_put_dec(BLK_CACHE_SECTORS / 2);
+    serial_puts(" KB\n");
+}
+
+static void blk_cache_drop(uint64_t lba, uint32_t count) {
+    if (!blk_cache) return;
+    for (int i = 0; i < BLK_CACHE_LINES; i++) {
+        blk_cache_line_t *l = &blk_cache[i];
+        if (l->base == ~(uint64_t)0) continue;
+        if (lba + count <= l->base || l->base + l->count <= lba) continue;
+        l->base = ~(uint64_t)0;
+        l->count = 0;
+    }
+}
+
+static int blk_read(uint64_t lba, uint32_t count, void *buf) {
+    if (blk_cur < 0) return -1;
+    const blk_dev_t *d = &blk_devs[blk_cur];
+    if (lba + count > d->sectors) return -1;
+
+    /* Anything larger than a cache line goes straight to the device;
+     * caching it would evict everything to hold data the caller has
+     * already asked for in full. */
+    if (!blk_cache || count > BLK_CACHE_SECTORS) {
+        uint64_t real = blk_remap_lookup(lba);
+        int rc = blk_read_raw(real, count, buf);
+        if (rc != 0 && count == 1) {
+            if (blk_retire_sector(real) == 0)
+                return blk_read_raw(real, 1, buf);
+        }
+        return rc;
+    }
+
+    for (int i = 0; i < BLK_CACHE_LINES; i++) {
+        blk_cache_line_t *l = &blk_cache[i];
+        if (l->base == ~(uint64_t)0) continue;
+        if (lba < l->base || lba + count > l->base + l->count) continue;
+        uint64_t off = (lba - l->base) * 512;
+        uint8_t *dst = (uint8_t *)buf;
+        for (uint64_t k = 0; k < (uint64_t)count * 512; k++)
+            dst[k] = l->data[off + k];
+        l->used = ++blk_cache_clock;
+        blk_cache_hits++;
+        return 0;
+    }
+
+    /* A miss. Fetch a whole line starting here, so the sectors that
+     * follow are already in hand when they are asked for. */
+    blk_cache_misses++;
+    int victim = 0;
+    uint64_t oldest = ~(uint64_t)0;
+    for (int i = 0; i < BLK_CACHE_LINES; i++) {
+        if (blk_cache[i].base == ~(uint64_t)0) { victim = i; break; }
+        if (blk_cache[i].used < oldest) { oldest = blk_cache[i].used; victim = i; }
+    }
+
+    blk_cache_line_t *l = &blk_cache[victim];
+    uint32_t want = BLK_CACHE_SECTORS;
+    if (lba + want > d->sectors) want = (uint32_t)(d->sectors - lba);
+    if (want < count) want = count;
+
+    uint64_t real = blk_remap_lookup(lba);
+    if (blk_read_raw(real, want, l->data) != 0) {
+        /* The bulk read failed. Fall back to exactly what was asked for,
+         * one sector at a time, so one bad sector does not lose the
+         * sixty-three good ones around it. */
+        l->base = ~(uint64_t)0;
+        uint8_t *dst = (uint8_t *)buf;
+        for (uint32_t k = 0; k < count; k++) {
+            uint64_t s = blk_remap_lookup(lba + k);
+            if (blk_read_raw(s, 1, dst + (uint64_t)k * 512) != 0) {
+                if (blk_retire_sector(s) != 0) return -1;
+                if (blk_read_raw(blk_remap_lookup(lba + k), 1,
+                                 dst + (uint64_t)k * 512) != 0) return -1;
+            }
+        }
+        return 0;
+    }
+
+    if (want > count) blk_readahead += want - count;
+    l->base  = lba;
+    l->count = want;
+    l->used  = ++blk_cache_clock;
+
+    uint8_t *dst = (uint8_t *)buf;
+    for (uint64_t k = 0; k < (uint64_t)count * 512; k++) dst[k] = l->data[k];
+    return 0;
+}
+
+static int blk_write(uint64_t lba, uint32_t count, const void *buf) {
+    if (blk_cur < 0) return -1;
+    const blk_dev_t *d = &blk_devs[blk_cur];
+    if (lba + count > d->sectors) return -1;
+
+    /* Anything the cache is holding for this range is now wrong. Dropping
+     * it rather than updating it is the safe direction: a stale line
+     * returns data that was never on the disk. */
+    blk_cache_drop(lba, count);
+    return blk_write_raw(blk_remap_lookup(lba), count, buf);
 }
 
 static int blk_flush(void) {

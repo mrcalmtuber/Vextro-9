@@ -46,7 +46,31 @@
  * it is written this way so that bringing up an AP later does not
  * require revisiting every caller.
  */
-typedef struct { volatile uint32_t locked; } spinlock_t;
+typedef struct {
+    volatile uint32_t locked;
+    const char       *name;      /* for the report when it never comes free */
+} spinlock_t;
+
+/*
+ * A lock that gives up.
+ *
+ * A plain spinlock has exactly one failure mode and it is the worst one:
+ * if the holder never releases -- because it faulted, or because two
+ * locks were taken in opposite orders on two processors -- every other
+ * processor spins forever and the machine is dead with nothing on the
+ * wire. There is no way to tell that apart from a hang.
+ *
+ * So the spin is bounded. After a number of attempts far beyond any
+ * legitimate hold time, the lock is *taken anyway* and the event is
+ * reported. That is not correct in the sense of preserving mutual
+ * exclusion -- nothing can preserve it once the holder is gone -- but it
+ * converts a silent freeze into a live machine and a message naming the
+ * lock, which is the difference between a bug that can be found and one
+ * that cannot.
+ */
+#define SPIN_TIMEOUT 40000000u
+
+static uint64_t spin_timeouts = 0;
 
 static inline uint64_t irq_save(void) {
     uint64_t flags;
@@ -56,10 +80,20 @@ static inline uint64_t irq_save(void) {
 static inline void irq_restore(uint64_t flags) {
     if (flags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
 }
+
+static void spin_report_timeout(spinlock_t *l);
+
 static inline uint64_t spin_lock_irq(spinlock_t *l) {
     uint64_t flags = irq_save();
-    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE))
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE)) {
+        if (++spins >= SPIN_TIMEOUT) {
+            spin_report_timeout(l);
+            __atomic_store_n(&l->locked, 1u, __ATOMIC_RELEASE);
+            break;
+        }
         __asm__ volatile("pause" ::: "memory");
+    }
     return flags;
 }
 static inline void spin_unlock_irq(spinlock_t *l, uint64_t flags) {
@@ -76,8 +110,15 @@ static uint64_t   pmm_total_frames = 0;   /* frames the map called usable   */
 static uint64_t   pmm_free_frames  = 0;
 static uint64_t   pmm_highest_frame = 0;  /* one past the last tracked bit  */
 static uint64_t   pmm_next_hint    = 0;   /* where the last search stopped  */
-static spinlock_t pmm_lock;
+static spinlock_t pmm_lock = { 0, "pmm" };
 static int        pmm_ready = 0;
+
+static void spin_report_timeout(spinlock_t *l) {
+    spin_timeouts++;
+    serial_puts("[lock] timed out waiting for ");
+    serial_puts(l->name ? l->name : "an unnamed lock");
+    serial_puts(" - taking it anyway; the holder is not coming back\n");
+}
 
 static inline int pmm_test(uint64_t frame) {
     return (pmm_bitmap[frame >> 6] >> (frame & 63)) & 1u;
@@ -220,11 +261,74 @@ static uint64_t pmm_alloc(void) {
     return phys;
 }
 
+/*
+ * ---- reference counts ----
+ *
+ * A frame used to have exactly one owner, so freeing it was
+ * unconditional. Copy-on-write breaks that: two address spaces point at
+ * one frame and neither knows about the other, so the first to release
+ * it must not take it away from the second.
+ *
+ * One counter per frame, sixteen bits, allocated from the allocator
+ * itself once the bitmap exists. Zero means "one owner" — the ordinary
+ * case — so nothing has to be initialised and no allocation path pays
+ * for the feature. Sharing raises it; freeing lowers it and only
+ * actually releases the frame at zero.
+ *
+ * Saturation is deliberate. A frame shared 65535 ways is never freed
+ * again, which wastes four kilobytes; wrapping would free it while
+ * thousands of mappings still pointed at it.
+ */
+static uint16_t *pmm_ref = 0;
+
+static uint64_t pmm_alloc_contig(uint64_t frames);
+
+static void pmm_ref_init(void) {
+    if (!pmm_ready || pmm_ref) return;
+    uint64_t bytes  = pmm_highest_frame * sizeof(uint16_t);
+    uint64_t frames = PAGE_ALIGN_UP(bytes) / PAGE_SIZE;
+    uint64_t phys   = pmm_alloc_contig(frames);
+    if (!phys) {
+        serial_puts("[pmm] no room for the reference table; "
+                    "copy-on-write unavailable\n");
+        return;
+    }
+    pmm_ref = (uint16_t *)(uintptr_t)phys_to_virt(phys);
+    for (uint64_t i = 0; i < pmm_highest_frame; i++) pmm_ref[i] = 0;
+    serial_puts("[pmm] reference table ");
+    serial_put_dec((uint32_t)(bytes / 1024));
+    serial_puts(" KB\n");
+}
+
+static void pmm_ref_inc(uint64_t phys) {
+    if (!pmm_ref) return;
+    uint64_t f = phys >> PAGE_SHIFT;
+    if (f >= pmm_highest_frame) return;
+    uint64_t flags = spin_lock_irq(&pmm_lock);
+    if (pmm_ref[f] < 0xFFFF) pmm_ref[f]++;
+    spin_unlock_irq(&pmm_lock, flags);
+}
+
+static int pmm_ref_count(uint64_t phys) {
+    if (!pmm_ref) return 1;
+    uint64_t f = phys >> PAGE_SHIFT;
+    if (f >= pmm_highest_frame) return 1;
+    return pmm_ref[f] + 1;
+}
+
 static void pmm_free(uint64_t phys) {
     if (!pmm_ready || !phys) return;
     uint64_t frame = phys >> PAGE_SHIFT;
     if (frame >= pmm_highest_frame) return;
     uint64_t flags = spin_lock_irq(&pmm_lock);
+
+    /* Still shared: this owner is done with it, the others are not. */
+    if (pmm_ref && pmm_ref[frame]) {
+        pmm_ref[frame]--;
+        spin_unlock_irq(&pmm_lock, flags);
+        return;
+    }
+
     if (pmm_test(frame)) {
         pmm_clear(frame);
         pmm_free_frames++;

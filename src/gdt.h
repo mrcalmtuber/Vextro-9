@@ -106,11 +106,39 @@ typedef struct {
 static gdt_entry_t gdt_table[GDT_ENTRIES] __attribute__((aligned(16)));
 static tss_t       tss __attribute__((aligned(16)));
 
-/* Stacks the processor switches to on its own. Neither is ever the
- * stack of a running thread, so both can be static. */
+/*
+ * Stacks the processor switches to on its own. None is ever the stack of
+ * a running thread, so all can be static.
+ *
+ * Four interrupt stack table entries, because four exceptions can arrive
+ * while the current stack is exactly what cannot be trusted:
+ *
+ *   IST1  #DF  a fault taken while handling a fault -- by definition the
+ *              stack in hand did not work
+ *   IST2  NMI  arrives at any instruction boundary including the middle
+ *              of a stack switch, and cannot be masked to avoid it
+ *   IST3  #SS  the stack segment itself faulted; pushing to it is what
+ *              just failed
+ *   IST4  #MC  a machine check may follow memory that is physically bad,
+ *              and the report is the only thing of value left
+ *
+ * The first was already here. The other three were sharing the faulting
+ * thread's stack, which means a stack overflow -- the single most common
+ * way to get #SS -- produced a triple fault and a reset instead of a
+ * report naming the thread that overflowed.
+ */
 #define KSTACK_SIZE  (32 * 1024)
+#define IST_SIZE     (16 * 1024)
 static uint8_t kernel_stack[KSTACK_SIZE] __attribute__((aligned(16)));
-static uint8_t df_stack[16 * 1024]       __attribute__((aligned(16)));
+static uint8_t df_stack[IST_SIZE]        __attribute__((aligned(16)));
+static uint8_t nmi_stack[IST_SIZE]       __attribute__((aligned(16)));
+static uint8_t ss_stack[IST_SIZE]        __attribute__((aligned(16)));
+static uint8_t mc_stack[IST_SIZE]        __attribute__((aligned(16)));
+
+#define IST_DF  1
+#define IST_NMI 2
+#define IST_SS  3
+#define IST_MC  4
 
 static void gdt_set(int i, uint32_t base, uint32_t limit,
                     uint8_t access, uint8_t flags) {
@@ -159,7 +187,10 @@ static void gdt_init(void) {
     uint8_t *t = (uint8_t *)&tss;
     for (uint64_t i = 0; i < sizeof(tss); i++) t[i] = 0;
     tss.rsp0   = (uint64_t)(uintptr_t)(kernel_stack + sizeof(kernel_stack));
-    tss.ist[0] = (uint64_t)(uintptr_t)(df_stack + sizeof(df_stack));
+    tss.ist[IST_DF  - 1] = (uint64_t)(uintptr_t)(df_stack  + IST_SIZE);
+    tss.ist[IST_NMI - 1] = (uint64_t)(uintptr_t)(nmi_stack + IST_SIZE);
+    tss.ist[IST_SS  - 1] = (uint64_t)(uintptr_t)(ss_stack  + IST_SIZE);
+    tss.ist[IST_MC  - 1] = (uint64_t)(uintptr_t)(mc_stack  + IST_SIZE);
     /* No I/O permission bitmap. Pointing the base past the segment limit
      * is how the architecture says "there isn't one", which denies every
      * port to ring 3 — IN and OUT from user space then raise #GP rather

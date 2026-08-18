@@ -61,6 +61,8 @@
 #define SYS_TTF_TEXT_WIDTH  20
 #define SYS_TTF_DRAW_STRING 21
 #define SYS_GFX_RECT        22
+#define SYS_FORK            23
+#define SYS_MEMINFO         24
 
 static inline long __syscall0(long n) {
     long r;

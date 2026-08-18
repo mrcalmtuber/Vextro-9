@@ -91,6 +91,70 @@ static void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, ui
     outl(PCI_CONFIG_DATA, val);
 }
 
+/* ===== PCIe EXTENDED CONFIGURATION SPACE (mechanism ECAM) =====
+ *
+ * The port pair above can address 256 bytes per function and no more,
+ * because the offset field in CF8 is eight bits wide. PCI Express gave
+ * every function 4096 bytes, and everything interesting that has been
+ * added since lives in the part beyond 256: MSI-X tables, advanced error
+ * reporting, link capabilities, single-root virtualisation.
+ *
+ * Reaching it is memory-mapped rather than port-based, at a window whose
+ * base the firmware reports in the ACPI MCFG table. That is the only way
+ * to find it -- it cannot be probed -- which is why extended config had
+ * to wait for the ACPI parser.
+ *
+ * The port mechanism stays as the fallback. Every machine has it, some
+ * have no MCFG at all, and the first 256 bytes are identical either way.
+ */
+static volatile uint8_t *pci_ecam = 0;
+static uint8_t  pci_ecam_bus_lo = 0, pci_ecam_bus_hi = 0;
+
+static volatile uint8_t *mmio_map(uint64_t phys_addr, uint64_t size);
+
+static void pci_ecam_init(uint64_t base, uint8_t bus_lo, uint8_t bus_hi) {
+    if (!base) return;
+    uint64_t span = ((uint64_t)(bus_hi - bus_lo) + 1) * 256ull * 4096ull;
+    pci_ecam = mmio_map(base, span);
+    if (!pci_ecam) {
+        serial_puts("[pci] extended config window could not be mapped\n");
+        return;
+    }
+    pci_ecam_bus_lo = bus_lo;
+    pci_ecam_bus_hi = bus_hi;
+    serial_puts("[pci] extended config space mapped, buses ");
+    serial_put_dec(bus_lo);
+    serial_puts("-");
+    serial_put_dec(bus_hi);
+    serial_puts(" (4096 bytes per function)\n");
+}
+
+static inline volatile uint8_t *pci_ecam_addr(uint8_t bus, uint8_t slot,
+                                              uint8_t func, uint16_t off) {
+    if (!pci_ecam || bus < pci_ecam_bus_lo || bus > pci_ecam_bus_hi) return 0;
+    uint64_t idx = ((uint64_t)(bus - pci_ecam_bus_lo) << 20) |
+                   ((uint64_t)(slot & 0x1F) << 15) |
+                   ((uint64_t)(func & 0x07) << 12) | off;
+    return pci_ecam + idx;
+}
+
+/* Read anywhere in the 4096-byte space, falling back to the ports for
+ * the first 256 bytes when there is no window. */
+static uint32_t pci_read32_ext(uint8_t bus, uint8_t slot, uint8_t func,
+                               uint16_t off) {
+    volatile uint8_t *a = pci_ecam_addr(bus, slot, func, off & 0xFFC);
+    if (a) return *(volatile uint32_t *)a;
+    if (off < 256) return pci_read32(bus, slot, func, (uint8_t)off);
+    return 0xFFFFFFFFu;
+}
+
+static void pci_write32_ext(uint8_t bus, uint8_t slot, uint8_t func,
+                            uint16_t off, uint32_t val) {
+    volatile uint8_t *a = pci_ecam_addr(bus, slot, func, off & 0xFFC);
+    if (a) { *(volatile uint32_t *)a = val; return; }
+    if (off < 256) pci_write32(bus, slot, func, (uint8_t)off, val);
+}
+
 typedef struct {
     uint8_t  bus, slot, func;
     uint16_t vendor, device;
@@ -225,6 +289,172 @@ static int pci_bar(const pci_dev_t *d, int bar_idx,
     *out_base = base;
     *out_size = (~mask) + 1;
     return 0;
+}
+
+/* ===== CAPABILITIES, AND MESSAGE-SIGNALLED INTERRUPTS =====
+ *
+ * A legacy PCI interrupt is a physical line shared by several devices,
+ * routed through a chipset the firmware programmed, arriving at whatever
+ * the ACPI tables say. Every device on the line is asked "was it you?"
+ * on every interrupt, level-triggered, and a device that answers wrongly
+ * hangs the line for everyone.
+ *
+ * MSI replaced all of that with something much simpler: the device does
+ * a memory write. On x86 the address 0xFEE00000 decodes to the local
+ * APIC, the low bits of the data are the vector, and the interrupt is
+ * edge-triggered, unshared, and needs no routing table at all. It is
+ * also the only way to have more than one interrupt per device, which is
+ * how a NVMe drive gets a completion queue per core.
+ *
+ * MSI-X is the same idea with the vectors in a table in device memory
+ * rather than in config space, so there can be thousands of them.
+ */
+#define PCI_CAP_MSI   0x05
+#define PCI_CAP_MSIX  0x11
+#define PCI_CAP_PM    0x01
+#define PCI_CAP_PCIE  0x10
+
+#define PCI_STATUS_CAPLIST 0x0010
+
+/* Walk the capability chain at 0x34 looking for one identifier.
+ * Bounded, because a malformed chain that points at itself would
+ * otherwise spin forever inside a driver's probe. */
+static uint8_t pci_find_cap(const pci_dev_t *d, uint8_t id) {
+    uint32_t st = pci_read32(d->bus, d->slot, d->func, 0x04);
+    if (!((st >> 16) & PCI_STATUS_CAPLIST)) return 0;
+
+    uint8_t off = (uint8_t)(pci_read32(d->bus, d->slot, d->func, 0x34) & 0xFC);
+    for (int guard = 0; guard < 48 && off >= 0x40; guard++) {
+        uint32_t hdr = pci_read32(d->bus, d->slot, d->func, off);
+        if ((hdr & 0xFF) == id) return off;
+        off = (uint8_t)((hdr >> 8) & 0xFC);
+        if (!off) break;
+    }
+    return 0;
+}
+
+/* The extended chain, which starts at 0x100 and only exists behind a
+ * memory-mapped window. */
+static uint16_t pci_find_ext_cap(const pci_dev_t *d, uint16_t id) {
+    if (!pci_ecam) return 0;
+    uint16_t off = 0x100;
+    for (int guard = 0; guard < 64 && off >= 0x100 && off < 0x1000; guard++) {
+        uint32_t hdr = pci_read32_ext(d->bus, d->slot, d->func, off);
+        if (hdr == 0xFFFFFFFFu || hdr == 0) break;
+        if ((hdr & 0xFFFF) == id) return off;
+        off = (uint16_t)((hdr >> 20) & 0xFFC);
+        if (!off) break;
+    }
+    return 0;
+}
+
+/* The message a device sends to raise `vector` on the processor whose
+ * local APIC id is `apic`. Fixed delivery, edge-triggered, physical
+ * destination — the only combination worth using for a device. */
+static inline uint64_t msi_address(uint32_t apic) {
+    return 0xFEE00000ull | ((uint64_t)(apic & 0xFF) << 12);
+}
+static inline uint32_t msi_data(uint8_t vector) { return vector; }
+
+/*
+ * Turn on MSI and point it at a vector. Returns 0 if the device has the
+ * capability and it was programmed.
+ *
+ * The 64-bit address bit matters: a device that only supports 32-bit
+ * addresses has its data register four bytes earlier, and writing the
+ * vector to the wrong offset silently programs a mask register instead.
+ */
+static int pci_msi_enable(const pci_dev_t *d, uint8_t vector, uint32_t apic) {
+    uint8_t cap = pci_find_cap(d, PCI_CAP_MSI);
+    if (!cap) return -1;
+
+    uint32_t ctrl = pci_read32(d->bus, d->slot, d->func, cap);
+    int is64 = (ctrl >> 16) & (1u << 7);
+
+    uint64_t addr = msi_address(apic);
+    pci_write32(d->bus, d->slot, d->func, (uint8_t)(cap + 4), (uint32_t)addr);
+    if (is64) {
+        pci_write32(d->bus, d->slot, d->func, (uint8_t)(cap + 8),
+                    (uint32_t)(addr >> 32));
+        pci_write32(d->bus, d->slot, d->func, (uint8_t)(cap + 12),
+                    msi_data(vector));
+    } else {
+        pci_write32(d->bus, d->slot, d->func, (uint8_t)(cap + 8),
+                    msi_data(vector));
+    }
+
+    /* Enable, and request exactly one vector however many were offered. */
+    ctrl &= ~(0x70u << 16);
+    ctrl |=  (1u << 16);
+    pci_write32(d->bus, d->slot, d->func, cap, ctrl);
+
+    /* Legacy INTx has to be masked or the device raises both. */
+    uint32_t cmd = pci_read32(d->bus, d->slot, d->func, 0x04);
+    cmd |= (1u << 10);
+    pci_write32(d->bus, d->slot, d->func, 0x04, cmd);
+    return 0;
+}
+
+/*
+ * MSI-X: the vectors live in a table inside one of the device's BARs.
+ * Which BAR, and how far into it, is in the capability itself.
+ */
+static int pci_msix_enable(const pci_dev_t *d, uint8_t vector, uint32_t apic) {
+    uint8_t cap = pci_find_cap(d, PCI_CAP_MSIX);
+    if (!cap) return -1;
+
+    uint32_t ctrl = pci_read32(d->bus, d->slot, d->func, cap);
+    uint32_t tbl  = pci_read32(d->bus, d->slot, d->func, (uint8_t)(cap + 4));
+    uint8_t  bir  = tbl & 7;
+    uint32_t toff = tbl & ~7u;
+
+    uint64_t bar_base, bar_size;
+    if (pci_bar(d, bir, &bar_base, &bar_size) != 0) return -1;
+    volatile uint8_t *tab = mmio_map(bar_base + toff, 4096);
+    if (!tab) return -1;
+
+    uint64_t addr = msi_address(apic);
+    volatile uint32_t *e = (volatile uint32_t *)tab;   /* entry 0 */
+    e[0] = (uint32_t)addr;
+    e[1] = (uint32_t)(addr >> 32);
+    e[2] = msi_data(vector);
+    e[3] = 0;                                          /* unmasked */
+
+    ctrl |= (1u << 31);                                /* MSI-X enable  */
+    ctrl &= ~(1u << 30);                               /* function mask */
+    pci_write32(d->bus, d->slot, d->func, cap, ctrl);
+
+    uint32_t cmd = pci_read32(d->bus, d->slot, d->func, 0x04);
+    cmd |= (1u << 10);
+    pci_write32(d->bus, d->slot, d->func, 0x04, cmd);
+    return 0;
+}
+
+/*
+ * ===== POWER STATES =====
+ *
+ * D0 is running, D3hot is off but still answering config cycles. A
+ * device left in D3 by the firmware answers reads with all ones and
+ * looks absent, which is a real way to conclude a machine has no disk.
+ * Putting one into D3 on the way out of a driver is how a laptop's
+ * battery survives an idle NVMe.
+ */
+static int pci_set_power_state(const pci_dev_t *d, int state) {
+    uint8_t cap = pci_find_cap(d, PCI_CAP_PM);
+    if (!cap) return -1;
+    uint32_t pmcsr = pci_read32(d->bus, d->slot, d->func, (uint8_t)(cap + 4));
+    int cur = pmcsr & 3;
+    if (cur == state) return 0;
+
+    pmcsr = (pmcsr & ~3u) | (uint32_t)(state & 3);
+    pci_write32(d->bus, d->slot, d->func, (uint8_t)(cap + 4), pmcsr);
+
+    /* The specification requires 10 ms before the device is touched
+     * again after a D3->D0 transition, and a device read too early
+     * returns garbage that looks like a missing device. */
+    for (volatile int i = 0; i < 2000000; i++) { }
+    return (pci_read32(d->bus, d->slot, d->func, (uint8_t)(cap + 4)) & 3)
+           == state ? 0 : -1;
 }
 
 /* ===== PHYSICAL <-> VIRTUAL (Limine HHDM) ===== */

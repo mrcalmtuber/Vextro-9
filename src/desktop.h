@@ -783,6 +783,45 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         sched_yield();
         return 0;
 
+    case SYS_FORK: {
+        /*
+         * A second thread over a copy-on-write duplicate of this
+         * process's address space.
+         *
+         * Nothing is copied. Every writable page in both copies is made
+         * read-only and flagged, and the first write from either side
+         * faults into the handler that gives that side a private page.
+         * Two instances of a program therefore share every page neither
+         * of them writes, which for a program's text is all of it.
+         *
+         * Returns 0 in the child and the child's pid in the parent, the
+         * way it has been done since the seventh edition.
+         */
+        if (!vmm_current || !cur_thread) return (uint64_t)-1;
+        addr_space_t *child = (addr_space_t *)kmalloc(sizeof(addr_space_t));
+        if (!child) return (uint64_t)-1;
+        for (uint64_t i = 0; i < sizeof(addr_space_t); i++)
+            ((uint8_t *)child)[i] = 0;
+        if (vmm_fork(child, vmm_current) != 0) {
+            vmm_destroy(child);
+            kfree(child);
+            return (uint64_t)-1;
+        }
+        child->canvas_va = vmm_current->canvas_va;
+        child->tramp_va  = vmm_current->tramp_va;
+
+        /* The child resumes at the same instruction with RAX zero. Its
+         * frame is built from the parent's, which the syscall stub has
+         * already saved. */
+        thread_t *t = sched_fork_thread(cur_thread, child);
+        if (!t) {
+            vmm_destroy(child);
+            kfree(child);
+            return (uint64_t)-1;
+        }
+        return t->pid;
+    }
+
     case SYS_TICKS:
         return sched_ticks;
 
@@ -795,7 +834,7 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         }
         uint64_t *out = (uint64_t *)(uintptr_t)a0;
         if (!out) return (uint64_t)-1;
-        out[0] = vmm_current ? USER_CANVAS_VA
+        out[0] = vmm_current ? vmm_current->canvas_va
                              : (uint64_t)(uintptr_t)app_canvas;
         out[1] = APP_CANVAS_W;
         out[2] = APP_CANVAS_H;
@@ -942,7 +981,7 @@ static uint8_t app_page_prot[APP_MAX_PAGES];
 
 static int app_arena_ready(void) {
     if (app_memory) return 1;
-    app_memory = (uint8_t *)kmalloc(APP_MEM_SIZE);
+    app_memory = (uint8_t *)kmalloc_paged(APP_MEM_SIZE);
     return app_memory != 0;
 }
 
@@ -980,11 +1019,25 @@ static vx_export_t kernel_exports[] = {
     { 0, 0 }
 };
 
-static void kernel_exports_init(void) {
-    kernel_exports[0].addr = utramp_user_addr(utramp_ttf_draw_string);
-    kernel_exports[1].addr = utramp_user_addr(utramp_ttf_text_width);
-    kernel_exports[2].addr = utramp_user_addr(utramp_gfx_rect);
+/*
+ * Where the stubs land *in this process*.
+ *
+ * The trampoline page is placed at a different address in every address
+ * space now, so the addresses patched into an image's import table
+ * cannot be computed once at boot. They are recomputed per launch,
+ * against that process's own base, immediately before the staged image
+ * is copied into its pages.
+ */
+static void kernel_exports_for(uint64_t tramp_base) {
+    kernel_exports[0].addr = tramp_base +
+        (uint64_t)(utramp_ttf_draw_string - utramp_start);
+    kernel_exports[1].addr = tramp_base +
+        (uint64_t)(utramp_ttf_text_width  - utramp_start);
+    kernel_exports[2].addr = tramp_base +
+        (uint64_t)(utramp_gfx_rect        - utramp_start);
 }
+
+static void kernel_exports_init(void) { kernel_exports_for(USER_TRAMP_VA); }
 
 static int vx_name_eq(const char *a, const char *b) {
     for (int i = 0; i < VX_IMPORT_NAMELEN; i++) {
@@ -1294,6 +1347,30 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
         return 0;
     }
 
+    /*
+     * Where everything movable goes, this time.
+     *
+     * Two processes running the same program used to have byte-identical
+     * layouts, so an address learned once was correct in every run and
+     * in every instance. Displacing the stack, the heap and the two
+     * shared mappings costs nothing and means an overflow that overwrites
+     * a return address has nowhere reliable to point it.
+     *
+     * The image itself does not move, and cannot until a loader here
+     * processes relocations: an image has to land where it was linked.
+     * That is the honest limit of this.
+     */
+    const uint64_t stack_top = USER_STACK_TOP - aslr_offset(256);
+    const uint64_t tramp_va  = USER_TRAMP_VA  + aslr_offset(1024);
+    const uint64_t canvas_va = USER_CANVAS_VA + aslr_offset(1024);
+    as->brk = as->brk_top = USER_HEAP_BASE + aslr_offset(4096);
+
+    /* Now that this process's trampoline address is known, resolve the
+     * staged image's imports against it. Doing it here rather than in
+     * the loader is what lets the page move. */
+    kernel_exports_for(tramp_va);
+    vx_resolve_imports(app_memory, span);
+
     /* The image, one page at a time, each with the protection its
      * segment asked for. A page that no segment claimed is not mapped
      * at all rather than mapped and empty. */
@@ -1316,14 +1393,20 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
     }
 
     /* Stack: writable, never executable. */
-    if (vmm_alloc_range(as, USER_STACK_TOP - USER_STACK_SIZE,
+    if (vmm_alloc_range(as, stack_top - USER_STACK_SIZE,
                         USER_STACK_SIZE,
                         PTE_USER | PTE_WRITE | PTE_NX) != USER_STACK_SIZE)
         goto fail;
+    /* One unmapped page below it, so an overflow is a fault at a known
+     * address rather than a write into the heap. */
+    {
+        uint64_t *g = vmm_walk(as, stack_top - USER_STACK_SIZE - PAGE_SIZE, 1);
+        if (g) *g = PTE_GUARD;
+    }
 
     /* The trampolines: readable and executable, and writable by nobody.
      * They are the same physical page in every process. */
-    if (vmm_map_shared(as, USER_TRAMP_VA, utramp_start,
+    if (vmm_map_shared(as, tramp_va, utramp_start,
                        (uint64_t)(utramp_end - utramp_start),
                        PTE_USER) != 0)
         goto fail;
@@ -1331,9 +1414,11 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
     /* The window's pixels, so a program can draw without a syscall per
      * pixel. No-execute, because a canvas full of attacker-chosen bytes
      * that the program can also jump to is the whole of the exploit. */
-    if (vmm_map_shared(as, USER_CANVAS_VA, app_canvas, sizeof(app_canvas),
+    if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
                        PTE_USER | PTE_WRITE | PTE_NX) != 0)
         goto fail;
+    as->canvas_va = canvas_va;
+    as->tramp_va  = tramp_va;
 
     /*
      * The return address.
@@ -1346,8 +1431,9 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
      * ABI says it is at function entry — eight past a sixteen-byte
      * boundary — which matters now that applications may use SSE.
      */
-    uint64_t sp = USER_STACK_TOP - 8;
-    if (as_poke64(as, sp, utramp_user_addr(utramp_exit)) != 0) goto fail;
+    uint64_t sp = stack_top - 8;
+    if (as_poke64(as, sp, tramp_va + (uint64_t)(utramp_exit - utramp_start))
+        != 0) goto fail;
 
     thread_t *t = sched_spawn_user(as, entry_va, sp, name, PRIO_NORMAL);
     if (!t) goto fail;

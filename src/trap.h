@@ -176,6 +176,34 @@ void exception_handle(exc_frame_t *f) {
 
     int from_user = (f->cs & 3) == 3;
 
+    /*
+     * A write to a copy-on-write page is not an error. It is the whole
+     * mechanism: the page was made read-only on purpose so that the
+     * first write would arrive here and be given a private copy.
+     *
+     * Checked before anything is printed, because on a process that
+     * forked and then ran, this is the common case and reporting it
+     * would bury every real fault in noise.
+     */
+    if (f->vector == 14 && (f->error & 1) && (f->error & 2)) {
+        if (vmm_resolve_cow(vmm_current, cr2)) return;
+    }
+
+    /* A fault on the page below a kernel stack has exactly one cause,
+     * and saying which stack is most of the diagnosis. */
+    if (f->vector == 14 && vmm_is_guard(cr2)) {
+        serial_puts("\n[trap] kernel stack overflow in thread ");
+        serial_puts(cur_thread ? cur_thread->name : "unknown");
+        serial_puts(" - it ran off the end of its stack and hit the "
+                    "guard page\n[trap]   guard at ");
+        serial_put_hex64(cr2);
+        serial_puts(", rip ");
+        serial_put_hex64(f->rip);
+        serial_puts("\n[trap] halted\n");
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+    }
+
     serial_puts("\n[trap] ");
     serial_puts(exc_name(f->vector));
     serial_puts(" (vector ");
@@ -259,12 +287,19 @@ static void trap_install(void) {
         (void *)exc_stub_18, (void *)exc_stub_19, (void *)exc_stub_20,
         (void *)exc_stub_21
     };
-    for (int v = 0; v <= 21; v++)
-        idt_set_gate_ex(v, stubs[v], GDT_KCODE, v == 8 ? 1 : 0, 0);
+    for (int v = 0; v <= 21; v++) {
+        uint8_t ist = 0;
+        if (v == 8)  ist = IST_DF;    /* double fault      */
+        if (v == 2)  ist = IST_NMI;   /* non-maskable      */
+        if (v == 12) ist = IST_SS;    /* stack-segment     */
+        if (v == 18) ist = IST_MC;    /* machine check     */
+        idt_set_gate_ex(v, stubs[v], GDT_KCODE, ist, 0);
+    }
     idt_set_gate_ex(29, (void *)exc_stub_29, GDT_KCODE, 0, 0);
     idt_set_gate_ex(30, (void *)exc_stub_30, GDT_KCODE, 0, 0);
 
-    serial_puts("[trap] 24 exception vectors installed, #DF on its own stack\n");
+    serial_puts("[trap] 24 exception vectors, four on interrupt stacks "
+                "(#DF #SS #MC NMI)\n");
 }
 
 #endif /* TRAP_H */

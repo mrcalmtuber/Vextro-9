@@ -5,6 +5,8 @@
 #include "pmm.h"
 #include "gdt.h"
 #include "vmm.h"
+#include "acpi.h"
+#include "ucode.h"
 #include "kheap.h"
 #include "klibc.h"
 #include "syscall.h"
@@ -68,6 +70,12 @@ static volatile struct limine_module_request mod_request = {
 __attribute__((used, section(".limine_reqs")))
 static volatile struct limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_reqs")))
+static volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST_ID,
     .revision = 0
 };
 
@@ -418,6 +426,28 @@ static void frame_report(void) {
  *   CR4.OSFXSR    - FXSAVE/FXRSTOR available, SSE instructions legal
  *   CR4.OSXMMEXCPT- unmasked SSE exceptions raise #XF rather than #UD
  */
+/*
+ * ---- the page reclaimer ----
+ *
+ * A kernel thread that walks the current process's page tables clearing
+ * accessed bits, so that the next pass can tell which pages were touched
+ * in between. That is the whole of an approximate least-recently-used
+ * order, and it is what anything that has to choose a page to evict
+ * needs to know first.
+ *
+ * It runs at just above idle priority and sleeps for a second between
+ * passes, so it costs nothing anybody can measure and never competes
+ * with either the compositor or an application. Nothing is evicted yet —
+ * there is no swap file to evict to — but the measurement is real and
+ * `free` reports it.
+ */
+static void reclaim_thread(void) {
+    for (;;) {
+        sched_sleep_ms(1000);
+        if (vmm_current) vmm_age_pass(vmm_current);
+    }
+}
+
 /*
  * Sleep out the rest of the frame, and let everything else run while we
  * do.
@@ -933,6 +963,21 @@ void kmain(void) {
         serial_puts("[vextro] no memory map: paging and heap unavailable\n");
     }
 
+    /*
+     * ---- what the firmware knows ----
+     *
+     * The processor's own patch revision has to be read before anything
+     * else touches IA32_BIOS_SIGN_ID, and the ACPI tables answer the
+     * questions no amount of probing can: how many cores there really
+     * are as opposed to threads, where the I/O APICs are, which line the
+     * firmware actually wired the timer to, and whether there is a
+     * PCIe extended configuration window.
+     */
+    ucode_init();
+    acpi_init(rsdp_request.response ? rsdp_request.response->address : 0);
+    if (acpi.mcfg_base)
+        pci_ecam_init(acpi.mcfg_base, acpi.mcfg_bus_start, acpi.mcfg_bus_end);
+
     /* SYSCALL/SYSRET, the int 0x80 gate at DPL 3, and EFER.NXE */
     syscall_init();
     kernel_exports_init();
@@ -962,9 +1007,11 @@ void kmain(void) {
      * — because it is already running and cannot be created.
      */
     lapic_init(1000);
+    aslr_seed();
     sched_init();
     sched_reap_hook = app_reaped;
     sched_start();
+    sched_spawn_kernel(reclaim_thread, "reclaim", PRIO_IDLE + 1);
 
     /* Initialize Intel e1000 NIC via PCI discovery */
     if (hhdm_request.response != NULL) {
@@ -1013,6 +1060,8 @@ void kmain(void) {
     if (hhdm_request.response != NULL)
         hal_hhdm_offset = hhdm_request.response->offset;
     blk_init();
+    blk_cache_init();
+    part_scan();
 #ifdef STORAGE_SELFTEST
     blk_selftest();
 #endif

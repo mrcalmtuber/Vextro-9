@@ -424,7 +424,12 @@ static thread_t *sched_new(const char *name, uint32_t prio) {
     if (!t) return 0;
     for (uint64_t i = 0; i < sizeof(thread_t); i++) ((uint8_t *)t)[i] = 0;
 
-    t->kstack = kmalloc(SCHED_KSTACK);
+    /* Not from the heap: the heap lives in the direct map, where every
+     * page of RAM is mapped and a hole cannot be made. A stack there has
+     * nothing below it but whatever the allocator handed out next, so an
+     * overflow corrupts silently. kstack_alloc puts an unmapped page
+     * under each one. */
+    t->kstack = kstack_alloc(SCHED_KSTACK);
     if (!t->kstack) { kfree(t); return 0; }
 
     t->pid        = sched_next_pid++;
@@ -453,7 +458,7 @@ static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
-        kfree(t->kstack); kfree(t);
+        kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
     irq_restore(flags);
@@ -474,7 +479,62 @@ static thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
-        kfree(t->kstack); kfree(t);
+        kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
+        return 0;
+    }
+    irq_restore(flags);
+    return t;
+}
+
+/*
+ * A thread that resumes where its parent is, in a different address
+ * space.
+ *
+ * The child's kernel stack is given a trap frame built out of the
+ * parent's syscall frame: same instruction pointer, same flags, same
+ * user stack pointer, every general-purpose register the same — and RAX
+ * zero, which is the only way the two of them can tell each other apart
+ * on the way back out.
+ *
+ * Only from the SYSCALL door. The legacy gate does not put the return
+ * address in RCX, so there would be nothing to build a frame from.
+ */
+static thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
+    if (!parent || !child_as || !syscall_cur_frame || !syscall_via_fast)
+        return 0;
+
+    thread_t *t = sched_new(parent->name, parent->prio);
+    if (!t) return 0;
+    t->user = 1;
+    t->as   = child_as;
+    t->cr3  = child_as->pml4_phys;
+
+    uint64_t top = ((uint64_t)(uintptr_t)t->kstack + SCHED_KSTACK) & ~15ULL;
+    trap_frame_t *f = (trap_frame_t *)(uintptr_t)(top - sizeof(trap_frame_t));
+    const syscall_frame_t *p = syscall_cur_frame;
+
+    f->r15 = p->r15; f->r14 = p->r14; f->r13 = p->r13; f->r12 = p->r12;
+    f->r11 = p->r11; f->r10 = p->r10; f->r9  = p->r9;  f->r8  = p->r8;
+    f->rbp = p->rbp; f->rdi = p->rdi; f->rsi = p->rsi; f->rdx = p->rdx;
+    f->rcx = p->rcx; f->rbx = p->rbx;
+    f->rax = 0;                       /* this is the child */
+
+    f->rip    = p->rcx;               /* SYSCALL left it there */
+    f->cs     = SEL_UCODE;
+    f->ss     = SEL_UDATA;
+    f->rsp    = p->user_rsp;
+    f->rflags = (p->r11 | 0x202ULL) & ~0x8ULL;   /* IF on, TF off */
+
+    /* The parent's own extended state, so the child starts with the same
+     * floating-point registers rather than a freshly reset unit. */
+    for (int i = 0; i < 512; i++) t->fx[i] = parent->fx[i];
+
+    t->rsp = (uint64_t)(uintptr_t)f;
+
+    uint64_t flags = irq_save();
+    if (sched_register(t) < 0) {
+        irq_restore(flags);
+        kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
     irq_restore(flags);
@@ -567,7 +627,7 @@ static void sched_reap(void) {
         irq_restore(flags);
 
         if (t->as) { vmm_destroy(t->as); kfree(t->as); }
-        if (t->kstack) kfree(t->kstack);
+        if (t->kstack) kstack_free(t->kstack, SCHED_KSTACK);
         serial_puts("[sched] reaped ");
         serial_puts(t->name);
         serial_puts("\n");

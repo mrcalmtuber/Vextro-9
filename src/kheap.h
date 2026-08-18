@@ -38,6 +38,30 @@
 #define KHEAP_SLAB_MAGIC   0x534C41425F565839ULL   /* "SLAB_VX9" */
 #define KHEAP_LARGE_MAGIC  0x4C4152475F565839ULL   /* "LARG_VX9" */
 
+/*
+ * ---- two pools ----
+ *
+ * One heap is one policy, and there are two policies here.
+ *
+ * NON-PAGED memory may be touched by an interrupt handler, by the
+ * scheduler, or by a device doing bus-master DMA. It must be resident,
+ * always, and nothing may ever take it away: page tables, thread control
+ * blocks, descriptor rings, the reference table. Reclaiming one of those
+ * would fault inside a handler that cannot fault.
+ *
+ * PAGED memory is only ever touched by a thread that can be made to
+ * wait: file caches, decoded images, a window's contents, the staging
+ * arena an image is assembled in. It is exactly what a reclaimer should
+ * look at first when memory runs short.
+ *
+ * The split is by allocation rather than by address, which is the
+ * arrangement Windows uses and for the same reason: the caller knows
+ * which kind it needs and nothing else can work it out afterwards.
+ */
+#define KPOOL_NONPAGED 0
+#define KPOOL_PAGED    1
+#define KPOOL_COUNT    2
+
 #define KHEAP_MAX_SLAB     2048
 #define KHEAP_HDR_BYTES    64
 
@@ -57,21 +81,23 @@ typedef struct kslab {
     uint32_t      obj_size;
     uint32_t      obj_total;
     uint32_t      obj_free;
-    uint32_t      cls;
+    uint16_t      cls;
+    uint16_t      pool;
 } kslab_t;
 
 typedef struct {
     uint64_t magic;
     uint64_t frames;        /* how many pages the run holds */
     uint64_t bytes;         /* what the caller asked for */
-    uint64_t pad;
+    uint32_t pool;
+    uint32_t pad;
 } klarge_t;
 
-static kslab_t   *kheap_partial[KHEAP_NCLASS];
-static spinlock_t kheap_lock;
-static uint64_t   kheap_live_bytes = 0;
-static uint64_t   kheap_slab_pages = 0;
-static uint64_t   kheap_large_pages = 0;
+static kslab_t   *kheap_partial[KPOOL_COUNT][KHEAP_NCLASS];
+static spinlock_t kheap_lock = { 0, "kheap" };
+static uint64_t   kheap_live_bytes[KPOOL_COUNT];
+static uint64_t   kheap_slab_pages[KPOOL_COUNT];
+static uint64_t   kheap_large_pages[KPOOL_COUNT];
 
 static int kheap_class_of(uint64_t n) {
     for (int i = 0; i < KHEAP_NCLASS; i++)
@@ -81,7 +107,7 @@ static int kheap_class_of(uint64_t n) {
 
 /* A new slab for a class, threaded so that the first object is the head
  * of the free list and each free object points at the next. */
-static kslab_t *kheap_new_slab(int cls) {
+static kslab_t *kheap_new_slab(int cls, int pool) {
     uint64_t phys = pmm_alloc();
     if (!phys) return 0;
     kslab_t *s = (kslab_t *)(uintptr_t)phys_to_virt(phys);
@@ -95,7 +121,8 @@ static kslab_t *kheap_new_slab(int cls) {
     s->obj_size  = osz;
     s->obj_total = total;
     s->obj_free  = total;
-    s->cls       = (uint32_t)cls;
+    s->cls       = (uint16_t)cls;
+    s->pool      = (uint16_t)pool;
 
     uint8_t *base = (uint8_t *)s + KHEAP_HDR_BYTES;
     s->freelist = base;
@@ -103,34 +130,35 @@ static kslab_t *kheap_new_slab(int cls) {
         *(void **)(base + (uint64_t)i * osz) = base + (uint64_t)(i + 1) * osz;
     *(void **)(base + (uint64_t)(total - 1) * osz) = 0;
 
-    kheap_slab_pages++;
+    kheap_slab_pages[pool]++;
     return s;
 }
 
 static void kheap_unlink(kslab_t *s) {
     if (s->prev) s->prev->next = s->next;
-    else         kheap_partial[s->cls] = s->next;
+    else         kheap_partial[s->pool][s->cls] = s->next;
     if (s->next) s->next->prev = s->prev;
     s->next = s->prev = 0;
 }
 
 static void kheap_link(kslab_t *s) {
     s->prev = 0;
-    s->next = kheap_partial[s->cls];
+    s->next = kheap_partial[s->pool][s->cls];
     if (s->next) s->next->prev = s;
-    kheap_partial[s->cls] = s;
+    kheap_partial[s->pool][s->cls] = s;
 }
 
-static void *kmalloc(uint64_t n) {
+static void *kmalloc_pool(uint64_t n, int pool) {
     if (n == 0) return 0;
+    if (pool < 0 || pool >= KPOOL_COUNT) pool = KPOOL_NONPAGED;
     uint64_t flags = spin_lock_irq(&kheap_lock);
     void *out = 0;
 
     int cls = n <= KHEAP_MAX_SLAB ? kheap_class_of(n) : -1;
     if (cls >= 0) {
-        kslab_t *s = kheap_partial[cls];
+        kslab_t *s = kheap_partial[pool][cls];
         if (!s) {
-            s = kheap_new_slab(cls);
+            s = kheap_new_slab(cls, pool);
             if (s) kheap_link(s);
         }
         if (s) {
@@ -140,7 +168,7 @@ static void *kmalloc(uint64_t n) {
             /* A slab with nothing left is taken off the partial list; it
              * comes back the moment one of its objects is freed. */
             if (s->obj_free == 0) kheap_unlink(s);
-            kheap_live_bytes += s->obj_size;
+            kheap_live_bytes[pool] += s->obj_size;
         }
     } else {
         uint64_t need   = KHEAP_HDR_BYTES + n;
@@ -151,15 +179,27 @@ static void *kmalloc(uint64_t n) {
             h->magic  = KHEAP_LARGE_MAGIC;
             h->frames = frames;
             h->bytes  = n;
+            h->pool   = (uint32_t)pool;
             h->pad    = 0;
             out = (uint8_t *)h + KHEAP_HDR_BYTES;
-            kheap_large_pages += frames;
-            kheap_live_bytes  += n;
+            kheap_large_pages[pool] += frames;
+            kheap_live_bytes[pool]  += n;
         }
     }
 
     spin_unlock_irq(&kheap_lock, flags);
     return out;
+}
+
+/* The default is non-paged, because it is the answer that is never
+ * wrong: memory that could have been paged and was not costs residency,
+ * memory that should not have been paged and was costs a fault in a
+ * handler that cannot take one. */
+static inline void *kmalloc(uint64_t n) {
+    return kmalloc_pool(n, KPOOL_NONPAGED);
+}
+static inline void *kmalloc_paged(uint64_t n) {
+    return kmalloc_pool(n, KPOOL_PAGED);
 }
 
 static void kfree(void *p) {
@@ -175,7 +215,7 @@ static void kfree(void *p) {
         *(void **)p = s->freelist;
         s->freelist = p;
         s->obj_free++;
-        kheap_live_bytes -= s->obj_size;
+        kheap_live_bytes[s->pool] -= s->obj_size;
         if (was_full) kheap_link(s);
         /* An entirely free slab goes back to the page allocator. Keeping
          * one around per class would avoid a little churn; giving it back
@@ -183,8 +223,9 @@ static void kfree(void *p) {
          * the machine the pages it briefly needed. */
         if (s->obj_free == s->obj_total) {
             kheap_unlink(s);
+            int pool = s->pool;
             s->magic = 0;
-            kheap_slab_pages--;
+            kheap_slab_pages[pool]--;
             uint64_t phys = kern_virt_to_phys((void *)(uintptr_t)page);
             spin_unlock_irq(&kheap_lock, flags);
             pmm_free(phys);
@@ -193,9 +234,10 @@ static void kfree(void *p) {
     } else if (magic == KHEAP_LARGE_MAGIC) {
         klarge_t *h = (klarge_t *)(uintptr_t)page;
         uint64_t frames = h->frames;
+        uint32_t pool = h->pool < KPOOL_COUNT ? h->pool : KPOOL_NONPAGED;
         h->magic = 0;
-        kheap_large_pages -= frames;
-        kheap_live_bytes  -= h->bytes;
+        kheap_large_pages[pool] -= frames;
+        kheap_live_bytes[pool]  -= h->bytes;
         uint64_t phys = kern_virt_to_phys((void *)(uintptr_t)page);
         spin_unlock_irq(&kheap_lock, flags);
         pmm_free_contig(phys, frames);
@@ -248,16 +290,24 @@ static void *kmalloc_pages(uint64_t frames, uint64_t *out_phys) {
     uint64_t phys = pmm_alloc_contig(frames);
     if (!phys) { if (out_phys) *out_phys = 0; return 0; }
     if (out_phys) *out_phys = phys;
-    kheap_large_pages += frames;
+    kheap_large_pages[KPOOL_NONPAGED] += frames;
     return (void *)(uintptr_t)phys_to_virt(phys);
 }
 
 static void kfree_pages(void *p, uint64_t frames) {
     if (!p) return;
-    kheap_large_pages -= frames;
+    kheap_large_pages[KPOOL_NONPAGED] -= frames;
     pmm_free_contig(kern_virt_to_phys(p), frames);
 }
 
-static uint64_t kheap_in_use_kb(void) { return kheap_live_bytes / 1024; }
+static uint64_t kheap_in_use_kb(void) {
+    return (kheap_live_bytes[0] + kheap_live_bytes[1]) / 1024;
+}
+static uint64_t kheap_pool_kb(int pool) {
+    return kheap_live_bytes[pool & 1] / 1024;
+}
+static uint64_t kheap_pool_pages(int pool) {
+    return kheap_slab_pages[pool & 1] + kheap_large_pages[pool & 1];
+}
 
 #endif /* KHEAP_H */

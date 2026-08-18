@@ -52,6 +52,8 @@
 #define SYS_TTF_TEXT_WIDTH  20
 #define SYS_TTF_DRAW_STRING 21
 #define SYS_GFX_RECT        22
+#define SYS_FORK            23
+#define SYS_MEMINFO         24
 
 /*
  * Every register a user thread had, in the order the entry stubs push
@@ -84,12 +86,34 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3, uint64_t a4,
                                 uint64_t a5);
 
+/*
+ * The frame the call in progress arrived on, and which door it came
+ * through.
+ *
+ * Only fork needs these, and it needs them absolutely: a child has to
+ * resume at the same instruction as its parent, and the only record of
+ * where that is lives in the frame. Safe as a global because interrupts
+ * are masked for the whole of a syscall, so there is never more than one
+ * in progress.
+ *
+ * The door matters because the two do not carry the same information.
+ * SYSCALL puts the return address in RCX and the flags in R11 by
+ * architecture; `int 0x80` puts them in the interrupt frame the
+ * processor pushed, above what this structure covers, and leaves RCX and
+ * R11 holding whatever the program had in them.
+ */
+static syscall_frame_t *syscall_cur_frame = 0;
+static int              syscall_via_fast  = 0;
+
 __attribute__((used))
 void syscall_dispatch_frame(syscall_frame_t *f);
 
 void syscall_dispatch_frame(syscall_frame_t *f) {
+    syscall_cur_frame = f;
+    syscall_via_fast  = 1;
     f->rax = syscall_service(f->rax, f->rdi, f->rsi, f->rdx,
                              f->r10, f->r8, f->r9);
+    syscall_cur_frame = 0;
 }
 
 /*
@@ -114,8 +138,11 @@ __attribute__((used))
 void syscall_dispatch_legacy(syscall_frame_t *f);
 
 void syscall_dispatch_legacy(syscall_frame_t *f) {
+    syscall_cur_frame = f;
+    syscall_via_fast  = 0;
     (void)syscall_service(f->rax, f->rdi, f->rsi, f->rdx,
                           f->r10, f->r8, f->r9);
+    syscall_cur_frame = 0;
 }
 
 /*

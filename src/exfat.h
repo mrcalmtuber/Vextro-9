@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "blk.h"
+#include "part.h"
 
 /*
  * exFAT driver — read and write.
