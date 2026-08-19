@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "ttf.h"
 #include "gfx.h"
+#include "sysx.h"
 #include "fat32.h"
 #include "exfat.h"
 #include "vx_format.h"

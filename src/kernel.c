@@ -18,7 +18,9 @@
 #include "ttf.h"
 #include "login.h"
 #include "e1000.h"
-#include "ac97.h"
+#define VEXTRO_HAVE_AUDIO 1
+#include "hda.h"
+#include "audio.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -538,32 +540,15 @@ static void fill_rect(uint32_t w, uint32_t x, uint32_t y,
 }
 
 /*
- * 12x18 arrow cursor: 'X' = black outline, '.' = white fill, ' ' = clear.
- * Upper-left hot spot.
+ * The pointer's footprint, for the damage rectangle the flip computes.
+ *
+ * The character-art arrow that used to live here is gone: the shapes are
+ * in sysx.h now, drawn rather than spelled, in ARGB with soft diagonals,
+ * and there are seven of them because the shape of the pointer is how a
+ * window edge says it can be dragged.
  */
-static const char *CURSOR_IMG[18] = {
-    "X           ",
-    "XX          ",
-    "X.X         ",
-    "X..X        ",
-    "X...X       ",
-    "X....X      ",
-    "X.....X     ",
-    "X......X    ",
-    "X.......X   ",
-    "X........X  ",
-    "X.....XXXXX ",
-    "X..X..X     ",
-    "X.X X..X    ",
-    "XX  X..X    ",
-    "X    X..X   ",
-    "     X..X   ",
-    "      X..X  ",
-    "      XXX   ",
-};
-
-#define CURSOR_W 12
-#define CURSOR_H 18
+#define CURSOR_W CUR_W
+#define CURSOR_H CUR_H
 
 /*
  * The pointer is composited by the flip, not drawn after it.
@@ -590,14 +575,26 @@ static const char *CURSOR_IMG[18] = {
 static int32_t cur_prev_x = 0, cur_prev_y = 0;
 static int     cur_valid = 0;      /* cur_prev_* describe a real position */
 
-/* The sprite's colour at a screen position, or 0 where it does not cover. */
+/*
+ * The sprite at a screen position, or 0 where it does not cover.
+ *
+ * `out` comes back as ARGB: the alpha matters now, because the pointers
+ * in sysx.h are antialiased along their diagonals and a hard-edged
+ * pointer over a busy background is the thing that made the old one hard
+ * to follow. The caller blends rather than assigning.
+ *
+ * Which shape is current is a property of what is under the pointer --
+ * a window edge, a link, a text field -- and is set by the desktop.
+ */
 static int cursor_at(int32_t px, int32_t py, int32_t cx, int32_t cy,
                      uint32_t *out) {
-    int32_t dx = px - cx, dy = py - cy;
-    if (dx < 0 || dx >= CURSOR_W || dy < 0 || dy >= CURSOR_H) return 0;
-    char c = CURSOR_IMG[dy][dx];
-    if (c == ' ') return 0;
-    *out = (c == 'X') ? 0x000000u : 0xFFFFFFu;
+    const cursor_t *c = &cursors[cursor_current];
+    int32_t dx = px - (cx - c->hot_x), dy = py - (cy - c->hot_y);
+    if (dx < 0 || dx >= (int32_t)c->w || dy < 0 || dy >= (int32_t)c->h)
+        return 0;
+    uint32_t p = c->pix[dy * CUR_W + dx];
+    if (!(p >> 24)) return 0;
+    *out = p;
     return 1;
 }
 
@@ -642,7 +639,7 @@ static int trail_at(int32_t px, int32_t py, uint32_t *colour, uint32_t *weight) 
         uint32_t c;
         if (!cursor_at(px, py, trail[i].x, trail[i].y, &c)) continue;
         uint32_t w = trail_weight(trail[i].life);
-        if (w > best) { best = w; bc = c; }
+        if (w > best) { best = w; bc = c & 0x00FFFFFFu; }
     }
     if (!best) return 0;
     *colour = bc;
@@ -750,8 +747,11 @@ static void vga_flip(volatile uint32_t *vram,
                 if (trail_used &&
                     trail_at((int32_t)col, (int32_t)row, &sprite, &gw))
                     px = trail_blend(px, sprite, gw);
-                if (cursor_at((int32_t)col, (int32_t)row, cx, cy, &sprite))
-                    px = sprite;              /* the pointer wins, always */
+                if (cursor_at((int32_t)col, (int32_t)row, cx, cy, &sprite)) {
+                    uint32_t a = sprite >> 24;
+                    px = (a == 255) ? (sprite & 0x00FFFFFFu)
+                                    : gfx_mix(sprite & 0x00FFFFFFu, px, a);
+                }
             }
             dst[col] = px;
         }
@@ -924,6 +924,21 @@ void kmain(void) {
     uint32_t w = panel_w > BUF_MAX_W ? BUF_MAX_W : panel_w;
     uint32_t h = panel_h > BUF_MAX_H ? BUF_MAX_H : panel_h;
 
+    /*
+     * Every panel the firmware found, not just the first. A second
+     * monitor was previously invisible: the list was read, entry zero
+     * was taken, and the rest were dropped on the floor.
+     */
+    for (uint64_t i = 0; i < fb_request.response->framebuffer_count &&
+                         i < DISPLAY_MAX; i++) {
+        struct limine_framebuffer *f = fb_request.response->framebuffers[i];
+        display_add((volatile uint32_t *)f->address, (uint32_t)f->width,
+                    (uint32_t)f->height,
+                    (uint32_t)(f->pitch / (f->bpp / 8)));
+    }
+    yuv_init();
+    cursors_init();
+
     /* The animation is centred on the real panel, not the back buffer */
     display_boot_animation(vram, panel_w, panel_h, pitch_px);
 
@@ -985,6 +1000,22 @@ void kmain(void) {
     /* HAL: safely probe and initialize PS/2 devices */
     hal_init_devices(cs, (int32_t)w, (int32_t)h);
 
+    /*
+     * USB, and no longer behind a build flag.
+     *
+     * It was optional because it was incomplete; what it was missing was
+     * hot plug, and a USB stack that only sees what was present at boot
+     * is not really a USB stack. Ports are watched every frame now, so a
+     * keyboard or mouse plugged in at any point is usable about a
+     * sixtieth of a second later, and one unplugged is released rather
+     * than left holding a slot.
+     *
+     * PS/2 stays exactly where it is. A machine that has both should use
+     * both -- they arrive through the same HAL and the desktop cannot
+     * tell which moved the pointer.
+     */
+    if (xhci_init()) xhci_enumerate();
+
     /* Start PIT at ~60 Hz so the render loop runs even when mouse is idle */
     pit_init(cs);
 
@@ -1018,11 +1049,27 @@ void kmain(void) {
         e1000_init(hhdm_request.response->offset);
     }
 
-    /* Initialize Intel AC97 audio via PCI discovery */
-    ac97_init();
+    /* Audio: HD Audio if this machine has it, AC'97 if it does not.
+     * Nothing above this line names either. */
+    audio_init();
 
     /* Initialize Layer 2 network stack (Ethernet + ARP) */
     netstack_init();
+
+    /*
+     * Policy over the wire: default-deny inbound with connection
+     * tracking, and more than one resolver so a single unreachable
+     * server is not the end of name resolution. ICMP echo is allowed in
+     * explicitly, because a machine that cannot be pinged is a machine
+     * nobody can diagnose.
+     */
+    fw_add_rule(FW_ALLOW, FW_DIR_IN, FW_PROTO_ICMP, 0, 0, 0, 0);
+    dns_add_server(0x0A000203);        /* 10.0.2.3, the QEMU resolver  */
+    dns_add_server(0x01010101);        /* 1.1.1.1                      */
+    dns_add_server(0x08080808);        /* 8.8.8.8                      */
+    serial_puts("[fw] default-deny inbound with connection tracking, ");
+    serial_put_dec((uint32_t)dns_server_count);
+    serial_puts(" resolvers\n");
 
     /* Intel Gen9 iGPU blitter — optional acceleration; on machines
      * without a supported iGPU we stay on the portable CPU renderer */
@@ -1311,10 +1358,10 @@ void kmain(void) {
     /* Render loop — wakes on each interrupt, redraws, sleeps again */
     while (1) {
         sched_reap();
+        audio_poll();
+        fw_tick();
         net_poll();
-#ifdef ENABLE_XHCI
         xhci_poll();
-#endif
 
         /* --- Confirmation message overlay --- */
         if (confirm_active) {

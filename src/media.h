@@ -31,14 +31,35 @@
  * and the reason for the silence is stated -- but it cannot play, and it
  * says so instead of pretending.
  */
+/*
+ * The player no longer names a controller. It asks the audio layer for a
+ * voice and the layer decides whether that ends up on an HD Audio codec,
+ * an AC'97 one, or nowhere -- and because it is a voice rather than the
+ * whole device, a system sound can be heard over the track instead of
+ * stopping it.
+ */
 #ifndef VEXTRO_HAVE_AUDIO
-static int  ac97_found = 0;
-static int  ac97_play(const int16_t *p, uint32_t n, uint32_t r) {
-    (void)p; (void)n; (void)r; return -1;
+static int  audio_present(void) { return 0; }
+static int  audio_voice_start(const int16_t *p, uint32_t n, uint32_t r,
+                              int vol, int loop) {
+    (void)p; (void)n; (void)r; (void)vol; (void)loop; return -1;
 }
-static void ac97_stop(void) { }
-static int  ac97_busy(void) { return 0; }
+static void audio_stop_all(void) { }
+static int  audio_voices_active(void) { return 0; }
+static const char *audio_backend_name(void) { return "none"; }
 #endif
+
+static int media_voice = -1;
+
+static int  media_out_play(const int16_t *p, uint32_t n, uint32_t r) {
+    media_voice = audio_voice_start(p, n, r, 256, 0);
+    return media_voice >= 0 ? 0 : -1;
+}
+static void media_out_stop(void) {
+    audio_stop_all();
+    media_voice = -1;
+}
+static int  media_out_busy(void) { return audio_voices_active() > 0; }
 
 #define MEDIA_MAX_SAMPLES (1u << 20)     /* 2 MB: ~11 s of 48 kHz stereo */
 #define MEDIA_MAX_TRACKS  32
@@ -221,13 +242,13 @@ static void media_play_selected(void) {
         return;
     }
 
-    if (!ac97_found) {
+    if (!audio_present()) {
         str_copy(media_status, "no audio device on this machine",
                  sizeof(media_status));
         media_status_err = 1;
         return;
     }
-    if (ac97_play(media_pcm, media_nsamples, media_rate) != 0) {
+    if (media_out_play(media_pcm, media_nsamples, media_rate) != 0) {
         str_copy(media_status, "the device refused the buffer", sizeof(media_status));
         media_status_err = 1;
         return;
@@ -237,7 +258,7 @@ static void media_play_selected(void) {
 }
 
 static void media_stop(void) {
-    ac97_stop();
+    media_out_stop();
     str_copy(media_status, "stopped", sizeof(media_status));
     media_status_err = 0;
 }
@@ -272,7 +293,7 @@ static void media_draw(uint32_t *buf, uint32_t w, uint32_t h,
 
     /* the level meter doubles as the running indicator: it only moves
      * while the controller is actually walking the descriptor list */
-    const int playing = ac97_busy();
+    const int playing = media_out_busy();
     const int32_t mx0 = cx + 178, mw = cw - 192;
     if (mw > 40) {
         gfx_rect(buf, w, h, mx0, by + 8, mw, 10, 0x1A1E2Au);
@@ -350,7 +371,7 @@ static void media_key(char ch) {
     case KEY_UP:   if (media_sel > 0) media_sel--; break;
     case KEY_DOWN: if (media_sel + 1 < media_track_n) media_sel++; break;
     case '\n':     media_play_selected(); break;
-    case ' ':      if (ac97_busy()) media_stop(); else media_play_selected(); break;
+    case ' ':      if (media_out_busy()) media_stop(); else media_play_selected(); break;
     default: break;
     }
 }

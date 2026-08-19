@@ -2,6 +2,7 @@
 #define NETSTACK_H
 
 #include "tls.h"
+#include "netx.h"
 
 #include <stdint.h>
 

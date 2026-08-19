@@ -641,16 +641,112 @@ static void xhci_queue_report(xhci_hid_t *h) {
     xhci_db[h->slot] = h->ep_id;
 }
 
+/*
+ * ---- hot plug ----
+ *
+ * Enumeration used to happen once, at boot, and that is the difference
+ * between "USB works" and "USB worked when the machine started". A
+ * keyboard plugged in afterwards was invisible; one unplugged left a
+ * slot pointing at a device that would never answer again, and the
+ * report queued to it sat in the ring forever.
+ *
+ * A port carries its own change bits, and they are write-one-to-clear:
+ * reading them and writing them back is what acknowledges the event.
+ * Getting that wrong in the other direction is worse than missing the
+ * event -- PORTSC has several bits that are also write-one-to-clear, so
+ * a careless read-modify-write acknowledges changes nobody has looked
+ * at yet.
+ */
+#define XHCI_PORTSC_OCC  (1u << 20)  /* over-current change */
+#define XHCI_PORTSC_PLC  (1u << 22)  /* port link state change */
+#define XHCI_PORTSC_CEC  (1u << 23)  /* config error change */
+#define XHCI_PORTSC_ACK  (XHCI_PORTSC_CSC | XHCI_PORTSC_PRC | \
+                          XHCI_PORTSC_OCC | XHCI_PORTSC_PLC | \
+                          XHCI_PORTSC_CEC)
+
+/* The bits that must never be written back as ones by accident. */
+#define XHCI_PORTSC_RW   (XHCI_PORTSC_PP)
+
+static void xhci_ack_port(uint32_t port, uint32_t bits) {
+    uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(port));
+    /* Keep only the read-write bits, then set exactly the change bits
+     * being acknowledged. */
+    uint32_t out = (psc & XHCI_PORTSC_RW) | (bits & XHCI_PORTSC_ACK);
+    xhci_wr32(xhci_op, XHCI_PORTSC(port), out);
+}
+
+static int xhci_hid_on_port(uint32_t port) {
+    for (int i = 0; i < XHCI_MAX_HID; i++)
+        if (xhci_hid[i].used && xhci_hid[i].port == port) return i;
+    return -1;
+}
+
+/*
+ * Let a device go.
+ *
+ * The slot is not disabled through the command ring, deliberately: the
+ * device is already gone, the command would time out waiting for a
+ * controller response about hardware that is not there, and a timeout
+ * inside the frame loop is exactly what a hot-unplug must not cost. The
+ * slot leaks until the next reset, which on a machine with four slots
+ * and a lifetime of a few hours is a trade worth making.
+ */
+static void xhci_drop_device(int idx) {
+    if (idx < 0 || idx >= XHCI_MAX_HID || !xhci_hid[idx].used) return;
+    xhci_log(xhci_hid[idx].is_keyboard ? "keyboard unplugged"
+                                       : "pointer unplugged");
+    xhci_hid[idx].used = 0;
+    xhci_hid[idx].slot = 0;
+
+    int n = 0;
+    for (int i = 0; i < XHCI_MAX_HID; i++) if (xhci_hid[i].used) n++;
+    xhci_hid_count = n;
+}
+
 static void xhci_enumerate(void) {
     if (!xhci_present) return;
-    for (uint32_t p = 0; p < xhci_max_ports && xhci_hid_count < XHCI_MAX_HID; p++) {
+    for (uint32_t p = 0; p < xhci_max_ports; p++) {
         uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(p));
         if (!(psc & XHCI_PORTSC_CCS)) continue;
-        if (xhci_setup_port(p)) {
+        if (xhci_hid_on_port(p) >= 0) continue;
+        if (xhci_hid_count >= XHCI_MAX_HID) break;
+        if (xhci_setup_port(p))
             xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
-        }
     }
     if (xhci_hid_count == 0) xhci_log("no HID devices found");
+}
+
+/*
+ * Called every frame. Walks the ports looking for anything that changed
+ * since last time, and acts on it: a device that has appeared is
+ * enumerated, one that has gone is released.
+ *
+ * Sixty times a second over eight ports is eight register reads a
+ * frame, which is nothing, and it means a keyboard is usable about a
+ * sixtieth of a second after it is plugged in.
+ */
+static void xhci_hotplug_poll(void) {
+    if (!xhci_present) return;
+
+    for (uint32_t p = 0; p < xhci_max_ports; p++) {
+        uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(p));
+        if (!(psc & XHCI_PORTSC_ACK)) continue;
+
+        int connected = (psc & XHCI_PORTSC_CCS) != 0;
+        xhci_ack_port(p, psc);
+
+        int idx = xhci_hid_on_port(p);
+        if (!connected) {
+            if (idx >= 0) xhci_drop_device(idx);
+            continue;
+        }
+        if (idx >= 0) continue;               /* already ours */
+        if (xhci_hid_count >= XHCI_MAX_HID) continue;
+
+        xhci_log("device connected - enumerating");
+        if (xhci_setup_port(p))
+            xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
+    }
 }
 
 
@@ -760,7 +856,13 @@ static void xhci_handle_mouse(const uint8_t *r) {
  * looks like a keyboard that works once.
  */
 static void xhci_poll(void) {
-    if (!xhci_present || xhci_hid_count == 0) return;
+    if (!xhci_present) return;
+
+    /* Ports first: a device that arrived this frame gets its transfer
+     * queued before the event ring is drained, so its first report is
+     * not one frame late. */
+    xhci_hotplug_poll();
+    if (xhci_hid_count == 0) return;
 
     for (int guard = 0; guard < 32; guard++) {
         xhci_trb_t *e = &xhci_evt_ring[xhci_evt_idx];
