@@ -196,9 +196,10 @@ all: os.iso disk.img
 # runs on the host. The property it exists for -- that a link must not end
 # the line -- cannot be seen in a screenshot and is awkward to assert from
 # inside the kernel, so it is checked here instead.
-test: build/wikidoc_test build/crypto_test build/mbedtls_test
+test: build/wikidoc_test build/crypto_test build/ntcrypto_test build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/crypto_test
+	@./build/ntcrypto_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
 	@python3 tools/linecount.py --check
 
@@ -244,6 +245,14 @@ build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
 build/crypto_test: tools/crypto_test.c src/chacha20.h src/sha256.h src/tls.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
+
+# The algorithms Windows networking still runs on -- MD4, MD5, SHA-1,
+# RC4 -- against RFC 1320, RFC 1321, FIPS 180-4, RFC 2202 and the worked
+# NTLMv2 example in MS-NLMP 4.2.4. Every one of them is broken for its
+# original purpose and every one is required to reach a domain.
+build/ntcrypto_test: tools/ntcrypto_test.c src/ntcrypto.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
 
 apps: $(REPO_BINS)
 

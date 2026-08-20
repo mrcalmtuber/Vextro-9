@@ -406,7 +406,7 @@ most often assumed to be present:
 | **Hardware-rasterised 3D** | There *is* a 3D API now — `src/g3d.h`: pipelines, buffers, matrices, a command buffer, and a shader language with a real compiler (see below). What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work and the backend dispatches only clears to the GPU. Solid reports which backend is live. |
 | **H.264, AAC, DivX** | Compressed *audio* is here — FLAC, IMA ADPCM and G.711, in `src/flac.h` and `src/adpcm.h`. Compressed *video* is not: H.264 alone is months of work, and there is no video container, no frame scheduler and no colour-space conversion to hang it on. |
 | **A hypervisor on ARM64** | x86 has one — `src/hyper.h` runs a guest on AMD-V with nested paging. The ARM64 port does not: it reaches EL2 only under TCG emulation with a VHE-capable core (HVF refuses to provide EL2 at all, and Limine panics on an ARMv8.0 one). The prerequisite is measured and reported rather than assumed; the hypervisor itself is not written. |
-| **Enterprise networking** | The transport is real now — lwIP 2.2.1 with sockets, so eight conversations can be in flight at once — but nothing is built on it. No VPN, no branch caching, no directory services: no LDAP, no Kerberos, no SMB, no Group Policy, no remote desktop. |
+| **Enterprise networking** | LDAP is here — bind and search against a real directory, with a BER encoder and a strict decoder — and so are the algorithms the rest of section nine needs. What is not: Kerberos, SMB/CIFS, Group Policy and remote desktop. No VPN and no branch caching either. |
 | **Certificate verification** | TLS 1.3 works and `https://` is no longer refused. What is missing is the part that makes it mean something: there is no certificate authority store on the volume, so the chain is parsed and the server's signature checked against the key in its own leaf, and nothing establishes that the leaf belongs to the host that was asked for. That stops an eavesdropper. It does not stop a machine in the middle, and every layer says so. |
 | **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
 | **Application sandboxing** | `.vx` applications run with full kernel privileges in a shared address space. The allow list and scanner decide whether a program *starts*; nothing constrains what it does once running. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
@@ -814,9 +814,9 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-**59,700 lines of C written here**, across 113 files, compiled as a
+**60,828 lines of C written here**, across 116 files, compiled as a
 single translation unit plus one for inference, over a user-space C
-library of its own. (63,315 counting the embedded typeface, the integer
+library of its own. (64,443 counting the embedded typeface, the integer
 sine table and Limine's own boot-protocol header — data and interface
 rather than logic.)
 
@@ -839,6 +839,7 @@ the counts are kept apart on purpose.
 | **Filesystem** | NTFS read-only: $MFT records, per-sector fixups, resident and non-resident data, signed run lists; GPT and MBR partition tables; case-insensitive matching, 8.3 short names, security identifiers and access control lists, open-handle share modes, directory change notification; read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO and USB mass storage (Bulk-Only Transport with SCSI) — behind one 512-byte sector view |
 | **Network** | lwIP 2.2.1: IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP — reassembly, retransmission with backoff, window scaling, delayed ACKs — behind the sockets API, with eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP. Intel e1000 driver |
+| **Directory** | LDAP v3 client: simple bind, subtree search with equality and presence filters, BER written by hand and parsed with a bounded reader that refuses the indefinite-length form. Tested against `tools/ldap_server.py`, which decodes independently and rejects encodings that are only nearly right |
 | **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology split into packages, cores and threads from CPUID leaf 0x0B; microcode revision read and updates applied if present |
 | **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; structured exception handling -- `__try`/`__except` dispatched from the trap handler through .pdata and .xdata; Thread and Process Environment Blocks reachable through GS; string resources read out of .rsrc; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
 | **Transport security** | Mbed TLS 3.6.4, stripped to TLS 1.3 with SHA-256 and AES-GCM, allocating through the kernel heap and seeded from RDRAND; eight parallel secure sessions. Also `src/tls.h`, written here, with X25519, ChaCha20-Poly1305 and HKDF checked against RFC 7748, 8439 and 5869. Neither verifies certificates, and every layer says so |

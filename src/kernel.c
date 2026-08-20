@@ -30,6 +30,8 @@
  * htons() macro away from the one netstack.h has always had. */
 #include "vxport.h"
 #include "vxnet.h"
+#include "ntcrypto.h"
+#include "ldap.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -1197,6 +1199,98 @@ void kmain(void) {
     serial_puts("[vextro] PE selftest: running /winhello.exe\n");
     execute_bin_blocking("/winhello.exe", 0);
     serial_puts("[vextro] PE selftest: done\n");
+#endif
+
+#ifdef LDAP_SELFTEST
+    /*
+     * Directory services, against a server that decodes the client's
+     * bytes independently and rejects the encodings that are nearly
+     * right. See tools/ldap_server.py -- the point is that a
+     * hand-written BER encoder's failure mode is a message which is
+     * perfectly self-consistent and which no real server accepts.
+     */
+    {
+        serial_puts("\n[ldap] selftest\n");
+        int checks = 0, bad = 0;
+        static ldap_entry_t ents[8];
+
+        checks++;
+        if (ldap_open("10.0.2.2", 3890) == 0) {
+            serial_puts("[ldap]   ok   connected to 10.0.2.2:3890\n");
+        } else {
+            bad++;
+            serial_puts("[ldap]   FAIL could not connect\n");
+        }
+
+        if (ldap_conn.open) {
+            checks++;
+            if (ldap_bind("", "", 1) == 0)
+                serial_puts("[ldap]   ok   anonymous bind accepted\n");
+            else { bad++; serial_puts("[ldap]   FAIL anonymous bind\n"); }
+
+            /* A presence filter: every entry that has objectClass at
+             * all, which is all of them. Encoded as a primitive -- the
+             * server rejects the constructed form. */
+            checks++;
+            int n = ldap_search("dc=vextro,dc=test", LDAP_SCOPE_SUBTREE,
+                                "objectClass", 0, 0, 0, ents, 8);
+            if (n == 4) {
+                serial_puts("[ldap]   ok   presence filter returned 4 entries\n");
+            } else {
+                bad++;
+                serial_puts("[ldap]   FAIL presence filter returned ");
+                serial_put_dec((uint32_t)(n < 0 ? 0 : n));
+                serial_puts("\n");
+            }
+
+            /* An equality match, which is the constructed form. */
+            checks++;
+            static const char *want[] = { "cn", "sn", "mail" };
+            n = ldap_search("dc=vextro,dc=test", LDAP_SCOPE_SUBTREE,
+                            "uid", "ada", want, 3, ents, 8);
+            int ok = (n == 1);
+            if (ok) {
+                serial_puts("[ldap]   ok   uid=ada is ");
+                serial_puts(ents[0].dn);
+                serial_puts("\n");
+                for (int a = 0; a < ents[0].nattrs; a++) {
+                    serial_puts("[ldap]          ");
+                    serial_puts(ents[0].attrs[a].name);
+                    serial_puts(" = ");
+                    for (int v = 0; v < ents[0].attrs[a].nvals; v++) {
+                        if (v) serial_puts(", ");
+                        serial_puts(ents[0].attrs[a].vals[v]);
+                    }
+                    serial_puts("\n");
+                }
+            } else {
+                bad++;
+                serial_puts("[ldap]   FAIL equality match on uid=ada\n");
+            }
+
+            checks++;
+            if (ldap_bind("cn=admin,dc=vextro,dc=test", "secret", 1) == 0)
+                serial_puts("[ldap]   ok   bind with credentials accepted\n");
+            else { bad++; serial_puts("[ldap]   FAIL bind with credentials\n"); }
+
+            /* The failure path matters as much: a client that reports
+             * success for a rejected password is worse than one that
+             * cannot bind at all. */
+            checks++;
+            if (ldap_bind("cn=admin,dc=vextro,dc=test", "wrong", 1) != 0 &&
+                ldap_last_result() == LDAP_INVALID_CREDENTIALS)
+                serial_puts("[ldap]   ok   a wrong password is rejected\n");
+            else { bad++; serial_puts("[ldap]   FAIL wrong password not rejected\n"); }
+
+            ldap_close();
+        }
+
+        serial_puts("[ldap] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+    }
 #endif
 
 #ifdef SEH_SELFTEST
