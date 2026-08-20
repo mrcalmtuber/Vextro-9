@@ -15,6 +15,7 @@
 #include "mouse.h"
 #include "keyboard.h"
 #include "xhci.h"
+#include "usbmsc.h"
 #include "ttf.h"
 #include "login.h"
 #include "e1000.h"
@@ -804,6 +805,10 @@ static int hal_init_devices(uint16_t cs, int32_t w, int32_t h) {
      * dependency visible instead of incidental.
      */
     if (hhdm_request.response) hal_hhdm_offset = hhdm_request.response->offset;
+    /* Storage must register its hook before enumeration, or a stick
+     * plugged in at boot is seen, found not to be a keyboard, and
+     * dropped. */
+    usbmsc_init();
     if (xhci_init()) xhci_enumerate();
 #endif
     return 0;
@@ -1020,6 +1025,10 @@ void kmain(void) {
      * both -- they arrive through the same HAL and the desktop cannot
      * tell which moved the pointer.
      */
+    /* Storage must register its hook before enumeration, or a stick
+     * plugged in at boot is seen, found not to be a keyboard, and
+     * dropped. */
+    usbmsc_init();
     if (xhci_init()) xhci_enumerate();
 
     /* Start PIT at ~60 Hz so the render loop runs even when mouse is idle */
@@ -1388,6 +1397,10 @@ void kmain(void) {
         fw_tick();
         net_poll();
         xhci_poll();
+        /* Only probes a port with nothing on it -- see the note in
+         * mouse.h about why asking a working mouse whether it is there
+         * makes the pointer jump. */
+        ps2_hotplug_poll();
 
         /* --- Confirmation message overlay --- */
         if (confirm_active) {

@@ -113,6 +113,7 @@
 #define TRB_STATUS_STAGE       4
 #define TRB_LINK               6
 #define TRB_ENABLE_SLOT        9
+#define TRB_DISABLE_SLOT       10
 #define TRB_ADDRESS_DEVICE     11
 #define TRB_CONFIGURE_ENDPOINT 12
 #define TRB_EVAL_CONTEXT       13
@@ -130,6 +131,10 @@
 #define TRB_GET_TYPE(c) (((c) >> 10) & 0x3F)
 #define TRB_GET_CC(s)   (((s) >> 24) & 0xFF)
 #define TRB_CC_SUCCESS  1
+/* A transfer that moved less than was asked for. Success with a residue,
+ * not an error: a device answering INQUIRY with fewer bytes than the
+ * buffer offered is doing exactly what it should. */
+#define TRB_CC_SHORT_PACKET 13
 
 #define XHCI_RING_TRBS 64
 
@@ -577,7 +582,25 @@ static int xhci_setup_port(uint32_t port) {
         }
         o += dl;
     }
-    if (ep_addr < 0 || is_kbd < 0) return 0;
+    if (ep_addr < 0 || is_kbd < 0) {
+        /*
+         * Addressed, and not a keyboard or a mouse.
+         *
+         * Returning here without giving the slot back was a real fault
+         * and not a leak of a scarce resource: the device stays
+         * addressed on this slot, so when the storage driver is offered
+         * the same port and tries to address it again, the controller
+         * refuses -- correctly -- and a perfectly good memory stick
+         * reports "gave up at address device". Handing the slot back
+         * leaves the device exactly as it was found.
+         */
+        xhci_cmd_push(0, 0,
+                      TRB_TYPE(TRB_DISABLE_SLOT) | ((uint32_t)slot << 24));
+        xhci_trb_t dev_ev;
+        xhci_wait_for(TRB_COMMAND_COMPLETE, &dev_ev, 200000);
+        xhci_dcbaa[slot] = 0;
+        return 0;
+    }
 
     /* Boot protocol, so reports arrive in the fixed layout. */
     xhci_control(h, 0x21, 0x0B, 0, iface_num, 0, 0);   /* SET_PROTOCOL(boot) */
@@ -703,15 +726,30 @@ static void xhci_drop_device(int idx) {
     xhci_hid_count = n;
 }
 
+/*
+ * Filled in by src/usbmsc.h. A hook rather than a direct call because
+ * storage is defined after this file -- and because the dependency runs
+ * the right way round this way: xhci knows nothing about SCSI, and the
+ * storage driver knows about xhci.
+ *
+ * Called for a port that has something on it which is not a HID device.
+ */
+static int (*xhci_storage_hook)(uint32_t port, uint32_t route,
+                                uint8_t parent_slot, uint8_t parent_port) = 0;
+
 static void xhci_enumerate(void) {
     if (!xhci_present) return;
     for (uint32_t p = 0; p < xhci_max_ports; p++) {
         uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(p));
         if (!(psc & XHCI_PORTSC_CCS)) continue;
         if (xhci_hid_on_port(p) >= 0) continue;
-        if (xhci_hid_count >= XHCI_MAX_HID) break;
-        if (xhci_setup_port(p))
+        if (xhci_hid_count < XHCI_MAX_HID && xhci_setup_port(p)) {
             xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
+            continue;
+        }
+        /* Not a keyboard or a mouse. Storage is the only other thing
+         * this system knows how to drive. */
+        if (xhci_storage_hook) xhci_storage_hook(p, 0, 0, 0);
     }
     if (xhci_hid_count == 0) xhci_log("no HID devices found");
 }
@@ -741,11 +779,13 @@ static void xhci_hotplug_poll(void) {
             continue;
         }
         if (idx >= 0) continue;               /* already ours */
-        if (xhci_hid_count >= XHCI_MAX_HID) continue;
 
         xhci_log("device connected - enumerating");
-        if (xhci_setup_port(p))
+        if (xhci_hid_count < XHCI_MAX_HID && xhci_setup_port(p)) {
             xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
+            continue;
+        }
+        if (xhci_storage_hook) xhci_storage_hook(p, 0, 0, 0);
     }
 }
 

@@ -35,6 +35,9 @@
 #define BLK_NVME  1
 #define BLK_AHCI  2
 #define BLK_ATA   3
+/* A memory stick, which is a SCSI disk on a different cable. See
+ * src/usbmsc.h. */
+#define BLK_USB   4
 
 #define BLK_MAX_DEV 6
 
@@ -68,6 +71,24 @@ static void blk_add(uint8_t kind, uint8_t unit, uint64_t sectors, const char *bu
  * decides which one gets tried first, and therefore which one an
  * ambiguous machine boots from.
  */
+/*
+ * A memory stick appeared. Published straight away rather than at the
+ * next probe, because there is no next probe -- blk_init runs once, and
+ * a disk that arrives afterwards would otherwise be invisible until the
+ * machine was restarted with it already in.
+ */
+static void blk_usb_attached(int unit) {
+    if (unit < 0 || unit >= usbmsc_count || !usbmsc_devs[unit].used) return;
+    for (int i = 0; i < blk_count; i++)
+        if (blk_devs[i].kind == BLK_USB && blk_devs[i].unit == unit) return;
+
+    blk_add(BLK_USB, (uint8_t)unit, usbmsc_devs[unit].sectors, "USB");
+    serial_puts("[blk] USB disk attached, now ");
+    serial_put_dec((uint32_t)blk_count);
+    serial_puts(blk_count == 1 ? " disk\n" : " disks\n");
+    if (blk_cur < 0 && blk_count > 0) blk_cur = 0;
+}
+
 static void blk_init(void) {
     blk_count = 0;
     blk_cur   = -1;
@@ -83,6 +104,13 @@ static void blk_init(void) {
     ata_init();
     if (ata_present)
         blk_add(BLK_ATA, 0, ata_sectors, "IDE");
+
+    /* Whatever USB found before this ran. Anything plugged in later
+     * arrives through blk_usb_attached instead. */
+    for (int i = 0; i < usbmsc_count; i++)
+        if (usbmsc_devs[i].used)
+            blk_add(BLK_USB, (uint8_t)i, usbmsc_devs[i].sectors, "USB");
+    usbmsc_attach_hook = blk_usb_attached;
 
     if (blk_count > 0) blk_cur = 0;
 
@@ -157,6 +185,7 @@ static int blk_read_raw(uint64_t lba, uint32_t count, void *buf) {
         case BLK_NVME: return nvme_read(d->unit, lba, count, buf);
         case BLK_AHCI: return ahci_read(d->unit, lba, count, buf);
         case BLK_ATA:  return ata_read(lba, count, buf);
+        case BLK_USB:  return usbmsc_read(d->unit, lba, count, buf);
     }
     return -1;
 }
@@ -167,6 +196,7 @@ static int blk_write_raw(uint64_t lba, uint32_t count, const void *buf) {
         case BLK_NVME: return nvme_write(d->unit, lba, count, buf);
         case BLK_AHCI: return ahci_write(d->unit, lba, count, buf);
         case BLK_ATA:  return ata_write(lba, count, buf);
+        case BLK_USB:  return usbmsc_write(d->unit, lba, count, buf);
     }
     return -1;
 }

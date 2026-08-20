@@ -15,25 +15,130 @@
  * actually running on instead of assuming this one.
  */
 
-/* ===== SERIAL DEBUG PORT (COM1) ===== */
+/* ===== SERIAL DEBUG PORT (COM1) =====
+ *
+ * A 16550, and used as one.
+ *
+ * The 8250 this replaces had a single transmit holding register: one
+ * byte, and the only safe way to use it is to read the line status
+ * before every write and spin until the previous byte has gone. That is
+ * what this driver did, and at 115200 baud a byte takes about 87
+ * microseconds -- so a forty-character line of boot output was three
+ * and a half milliseconds of the processor spent doing nothing, most of
+ * a display frame, for one line.
+ *
+ * The 16550 has a sixteen-byte FIFO in each direction. Once the
+ * transmitter is empty, sixteen bytes can be written back to back with
+ * no status check between them, because the FIFO -- not the shift
+ * register -- is what is being filled. That is the whole optimisation
+ * and it is worth about fifteen sixteenths of the polling.
+ *
+ * The receive side gets a trigger level rather than a byte-at-a-time
+ * poll for the same reason in reverse.
+ */
+
+#define UART_COM1       0x3F8
+#define UART_THR        (UART_COM1 + 0)   /* transmit holding / rx buffer */
+#define UART_IER        (UART_COM1 + 1)
+#define UART_FCR        (UART_COM1 + 2)   /* FIFO control (write)         */
+#define UART_IIR        (UART_COM1 + 2)   /* interrupt ident (read)       */
+#define UART_LCR        (UART_COM1 + 3)
+#define UART_MCR        (UART_COM1 + 4)
+#define UART_LSR        (UART_COM1 + 5)
+
+#define UART_LSR_DR     0x01              /* data ready                   */
+#define UART_LSR_THRE   0x20              /* holding register empty       */
+#define UART_LSR_TEMT   0x40              /* transmitter fully idle       */
+
+/* Sixteen on a genuine 16550A and on everything since; one on an 8250,
+ * which is why this is not simply assumed. serial_init measures it. */
+static int serial_fifo_depth = 1;
+static int serial_tx_credit  = 0;   /* bytes writable without re-polling */
 
 static void serial_putc(char c) {
-    while (!(inb(0x3FD) & 0x20));
-    outb(0x3F8, (uint8_t)c);
+    /* The credit is how many more bytes will fit in the FIFO without
+     * asking. It is spent down to zero and then refilled by one poll,
+     * so the status register is read once per FIFO-full rather than
+     * once per byte. */
+    if (serial_tx_credit <= 0) {
+        while (!(inb(UART_LSR) & UART_LSR_THRE));
+        serial_tx_credit = serial_fifo_depth;
+    }
+    outb(UART_THR, (uint8_t)c);
+    serial_tx_credit--;
 }
 
 static void serial_puts(const char *s) {
     while (*s) serial_putc(*s++);
 }
 
+/* ---- the receive side ----
+ *
+ * Drained into a ring rather than read where it is needed, so that a
+ * character typed into the serial console while the compositor is
+ * drawing is not lost -- the FIFO is sixteen deep and a frame is long
+ * enough to overrun it at 115200.
+ */
+#define SERIAL_RX_RING 256
+static uint8_t   serial_rx_buf[SERIAL_RX_RING];
+static volatile uint32_t serial_rx_head = 0;
+static volatile uint32_t serial_rx_tail = 0;
+static uint32_t  serial_rx_lost = 0;
+
+static void serial_rx_drain(void) {
+    /* Bounded: a peer that never stops sending must not be able to hold
+     * this loop forever, because it runs from the frame path. */
+    for (int i = 0; i < 64 && (inb(UART_LSR) & UART_LSR_DR); i++) {
+        uint8_t c = inb(UART_THR);
+        uint32_t next = (serial_rx_head + 1) % SERIAL_RX_RING;
+        if (next == serial_rx_tail) { serial_rx_lost++; continue; }
+        serial_rx_buf[serial_rx_head] = c;
+        serial_rx_head = next;
+    }
+}
+
+/* -1 when there is nothing waiting. */
+static int serial_getc(void) {
+    if (serial_rx_tail == serial_rx_head) serial_rx_drain();
+    if (serial_rx_tail == serial_rx_head) return -1;
+    uint8_t c = serial_rx_buf[serial_rx_tail];
+    serial_rx_tail = (serial_rx_tail + 1) % SERIAL_RX_RING;
+    return c;
+}
+
 static void serial_init(void) {
-    outb(0x3F9, 0x00);   /* Disable interrupts */
-    outb(0x3FB, 0x80);   /* Enable DLAB */
-    outb(0x3F8, 0x01);   /* Divisor low: 115200 baud */
-    outb(0x3F9, 0x00);   /* Divisor high */
-    outb(0x3FB, 0x03);   /* 8N1 */
-    outb(0x3FA, 0xC7);   /* Enable FIFO */
-    outb(0x3FC, 0x03);   /* RTS/DSR set */
+    outb(UART_IER, 0x00);   /* polled, no interrupts                     */
+    outb(UART_LCR, 0x80);   /* DLAB, so the next two are the divisor     */
+    outb(UART_THR, 0x01);   /* 115200 baud                               */
+    outb(UART_IER, 0x00);
+    outb(UART_LCR, 0x03);   /* 8N1, DLAB off                             */
+
+    /*
+     * 0xC7 is: enable both FIFOs, clear both, and set the receive
+     * trigger to fourteen bytes.
+     *
+     * Fourteen rather than one is the trigger part of the exercise. A
+     * trigger of one raises the ready flag per character; fourteen
+     * batches them, so the poll below finds a FIFO worth of input in a
+     * single pass. Fourteen and not sixteen because the last two slots
+     * are the margin between "tell me" and "you are too late" -- a
+     * trigger at the very top has no time left in it.
+     */
+    outb(UART_FCR, 0xC7);
+    outb(UART_MCR, 0x03);   /* DTR and RTS                               */
+
+    /*
+     * Did the FIFO take?
+     *
+     * IIR bits 6 and 7 both set means a working 16550A FIFO. An 8250 or
+     * an early 16550 with the broken FIFO reports otherwise, and on
+     * those the transmit credit must stay at one -- writing sixteen
+     * bytes to a one-byte holding register loses fifteen of them, which
+     * would corrupt exactly the boot log needed to notice.
+     */
+    uint8_t iir = inb(UART_IIR);
+    serial_fifo_depth = ((iir & 0xC0) == 0xC0) ? 16 : 1;
+    serial_tx_credit  = 0;
 }
 
 static void serial_put_hex32(uint32_t v) {

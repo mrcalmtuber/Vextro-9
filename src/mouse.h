@@ -25,6 +25,11 @@ static int32_t mouse_max_x = 1023;
 static int32_t mouse_max_y = 767;
 
 /* Packet assembly state.  Wheel mice send four bytes, plain ones three. */
+/* Whether a pointing device has ever answered on the aux port. Drives
+ * hot-plug probing: see ps2_hotplug_poll. */
+static int      mouse_seen = 0;
+static uint16_t mouse_init_cs = 0;
+
 static uint8_t mouse_buf[4];
 static int     mouse_phase = 0;
 static int     mouse_pkt_len = 3;
@@ -177,6 +182,7 @@ static void irq12_handler(interrupt_frame_t *frame) {
 
 /* ---- Initialize PS/2 mouse and hook IRQ12 ---- */
 static void mouse_init(uint16_t cs, int32_t max_x, int32_t max_y) {
+    mouse_init_cs = cs;
     mouse_max_x = max_x;
     mouse_max_y = max_y;
     mouse_x     = max_x / 2;
@@ -202,8 +208,11 @@ static void mouse_init(uint16_t cs, int32_t max_x, int32_t max_y) {
     ps2_aux_cmd(0xF3); ps2_aux_cmd(100);
     ps2_aux_cmd(0xF3); ps2_aux_cmd(80);
 
-    ps2_aux_cmd(0xF2);                  /* read device id */
-    if (ps2_read() == 3) mouse_pkt_len = 4;
+    /* The acknowledgement to identify is also the presence test: an
+     * empty port cannot produce 0xFA. */
+    uint8_t id_ack = ps2_aux_cmd(0xF2);
+    uint8_t id     = ps2_read();
+    if (id == 3) mouse_pkt_len = 4;
 
     ps2_aux_cmd(0xF3); ps2_aux_cmd(100);  /* back to a sane report rate */
     ps2_aux_cmd(0xF4);                    /* enable packet reporting */
@@ -218,6 +227,80 @@ static void mouse_init(uint16_t cs, int32_t max_x, int32_t max_y) {
     /* Unmask: IRQ2 (cascade) on master, IRQ4 (IRQ12) on slave */
     outb(PIC1_DATA, (uint8_t)~(1 << 2));
     outb(PIC2_DATA, (uint8_t)~(1 << 4));
+
+    mouse_seen = (id_ack == 0xFA);
+}
+
+/* ===== HOT-PLUG =====
+ *
+ * PS/2 has no hot-plug. There is no presence pin, no insertion
+ * interrupt, and nothing in the specification that says a device may
+ * arrive after boot -- the port was designed on the assumption that
+ * unplugging a mouse from a running machine was something you did not
+ * do. So detection here means asking, and asking is not free.
+ *
+ * The rule this follows is: only probe a port believed to be *empty*.
+ *
+ * That asymmetry is the whole design. Sending an identify command to a
+ * mouse that is working means the next byte the controller returns is
+ * the answer to that command rather than the next third of a movement
+ * packet, and the packet decoder -- which has no way to tell the two
+ * apart -- loses its phase. The symptom is a pointer that jumps across
+ * the screen every few seconds, caused entirely by the code checking
+ * whether the pointer is still there.
+ *
+ * A mouse that is unplugged simply stops sending. Nothing detects that,
+ * and nothing needs to: an absent mouse and a still mouse look the same
+ * to everything above this file. What matters is that plugging one *in*
+ * works, and that is what this does.
+ */
+static uint32_t ps2_probe_tick = 0;
+
+/* Drain anything the controller has buffered without interpreting it.
+ * Used before a probe so the reply cannot be confused with stale data. */
+static void ps2_flush(void) {
+    for (int i = 0; i < 32 && (inb(0x64) & 0x01); i++) (void)inb(0x60);
+}
+
+/*
+ * Called from the frame loop. Returns 1 if a device has just appeared.
+ *
+ * Once a second, not every frame: an identify command with its
+ * acknowledgement is a handful of microseconds of port I/O each of
+ * which stalls the processor, and a device that arrives is noticed
+ * within a second either way -- which is faster than the hand that
+ * plugged it in can reach the desk.
+ */
+static int ps2_hotplug_poll(void) {
+    if (mouse_seen) return 0;
+    if (++ps2_probe_tick < 60) return 0;
+    ps2_probe_tick = 0;
+
+    ps2_flush();
+
+    /* 0xF2 is identify. A port with nothing on it times out in
+     * ps2_wait_read and returns whatever the data port held, so the
+     * answer is only believed when it is one of the values a real
+     * pointing device gives: 0x00 for a plain mouse, 0x03 for a wheel
+     * mouse, 0x04 for a five-button one. */
+    ps2_cmd(0xD4);
+    ps2_data(0xF2);
+    uint8_t ack = ps2_read();
+    if (ack != 0xFA) return 0;
+
+    uint8_t id = ps2_read();
+    if (id != 0x00 && id != 0x03 && id != 0x04) return 0;
+
+    serial_puts("[ps2] pointer plugged in (id ");
+    serial_put_dec(id);
+    serial_puts(")\n");
+
+    /* Re-run the full initialisation rather than only enabling
+     * reporting: a device that has just been powered up has none of the
+     * sample rate, resolution or wheel negotiation that mouse_init
+     * performs, and its defaults are not the ones this system wants. */
+    mouse_init(mouse_init_cs, mouse_max_x, mouse_max_y);
+    return 1;
 }
 
 #endif /* MOUSE_H */
