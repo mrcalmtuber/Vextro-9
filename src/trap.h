@@ -157,6 +157,18 @@ static void serial_put_hex64(uint64_t v) {
     }
 }
 
+/*
+ * Structured exception handling, if the faulting thread is running a PE
+ * that has any.
+ *
+ * A hook rather than a call, because the tables live in the staged image
+ * that src/desktop.h owns and this file is included long before it. Set
+ * by win_seh_install(); null on a system that has never loaded a PE.
+ *
+ * Returns 1 and fills *resume with an absolute address to continue at.
+ */
+static int (*trap_seh_hook)(uint64_t rip, int vector, uint64_t *resume) = 0;
+
 /* Where a killed user thread lands. It runs in ring 0 on its own kernel
  * stack with a frame the handler wrote, and never returns. */
 __attribute__((used))
@@ -244,6 +256,26 @@ void exception_handle(exc_frame_t *f) {
     serial_puts(from_user ? " in ring 3\n" : " in ring 0\n");
 
     if (from_user && cur_thread && cur_thread->user) {
+        /*
+         * Before killing it: does the program have a `__try` around the
+         * instruction that faulted?
+         *
+         * On x86-64 that question can only be answered here. The 32-bit
+         * convention kept a handler chain on the stack, so a program
+         * could catch its own faults; the 64-bit one replaced that with
+         * static tables in .pdata and .xdata, and looking an address up
+         * in them at fault time is the operating system's job. At the
+         * moment of the fault the program is not running -- this is.
+         */
+        uint64_t resume = 0;
+        if (trap_seh_hook && trap_seh_hook(f->rip, f->vector, &resume)) {
+            serial_puts("[seh] handled by the program, resuming at ");
+            serial_put_hex64(resume);
+            serial_putc('\n');
+            f->rip = resume;
+            return;
+        }
+
         /*
          * Return into the kernel instead of into the instruction that
          * just faulted. Everything the processor pops from here on is

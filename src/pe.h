@@ -136,6 +136,12 @@ typedef struct {
     int      imports_resolved;
     int      imports_missing;
     char     missing[64];          /* the first name that was not found */
+    /* The two data directories src/winproc.h needs. Carried out of the
+     * loader rather than re-parsed later, because the fault path that
+     * wants .pdata cannot afford to walk a PE header again -- and by
+     * then the header may not be mapped. */
+    uint32_t pdata_rva, pdata_size;
+    uint32_t rsrc_rva,  rsrc_size;
 } pe_image_t;
 
 /* ===== THE BUILT-IN LIBRARY =====
@@ -401,6 +407,11 @@ static int pe_load(const uint8_t *file, uint64_t fsize, uint64_t load_base,
 
     if (pe_link_imports(opt, img) < 0 && img->imports_missing)
         return -3;
+
+    img->pdata_rva  = opt->dir_count > 3 ? opt->dir[3].rva  : 0;
+    img->pdata_size = opt->dir_count > 3 ? opt->dir[3].size : 0;
+    img->rsrc_rva   = opt->dir_count > 2 ? opt->dir[2].rva  : 0;
+    img->rsrc_size  = opt->dir_count > 2 ? opt->dir[2].size : 0;
 
     img->entry = img->base + opt->entry_rva;
     return 0;

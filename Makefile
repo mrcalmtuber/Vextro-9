@@ -405,7 +405,7 @@ build/hello: build/hello.o apps/app.ld $(LIBC)
 # this; the loader is still there and still refuses malformed images.
 MINGW := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 ifneq ($(MINGW),)
-WINAPPS := build/win/winhello.exe
+WINAPPS := build/win/winhello.exe build/win/wintry.exe
 else
 WINAPPS :=
 endif
@@ -420,6 +420,22 @@ build/win/winhello.exe: apps/win/winhello.c build/win/libvextro.a
 		-c $< -o build/win/winhello.o
 	x86_64-w64-mingw32-gcc -nostdlib -nostartfiles -Wl,-e,PeMain \
 		-Wl,--dynamicbase -o $@ build/win/winhello.o build/win/libvextro.a
+
+# The SEH test. Its guarded ranges are written with the assembler's own
+# .seh_* directives, which emit exactly the .pdata and .xdata a Microsoft
+# compiler emits for __try -- so what the kernel reads is a table the
+# toolchain produced, not one this repository wrote to suit itself.
+# It also carries a real .rsrc string table, compiled by windres, so the
+# resource reader is tested against what a resource compiler emits rather
+# than bytes this repository laid out to suit itself.
+build/win/wintry.exe: apps/win/wintry.c apps/win/wintry.rc build/win/libvextro.a
+	@mkdir -p build/win
+	x86_64-w64-mingw32-gcc -O2 -Wall -ffreestanding -fno-stack-protector \
+		-c $< -o build/win/wintry.o
+	x86_64-w64-mingw32-windres apps/win/wintry.rc -O coff -o build/win/wintry_res.o
+	x86_64-w64-mingw32-gcc -nostdlib -nostartfiles -Wl,-e,PeMain \
+		-Wl,--dynamicbase -o $@ build/win/wintry.o build/win/wintry_res.o \
+		build/win/libvextro.a
 
 .PHONY: winapps
 winapps: $(WINAPPS)

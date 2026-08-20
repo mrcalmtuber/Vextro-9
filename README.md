@@ -814,9 +814,9 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-**58,815 lines of C written here**, across 111 files, compiled as a
+**59,700 lines of C written here**, across 113 files, compiled as a
 single translation unit plus one for inference, over a user-space C
-library of its own. (62,430 counting the embedded typeface, the integer
+library of its own. (63,315 counting the embedded typeface, the integer
 sine table and Limine's own boot-protocol header — data and interface
 rather than logic.)
 
@@ -840,7 +840,7 @@ the counts are kept apart on purpose.
 | **Storage** | NVMe, AHCI/SATA, ATA PIO and USB mass storage (Bulk-Only Transport with SCSI) — behind one 512-byte sector view |
 | **Network** | lwIP 2.2.1: IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP — reassembly, retransmission with backoff, window scaling, delayed ACKs — behind the sockets API, with eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP. Intel e1000 driver |
 | **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology split into packages, cores and threads from CPUID leaf 0x0B; microcode revision read and updates applied if present |
-| **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
+| **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; structured exception handling -- `__try`/`__except` dispatched from the trap handler through .pdata and .xdata; Thread and Process Environment Blocks reachable through GS; string resources read out of .rsrc; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
 | **Transport security** | Mbed TLS 3.6.4, stripped to TLS 1.3 with SHA-256 and AES-GCM, allocating through the kernel heap and seeded from RDRAND; eight parallel secure sessions. Also `src/tls.h`, written here, with X25519, ChaCha20-Poly1305 and HKDF checked against RFC 7748, 8439 and 5869. Neither verifies certificates, and every layer says so |
 | **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage, alpha-blended drop shadows with radial corners, spring-driven window motion, Intel Gen9 blitter with batched command buffers and hang capture, firmware framebuffer fallback |
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |

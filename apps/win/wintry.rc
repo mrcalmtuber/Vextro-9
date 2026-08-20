@@ -1,0 +1,19 @@
+/*
+ * apps/win/wintry.rc — a real string table, so the resource reader in
+ * src/winproc.h is tested against something a resource compiler
+ * produced rather than bytes this repository laid out to suit itself.
+ *
+ * The ids are deliberately spread across bundle boundaries. Strings are
+ * stored sixteen to a bundle and reached by walking the lengths inside
+ * one, so an id at the start of a bundle and an id in the middle of a
+ * later one exercise different halves of the lookup. 1 is the first
+ * entry of bundle 1; 17 is the first of bundle 2; 20 is four entries
+ * into bundle 2 and can only be found by skipping the three before it.
+ */
+STRINGTABLE
+BEGIN
+    1,  "the first string, in bundle one"
+    2,  "the second"
+    17, "the first string of bundle two"
+    20, "four entries in, reached by walking lengths"
+END

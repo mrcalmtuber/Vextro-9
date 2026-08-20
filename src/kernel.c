@@ -19,6 +19,7 @@
 #include "usbhub.h"
 #include "ttf.h"
 #include "login.h"
+#include "winproc.h"
 #include "e1000.h"
 #define VEXTRO_HAVE_AUDIO 1
 #include "hda.h"
@@ -1087,6 +1088,10 @@ void kmain(void) {
      * thread before it returns and there must be something to spawn it
      * with.
      */
+    /* Let a faulting Windows program's own __except run before the
+     * thread is killed. */
+    win_seh_install();
+
     if (vxnet_init()) {
         vxsec_init();
 #ifdef NET_SELFTEST
@@ -1192,6 +1197,76 @@ void kmain(void) {
     serial_puts("[vextro] PE selftest: running /winhello.exe\n");
     execute_bin_blocking("/winhello.exe", 0);
     serial_puts("[vextro] PE selftest: done\n");
+#endif
+
+#ifdef SEH_SELFTEST
+    /*
+     * Structured exception handling, proved the only way it can be.
+     *
+     * /wintry.exe writes through a null pointer inside a guarded range
+     * whose .pdata and .xdata the mingw-w64 assembler emitted -- the
+     * same tables a Microsoft compiler produces for `__try`. Without
+     * the dispatcher in src/winproc.h the thread dies at that write and
+     * nothing after it prints. With it, the kernel finds the scope entry
+     * covering the faulting address and resumes the program at its own
+     * handler.
+     *
+     * So the test is not a returned value. It is whether the lines after
+     * the fault appear at all.
+     */
+    serial_puts("[vextro] SEH selftest: running /wintry.exe\n");
+    {
+        uint32_t before = win_seh_handled;
+        int rc = execute_bin_blocking("/wintry.exe", 0);
+        uint32_t caught = win_seh_handled - before;
+
+        /*
+         * Two things have to be true and they are different claims.
+         * That an exception was dispatched says the tables were read
+         * and the scope entry found. That the program then ran to
+         * completion says the resumption was into a frame it could
+         * actually continue from -- which is the part that would fail
+         * silently if the stack were wrong.
+         */
+        serial_puts(caught == 1 ? "[vextro] SEH selftest:   ok   "
+                                : "[vextro] SEH selftest:   FAIL ");
+        serial_puts("exactly one fault dispatched to __except (");
+        serial_put_dec(caught);
+        serial_puts(")\n");
+
+        serial_puts(rc == 0 ? "[vextro] SEH selftest:   ok   "
+                            : "[vextro] SEH selftest:   FAIL ");
+        serial_puts("ran to completion, and found its TEB through GS\n");
+
+        /*
+         * The string table, from the same image.
+         *
+         * The ids are chosen to exercise both halves of the lookup:
+         * strings live sixteen to a bundle and are reached by walking
+         * the lengths inside one, so 1 is the first entry of the first
+         * bundle and 20 is four entries into the second -- findable
+         * only by skipping the three before it. There is no index.
+         */
+        static const struct { uint32_t id; const char *want; } sres[] = {
+            { 1,  "the first string, in bundle one" },
+            { 2,  "the second" },
+            { 17, "the first string of bundle two" },
+            { 20, "four entries in, reached by walking lengths" },
+        };
+        for (unsigned i = 0; i < sizeof(sres) / sizeof(sres[0]); i++) {
+            char got[80];
+            int n = win_load_string(pe_stage, sres[i].id, got, sizeof got);
+            int ok = n > 0 && str_eq(got, sres[i].want);
+            serial_puts(ok ? "[vextro] SEH selftest:   ok   "
+                           : "[vextro] SEH selftest:   FAIL ");
+            serial_puts("string ");
+            serial_put_dec(sres[i].id);
+            serial_puts(" = \"");
+            serial_puts(got);
+            serial_puts("\"\n");
+        }
+    }
+    serial_puts("[vextro] SEH selftest: done\n");
 #endif
 
 #ifdef FAULT_SELFTEST

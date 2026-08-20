@@ -120,6 +120,38 @@ static int        sched_running = 0;
 static uint8_t    fx_template[512] __attribute__((aligned(16)));
 
 /*
+ * What IA32_GS_BASE holds, and why it is not per-thread.
+ *
+ * A Windows program reads its Thread Environment Block through GS, so
+ * something has to put an address there. The obvious design is a field
+ * in thread_t written by the context switch alongside CR3 -- and that
+ * was tried, and it is wrong twice over.
+ *
+ * Wrong because it is unnecessary: the TEB sits at the same virtual
+ * address in every process (WIN_TEB_VA is a constant), and GS_BASE is a
+ * *linear* address resolved through whatever CR3 is current. One value
+ * therefore serves every process, each seeing its own page. There is
+ * nothing to switch.
+ *
+ * And wrong because sched_on_tick is the most delicate function in this
+ * kernel -- hand-tuned, compiled general-regs-only, moving extended
+ * state through registers the compiler has been told not to touch.
+ * Adding a WRMSR to it produced a #GP on the FXRSTOR two instructions
+ * later. Whatever the precise mechanism, a serialising instruction in
+ * the middle of that sequence is not worth the risk for a value that
+ * never changes.
+ *
+ * So it is written once, the first time a PE is spawned, and left.
+ */
+static uint64_t   gs_base_live = 0;
+
+static void sched_set_gs_base(uint64_t va) {
+    if (gs_base_live == va) return;
+    gs_base_live = va;
+    wrmsr(0xC0000101u, va);
+}
+
+/*
  * Raised for the length of a software-requested switch.
  *
  * A thread that gives up the processor does it by raising the timer

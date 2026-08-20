@@ -1625,6 +1625,37 @@ fail:
  * safety -- the same four mappings, the same W^X, the same stack with a
  * guard page and an exit address on it.
  */
+/*
+ * The trap handler's way in.
+ *
+ * It has the faulting address and nothing else; everything needed to
+ * answer "was this inside a __try" lives in the staged image, which is
+ * this file's. So the lookup happens here and the answer goes back as
+ * an absolute address to resume at.
+ *
+ * One limitation, stated rather than discovered: the resumption keeps
+ * the faulting frame. That is correct when the fault is inside the same
+ * function as the `__try` -- which is what the scope table lookup
+ * requires anyway, since it is that function's table -- and it is why
+ * no stack unwinding happens here. A fault deeper in a call chain finds
+ * no entry and the thread dies as before.
+ */
+static uint32_t win_seh_handled = 0;
+
+static int win_seh_dispatch(uint64_t rip, int vector, uint64_t *resume) {
+    uint32_t target = 0;
+    uint32_t code = win_exception_code(vector);
+    if (!win_dispatch_exception(pe_stage, rip, code, &target)) return 0;
+    *resume = win_image.base + target;
+    win_seh_handled++;
+    serial_puts("[seh] ");
+    serial_puts(win_exception_name(code));
+    serial_puts(" caught by __except\n");
+    return 1;
+}
+
+static void win_seh_install(void) { trap_seh_hook = win_seh_dispatch; }
+
 static thread_t *pe_spawn(const char *name, pe_image_t *img,
                           const app_layout_t *lay, int verbose) {
     if (!vmm_ready || !sched_running) return 0;
@@ -1684,8 +1715,49 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     if (as_poke64(as, sp, tramp_va + (uint64_t)(petramp_exit - utramp_start))
         != 0) goto fail;
 
+    /*
+     * The Thread and Process Environment Blocks.
+     *
+     * Two pages a Windows program expects to find already populated
+     * before its entry point runs. Nothing here calls them optional: a C
+     * runtime reads its stack bounds out of GS:[0x08] and GS:[0x10] the
+     * first time it needs to know whether a buffer fits, and a zeroed
+     * pair of those means every such check concludes the stack is
+     * nowhere and behaves accordingly.
+     *
+     * Writable because a program sets its own last-error value, and NX
+     * because it is data.
+     */
+    if (vmm_alloc_range(as, WIN_TEB_VA, 2 * PAGE_SIZE,
+                        PTE_USER | PTE_WRITE | PTE_NX) != 2 * PAGE_SIZE)
+        goto fail;
+
+    as_poke64(as, WIN_TEB_VA + TEB_EXCEPTION_LIST, 0);
+    as_poke64(as, WIN_TEB_VA + TEB_STACK_BASE,  stack_top);
+    as_poke64(as, WIN_TEB_VA + TEB_STACK_LIMIT, stack_top - USER_STACK_SIZE);
+    as_poke64(as, WIN_TEB_VA + TEB_SELF,        WIN_TEB_VA);
+    as_poke64(as, WIN_TEB_VA + TEB_PEB,         WIN_PEB_VA);
+    as_poke64(as, WIN_TEB_VA + TEB_LAST_ERROR,  0);
+
+    as_poke64(as, WIN_PEB_VA + PEB_IMAGE_BASE,     img->base);
+    as_poke64(as, WIN_PEB_VA + PEB_LDR,            0);
+    as_poke64(as, WIN_PEB_VA + PEB_PROCESS_PARAMS, 0);
+    /* Version 5.1 build 2600: what this system is aiming at, and what a
+     * program checking for "at least XP" wants to see. */
+    as_poke64(as, WIN_PEB_VA + PEB_OS_MAJOR, 5);
+    as_poke64(as, WIN_PEB_VA + PEB_OS_MINOR, 1);
+    as_poke64(as, WIN_PEB_VA + PEB_OS_BUILD, 2600);
+
     thread_t *t = sched_spawn_user(as, img->entry, sp, name, PRIO_NORMAL);
     if (!t) goto fail;
+
+    /* One write, for every Windows process there will ever be: the TEB
+     * is at the same virtual address in each of them, and GS_BASE is a
+     * linear address resolved through the current CR3. See the note in
+     * sched.h about why this is not in the context switch. */
+    sched_set_gs_base(WIN_TEB_VA);
+    as_poke64(as, WIN_TEB_VA + TEB_PROCESS_ID, t->pid);
+    as_poke64(as, WIN_TEB_VA + TEB_THREAD_ID,  t->pid);
     return t;
 
 fail:
@@ -1818,6 +1890,7 @@ static int execute_bin_full(const char *filepath, int verbose,
 
         uint64_t pe_base = 0x0000000000400000ULL + aslr_offset(2048);
         pe_image_t img;
+        win_image_forget();
         int prc = pe_load(file, fsize, pe_base, &img);
         if (prc != 0) {
             serial_puts("[exec] ");
@@ -1855,7 +1928,29 @@ static int execute_bin_full(const char *filepath, int verbose,
         serial_put_dec((uint32_t)img.relocations);
         serial_puts(" relocations, ");
         serial_put_dec((uint32_t)img.imports_resolved);
-        serial_puts(" imports\n");
+        serial_puts(" imports");
+        if (img.pdata_size) {
+            serial_puts(", ");
+            serial_put_dec(img.pdata_size / 12);
+            serial_puts(" unwind entries");
+        }
+        serial_puts("\n");
+
+        /* Where its exception and resource tables are, so the trap
+         * handler can find them without re-reading a header. */
+        win_image_record(&img);
+
+        {
+            char sres[64];
+            /* Resource string 1, if it has one. Read here rather than on
+             * demand because .rsrc is in the staged image, and the stage
+             * is reused by the next program to run. */
+            if (win_load_string(pe_stage, 1, sres, sizeof sres) > 0) {
+                serial_puts("[exec]   string 1: \"");
+                serial_puts(sres);
+                serial_puts("\"\n");
+            }
+        }
 
         thread_t *pt = pe_spawn(shortname, &img, &lay, verbose);
         if (!pt) return -1;
