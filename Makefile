@@ -200,6 +200,7 @@ test: build/wikidoc_test build/crypto_test build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/crypto_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
+	@python3 tools/linecount.py --check
 
 # The stripped Mbed TLS, proved on the host before it is trusted on the
 # wire. Without a server it runs the offline half -- the allocator hooks,

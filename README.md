@@ -160,11 +160,12 @@ nothing else here needed.
 </tr>
 <tr>
 <td><b>Shell</b> — a real filesystem, and <code>ping</code> and
-<code>fetch</code> going out over a TCP/IP stack that is 1,200 lines of
-this repository.</td>
+<code>fetch</code> going out over lwIP, with eight conversations able to
+be in flight at once.</td>
 <td><b>Browser</b> — <code>info.cern.ch</code>, the first website, fetched
-and rendered on bare metal. HTTP only: there is no TLS, because there are
-no secrets on a machine with no users.</td>
+and rendered on bare metal. <code>https://</code> works now too, over
+TLS 1.3 — though nothing verifies the certificate, and the browser says
+so rather than showing a padlock it has not earned.</td>
 </tr>
 <tr>
 <td><img src="docs/wikipedia.png" alt="Wikipedia search"></td>
@@ -813,9 +814,19 @@ Point it elsewhere with `store repo <url>`.
 
 ## What is actually in here
 
-**34,000 lines of C**, compiled as a single translation unit plus one for
-inference, over a user-space C library of its own. (35,092 counting the embedded typeface and the integer
-sine table, which are data rather than logic.)
+**58,815 lines of C written here**, across 111 files, compiled as a
+single translation unit plus one for inference, over a user-space C
+library of its own. (62,430 counting the embedded typeface, the integer
+sine table and Limine's own boot-protocol header — data and interface
+rather than logic.)
+
+Underneath the network sit two libraries that were **not** written here:
+lwIP 2.2.1 and Mbed TLS 3.6.4, 228,969 lines vendored unmodified at
+their release tags. They are reached through a 3,093-line port — the
+`sys_arch` layer on this scheduler, the netif on the e1000, the platform
+hooks on the kernel heap, and a freestanding C library for code that
+expects a hosted one. That port is ours; the 228,969 lines are not, and
+the counts are kept apart on purpose.
 
 | | |
 |---|---|
