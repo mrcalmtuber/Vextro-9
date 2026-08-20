@@ -16,6 +16,7 @@
 #include "keyboard.h"
 #include "xhci.h"
 #include "usbmsc.h"
+#include "usbhub.h"
 #include "ttf.h"
 #include "login.h"
 #include "e1000.h"
@@ -809,6 +810,7 @@ static int hal_init_devices(uint16_t cs, int32_t w, int32_t h) {
      * plugged in at boot is seen, found not to be a keyboard, and
      * dropped. */
     usbmsc_init();
+    usbhub_init();
     if (xhci_init()) xhci_enumerate();
 #endif
     return 0;
@@ -1029,6 +1031,7 @@ void kmain(void) {
      * plugged in at boot is seen, found not to be a keyboard, and
      * dropped. */
     usbmsc_init();
+    usbhub_init();
     if (xhci_init()) xhci_enumerate();
 
     /* Start PIT at ~60 Hz so the render loop runs even when mouse is idle */

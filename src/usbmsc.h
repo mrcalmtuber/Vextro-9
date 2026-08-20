@@ -366,6 +366,15 @@ static int usbmsc_fail(const char *why) {
     return 0;
 }
 
+/* The same, once a slot has been taken. Handing it back is what lets the
+ * next driver offered this port address the device -- see the note on
+ * xhci_release_slot. Not doing so is why a hub behind this path was
+ * invisible. */
+static int usbmsc_fail_slot(const char *why, uint8_t slot) {
+    xhci_release_slot(slot);
+    return usbmsc_fail(why);
+}
+
 static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
                              uint8_t parent_port) {
     if (usbmsc_count >= USBMSC_MAX) return 0;
@@ -438,8 +447,8 @@ static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
 
     xhci_cmd_push(kern_virt_to_phys(usbmsc_in_ctx[i]), 0,
                   TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot << 24));
-    if (xhci_wait_for(TRB_COMMAND_COMPLETE, &ev, 200000) < 0) return usbmsc_fail("address device");
-    if (TRB_GET_CC(ev.status) != TRB_CC_SUCCESS) return usbmsc_fail("address device");
+    if (xhci_wait_for(TRB_COMMAND_COMPLETE, &ev, 200000) < 0) return usbmsc_fail_slot("address device", slot);
+    if (TRB_GET_CC(ev.status) != TRB_CC_SUCCESS) return usbmsc_fail_slot("address device", slot);
 
     /* A control transfer needs a HID-shaped handle, because xhci_control
      * was written against one. The fields it touches are the slot and
@@ -453,11 +462,11 @@ static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
 
     uint8_t *cfg = usbmsc_data[i];
     if (xhci_control(&ctl, 0x80, 6, 0x0200, 0, cfg, 64) != 0)
-        return usbmsc_fail("first config descriptor read");
+        return usbmsc_fail_slot("first config descriptor read", slot);
     uint16_t total = (uint16_t)(cfg[2] | (cfg[3] << 8));
     if (total > 512) total = 512;
     if (total > 64 && xhci_control(&ctl, 0x80, 6, 0x0200, 0, cfg, total) != 0)
-        return usbmsc_fail("full config descriptor read");
+        return usbmsc_fail_slot("full config descriptor read", slot);
 
     /* Class 8 subclass 6 protocol 0x50: SCSI transparent command set
      * over Bulk-Only Transport. Anything else -- CBI, UFI, a floppy
@@ -487,10 +496,16 @@ static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
         }
         o += dl;
     }
-    if (!found) return usbmsc_fail("no bulk-only interface");
+    if (!found) {
+        /* Not a disk. That is an ordinary answer for a port with a hub
+         * or a keyboard on it, so it is silent -- the driver is offered
+         * every port and most of them are not its business. */
+        xhci_release_slot(slot);
+        return 0;
+    }
 
     if (xhci_control(&ctl, 0x00, 9, cfg_value, 0, 0, 0) != 0)
-        return usbmsc_fail("set configuration");
+        return usbmsc_fail_slot("set configuration", slot);
 
     d->ep_in_id  = (uint8_t)(ep_in * 2 + 1);
     d->ep_out_id = (uint8_t)(ep_out * 2);
@@ -519,8 +534,8 @@ static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
 
     xhci_cmd_push(kern_virt_to_phys(usbmsc_in_ctx[i]), 0,
                   TRB_TYPE(TRB_CONFIGURE_ENDPOINT) | ((uint32_t)slot << 24));
-    if (xhci_wait_for(TRB_COMMAND_COMPLETE, &ev, 200000) < 0) return usbmsc_fail("configure endpoints");
-    if (TRB_GET_CC(ev.status) != TRB_CC_SUCCESS) return usbmsc_fail("configure endpoints");
+    if (xhci_wait_for(TRB_COMMAND_COMPLETE, &ev, 200000) < 0) return usbmsc_fail_slot("configure endpoints", slot);
+    if (TRB_GET_CC(ev.status) != TRB_CC_SUCCESS) return usbmsc_fail_slot("configure endpoints", slot);
 
     d->used = 1;
     usbmsc_count++;
@@ -537,16 +552,14 @@ static int usbmsc_setup_port(uint32_t port, uint32_t route, uint8_t parent_slot,
         xhci_delay(50);
     }
     if (!ready) {
-        serial_puts("[usb-msc] device never became ready\n");
         d->used = 0; usbmsc_count--;
-        return 0;
+        return usbmsc_fail_slot("test unit ready", slot);
     }
 
     usbmsc_inquiry(d);
     if (usbmsc_read_capacity(d) != 0) {
-        serial_puts("[usb-msc] no capacity\n");
         d->used = 0; usbmsc_count--;
-        return 0;
+        return usbmsc_fail_slot("read capacity", slot);
     }
 
     serial_puts("[usb-msc] ");

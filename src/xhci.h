@@ -310,6 +310,8 @@ static void xhci_zero(uint8_t *p, uint32_t n) {
  * the HID boot protocol. Three TRBs: setup, data, status — which is the
  * shape of every USB control transfer, made explicit by the ring.
  */
+static void xhci_release_slot(uint8_t slot);
+
 static int xhci_control(xhci_hid_t *h, uint8_t rtype, uint8_t req,
                         uint16_t value, uint16_t index,
                         void *data, uint16_t len) {
@@ -492,25 +494,35 @@ static int xhci_init(void) {
  * interrupt IN endpoint, configure that endpoint, then put a transfer on
  * its ring and leave it there.
  */
-static int xhci_setup_port(uint32_t port) {
+static int xhci_setup_routed(uint32_t port, uint32_t route,
+                             uint8_t parent_slot, uint8_t parent_port,
+                             uint32_t routed_speed) {
     if (xhci_hid_count >= XHCI_MAX_HID) return 0;
 
-    uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(port));
-    if (!(psc & XHCI_PORTSC_CCS)) return 0;
+    uint32_t speed;
 
-    /* Reset, and wait for the controller to say it finished. */
-    xhci_wr32(xhci_op, XHCI_PORTSC(port),
-              (psc & ~0x80FFu) | XHCI_PORTSC_PR | XHCI_PORTSC_PP);
-    int ok = 0;
-    for (int i = 0; i < 1000; i++) {
-        psc = xhci_rd32(xhci_op, XHCI_PORTSC(port));
-        if (psc & XHCI_PORTSC_PRC) { ok = 1; break; }
-        xhci_delay(2);
+    if (route == 0) {
+        uint32_t psc = xhci_rd32(xhci_op, XHCI_PORTSC(port));
+        if (!(psc & XHCI_PORTSC_CCS)) return 0;
+
+        /* Reset, and wait for the controller to say it finished. */
+        xhci_wr32(xhci_op, XHCI_PORTSC(port),
+                  (psc & ~0x80FFu) | XHCI_PORTSC_PR | XHCI_PORTSC_PP);
+        int ok = 0;
+        for (int i = 0; i < 1000; i++) {
+            psc = xhci_rd32(xhci_op, XHCI_PORTSC(port));
+            if (psc & XHCI_PORTSC_PRC) { ok = 1; break; }
+            xhci_delay(2);
+        }
+        if (!ok || !(psc & XHCI_PORTSC_PED)) return 0;
+        xhci_wr32(xhci_op, XHCI_PORTSC(port), psc);   /* ack the change bits */
+        speed = (psc >> 10) & 0xF;
+    } else {
+        /* Behind a hub. The hub has already reset the port and reported
+         * the speed; resetting the *root* port here would knock the hub
+         * itself off the bus along with everything else on it. */
+        speed = routed_speed;
     }
-    if (!ok || !(psc & XHCI_PORTSC_PED)) return 0;
-    xhci_wr32(xhci_op, XHCI_PORTSC(port), psc);   /* ack the change bits */
-
-    uint32_t speed = (psc >> 10) & 0xF;
 
     xhci_cmd_push(0, 0, TRB_TYPE(TRB_ENABLE_SLOT));
     xhci_trb_t ev;
@@ -537,8 +549,11 @@ static int xhci_setup_port(uint32_t port) {
     uint32_t *icc = xhci_ctx_at(xhci_in_ctx[h_idx], 0);
     icc[1] = 0x3;                                  /* add slot + ep0 */
     uint32_t *sc = xhci_ctx_at(xhci_in_ctx[h_idx], 1);
-    sc[0] = (1u << 27) | (speed << 20);            /* context entries=1 */
+    sc[0] = (1u << 27) | (speed << 20) | (route & 0xFFFFF);
     sc[1] = (port + 1) << 16;                      /* root hub port number */
+    /* Which hub translates for a slow device on a fast bus. Wrong here
+     * does not fail loudly: the device is addressed and then silent. */
+    if (route) sc[2] = (uint32_t)parent_slot | ((uint32_t)parent_port << 8);
 
     uint32_t mps = (speed == 4) ? 512 : (speed == 3) ? 64 : 8;
     uint32_t *ep0 = xhci_ctx_at(xhci_in_ctx[h_idx], 2);
@@ -594,11 +609,7 @@ static int xhci_setup_port(uint32_t port) {
          * reports "gave up at address device". Handing the slot back
          * leaves the device exactly as it was found.
          */
-        xhci_cmd_push(0, 0,
-                      TRB_TYPE(TRB_DISABLE_SLOT) | ((uint32_t)slot << 24));
-        xhci_trb_t dev_ev;
-        xhci_wait_for(TRB_COMMAND_COMPLETE, &dev_ev, 200000);
-        xhci_dcbaa[slot] = 0;
+        xhci_release_slot(slot);
         return 0;
     }
 
@@ -611,8 +622,9 @@ static int xhci_setup_port(uint32_t port) {
     icc = xhci_ctx_at(xhci_in_ctx[h_idx], 0);
     icc[1] = 1u | (1u << ep_id);
     sc = xhci_ctx_at(xhci_in_ctx[h_idx], 1);
-    sc[0] = (ep_id << 27) | (speed << 20);
+    sc[0] = (ep_id << 27) | (speed << 20) | (route & 0xFFFFF);
     sc[1] = (port + 1) << 16;
+    if (route) sc[2] = (uint32_t)parent_slot | ((uint32_t)parent_port << 8);
 
     uint32_t *epc = xhci_ctx_at(xhci_in_ctx[h_idx], ep_id + 1);
     uint32_t ival = ep_interval ? ep_interval - 1 : 3;
@@ -638,11 +650,18 @@ static int xhci_setup_port(uint32_t port) {
 
     serial_puts("[xhci] port ");
     xhci_dec(port);
+    if (route) { serial_puts(" route "); xhci_dec(route); }
     serial_puts(is_kbd ? ": keyboard" : ": pointer");
     serial_puts(" on slot ");
     xhci_dec(slot);
     serial_putc('\n');
     return 1;
+}
+
+/* The root-port case, which is what every caller outside the hub driver
+ * wants. */
+static int xhci_setup_port(uint32_t port) {
+    return xhci_setup_routed(port, 0, 0, 0, 0);
 }
 
 /* Queue one interrupt-IN transfer, so the controller has somewhere to
@@ -714,6 +733,26 @@ static int xhci_hid_on_port(uint32_t port) {
  * slot leaks until the next reset, which on a machine with four slots
  * and a lifetime of a few hours is a trade worth making.
  */
+/*
+ * Give a slot back.
+ *
+ * Every path that enables a slot and then decides the device is not
+ * its business must call this, and the reason is sharper than tidiness:
+ * a slot that is not disabled leaves the device *addressed*, and the
+ * next driver offered the same port cannot address it again. The
+ * controller refuses, correctly, and a working device reports a failure
+ * that names the wrong step. It cost this twice -- once for a memory
+ * stick behind the keyboard path, once for a hub behind the storage
+ * path -- before it was worth a function.
+ */
+static void xhci_release_slot(uint8_t slot) {
+    if (!slot) return;
+    xhci_cmd_push(0, 0, TRB_TYPE(TRB_DISABLE_SLOT) | ((uint32_t)slot << 24));
+    xhci_trb_t ev;
+    xhci_wait_for(TRB_COMMAND_COMPLETE, &ev, 200000);
+    xhci_dcbaa[slot] = 0;
+}
+
 static void xhci_drop_device(int idx) {
     if (idx < 0 || idx >= XHCI_MAX_HID || !xhci_hid[idx].used) return;
     xhci_log(xhci_hid[idx].is_keyboard ? "keyboard unplugged"
@@ -737,6 +776,11 @@ static void xhci_drop_device(int idx) {
 static int (*xhci_storage_hook)(uint32_t port, uint32_t route,
                                 uint8_t parent_slot, uint8_t parent_port) = 0;
 
+/* And src/usbhub.h, for a port that turned out to hold neither a
+ * keyboard, a mouse nor a disk. A hub is what is left. */
+static int (*xhci_hub_hook)(uint32_t port, uint32_t route,
+                            uint8_t parent_slot, uint8_t parent_port) = 0;
+
 static void xhci_enumerate(void) {
     if (!xhci_present) return;
     for (uint32_t p = 0; p < xhci_max_ports; p++) {
@@ -747,9 +791,10 @@ static void xhci_enumerate(void) {
             xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
             continue;
         }
-        /* Not a keyboard or a mouse. Storage is the only other thing
-         * this system knows how to drive. */
-        if (xhci_storage_hook) xhci_storage_hook(p, 0, 0, 0);
+        /* Not a keyboard or a mouse. Storage next, then a hub -- and a
+         * hub enumerates everything behind it before returning. */
+        if (xhci_storage_hook && xhci_storage_hook(p, 0, 0, 0)) continue;
+        if (xhci_hub_hook) xhci_hub_hook(p, 0, 0, 0);
     }
     if (xhci_hid_count == 0) xhci_log("no HID devices found");
 }
@@ -785,7 +830,8 @@ static void xhci_hotplug_poll(void) {
             xhci_queue_report(&xhci_hid[xhci_hid_count - 1]);
             continue;
         }
-        if (xhci_storage_hook) xhci_storage_hook(p, 0, 0, 0);
+        if (xhci_storage_hook && xhci_storage_hook(p, 0, 0, 0)) continue;
+        if (xhci_hub_hook) xhci_hub_hook(p, 0, 0, 0);
     }
 }
 
