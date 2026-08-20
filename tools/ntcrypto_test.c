@@ -55,6 +55,31 @@ int main(void){
     hmac_md5((const uint8_t*)"Jefe",4,(const uint8_t*)"what do ya want for nothing?",28,o);
     hexcheck("case 2",o,"750c783e6ab0b503eaa86e310a5db738",16);
 
+    printf("\nHMAC-SHA1 (RFC 2202)\n");
+    { uint8_t k[20]; memset(k,0x0b,20);
+      hmac_sha1(k,20,(const uint8_t*)"Hi There",8,o);
+      hexcheck("case 1",o,"b617318655057264e28bc0b6fb378c8ef146be00",20); }
+    hmac_sha1((const uint8_t*)"Jefe",4,(const uint8_t*)"what do ya want for nothing?",28,o);
+    hexcheck("case 2",o,"effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",20);
+    { uint8_t k[20], d[50]; memset(k,0xaa,20); memset(d,0xdd,50);
+      hmac_sha1(k,20,d,50,o);
+      hexcheck("case 3",o,"125d7342b9ac11cd91a39af48aa17b4f63f175d3",20); }
+    /* Cases 6 and 7 use an 80-byte key, which is longer than SHA-1's
+     * 64-byte block and so must be hashed down first. That branch is
+     * the one an HMAC written from the formula alone tends to omit. */
+    /* strlen rather than a counted literal, and for a reason: writing
+     * 53 where the string is 54 characters long produces a MAC that is
+     * perfectly correct for the message actually passed, and reads as a
+     * broken HMAC. That exact mistake happened here. */
+    { uint8_t k[80]; memset(k,0xaa,80);
+      const char *m6 = "Test Using Larger Than Block-Size Key - Hash Key First";
+      const char *m7 = "Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data";
+      hmac_sha1(k,80,(const uint8_t*)m6,(uint32_t)strlen(m6),o);
+      hexcheck("case 6, key longer than the block",o,
+               "aa4ae5e15272d00e95705637ce8a3b55ed402112",20);
+      hmac_sha1(k,80,(const uint8_t*)m7,(uint32_t)strlen(m7),o);
+      hexcheck("case 7",o,"e8e99d0f45237d786d6bbaa7965c7808bbff1a91",20); }
+
     printf("\nRC4 (published test vectors)\n");
     { rc4_ctx c; uint8_t out[9];
       rc4_init(&c,(const uint8_t*)"Key",3);

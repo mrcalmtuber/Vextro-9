@@ -310,6 +310,35 @@ static void sha1(const uint8_t *p, uint32_t n, uint8_t out[20]) {
     sha1_ctx s; sha1_init(&s); sha1_update(&s, p, n); sha1_final(&s, out);
 }
 
+/* ===== HMAC-SHA1 (RFC 2104) =====
+ *
+ * Kerberos's aes256-cts-hmac-sha1-96 is named for this: it is the
+ * checksum over every encrypted message, and PBKDF2 calls it four
+ * thousand times to turn a password into a key.
+ *
+ * The same shape as hmac_md5 above, and deliberately a separate
+ * function rather than one parameterised by a hash. A hash-agnostic
+ * HMAC needs a block size passed in alongside the digest, and the
+ * failure mode when the two disagree is a MAC that is stable, plausible
+ * and verifies against nothing.
+ */
+static void hmac_sha1(const uint8_t *key, uint32_t klen,
+                      const uint8_t *msg, uint32_t mlen, uint8_t out[20]) {
+    uint8_t k[64], ipad[64], opad[64], inner[20];
+    for (int i = 0; i < 64; i++) k[i] = 0;
+
+    if (klen > 64) sha1(key, klen, k);
+    else for (uint32_t i = 0; i < klen; i++) k[i] = key[i];
+
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5C; }
+
+    sha1_ctx s;
+    sha1_init(&s); sha1_update(&s, ipad, 64); sha1_update(&s, msg, mlen);
+    sha1_final(&s, inner);
+    sha1_init(&s); sha1_update(&s, opad, 64); sha1_update(&s, inner, 20);
+    sha1_final(&s, out);
+}
+
 /* ===== RC4 =====
  *
  * Only for NTLM session sealing, which defines itself in terms of it.

@@ -196,10 +196,13 @@ all: os.iso disk.img
 # runs on the host. The property it exists for -- that a link must not end
 # the line -- cannot be seen in a screenshot and is awkward to assert from
 # inside the kernel, so it is checked here instead.
-test: build/wikidoc_test build/crypto_test build/ntcrypto_test build/mbedtls_test
+test: build/wikidoc_test build/crypto_test build/ntcrypto_test build/aes_test \
+      build/krb5_test build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/crypto_test
 	@./build/ntcrypto_test
+	@./build/aes_test
+	@./build/krb5_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
 	@python3 tools/linecount.py --check
 
@@ -251,6 +254,30 @@ build/crypto_test: tools/crypto_test.c src/chacha20.h src/sha256.h src/tls.h
 # NTLMv2 example in MS-NLMP 4.2.4. Every one of them is broken for its
 # original purpose and every one is required to reach a domain.
 build/ntcrypto_test: tools/ntcrypto_test.c src/ntcrypto.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# AES against FIPS-197, RFC 3962's ciphertext-stealing vectors and RFC
+# 4493's CMACs.
+#
+# What runs here is the *portable* implementation, and that is the point
+# rather than a limitation: this repository is edited on an arm64 Mac,
+# which has no AESENC, so the fallback path gets exercised on the host
+# and the AES-NI path is compared against it inside the kernel. Without
+# this, the software AES would be dead code on every machine that could
+# run it and would rot unnoticed.
+build/aes_test: tools/aes_test.c src/aes.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# The Kerberos encryption profile: n-fold, PBKDF2, DK and string-to-key
+# against RFC 3961 appendix A and RFC 3962 appendix B.
+#
+# Worth running before anything talks to a KDC, because every one of
+# these failing looks identical from the far end -- the KDC says the
+# password is wrong, and means it, because the key it derived does not
+# match the one this end derived.
+build/krb5_test: tools/krb5_test.c src/krb5crypto.h src/aes.h src/ntcrypto.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
 

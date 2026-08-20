@@ -32,6 +32,7 @@
 #include "vxnet.h"
 #include "ntcrypto.h"
 #include "ldap.h"
+#include "kerberos.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -1286,6 +1287,178 @@ void kmain(void) {
         }
 
         serial_puts("[ldap] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+    }
+#endif
+
+#ifdef AES_SELFTEST
+    /*
+     * The two AES implementations, made to agree.
+     *
+     * tools/aes_test.c checks the portable one against FIPS-197 on the
+     * host, and cannot check the other: the host is an arm64 Mac and
+     * has no AESENC. This is the only place both exist at once, so it
+     * is the only place the claim "these compute the same function" can
+     * be tested at all.
+     *
+     * It matters more than a redundant-looking check usually does.
+     * Every machine that runs this kernel takes the AES-NI branch, so a
+     * fault there is a fault in *all* of Kerberos -- and it presents as
+     * the KDC saying the password is wrong, which is the last thing
+     * that would send anyone looking at an assembler loop.
+     */
+    {
+        serial_puts("\n[aes] selftest\n");
+        int checks = 0, bad = 0;
+
+        serial_puts("[aes]   this processor ");
+        serial_puts(aes_have_ni() ? "has AES-NI\n" : "has no AES-NI\n");
+
+        static const struct { int bits; const char *name; } sizes[] = {
+            { 128, "aes-128" }, { 192, "aes-192" }, { 256, "aes-256" }
+        };
+        /* FIPS-197 appendix C: one published answer per key size, so a
+         * pair that agree with each other and with nobody else is still
+         * caught. */
+        static const uint8_t want[3][16] = {
+            { 0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,
+              0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a },
+            { 0xdd,0xa9,0x7c,0xa4,0x86,0x4c,0xdf,0xe0,
+              0x6e,0xaf,0x70,0xa0,0xec,0x0d,0x71,0x91 },
+            { 0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,
+              0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89 }
+        };
+
+        for (int s = 0; s < 3; s++) {
+            uint8_t key[32], in[16], a[16], b[16], back[16];
+            for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+            /* 00112233445566778899aabbccddeeff */
+            for (int i = 0; i < 16; i++) in[i] = (uint8_t)(i * 0x11);
+
+            aes_key_t k;
+            aes_setkey(&k, key, sizes[s].bits);
+
+            aes_sw_encrypt(&k, in, a);
+            aes_encrypt_block(&k, in, b);
+
+            checks++;
+            int okv = 1;
+            for (int i = 0; i < 16; i++) if (a[i] != want[s][i]) okv = 0;
+            if (okv) { serial_puts("[aes]   ok   "); serial_puts(sizes[s].name);
+                       serial_puts(" portable matches FIPS-197\n"); }
+            else { bad++; serial_puts("[aes]   FAIL "); serial_puts(sizes[s].name);
+                   serial_puts(" portable disagrees with FIPS-197\n"); }
+
+            checks++;
+            okv = 1;
+            for (int i = 0; i < 16; i++) if (a[i] != b[i]) okv = 0;
+            if (okv) { serial_puts("[aes]   ok   "); serial_puts(sizes[s].name);
+                       serial_puts(" both implementations agree\n"); }
+            else {
+                bad++;
+                serial_puts("[aes]   FAIL "); serial_puts(sizes[s].name);
+                serial_puts(" the two implementations disagree\n");
+                static const char hx[] = "0123456789abcdef";
+                char line[40];
+                for (int i = 0; i < 16; i++) {
+                    line[i*2] = hx[a[i] >> 4]; line[i*2+1] = hx[a[i] & 15];
+                }
+                line[32] = 0;
+                serial_puts("[aes]        sw "); serial_puts(line); serial_puts("\n");
+                for (int i = 0; i < 16; i++) {
+                    line[i*2] = hx[b[i] >> 4]; line[i*2+1] = hx[b[i] & 15];
+                }
+                line[32] = 0;
+                serial_puts("[aes]        ni "); serial_puts(line); serial_puts("\n");
+            }
+
+            checks++;
+            aes_decrypt_block(&k, b, back);
+            okv = 1;
+            for (int i = 0; i < 16; i++) if (back[i] != in[i]) okv = 0;
+            if (okv) { serial_puts("[aes]   ok   "); serial_puts(sizes[s].name);
+                       serial_puts(" decrypt returns the plaintext\n"); }
+            else { bad++; serial_puts("[aes]   FAIL "); serial_puts(sizes[s].name);
+                   serial_puts(" decrypt\n"); }
+        }
+
+        serial_puts("[aes] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+    }
+#endif
+
+#ifdef KRB_SELFTEST
+    /*
+     * Kerberos, against a key distribution centre that implements RFC
+     * 4120 independently -- see tools/kdc.py, which builds its AES from
+     * exp/log tables where src/aes.h finds inverses by search, and folds
+     * a materialised bit string where src/krb5crypto.h computes each bit
+     * on demand. Two implementations that agree, arrived at differently.
+     *
+     * The check that carries the most weight is the third one. A TGS
+     * request carries a checksum over its own request body, and the KDC
+     * verifies that checksum against the bytes it actually received. A
+     * client that re-encodes the body to compute it -- the obvious way,
+     * and wrong -- passes every test it can run against itself and fails
+     * this one.
+     */
+    {
+        serial_puts("\n[krb5] selftest\n");
+        int checks = 0, bad = 0;
+
+        checks++;
+        if (krb_get_tgt("10.0.2.2", 8088, "VEXTRO.TEST", "ada", "hunter2") == 0)
+            serial_puts("[krb5]   ok   a password became a ticket-granting "
+                        "ticket\n");
+        else { bad++; serial_puts("[krb5]   FAIL could not get a TGT\n"); }
+
+        /* The session key came out of the encrypted half of the reply,
+         * so its length being right means the whole chain worked:
+         * PBKDF2, the DK with "kerberos", the usage-3 derivation, CTS
+         * and the truncated HMAC. */
+        checks++;
+        if (krb_have_tgt() && krb.tgt.session.len == 32 &&
+            krb.tgt.session.etype == KRB_ETYPE_AES256_CTS) {
+            serial_puts("[krb5]   ok   the session key is 256-bit aes-cts\n");
+        } else {
+            bad++;
+            serial_puts("[krb5]   FAIL no usable session key\n");
+        }
+
+        checks++;
+        if (krb_have_tgt() &&
+            krb_get_service_ticket("10.0.2.2", 8088, "cifs",
+                                   "files.vextro.test") == 0 &&
+            krb_have_service()) {
+            serial_puts("[krb5]   ok   the TGT bought a ticket to "
+                        "cifs/files.vextro.test\n");
+        } else {
+            bad++;
+            serial_puts("[krb5]   FAIL no service ticket\n");
+        }
+
+        /* Both failure paths matter as much as the success. A client
+         * that reports success for a wrong password is worse than one
+         * that cannot authenticate at all. */
+        checks++;
+        if (krb_get_tgt("10.0.2.2", 8088, "VEXTRO.TEST", "ada", "wrong") != 0 &&
+            krb.last_code == KDC_ERR_PREAUTH_FAILED)
+            serial_puts("[krb5]   ok   a wrong password is refused\n");
+        else { bad++; serial_puts("[krb5]   FAIL wrong password not refused\n"); }
+
+        checks++;
+        if (krb_get_tgt("10.0.2.2", 8088, "VEXTRO.TEST", "nobody", "x") != 0 &&
+            krb.last_code == KDC_ERR_C_PRINCIPAL_UNKNOWN)
+            serial_puts("[krb5]   ok   an unknown principal is refused\n");
+        else { bad++; serial_puts("[krb5]   FAIL unknown principal accepted\n"); }
+
+        serial_puts("[krb5] ");
         serial_put_dec((uint32_t)checks);
         serial_puts(" checks, ");
         serial_put_dec((uint32_t)bad);

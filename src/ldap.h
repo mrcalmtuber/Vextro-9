@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "vxnet.h"
+#include "ber.h"
 
 /*
  * src/ldap.h — asking a directory who someone is.
@@ -14,21 +15,18 @@
  * is why this is the first piece of section nine and everything else in
  * that section assumes it.
  *
- * ---- BER, and why it is written out longhand here ----
+ * ---- BER ----
  *
  * Every LDAP message is BER: a tag byte, a length, and a value, nested.
- * That sounds like it wants a general encoder, and a general BER
- * encoder is a famous source of security bugs -- the format is
- * self-describing, permits multiple encodings of the same value, and
- * has an indefinite-length form that invites unbounded recursion.
+ * The writer and reader are in src/ber.h, which explains at length why
+ * they are a fixed set of shapes rather than a general encoder. They
+ * started life in this file and moved out when Kerberos turned out to
+ * need the same bytes.
  *
- * So there is no general encoder here. There is a writer that emits
- * exactly the shapes this client sends, and a reader that walks a
- * response with a hard bound on depth and an explicit refusal of the
- * indefinite form. Both check every length against the end of the
- * buffer before advancing, because the buffer arrived over a network
- * from a machine that has not authenticated itself yet -- the bind has
- * not happened when the first response is parsed.
+ * What matters here is when the parsing happens: the first response is
+ * read *before* the bind, so every length is checked against the end of
+ * the buffer while the machine on the other end is still completely
+ * unauthenticated.
  *
  * ---- what this does not do ----
  *
@@ -56,15 +54,6 @@
 #define LDAP_SCOPE_ONELEVEL 1
 #define LDAP_SCOPE_SUBTREE  2
 
-/* Universal tags. */
-#define BER_BOOL      0x01
-#define BER_INT       0x02
-#define BER_OCTET     0x04
-#define BER_NULL      0x05
-#define BER_ENUM      0x0A
-#define BER_SEQ       0x30
-#define BER_SET       0x31
-
 /* Application tags, which is how LDAP names its operations. */
 #define LDAP_BIND_REQUEST     0x60
 #define LDAP_BIND_RESPONSE    0x61
@@ -80,177 +69,6 @@
 #define LDAP_BUF   8192
 #define LDAP_MAX_ATTRS 16
 #define LDAP_MAX_VALS  8
-
-/* ===========================================================
- * the writer
- *
- * Lengths are not known until the contents have been written, so every
- * constructed element is opened, filled, and then closed -- at which
- * point the length is known and the body is shifted if the length
- * needed more than one byte to express. Shifting is cheaper than the
- * alternative of encoding twice, and far cheaper than the usual
- * mistake of reserving three bytes and emitting a non-minimal length,
- * which some servers reject.
- * =========================================================== */
-
-typedef struct {
-    uint8_t *buf;
-    uint32_t cap;
-    uint32_t n;
-    int      overflow;
-} ber_w;
-
-static void ber_put(ber_w *w, uint8_t b) {
-    if (w->n >= w->cap) { w->overflow = 1; return; }
-    w->buf[w->n++] = b;
-}
-
-static void ber_puts(ber_w *w, const uint8_t *p, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) ber_put(w, p[i]);
-}
-
-static uint32_t ber_strlen(const char *s) {
-    uint32_t n = 0; while (s && s[n]) n++; return n;
-}
-
-/* How many bytes a definite length needs, minimally encoded. */
-static uint32_t ber_len_bytes(uint32_t len) {
-    if (len < 0x80) return 1;
-    if (len <= 0xFF) return 2;
-    if (len <= 0xFFFF) return 3;
-    if (len <= 0xFFFFFF) return 4;
-    return 5;
-}
-
-static void ber_write_len(ber_w *w, uint32_t len) {
-    if (len < 0x80) { ber_put(w, (uint8_t)len); return; }
-    uint32_t nb = ber_len_bytes(len) - 1;
-    ber_put(w, (uint8_t)(0x80 | nb));
-    for (uint32_t i = nb; i-- > 0; ) ber_put(w, (uint8_t)(len >> (i * 8)));
-}
-
-/* Open a constructed element; returns the offset to close it with. */
-static uint32_t ber_open(ber_w *w, uint8_t tag) {
-    ber_put(w, tag);
-    ber_put(w, 0);          /* one byte reserved for the length */
-    return w->n;            /* where the body starts */
-}
-
-static void ber_close(ber_w *w, uint32_t body_start) {
-    uint32_t len = w->n - body_start;
-    uint32_t need = ber_len_bytes(len);
-    if (need == 1) {
-        w->buf[body_start - 1] = (uint8_t)len;
-        return;
-    }
-    /* The length needs more room than the one byte reserved. Shift the
-     * body up and write the longer form. */
-    uint32_t extra = need - 1;
-    if (w->n + extra > w->cap) { w->overflow = 1; return; }
-    for (uint32_t i = w->n; i-- > body_start; )
-        w->buf[i + extra] = w->buf[i];
-    w->n += extra;
-    uint32_t at = body_start - 1;
-    w->buf[at++] = (uint8_t)(0x80 | extra);
-    for (uint32_t i = extra; i-- > 0; )
-        w->buf[at++] = (uint8_t)(len >> (i * 8));
-}
-
-static void ber_int(ber_w *w, uint8_t tag, int32_t v) {
-    ber_put(w, tag);
-    /* Minimal two's-complement, which for the small positive values
-     * LDAP uses is one byte unless the top bit would make it look
-     * negative. */
-    if (v >= 0 && v < 0x80) { ber_put(w, 1); ber_put(w, (uint8_t)v); return; }
-    uint8_t tmp[4];
-    int n = 0;
-    uint32_t u = (uint32_t)v;
-    for (int i = 3; i >= 0; i--) {
-        uint8_t b = (uint8_t)(u >> (i * 8));
-        if (n == 0 && b == 0 && i != 0) continue;
-        tmp[n++] = b;
-    }
-    if (tmp[0] & 0x80) { ber_put(w, (uint8_t)(n + 1)); ber_put(w, 0); }
-    else                 ber_put(w, (uint8_t)n);
-    ber_puts(w, tmp, (uint32_t)n);
-}
-
-static void ber_str(ber_w *w, uint8_t tag, const char *s) {
-    uint32_t n = ber_strlen(s);
-    ber_put(w, tag);
-    ber_write_len(w, n);
-    ber_puts(w, (const uint8_t *)s, n);
-}
-
-static void ber_bool(ber_w *w, int v) {
-    ber_put(w, BER_BOOL); ber_put(w, 1); ber_put(w, v ? 0xFF : 0x00);
-}
-
-/* ===========================================================
- * the reader
- * =========================================================== */
-
-typedef struct {
-    const uint8_t *buf;
-    uint32_t n;
-    uint32_t at;
-    int      bad;
-} ber_r;
-
-/*
- * Read one tag and length. Returns the tag, sets *len and leaves `at`
- * on the first content byte.
- *
- * The indefinite form -- length byte 0x80, contents terminated by two
- * zero bytes -- is refused outright. It is legal BER and no LDAP server
- * needs it, and accepting it means a parser whose termination depends
- * on finding a sentinel in attacker-supplied data.
- */
-static int ber_next(ber_r *r, uint32_t *len) {
-    if (r->bad || r->at + 2 > r->n) { r->bad = 1; return -1; }
-    int tag = r->buf[r->at++];
-    uint32_t l = r->buf[r->at++];
-
-    if (l == 0x80) { r->bad = 1; return -1; }      /* indefinite */
-    if (l & 0x80) {
-        uint32_t nb = l & 0x7F;
-        if (nb > 4 || r->at + nb > r->n) { r->bad = 1; return -1; }
-        l = 0;
-        for (uint32_t i = 0; i < nb; i++) l = (l << 8) | r->buf[r->at++];
-    }
-    if (r->at + l > r->n) { r->bad = 1; return -1; }
-    *len = l;
-    return tag;
-}
-
-static int32_t ber_read_int(ber_r *r) {
-    uint32_t len;
-    int tag = ber_next(r, &len);
-    if (tag < 0 || (tag != BER_INT && tag != BER_ENUM) || len == 0 || len > 4) {
-        r->bad = 1; return 0;
-    }
-    int32_t v = (r->buf[r->at] & 0x80) ? -1 : 0;
-    for (uint32_t i = 0; i < len; i++) v = (v << 8) | r->buf[r->at + i];
-    r->at += len;
-    return v;
-}
-
-static void ber_read_str(ber_r *r, char *out, uint32_t max) {
-    uint32_t len;
-    int tag = ber_next(r, &len);
-    if (out && max) out[0] = 0;
-    if (tag < 0) { r->bad = 1; return; }
-    uint32_t take = len < max - 1 ? len : (max ? max - 1 : 0);
-    for (uint32_t i = 0; i < take; i++) out[i] = (char)r->buf[r->at + i];
-    if (max) out[take] = 0;
-    r->at += len;
-}
-
-static void ber_skip(ber_r *r) {
-    uint32_t len;
-    if (ber_next(r, &len) < 0) return;
-    r->at += len;
-}
 
 /* ===========================================================
  * the connection
