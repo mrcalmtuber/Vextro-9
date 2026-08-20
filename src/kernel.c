@@ -21,6 +21,12 @@
 #define VEXTRO_HAVE_AUDIO 1
 #include "hda.h"
 #include "audio.h"
+/* Before netstack.h, which now runs its transfers over these. Both are
+ * plain declarations in native types -- no lwIP header and no Mbed TLS
+ * header reaches this translation unit, which is what keeps lwIP's
+ * htons() macro away from the one netstack.h has always had. */
+#include "vxport.h"
+#include "vxnet.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -1057,6 +1063,26 @@ void kmain(void) {
     netstack_init();
 
     /*
+     * The stack that actually carries traffic.
+     *
+     * lwIP takes the receive ring from here on -- netstack.h's poll no
+     * longer drains it, because two stacks sharing one ring each see a
+     * random half of the frames. Above it, Mbed TLS gives eight
+     * simultaneous TLS 1.3 sessions.
+     *
+     * Both come up after the scheduler, and they have to: lwIP is run
+     * with an operating system underneath it, so tcpip_init() spawns a
+     * thread before it returns and there must be something to spawn it
+     * with.
+     */
+    if (vxnet_init()) {
+        vxsec_init();
+#ifdef NET_SELFTEST
+        vxnet_selftest();
+#endif
+    }
+
+    /*
      * Policy over the wire: default-deny inbound with connection
      * tracking, and more than one resolver so a single unreachable
      * server is not the end of name resolution. ICMP echo is allowed in
@@ -1857,3 +1883,14 @@ void kmain(void) {
         frame_idle();  /* sleep until next IRQ */
     }
 }
+
+/*
+ * The kernel's half of the seam with the vendored network stack.
+ *
+ * Last, deliberately: every function it defines is a wrapper over the
+ * heap, the scheduler or the NIC, and all three have to be in scope.
+ * It is also the one file in this translation unit whose contents are
+ * not static, which is the whole reason it is a separate file rather
+ * than a section here -- the exception is visible instead of scattered.
+ */
+#include "vxport_impl.h"

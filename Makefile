@@ -109,11 +109,20 @@ CFLAGS  += -DBUF_MAX_W=$(FB_MAX_W)  -DBUF_MAX_H=$(FB_MAX_H) \
 # modification times to the whole second, so a stamp rewritten in the
 # same second as the previous build is not "newer" and changes nothing.
 # Deleting before the graph exists sidesteps both.
+# build/tp is in here too, and leaving it out cost an evening. lwIP and
+# Mbed TLS are configured entirely by preprocessor switches, so
+# `make iso EXTRA=-DVX_LWIP_DEBUG` changes what those files compile to
+# more than it changes kernel.o -- and with only the two objects below
+# being deleted, the debug build linked yesterday's silent lwIP and
+# printed nothing. Which reads as "the debug flag does not work", and is
+# really "the flag was never applied".
 BUILD_FLAGS := $(CFLAGS)
 $(shell mkdir -p build; \
         [ "`cat build/.flags 2>/dev/null`" = "$(BUILD_FLAGS)" ] || \
         { printf '%s\n' "$(BUILD_FLAGS)" > build/.flags; \
-          rm -f build/kernel.o build/llm.o; })
+          rm -f build/kernel.o build/llm.o \
+                build/lwipglue.o build/tlsglue.o; \
+          rm -rf build/tp; })
 
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
@@ -187,9 +196,42 @@ all: os.iso disk.img
 # runs on the host. The property it exists for -- that a link must not end
 # the line -- cannot be seen in a screenshot and is awkward to assert from
 # inside the kernel, so it is checked here instead.
-test: build/wikidoc_test build/crypto_test
+test: build/wikidoc_test build/crypto_test build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/crypto_test
+	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
+
+# The stripped Mbed TLS, proved on the host before it is trusted on the
+# wire. Without a server it runs the offline half -- the allocator hooks,
+# the entropy hook, AES-GCM and SHA-256 against published vectors -- and
+# says which part it skipped.
+#
+# With one, it does a real TLS 1.3 handshake:
+#     openssl s_server -accept 14433 -cert c.pem -key k.pem -tls1_3 -www
+#     make test TLS_HOST=127.0.0.1 TLS_PORT=14433
+#
+# Debugging a configuration here beats debugging it over a serial line
+# in a kernel with no debugger, which is the entire reason it exists:
+# every switch turned off in vextro_config.h is one that could silently
+# remove something the handshake needs, and the failure would otherwise
+# first appear as an error code twelve frames deep on a machine that
+# cannot print a backtrace.
+TLS_HOST ?=
+TLS_PORT ?=
+
+MBED_HOST_OBJ := $(patsubst $(MBED_DIR)/library/%.c,build/mbedhost/%.o,\
+                   $(wildcard $(MBED_DIR)/library/*.c))
+
+build/mbedhost/%.o: $(MBED_DIR)/library/%.c $(MBED_DIR)/vextro_config.h
+	@mkdir -p build/mbedhost
+	@$(HOSTCC) -c -O1 -w -I$(MBED_DIR)/include -I$(MBED_DIR) \
+		-DMBEDTLS_CONFIG_FILE='"vextro_config.h"' -o $@ $<
+
+build/mbedtls_test: tools/mbedtls_test.c $(MBED_HOST_OBJ)
+	@mkdir -p build
+	@$(HOSTCC) -O1 -w -I$(MBED_DIR)/include -I$(MBED_DIR) \
+		-DMBEDTLS_CONFIG_FILE='"vextro_config.h"' \
+		-o $@ tools/mbedtls_test.c $(MBED_HOST_OBJ)
 
 build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
 	@mkdir -p build
@@ -460,8 +502,79 @@ build/llm.o: src/llm.c src/llm.h
 	@mkdir -p build
 	$(CC) $(LLM_CFLAGS) -c $< -o $@
 
-build/kernel: build/kernel.o build/llm.o linker.ld
-	$(LD) $(LDFLAGS) build/kernel.o build/llm.o -o $@
+# --- The network stack: lwIP 2.2.1 and Mbed TLS 3.6.4 ---
+#
+# Vendored under third_party/, compiled as their own translation units
+# and linked like build/llm.o. They cannot be included into kernel.c and
+# it is not a matter of effort: the kernel is one unit of `static`
+# functions, and `static` is exactly what makes them unreachable from
+# another file. lwIP also macro-defines htons() over the top of the one
+# in src/netstack.h, and declares a `struct sockaddr` and an `fd_set`
+# that a 74,000-line translation unit has no room for.
+#
+# So the seam is src/vxport.h -- twenty-odd functions, native types, no
+# foreign header -- and everything on the far side of it is compiled
+# here.
+#
+# -w on the vendored files only. They are correct and they are not ours;
+# -Wall -Wextra on a quarter of a million lines of someone else's code
+# produces several thousand warnings, and a build whose warnings are
+# always ignored is a build with no warnings at all. The glue in src/ is
+# compiled with the kernel's full warning set.
+LWIP_DIR  := third_party/lwip
+MBED_DIR  := third_party/mbedtls
+
+NET_INC   := -Ithird_party/include \
+             -I$(LWIP_DIR)/src/include -Ithird_party/lwip-port \
+             -I$(MBED_DIR)/include -I$(MBED_DIR)
+NET_DEF   := -DMBEDTLS_CONFIG_FILE='"vextro_config.h"'
+NET_FLAGS := $(CFLAGS) $(NET_INC) $(NET_DEF)
+
+LWIP_SRC  := $(shell find $(LWIP_DIR)/src -name '*.c' 2>/dev/null)
+MBED_SRC  := $(wildcard $(MBED_DIR)/library/*.c)
+TP_SRC    := $(LWIP_SRC) $(MBED_SRC) third_party/vxport.c
+TP_OBJ    := $(patsubst third_party/%.c,build/tp/%.o,$(TP_SRC))
+
+build/tp/%.o: third_party/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(NET_FLAGS) -w -c $< -o $@
+
+# The glue is ours, so it is compiled the way the rest of the kernel is.
+build/lwipglue.o: src/lwipglue.c src/vxport.h src/vxnet.h \
+                  third_party/lwip-port/lwipopts.h \
+                  third_party/lwip-port/arch/cc.h \
+                  third_party/lwip-port/arch/sys_arch.h
+	@mkdir -p build
+	$(CC) $(NET_FLAGS) -c $< -o $@
+
+build/tlsglue.o: src/tlsglue.c src/vxport.h src/vxnet.h \
+                 $(MBED_DIR)/vextro_config.h $(MBED_DIR)/threading_alt.h
+	@mkdir -p build
+	$(CC) $(NET_FLAGS) -c $< -o $@
+
+NET_OBJ := $(TP_OBJ) build/lwipglue.o build/tlsglue.o
+
+# libgcc, and it is not a standard library.
+#
+# GCC does not promise to compile every C construct into instructions.
+# Some of them -- 128-bit division being the one that turns up here --
+# it compiles into a *call*, to a routine in libgcc, on the assumption
+# that libgcc is always linked. -nostdlib turns that assumption off
+# along with the C library, which is why this has to be named
+# explicitly.
+#
+# Mbed TLS's bignum divides `unsigned __int128` by a 64-bit limb, which
+# is __udivti3. Without this the link fails with an undefined reference
+# in a file nobody has touched, and the obvious reading -- that
+# something is missing from the vendored sources -- is the wrong one.
+#
+# It is part of the compiler, not the platform: it needs no operating
+# system, calls nothing, and is exactly as freestanding as the code that
+# calls it.
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+
+build/kernel: build/kernel.o build/llm.o $(NET_OBJ) linker.ld
+	$(LD) $(LDFLAGS) build/kernel.o build/llm.o $(NET_OBJ) $(LIBGCC) -o $@
 
 # --- ISO root population ---
 $(ISO)/boot/kernel: build/kernel

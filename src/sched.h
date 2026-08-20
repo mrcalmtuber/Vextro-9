@@ -95,6 +95,11 @@ typedef struct thread {
     uint64_t       slices;              /* how much processor it has had  */
     int            user;                /* runs in ring 3                 */
     int            waits_frame;         /* asleep until the frame clock   */
+    /* What this thread is blocked on, or null. Any address will do as a
+     * channel -- a semaphore's own address is the usual one -- because
+     * nothing dereferences it; it is only ever compared. See
+     * sched_block_on. */
+    void          *wait_chan;
     int            exit_code;
     char           name[SCHED_NAME_LEN];
     /* 512 bytes, sixteen-aligned, exactly as FXSAVE64 wants them. The
@@ -419,6 +424,56 @@ static uint64_t sched_build_frame(thread_t *t, uint64_t entry,
     return (uint64_t)(uintptr_t)f;
 }
 
+/*
+ * Where a thread lands if it falls off the end of its function.
+ *
+ * There is no caller to return to -- the frame a thread starts on was
+ * written by sched_build_frame and has no return address in it -- so
+ * before this existed, returning meant popping whatever happened to be
+ * on the stack and jumping to it. Naming that is worth eight bytes.
+ */
+static void sched_exit(int code);
+
+static void sched_thread_fell_off(void) {
+    serial_puts("[sched] thread returned from its entry point\n");
+    sched_exit(0);
+}
+
+/*
+ * Set a new thread's stack pointer so the ABI holds when it starts.
+ *
+ * The subtlety here cost a general protection fault in the middle of a
+ * TLS handshake, and it is worth writing down because it is invisible
+ * until the day it is not.
+ *
+ * System V says that at the first instruction of a function, RSP is
+ * congruent to 8 modulo 16 -- because the CALL that got there pushed an
+ * eight-byte return address onto an aligned stack. Every compiler
+ * relies on this: it is how a function knows that placing a local at a
+ * particular offset from RBP makes that local sixteen-byte aligned,
+ * which is what lets it use MOVAPS instead of MOVUPS.
+ *
+ * A thread here does not arrive by CALL. It arrives by IRETQ, which
+ * loads RSP from the frame -- and that frame was sixteen-byte aligned,
+ * so the thread began life with RSP aligned rather than eight past it.
+ * Every stack local in every kernel thread has therefore been eight
+ * bytes off its declared alignment since threads were introduced.
+ *
+ * Nothing noticed, because nothing had asked for an aligned local yet.
+ * Then GCC turned the zeroing of a `struct sockaddr_in` into a single
+ * MOVAPS, and MOVAPS to an unaligned address is #GP -- in a thread
+ * doing nothing more exotic than opening a socket.
+ *
+ * The eight bytes are spent on a return address rather than simply
+ * subtracted, so the fix also gives the fall-off-the-end case somewhere
+ * to land.
+ */
+static uint64_t sched_entry_sp(uint64_t frame) {
+    uint64_t sp = frame - 8;
+    *(uint64_t *)(uintptr_t)sp = (uint64_t)(uintptr_t)sched_thread_fell_off;
+    return sp;
+}
+
 static thread_t *sched_new(const char *name, uint32_t prio) {
     thread_t *t = (thread_t *)kmalloc(sizeof(thread_t));
     if (!t) return 0;
@@ -450,9 +505,48 @@ static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
     t->as   = 0;
     __asm__ volatile("mov %%cr3, %0" : "=r"(t->cr3));
     t->cr3 &= PTE_ADDR_MASK;
-    /* Its stack pointer at entry is whatever is left below the frame. */
+    /* Its stack pointer at entry is whatever is left below the frame,
+     * offset by eight so the System V alignment rule holds. See
+     * sched_entry_sp. */
     uint64_t frame = sched_build_frame(t, (uint64_t)(uintptr_t)fn, 0, 0);
-    ((trap_frame_t *)(uintptr_t)frame)->rsp = frame;
+    ((trap_frame_t *)(uintptr_t)frame)->rsp = sched_entry_sp(frame);
+    t->rsp = frame;
+
+    uint64_t flags = irq_save();
+    if (sched_register(t) < 0) {
+        irq_restore(flags);
+        kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
+        return 0;
+    }
+    irq_restore(flags);
+    return t;
+}
+
+/*
+ * The same, for an entry point that takes an argument.
+ *
+ * There is no trampoline and no side table here, and there does not need
+ * to be one: a new thread is started by IRETQ-ing into a frame this
+ * kernel wrote itself, and the System V ABI puts the first argument in
+ * RDI. Setting that one field in the frame *is* passing the argument.
+ *
+ * lwIP needs this -- sys_thread_new hands every thread a void* and its
+ * tcpip thread is useless without it -- and so does anything else that
+ * wants two workers running the same function over different state.
+ */
+static thread_t *sched_spawn_kernel_arg(void (*fn)(void *), void *arg,
+                                        const char *name, uint32_t prio) {
+    thread_t *t = sched_new(name, prio);
+    if (!t) return 0;
+    t->user = 0;
+    t->as   = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(t->cr3));
+    t->cr3 &= PTE_ADDR_MASK;
+
+    uint64_t frame = sched_build_frame(t, (uint64_t)(uintptr_t)fn, 0, 0);
+    trap_frame_t *f = (trap_frame_t *)(uintptr_t)frame;
+    f->rsp = sched_entry_sp(frame);
+    f->rdi = (uint64_t)(uintptr_t)arg;
     t->rsp = frame;
 
     uint64_t flags = irq_save();
@@ -555,6 +649,85 @@ static void sched_sleep_ms(uint64_t ms) {
     cur_thread->wake_at = sched_ticks + (ms ? ms : 1);
     cur_thread->state   = T_SLEEPING;
     while (cur_thread->state == T_SLEEPING) sched_yield();
+}
+
+/*
+ * ---- wait channels ----
+ *
+ * Everything above blocks on a deadline. A semaphore has to block on an
+ * *event*, and there was nothing here that could: sleeping a millisecond
+ * at a time and re-checking works, but it puts a millisecond of latency
+ * on every packet and burns a slice per poll doing it.
+ *
+ * A channel is just an address. A thread parks itself against one and
+ * whoever satisfies the condition wakes everything parked on it. No
+ * queue is kept, because the scheduler already walks every thread on
+ * each tick and the cost of testing one more field there is nothing
+ * against the cost of maintaining a list under interrupts.
+ *
+ * Returns 1 if woken by sched_wake_chan, 0 if the timeout expired. The
+ * caller must re-test its own condition either way: two threads can be
+ * woken for one item, and the loser has to go back to sleep. That is a
+ * property of every wakeup primitive worth having, not a shortcut.
+ */
+/*
+ * The version that takes the interrupt flags from its caller, because
+ * for a semaphore the check and the parking must be one atomic step.
+ *
+ * A semaphore wait is "if the count is zero, sleep". Written as two
+ * statements with interrupts on between them, there is a window in
+ * which the count is raised and the sleeper woken *before* it is
+ * asleep -- so it then sleeps, and the wakeup it needed has already
+ * happened. That is the lost-wakeup race, it hangs one connection out
+ * of thousands, and it is unreproducible by construction.
+ *
+ * Closing it needs no lock on a kernel that schedules one processor:
+ * the caller disables interrupts, tests its own condition, and hands
+ * the flags here still disabled. Nothing can run in between because
+ * nothing can interrupt.
+ */
+static int sched_block_on_locked(void *chan, uint32_t timeout_ms,
+                                 uint64_t flags) {
+    if (!cur_thread || !sched_running) {
+        irq_restore(flags);
+        /* Before the scheduler exists there is nobody to wake us, so the
+         * honest thing is to spin briefly rather than block forever. */
+        for (volatile int i = 0; i < 10000; i++) __asm__ volatile("pause");
+        return 0;
+    }
+    cur_thread->wait_chan = chan;
+    cur_thread->wake_at   = timeout_ms ? sched_ticks + timeout_ms
+                                       : ~(uint64_t)0;
+    cur_thread->state     = T_SLEEPING;
+    irq_restore(flags);
+
+    while (cur_thread->state == T_SLEEPING) sched_yield();
+
+    /* Still flagged means the tick released us on the deadline rather
+     * than a poster clearing it. */
+    int woken = (cur_thread->wait_chan == 0);
+    cur_thread->wait_chan = 0;
+    return woken;
+}
+
+static int sched_block_on(void *chan, uint32_t timeout_ms) {
+    return sched_block_on_locked(chan, timeout_ms, irq_save());
+}
+
+/*
+ * Release what is parked on a channel. Safe from an interrupt: it only
+ * writes two fields and never allocates.
+ */
+static void sched_wake_chan(void *chan, int all) {
+    uint64_t flags = irq_save();
+    for (int i = 0; i < SCHED_MAX_THREADS; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->wait_chan != chan) continue;
+        t->wait_chan = 0;
+        if (t->state == T_SLEEPING) t->state = T_READY;
+        if (!all) break;
+    }
+    irq_restore(flags);
 }
 
 /*

@@ -802,7 +802,11 @@ static void tcp_tick(void) {
 
 static int      http_owner = HTTP_OWNER_NONE;
 
-static int      http_state = HTTP_IDLE;
+/* Written by the transfer thread, read by the compositor every frame.
+ * Without volatile the compositor's poll is a loop over a value the
+ * compiler is entitled to load once and keep in a register -- which
+ * presents as a page that never finishes loading. */
+static volatile int http_state = HTTP_IDLE;
 static char     http_host[128];
 static char     http_path[256];
 static uint16_t http_port = 80;
@@ -823,6 +827,25 @@ static void http_set_err(const char *msg) {
     tcp_abort();
 }
 
+/*
+ * ---- the transfer, on the new stack ----
+ *
+ * What used to be here was a state machine advanced once per display
+ * frame, because there was one TCP connection in the whole system and
+ * nothing that could block on it. Every wait cost sixteen milliseconds
+ * whether or not the data had arrived, and two transfers at once were
+ * not slow but impossible.
+ *
+ * Now a transfer is a thread. It blocks on the socket, wakes when bytes
+ * arrive, and costs nothing while it waits -- and the interface polls
+ * `http_state` exactly as it did before, so the browser, the terminal
+ * and the package store did not have to change at all.
+ */
+static void http_worker(void *arg);
+
+static volatile int http_in_worker = 0;   /* a transfer thread is live   */
+static volatile int http_restart   = 0;   /* a redirect wants another go */
+
 static void http_begin(const char *host, uint16_t port, const char *path) {
     int i = 0;
     while (host[i] && i < 127) { http_host[i] = host[i]; i++; }
@@ -839,11 +862,25 @@ static void http_begin(const char *host, uint16_t port, const char *path) {
     http_err[0] = '\0';
     http_start_tick = net_ticks;
 
-    if (!e1000_found) { http_set_err("no network adapter"); return; }
+    if (!vxnet_up()) { http_set_err("no network"); return; }
+    if (http_port == 443 && !vxsec_ready()) {
+        http_set_err("TLS is not available");
+        return;
+    }
 
-    tcp_abort();                       /* drop any previous connection */
     http_state = HTTP_RESOLVING;
-    dns_resolve_start(http_host);
+
+    /* A redirect is discovered *by* the transfer thread. Spawning a
+     * second thread from inside the first would leave two of them
+     * writing the same response buffer, so the running one is told to
+     * go round again instead. */
+    if (http_in_worker) { http_restart = 1; return; }
+
+    http_in_worker = 1;
+    if (!vx_thread_start(http_worker, 0, "http", PRIO_NORMAL)) {
+        http_in_worker = 0;
+        http_set_err("cannot start the transfer");
+    }
 }
 
 /* Public entry: fresh request resets the redirect budget */
@@ -903,15 +940,25 @@ static int http_parse_url(const char *url, char *host, int host_max,
         }
         if (url[i] == '/' || url[i] == '.') break;
     }
+    int secure = 0;
     if (has_scheme) {
-        if (!(p[0]=='h' && p[1]=='t' && p[2]=='t' && p[3]=='p' &&
-              p[4]==':' && p[5]=='/' && p[6]=='/'))
+        if (p[0]=='h' && p[1]=='t' && p[2]=='t' && p[3]=='p' &&
+            p[4]==':' && p[5]=='/' && p[6]=='/') {
+            p += 7;
+        } else if (p[0]=='h' && p[1]=='t' && p[2]=='t' && p[3]=='p' &&
+                   p[4]=='s' && p[5]==':' && p[6]=='/' && p[7]=='/') {
+            /* Reachable now. It was not before: the old transport was
+             * plaintext TCP and a redirect to https was a dead end,
+             * which is most of the web. */
+            secure = 1;
+            p += 8;
+        } else {
             return 0;
-        p += 7;
+        }
     }
 
     int hi = 0;
-    *port = 80;
+    *port = secure ? 443 : 80;
     while (*p && *p != '/' && *p != ':' && hi < host_max - 1)
         host[hi++] = *p++;
     host[hi] = '\0';
@@ -968,7 +1015,7 @@ static void http_finish_response(void) {
                 http_begin(host, port, path);
                 return;
             }
-            http_set_err("redirect to https not supported");
+            http_set_err("cannot parse redirect target");
             return;
         }
     }
@@ -991,69 +1038,102 @@ static void http_finish_response(void) {
     http_state = HTTP_DONE;
 }
 
-static void http_tick(void) {
-    switch (http_state) {
-    case HTTP_RESOLVING:
-        if (dns_state == DNS_STATE_DONE) {
-            for (int i = 0; i < 4; i++) http_server_ip[i] = dns_result[i];
-            tcp_open(http_server_ip, http_port, http_raw, HTTP_BUF_MAX);
-            http_state = HTTP_CONNECTING;
-        } else if (dns_state == DNS_STATE_FAIL) {
-            http_set_err("host not found");
-        }
-        break;
+/*
+ * One request, start to finish, on the calling thread.
+ *
+ * HTTP/1.0 with `Connection: close`, so the end of the body is the end
+ * of the connection and there is no chunked encoding to unpick. The
+ * cost is a connection per request; the eight-slot secure pool and
+ * lwIP's two dozen PCBs are what make that affordable.
+ */
+static void http_do_request(void) {
+    tcp_rx_len = 0;
 
-    case HTTP_CONNECTING:
-        if (tcp_state == TCP_ESTABLISHED) {
-            char req[512];
-            int p = 0;
-            const char *parts[7];
-            parts[0] = "GET ";
-            parts[1] = http_path;
-            parts[2] = " HTTP/1.0\r\nHost: ";
-            parts[3] = http_host;
-            parts[4] = "\r\nUser-Agent: Vextro/9.0\r\nAccept: text/html, text/plain\r\n";
-            parts[5] = "Connection: close\r\n\r\n";
-            parts[6] = 0;
-            for (int i = 0; parts[i]; i++)
-                for (int j = 0; parts[i][j] && p < 511; j++)
-                    req[p++] = parts[i][j];
-            tcp_send_data((const uint8_t *)req, p);
-            http_state = HTTP_REQUESTING;
-        } else if (tcp_error || tcp_state == TCP_CLOSED) {
+    char req[512];
+    int p = 0;
+    const char *parts[7];
+    parts[0] = "GET ";
+    parts[1] = http_path;
+    parts[2] = " HTTP/1.0\r\nHost: ";
+    parts[3] = http_host;
+    parts[4] = "\r\nUser-Agent: Vextro/9.0\r\nAccept: text/html, text/plain\r\n";
+    parts[5] = "Connection: close\r\n\r\n";
+    parts[6] = 0;
+    for (int i = 0; parts[i]; i++)
+        for (int j = 0; parts[i][j] && p < 511; j++)
+            req[p++] = parts[i][j];
+
+    int total = 0;
+    http_state = HTTP_CONNECTING;
+
+    if (http_port == 443) {
+        int slot = vxsec_open(http_host, http_port);
+        if (slot < 0) { http_set_err("TLS handshake failed"); return; }
+
+        http_state = HTTP_REQUESTING;
+        if (vxsec_write(slot, req, p) != p) {
+            vxsec_close(slot);
+            http_set_err("could not send the request");
+            return;
+        }
+        http_state = HTTP_RECEIVING;
+        while (total < HTTP_BUF_MAX) {
+            int r = vxsec_read(slot, http_raw + total, HTTP_BUF_MAX - total);
+            if (r <= 0) break;
+            total += r;
+        }
+        vxsec_close(slot);
+    } else {
+        uint8_t ip[4];
+        if (!vxnet_resolve(http_host, ip)) { http_set_err("host not found"); return; }
+        for (int i = 0; i < 4; i++) http_server_ip[i] = ip[i];
+
+        int s = vxnet_socket();
+        if (s < 0) { http_set_err("no socket available"); return; }
+        vxnet_timeout(s, 15000);
+        if (vxnet_connect(s, ip, http_port) != 0) {
+            vxnet_close(s);
             http_set_err("connection refused");
-        } else if (net_ticks - http_start_tick > 600) {
-            http_set_err("connection timed out");
+            return;
         }
-        break;
 
-    case HTTP_REQUESTING:
-    case HTTP_RECEIVING:
-        if (tcp_error) {
-            if (tcp_rx_len > 0) http_finish_response();
-            else http_set_err("connection reset");
-            break;
+        http_state = HTTP_REQUESTING;
+        if (vxnet_send(s, req, p) != p) {
+            vxnet_close(s);
+            http_set_err("could not send the request");
+            return;
         }
-        if (tcp_rx_len > 0)
-            http_state = HTTP_RECEIVING;
-        if (tcp_peer_fin) {
-            tcp_start_close();
-            http_finish_response();
-            break;
+        http_state = HTTP_RECEIVING;
+        while (total < HTTP_BUF_MAX) {
+            int r = vxnet_recv(s, http_raw + total, HTTP_BUF_MAX - total);
+            if (r <= 0) break;
+            total += r;
         }
-        if (tcp_state == TCP_CLOSED) {
-            if (tcp_rx_len > 0) http_finish_response();
-            else http_set_err("connection closed early");
-            break;
-        }
-        if (net_ticks - http_start_tick > 1800)   /* 30 s hard cap */
-            http_set_err("request timed out");
-        break;
-
-    default:
-        break;
+        vxnet_close(s);
     }
+
+    tcp_rx_len = total;
+    if (total == 0) { http_set_err("no response"); return; }
+
+    /* Sets HTTP_DONE, or calls http_begin again for a redirect -- which
+     * raises http_restart rather than spawning a second thread. */
+    http_finish_response();
 }
+
+static void http_worker(void *arg) {
+    (void)arg;
+    do {
+        http_restart = 0;
+        http_do_request();
+    } while (http_restart);
+    http_in_worker = 0;
+    sched_exit(0);
+}
+
+/* Nothing left to advance: the transfer runs on its own thread and
+ * publishes its result through http_state. Kept so the callers that
+ * have always called it once a frame do not have to change. */
+static void http_tick(void) { }
 
 /* ===== IPv4 RX DISPATCH ===== */
 
@@ -1153,19 +1233,25 @@ static void net_handle_ethernet(const uint8_t *frame, uint16_t len) {
 
 /* ===== POLL — one call per main-loop frame ===== */
 
+/*
+ * Once a frame.
+ *
+ * The receive ring is deliberately *not* drained here any more, and
+ * that is the whole handover. Two stacks polling one ring do not share
+ * it: each frame goes to whichever asked first, so both would see a
+ * random half of the traffic and neither would work. lwIP's receive
+ * thread owns it now, and this is left with the frame counter that the
+ * terminal and the store measure elapsed time against.
+ *
+ * Everything below the counter -- ARP, IP, ICMP, UDP, DNS and the
+ * single-connection TCP -- is still compiled and still correct, and
+ * nothing calls it. It is kept rather than deleted because the NTP
+ * client and the firewall in netx.h are built on its packet
+ * constructors, and because it is the reference the new path was
+ * checked against.
+ */
 static void net_poll(void) {
-    if (!e1000_found) return;
-
     net_ticks++;
-
-    uint8_t  *buf;
-    uint16_t  len;
-    while (e1000_rx_poll(&buf, &len))
-        net_handle_ethernet(buf, len);
-
-    dns_tick();
-    tcp_tick();
-    http_tick();
 }
 
 /* ===== INITIALIZATION ===== */
