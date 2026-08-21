@@ -40,12 +40,48 @@ import sys
 import time
 
 USER, PASSWORD, DOMAIN = "vextro", "hunter2", "WORKGROUP"
-SHARE = "share"
+SHARES = ("share", "sysvol")   # SYSVOL is where Group Policy lives
+
+def preg(entries):
+    """MS-GPREG: "PReg", version 1, then [key;value;type;size;data] with
+    every delimiter a UTF-16 character rather than a byte."""
+    out = bytearray(b"PReg" + struct.pack("<I", 1))
+    for key, name, typ, data in entries:
+        out += "[".encode("utf-16-le")
+        out += key.encode("utf-16-le") + b"\x00\x00"
+        out += ";".encode("utf-16-le")
+        out += name.encode("utf-16-le") + b"\x00\x00"
+        out += ";".encode("utf-16-le")
+        out += struct.pack("<I", typ)
+        out += ";".encode("utf-16-le")
+        out += struct.pack("<I", len(data))
+        out += ";".encode("utf-16-le")
+        out += data
+        out += "]".encode("utf-16-le")
+    return bytes(out)
+
+
+GPO = "{31B2F340-016D-11D2-945F-00C04FB984F9}"
+POLDIR = "vextro.test\\Policies\\" + GPO
 
 FILES = {
     "hello.txt": b"Hello from a share on another machine.\n",
     "notes.txt": b"SMB2 signs every message.\nIt does not encrypt them.\n",
     "numbers.txt": b"".join(b"%d\n" % i for i in range(1, 201)),
+
+    # A domain policy, laid out the way a real SYSVOL is.
+    POLDIR + "\\GPT.INI":
+        b"[General]\r\nVersion=65539\r\ndisplayName=Default Domain Policy\r\n",
+    POLDIR + "\\Machine\\Registry.pol": preg([
+        ("Software\\Policies\\Vextro\\Desktop", "ScreenSaverTimeout", 4,
+         struct.pack("<I", 600)),
+        ("Software\\Policies\\Vextro\\Desktop", "Wallpaper", 1,
+         "starfield".encode("utf-16-le") + b"\x00\x00"),
+        ("Software\\Policies\\Vextro\\Security", "RequireSigning", 4,
+         struct.pack("<I", 1)),
+        ("Software\\Policies\\Vextro\\Security", "LegalNotice", 1,
+         "Authorised users only".encode("utf-16-le") + b"\x00\x00"),
+    ]),
 }
 
 
@@ -480,7 +516,7 @@ class Handler(socketserver.BaseRequestHandler):
         ln = struct.unpack_from("<H", b, 6)[0]
         path = b[off:off + ln].decode("utf-16-le")
         self.log("  TREE_CONNECT %s" % path)
-        if not path.lower().endswith("\\" + SHARE):
+        if not any(path.lower().endswith("\\" + sh) for sh in SHARES):
             return ST_BAD_SHARE, struct.pack("<HH", 9, 0)
         self.tree_id = 1
         out = bytearray(16)
@@ -501,7 +537,8 @@ class Handler(socketserver.BaseRequestHandler):
         self.log("  CREATE %r%s" % (name, " (directory)" if opts & 1 else ""))
 
         if opts & 1:                                   # FILE_DIRECTORY_FILE
-            if name not in ("", "."):
+            if name not in ("", ".") and not any(
+                    f.startswith(name + "\\") for f in FILES):
                 return ST_NOT_FOUND, b"\x00" * 8
             size, isdir = 0, True
         else:
@@ -573,31 +610,51 @@ class Handler(socketserver.BaseRequestHandler):
         if struct.unpack_from("<H", b, 0)[0] != 33:
             raise Bad("QUERY_DIRECTORY StructureSize is not 33")
         flags = b[3]
-        self._fid(b, 8)
-        if not (flags & 0x01) and getattr(self, "listed", False):
+        fid = self._fid(b, 8)
+        base = self.handles[fid][0]
+        if base in (".",):
+            base = ""
+        if not (flags & 0x01) and fid in getattr(self, "listed", set()):
             self.log("  QUERY_DIRECTORY -> no more files")
             return ST_NO_MORE_FILES, struct.pack("<HHI", 9, 0, 0)
-        self.listed = True
+        self.listed = getattr(self, "listed", set()) | {fid}
+
+        # Immediate children only. A share is a tree, and a server that
+        # returns every path under the handle makes a client's recursive
+        # walk visit each file as many times as it has ancestors.
+        prefix = (base + "\\") if base else ""
+        names, dirs = [], set()
+        for f in FILES:
+            if not f.startswith(prefix):
+                continue
+            rest = f[len(prefix):]
+            if "\\" in rest:
+                dirs.add(rest.split("\\", 1)[0])
+            else:
+                names.append(rest)
+        names = sorted(names)
+        dirnames = sorted(dirs)
 
         buf = bytearray()
-        names = sorted(FILES)
-        for i, name in enumerate(names):
+        rows = ([(d, 0, 0x10) for d in dirnames] +
+                [(n, len(FILES[prefix + n]), 0x80) for n in names])
+        for i, (name, size, attr) in enumerate(rows):
             wide = name.encode("utf-16-le")
             ent = bytearray(64)
             struct.pack_into("<I", ent, 4, i)
             for o in (8, 16, 24, 32):
                 struct.pack_into("<Q", ent, o, filetime())
-            struct.pack_into("<Q", ent, 40, len(FILES[name]))
-            struct.pack_into("<Q", ent, 48, len(FILES[name]))
-            struct.pack_into("<I", ent, 56, 0x80)
+            struct.pack_into("<Q", ent, 40, size)
+            struct.pack_into("<Q", ent, 48, size)
+            struct.pack_into("<I", ent, 56, attr)
             struct.pack_into("<I", ent, 60, len(wide))
             ent += wide
             while len(ent) % 8:
                 ent.append(0)
-            if i != len(names) - 1:
+            if i != len(rows) - 1:
                 struct.pack_into("<I", ent, 0, len(ent))
             buf += ent
-        self.log("  QUERY_DIRECTORY -> %d entries" % len(names))
+        self.log("  QUERY_DIRECTORY %r -> %d entries" % (base, len(rows)))
 
         out = bytearray(8)
         struct.pack_into("<H", out, 0, 9)
@@ -641,6 +698,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 4445
-    print("smb2 server on port %d, share \\\\*\\%s" % (port, SHARE), flush=True)
+    print("smb2 server on port %d, shares %s"
+          % (port, ", ".join(SHARES)), flush=True)
     print("  account %s\\%s, %d files" % (DOMAIN, USER, len(FILES)), flush=True)
     Server(("0.0.0.0", port), Handler).serve_forever()

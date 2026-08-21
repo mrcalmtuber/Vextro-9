@@ -35,6 +35,7 @@
 #include "kerberos.h"
 #include "ntlmssp.h"
 #include "smb2.h"
+#include "gpo.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -1588,6 +1589,78 @@ void kmain(void) {
         smb2_disconnect();
 
         serial_puts("[smb2] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+    }
+#endif
+
+#ifdef GPO_SELFTEST
+    /*
+     * Group Policy: settings that arrive from somewhere else.
+     *
+     * There is no Group Policy protocol -- the policies are files on a
+     * share, and this fetches them over the SMB2 client next door and
+     * applies them through the registry. The whole file is parsed
+     * before the transaction opens, so a malformed policy leaves
+     * nothing behind rather than half of itself.
+     */
+    {
+        serial_puts("\n[gpo] selftest\n");
+        int checks = 0, bad = 0;
+
+        int hh = 0, mi = 0, ss = 0, dd = 1, mo = 1, yr = 2000;
+        rtc_read(&hh, &mi, &ss, &dd, &mo, &yr);
+        uint64_t now = ntlm_filetime(yr, mo, dd, hh, mi, ss);
+
+        checks++;
+        int applied = gpo_refresh("10.0.2.2", 4445, "vextro.test",
+                                  "vextro", "hunter2", now);
+        if (applied == 4 && gpo_count() == 1)
+            serial_puts("[gpo]   ok   one policy fetched, 4 settings applied\n");
+        else {
+            bad++;
+            serial_puts("[gpo]   FAIL applied ");
+            serial_put_dec((uint32_t)(applied < 0 ? 0 : applied));
+            serial_puts(" settings from ");
+            serial_put_dec((uint32_t)gpo_count());
+            serial_puts(" policies\n");
+        }
+
+        /* The version is two counters in one word, and reading it as a
+         * single number is the classic misreport. */
+        checks++;
+        if (gpo.policy[0].machine_version == 3 &&
+            gpo.policy[0].user_version == 1)
+            serial_puts("[gpo]   ok   version split into 3 machine / 1 user\n");
+        else { bad++; serial_puts("[gpo]   FAIL version halves\n"); }
+
+        /* And the settings actually landed where a program would look. */
+        checks++;
+        uint32_t t = reg_get_dword("Software\\Policies\\Vextro\\Desktop",
+                                   "ScreenSaverTimeout", 0);
+        char wall[64];
+        int gotstr = reg_get_string("Software\\Policies\\Vextro\\Desktop",
+                                    "Wallpaper", wall, sizeof wall);
+        if (t == 600 && gotstr == 0 && wall[0] == 's') {
+            serial_puts("[gpo]   ok   the registry holds the policy: timeout ");
+            serial_put_dec(t);
+            serial_puts(", wallpaper ");
+            serial_puts(wall);
+            serial_puts("\n");
+        } else {
+            bad++;
+            serial_puts("[gpo]   FAIL the settings did not reach the registry\n");
+        }
+
+        checks++;
+        if (reg_get_dword("Software\\Policies\\Vextro\\Security",
+                          "RequireSigning", 0) == 1)
+            serial_puts("[gpo]   ok   a second key was populated too\n");
+        else { bad++; serial_puts("[gpo]   FAIL second key\n"); }
+
+        serial_puts("[gpo] ");
         serial_put_dec((uint32_t)checks);
         serial_puts(" checks, ");
         serial_put_dec((uint32_t)bad);
