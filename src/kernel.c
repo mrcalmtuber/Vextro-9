@@ -33,6 +33,8 @@
 #include "ntcrypto.h"
 #include "ldap.h"
 #include "kerberos.h"
+#include "ntlmssp.h"
+#include "smb2.h"
 #include "netstack.h"
 #include "igpu.h"
 #include "llm.h"
@@ -1459,6 +1461,133 @@ void kmain(void) {
         else { bad++; serial_puts("[krb5]   FAIL unknown principal accepted\n"); }
 
         serial_puts("[krb5] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+    }
+#endif
+
+#ifdef SMB_SELFTEST
+    /*
+     * SMB2, against tools/smbserver.py -- which recomputes the NTLMv2
+     * proof from its own account table and recomputes the HMAC-SHA256
+     * on every signed message. Neither can be satisfied by a client
+     * that is merely self-consistent.
+     */
+    {
+        serial_puts("\n[smb2] selftest\n");
+        int checks = 0, bad = 0;
+        static uint8_t buf[4096];
+        static smb2_entry_t ents[SMB2_MAX_ENTRIES];
+
+        int hh = 0, mi = 0, ss = 0, dd = 1, mo = 1, yr = 2000;
+        rtc_read(&hh, &mi, &ss, &dd, &mo, &yr);
+        uint64_t now = ntlm_filetime(yr, mo, dd, hh, mi, ss);
+
+        checks++;
+        if (smb2_connect("10.0.2.2", 4445, "WORKGROUP", "vextro",
+                         "hunter2", now) == 0)
+            serial_puts("[smb2]   ok   authenticated with NTLMv2\n");
+        else { bad++; serial_puts("[smb2]   FAIL could not authenticate\n"); }
+
+        /* Signing is the property worth asserting separately. A session
+         * that authenticated but negotiated no signature is one an
+         * attacker on the path can inject requests into. */
+        checks++;
+        if (smb2_signed())
+            serial_puts("[smb2]   ok   the session is signed\n");
+        else { bad++; serial_puts("[smb2]   FAIL the session is unsigned\n"); }
+
+        if (smb2.open) {
+            checks++;
+            if (smb2_tree_connect("\\\\10.0.2.2\\share") == 0)
+                serial_puts("[smb2]   ok   connected to \\\\10.0.2.2\\share\n");
+            else { bad++; serial_puts("[smb2]   FAIL tree connect\n"); }
+
+            checks++;
+            if (smb2_create("hello.txt", 0, 0) == 0 && smb2.file_size > 0) {
+                int n = smb2_read(0, buf, sizeof buf);
+                if (n > 0) {
+                    buf[n] = 0;
+                    serial_puts("[smb2]   ok   read hello.txt: ");
+                    serial_puts((const char *)buf);
+                } else { bad++; serial_puts("[smb2]   FAIL read\n"); }
+                smb2_close_file();
+            } else { bad++; serial_puts("[smb2]   FAIL open hello.txt\n"); }
+
+            /* A file larger than one round trip, to prove the offset is
+             * carried rather than every read starting at zero. */
+            checks++;
+            if (smb2_create("numbers.txt", 0, 0) == 0) {
+                uint32_t got = 0;
+                int n;
+                while ((n = smb2_read(got, buf, 256)) > 0) {
+                    got += (uint32_t)n;
+                    if (got >= smb2.file_size) break;
+                }
+                if (got == smb2.file_size && got > 256) {
+                    serial_puts("[smb2]   ok   read ");
+                    serial_put_dec(got);
+                    serial_puts(" bytes across several requests\n");
+                } else {
+                    bad++;
+                    serial_puts("[smb2]   FAIL partial read\n");
+                }
+                smb2_close_file();
+            } else { bad++; serial_puts("[smb2]   FAIL open numbers.txt\n"); }
+
+            checks++;
+            static const char msg[] = "written from bare metal\n";
+            if (smb2_create("written.txt", 0, 1) == 0 &&
+                smb2_write(0, (const uint8_t *)msg, sizeof msg - 1) ==
+                    (int)(sizeof msg - 1)) {
+                smb2_close_file();
+                /* Read it back, because a write the server acknowledged
+                 * and did not store is a write that failed. */
+                if (smb2_create("written.txt", 0, 0) == 0) {
+                    int n = smb2_read(0, buf, sizeof buf);
+                    if (n == (int)(sizeof msg - 1) &&
+                        buf[0] == 'w' && buf[n-1] == '\n')
+                        serial_puts("[smb2]   ok   wrote a file and read it "
+                                    "back\n");
+                    else { bad++; serial_puts("[smb2]   FAIL readback\n"); }
+                    smb2_close_file();
+                } else { bad++; serial_puts("[smb2]   FAIL reopen\n"); }
+            } else { bad++; serial_puts("[smb2]   FAIL write\n"); }
+
+            checks++;
+            if (smb2_create("", 1, 0) == 0) {
+                int n = smb2_list("*", ents, SMB2_MAX_ENTRIES);
+                if (n >= 3) {
+                    serial_puts("[smb2]   ok   listed ");
+                    serial_put_dec((uint32_t)n);
+                    serial_puts(" files:");
+                    for (int i = 0; i < n && i < 6; i++) {
+                        serial_puts(" ");
+                        serial_puts(ents[i].name);
+                    }
+                    serial_puts("\n");
+                } else {
+                    bad++;
+                    serial_puts("[smb2]   FAIL directory listing\n");
+                }
+                smb2_close_file();
+            } else { bad++; serial_puts("[smb2]   FAIL open the share root\n"); }
+
+            smb2_disconnect();
+        }
+
+        /* And the failure path. */
+        checks++;
+        if (smb2_connect("10.0.2.2", 4445, "WORKGROUP", "vextro",
+                         "wrong", now) != 0 &&
+            smb2.last_status == STATUS_LOGON_FAILURE)
+            serial_puts("[smb2]   ok   a wrong password is refused\n");
+        else { bad++; serial_puts("[smb2]   FAIL wrong password accepted\n"); }
+        smb2_disconnect();
+
+        serial_puts("[smb2] ");
         serial_put_dec((uint32_t)checks);
         serial_puts(" checks, ");
         serial_put_dec((uint32_t)bad);

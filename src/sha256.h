@@ -188,4 +188,29 @@ static int ct_equal(const uint8_t *a, const uint8_t *b, uint32_t n) {
     return diff == 0;
 }
 
+/* ===== HMAC-SHA256 (RFC 2104) =====
+ *
+ * Every SMB2 message is signed with this. The signature is the first
+ * sixteen bytes of the HMAC over the whole message with its own
+ * signature field zeroed -- which is why a server rejecting a signature
+ * says nothing about whether the key is wrong or the message was built
+ * wrong, and why the failure is always worth checking both ways.
+ */
+static void hmac_sha256(const uint8_t *key, uint32_t klen,
+                        const uint8_t *msg, uint32_t mlen, uint8_t out[32]) {
+    uint8_t k[64], ipad[64], opad[64], inner[32];
+    for (int i = 0; i < 64; i++) k[i] = 0;
+
+    if (klen > 64) sha256(key, klen, k);
+    else for (uint32_t i = 0; i < klen; i++) k[i] = key[i];
+
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5C; }
+
+    sha256_t s;
+    sha256_init(&s); sha256_update(&s, ipad, 64); sha256_update(&s, msg, mlen);
+    sha256_final(&s, inner);
+    sha256_init(&s); sha256_update(&s, opad, 64); sha256_update(&s, inner, 32);
+    sha256_final(&s, out);
+}
+
 #endif /* SHA256_H */

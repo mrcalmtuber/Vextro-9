@@ -449,26 +449,9 @@ static void poly1305_final(poly1305_t *st, uint8_t mac[16]) {
  * different labels, so getting a label wrong produces a handshake that
  * fails with no clue as to why.
  */
-static void hmac_sha256(const uint8_t *key, uint32_t klen,
-                        const uint8_t *msg, uint32_t mlen, uint8_t out[32]) {
-    uint8_t k[64], ipad[64], opad[64], inner[32];
-    for (int i = 0; i < 64; i++) k[i] = 0;
-    if (klen > 64) sha256(key, klen, k);
-    else for (uint32_t i = 0; i < klen; i++) k[i] = key[i];
-
-    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
-
-    sha256_t s;
-    sha256_init(&s);
-    sha256_update(&s, ipad, 64);
-    sha256_update(&s, msg, mlen);
-    sha256_final(&s, inner);
-
-    sha256_init(&s);
-    sha256_update(&s, opad, 64);
-    sha256_update(&s, inner, 32);
-    sha256_final(&s, out);
-}
+/* hmac_sha256 lives in src/sha256.h, next to the hash it is built on.
+ * It was here first, and moved when SMB2 turned out to sign with it --
+ * two copies of an HMAC is two chances to get the block size wrong. */
 
 static void hkdf_extract(const uint8_t *salt, uint32_t slen,
                          const uint8_t *ikm, uint32_t ilen, uint8_t out[32]) {
