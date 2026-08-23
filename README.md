@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="ring 3" src="https://img.shields.io/badge/userland-ring%203-d4af37?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-32k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/kernel-84k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
   <a href="https://github.com/mrcalmtuber/vextro-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
