@@ -30,6 +30,7 @@
  */
 
 #include <stdint.h>
+#include "kernel_shared.h"
 #include "gdt.h"
 #include "vmm.h"
 
@@ -74,15 +75,15 @@
 
 /*
  * Every register a user thread had, in the order the entry stubs push
- * them. The offsets are load-bearing — the assembly below writes them by
- * position, this reads them by name, and nothing checks that the two
- * agree except that the machine stops working if they do not.
+ * them, is syscall_frame_t in include/kernel_shared.h. It moved there
+ * because sched_fork_thread copies a parent's registers out of it and
+ * scheduler.o is compiled separately now.
+ *
+ * The offsets are load-bearing — the assembly below writes them by
+ * position, the C reads them by name, and nothing checks that the two
+ * agree except that the machine stops working if they do not. That is
+ * an argument for one definition, not two.
  */
-typedef struct {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    uint64_t user_rsp;
-} syscall_frame_t;
 
 /*
  * Where the next entry from user mode should put its stack pointer. The
@@ -119,8 +120,10 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
  * processor pushed, above what this structure covers, and leaves RCX and
  * R11 holding whatever the program had in them.
  */
-static syscall_frame_t *syscall_cur_frame = 0;
-static int              syscall_via_fast  = 0;
+/* Not static: sched_fork_thread copies the parent's registers out of
+ * whichever frame it entered the kernel through. */
+syscall_frame_t *syscall_cur_frame = 0;
+int              syscall_via_fast  = 0;
 
 __attribute__((used))
 void syscall_dispatch_frame(syscall_frame_t *f);

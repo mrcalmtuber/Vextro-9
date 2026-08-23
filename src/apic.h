@@ -27,6 +27,7 @@
  */
 
 #include <stdint.h>
+#include "kernel_shared.h"
 #include "pci.h"
 
 #define MSR_APIC_BASE     0x1B
@@ -48,12 +49,14 @@
 #define APIC_LVT_MASKED   0x10000
 #define APIC_TIMER_PERIODIC 0x20000
 
-#define APIC_VEC_SPURIOUS 0xFF
-#define APIC_VEC_TIMER    0x40
+/* APIC_VEC_SPURIOUS and APIC_VEC_TIMER moved to
+ * include/kernel_shared.h, with lapic_eoi — the scheduler installs both
+ * vectors and acknowledges from inside the timer stub. */
 
-static volatile uint8_t *lapic_base = 0;
-static int      lapic_present = 0;
-static uint32_t lapic_ticks_per_ms = 0;
+/* Not static: lapic_eoi is inlined into scheduler.o and reads both. */
+volatile uint8_t *lapic_base = 0;
+int               lapic_present = 0;
+static uint32_t   lapic_ticks_per_ms = 0;
 
 static inline uint32_t lapic_read(uint32_t reg) {
     return *(volatile uint32_t *)(lapic_base + reg);
@@ -62,14 +65,8 @@ static inline void lapic_write(uint32_t reg, uint32_t val) {
     *(volatile uint32_t *)(lapic_base + reg) = val;
 }
 
-/* Acknowledge. Every APIC-delivered interrupt ends with this, and one
- * that does not blocks every interrupt at or below its priority for
- * good — which presents as the machine freezing some seconds after
- * boot, with no fault and nothing on the wire. */
-__attribute__((always_inline, target("general-regs-only")))
-static inline void lapic_eoi(void) {
-    if (lapic_present) lapic_write(APIC_REG_EOI, 0);
-}
+/* lapic_eoi moved to include/kernel_shared.h, unchanged and still
+ * always_inline: it is called from the timer stub in scheduler.o. */
 
 static int cpu_has_apic(void) {
     uint32_t eax, ebx, ecx, edx;

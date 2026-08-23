@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="ring 3" src="https://img.shields.io/badge/userland-ring%203-d4af37?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-84k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/kernel-87k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
   <a href="https://github.com/mrcalmtuber/vextro-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
@@ -816,7 +816,7 @@ Point it elsewhere with `store repo <url>`.
 
 ## NTFS, read and write
 
-There is a full NTFS **writer** in `src/ntfswrite.h`, and a formatter in
+There is a full NTFS **writer** in `src/fs/ntfs/ntfs_ops.c`, and a formatter in
 `tools/mkntfs.py` that produces volumes Linux and Windows both mount.
 What it implements is the part that actually allocates:
 
@@ -834,7 +834,13 @@ is exercised by `tools/ntfs_test.c` — 72 checks against a scratch image,
 compiling the same source the kernel runs — and until a volume that
 matters has nothing to lose, that is where it stays.
 
-What is deliberately absent is listed at the top of `src/ntfswrite.h`
+It is, however, *in* the kernel now. Before the module split the writer
+was included by nothing but that test, so twelve hundred lines of it
+compiled only on the build machine; giving NTFS a declaration header
+put it in the image, where it is built with the kernel's own flags and
+warning set on every build rather than only when the suite runs.
+
+What is deliberately absent is listed inside `src/fs/ntfs/ntfs_ops.c`
 rather than discovered later: `$INDEX_ALLOCATION` (a directory that
 outgrows its record is refused, not split into a B-tree),
 `$ATTRIBUTE_LIST`, compression, and NTFS's own `$LogFile` — whose redo
@@ -861,11 +867,22 @@ about the peer.
 
 ## What is actually in here
 
-**85,703 lines of C written here**, across 148 files, compiled as a
-single translation unit plus one for inference, over a user-space C
-library of its own. (89,318 counting the embedded typeface, the integer
-sine table and Limine's own boot-protocol header — data and interface
-rather than logic.)
+**87,071 lines of C written here**, across 153 files, compiled as four
+kernel objects plus one for inference, over a user-space C library of
+its own. (90,686 counting the embedded typeface, the integer sine table
+and Limine's own boot-protocol header — data and interface rather than
+logic.)
+
+The four are `src/core/main.o`, which composes the drivers and the
+desktop; `src/sched/scheduler.o`; `src/fs/ntfs/ntfs_ops.o`; and
+`src/security/anti_virus.o`. The composition root is still one large
+translation unit because the driver headers genuinely share state — one
+MMIO map, one heap, one window list — and what came out of it are the
+three modules whose interfaces were narrow enough to write down:
+fourteen symbols in and twenty-eight out for the scheduler, nine and
+eight for NTFS, five and fourteen for the scanner. Everything crossing those
+boundaries is declared in `include/kernel_shared.h`, which explains the
+one rule that keeps the arrangement honest.
 
 Underneath the network sit two libraries that were **not** written here:
 lwIP 2.2.1 and Mbed TLS 3.6.4, 228,969 lines vendored unmodified at

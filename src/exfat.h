@@ -5,7 +5,6 @@
 #include "blk.h"
 #include "part.h"
 #include "fsmeta.h"
-#include "ntfs.h"
 
 /*
  * exFAT driver — read and write.

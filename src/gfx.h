@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "font.h"
+#include "kernel_shared.h"   /* str_*, uint_to_str — moved out of here */
 
 /*
  * Shared UI theme + software drawing primitives for the Vextro desktop.
@@ -482,21 +483,11 @@ static void mono_text(uint32_t *buf, uint32_t bw, uint32_t bh,
 
 /* ===== SMALL STRING HELPERS (freestanding) ===== */
 
-static int str_eq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
-    }
-    return *a == *b;
-}
+/* str_len, str_eq, str_starts_with, str_copy, str_append and
+ * uint_to_str moved to include/kernel_shared.h, as `static inline`.
+ * They are pure functions and three translation units need them; they
+ * live at the seam rather than being copied into each. */
 
-static int str_starts_with(const char *str, const char *prefix) {
-    while (*prefix) {
-        if (*str != *prefix) return 0;
-        str++; prefix++;
-    }
-    return 1;
-}
 
 /*
  * Real time, counted by the PIT at ~60 Hz.
@@ -525,34 +516,9 @@ static int str_cmp_bytes(const char *a, const char *b) {
     return (int)*x - (int)*y;
 }
 
-static int str_len(const char *s) {
-    int n = 0;
-    while (s[n]) n++;
-    return n;
-}
 
-static void str_copy(char *dst, const char *src, int max) {
-    int i = 0;
-    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
 
-static void str_append(char *dst, const char *src, int max) {
-    int len = str_len(dst);
-    int i = 0;
-    while (src[i] && len < max - 1) { dst[len++] = src[i++]; }
-    dst[len] = '\0';
-}
 
-static void uint_to_str(uint32_t val, char *out) {
-    if (val == 0) { out[0] = '0'; out[1] = '\0'; return; }
-    char tmp[12];
-    int i = 0;
-    while (val > 0) { tmp[i++] = (char)('0' + val % 10); val /= 10; }
-    int j = 0;
-    while (i > 0) out[j++] = tmp[--i];
-    out[j] = '\0';
-}
 
 /* ===== CMOS RTC ===== */
 

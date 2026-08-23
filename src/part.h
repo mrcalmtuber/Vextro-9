@@ -21,23 +21,18 @@
 
 #include <stdint.h>
 #include "blk.h"
+/* partition_t, PART_MAX and PART_NAME_LEN moved to the seam header:
+ * src/fs/ntfs/ntfs_ops.c walks this table from another translation unit
+ * and needs the layout. The definitions were moved rather than copied,
+ * so there is exactly one of them and no way for the two to drift. */
+#include "kernel_shared.h"
 
-#define PART_MAX      64
-#define PART_NAME_LEN 40
-
-typedef struct {
-    uint64_t start;              /* first LBA                       */
-    uint64_t sectors;
-    uint8_t  mbr_type;           /* 0 when the entry came from GPT  */
-    uint8_t  from_gpt;
-    uint8_t  bootable;
-    char     name[PART_NAME_LEN];
-    uint8_t  type_guid[16];
-} partition_t;
-
-static partition_t part_table[PART_MAX];
-static int         part_count = 0;
-static int         part_scheme = 0;     /* 0 none, 1 MBR, 2 GPT */
+/* Not static: read by ntfs_ops.o, which asks where each volume starts.
+ * part_scheme stays private — nothing outside this file has ever needed
+ * to know which of the two schemes the list came from. */
+partition_t part_table[PART_MAX];
+int         part_count = 0;
+static int  part_scheme = 0;     /* 0 none, 1 MBR, 2 GPT */
 
 /* The type GUIDs worth naming. Everything else is reported as its raw
  * value, because a partition this system cannot use is still a

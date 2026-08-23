@@ -72,14 +72,8 @@ typedef struct {
 
 static uint64_t spin_timeouts = 0;
 
-static inline uint64_t irq_save(void) {
-    uint64_t flags;
-    __asm__ volatile("pushfq\n\tpopq %0\n\tcli" : "=r"(flags) :: "memory");
-    return flags;
-}
-static inline void irq_restore(uint64_t flags) {
-    if (flags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
-}
+/* irq_save and irq_restore moved to include/kernel_shared.h — the
+ * scheduler brackets its critical sections with them. */
 
 static void spin_report_timeout(spinlock_t *l);
 

@@ -417,7 +417,7 @@ static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
     return 0;
 }
 
-static const void *fs_read_file(const char *filename, uint64_t *out_size) {
+const void *fs_read_file(const char *filename, uint64_t *out_size) {
     char abs[256];
     fs_abs(filename, abs, sizeof(abs));
     if (!prof_may(abs, 0)) { if (out_size) *out_size = 0; return 0; }
@@ -558,7 +558,7 @@ static int fs_pread(fs_file_t *f, uint64_t off, void *buf, uint32_t len,
     return fs_read_range(f->path, off, buf, len, got);
 }
 
-static int fs_write_file(const char *path, const void *data, uint32_t len) {
+int fs_write_file(const char *path, const void *data, uint32_t len) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 1)) return -1;
@@ -606,7 +606,7 @@ static int fs_delete(const char *path) {
     return -1;
 }
 
-static int fs_mkdir(const char *path) {
+int fs_mkdir(const char *path) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 1)) return -1;

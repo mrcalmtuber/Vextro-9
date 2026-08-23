@@ -2,6 +2,7 @@
 #define IDT_H
 
 #include <stdint.h>
+#include "kernel_shared.h"
 
 /* ---- I/O port helpers ---- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -72,16 +73,9 @@ static inline uint32_t cycles_to_ms(uint64_t cycles) {
     return cycles_per_ms ? (uint32_t)(cycles / cycles_per_ms) : 0;
 }
 
-/* ---- MSR access helpers ---- */
-static inline uint64_t rdmsr(uint32_t msr) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
-    return ((uint64_t)hi << 32) | lo;
-}
-static inline void wrmsr(uint32_t msr, uint64_t val) {
-    __asm__ volatile("wrmsr" :: "c"(msr),
-                     "a"((uint32_t)val), "d"((uint32_t)(val >> 32)) : "memory");
-}
+/* ---- MSR access helpers ----
+ * rdmsr and wrmsr moved to include/kernel_shared.h: scheduler.o needs
+ * them and they are pure instructions with no state to share. */
 
 #define MSR_EFER   0xC0000080
 #define MSR_STAR   0xC0000081
@@ -128,7 +122,7 @@ static idt_entry_t idt_table[IDT_SIZE];
  *          fault, where the stack in hand is exactly what cannot be
  *          trusted.
  */
-static void idt_set_gate_ex(int vec, void *fn, uint16_t sel,
+void idt_set_gate_ex(int vec, void *fn, uint16_t sel,
                             uint8_t ist, uint8_t dpl) {
     uint64_t addr = (uint64_t)(uintptr_t)fn;
     idt_table[vec].offset_lo  = (uint16_t)(addr & 0xFFFF);

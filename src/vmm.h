@@ -31,6 +31,7 @@
  */
 
 #include <stdint.h>
+#include "kernel_shared.h"
 #include "pmm.h"
 
 /* Page table entry bits beyond the ones pci.h already names. */
@@ -108,15 +109,8 @@
 #define APROT_WRITE 2
 #define APROT_EXEC  4
 
-typedef struct {
-    uint64_t  pml4_phys;
-    uint64_t *pml4;          /* through the HHDM */
-    uint64_t  brk;           /* next unallocated heap byte */
-    uint64_t  brk_top;       /* how far the heap has actually been mapped */
-    uint64_t  canvas_va;     /* where the window's pixels landed this run */
-    uint64_t  tramp_va;      /* and the trampoline page - both randomised */
-    int       live;
-} addr_space_t;
+/* addr_space_t moved to include/kernel_shared.h: the context switch
+ * loads CR3 out of one on every switch. */
 
 static uint64_t *vmm_kernel_pml4      = 0;
 static uint64_t  vmm_kernel_pml4_phys = 0;
@@ -127,7 +121,8 @@ static int       vmm_ready            = 0;
  * Every syscall that validates a user pointer needs to know which set of
  * page tables the pointer is supposed to make sense in, and this is it.
  */
-static addr_space_t *vmm_current = 0;
+/* Not static: written by the context switch in scheduler.o. */
+addr_space_t *vmm_current = 0;
 
 /* The kernel's own half, described as an address space so the same
  * mapping code can serve it. */
@@ -327,7 +322,7 @@ static int vmm_create(addr_space_t *as) {
  * other one. Frames flagged PTE_SHARED are unmapped but not freed; they
  * were never this process's to release.
  */
-static void vmm_destroy(addr_space_t *as) {
+void vmm_destroy(addr_space_t *as) {
     if (!as->live) return;
     for (int i = 0; i < 256; i++) {
         if (!(as->pml4[i] & PTE_PRESENT)) continue;
@@ -445,7 +440,7 @@ static uint64_t   kstack_live = 0;
  * machine has in genuine abundance. Not reusing it means a stale pointer
  * into a freed stack faults instead of landing in somebody else's.
  */
-static void *kstack_alloc(uint64_t bytes) {
+void *kstack_alloc(uint64_t bytes) {
     if (!vmm_ready) return 0;
     uint64_t pages = PAGE_ALIGN_UP(bytes) / PAGE_SIZE;
 
@@ -477,7 +472,7 @@ static void *kstack_alloc(uint64_t bytes) {
     return (void *)(uintptr_t)base;
 }
 
-static void kstack_free(void *p, uint64_t bytes) {
+void kstack_free(void *p, uint64_t bytes) {
     if (!p) return;
     uint64_t base = (uint64_t)(uintptr_t)p;
     uint64_t pages = PAGE_ALIGN_UP(bytes) / PAGE_SIZE;

@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 #include "idt.h"
+/* The console below is exported to the module translation units, so the
+ * prototypes are included here as well as declared there — a signature
+ * that drifts from the seam then fails to compile at the definition
+ * rather than silently at the call. */
+#include "kernel_shared.h"
 
 /*
  * Generic PCI + MMIO support layer.
@@ -55,7 +60,7 @@
 static int serial_fifo_depth = 1;
 static int serial_tx_credit  = 0;   /* bytes writable without re-polling */
 
-static void serial_putc(char c) {
+void serial_putc(char c) {
     /* The credit is how many more bytes will fit in the FIFO without
      * asking. It is spent down to zero and then refilled by one poll,
      * so the status register is read once per FIFO-full rather than
@@ -68,7 +73,7 @@ static void serial_putc(char c) {
     serial_tx_credit--;
 }
 
-static void serial_puts(const char *s) {
+void serial_puts(const char *s) {
     while (*s) serial_putc(*s++);
 }
 
@@ -141,7 +146,7 @@ static void serial_init(void) {
     serial_tx_credit  = 0;
 }
 
-static void serial_put_hex32(uint32_t v) {
+void serial_put_hex32(uint32_t v) {
     static const char hx[] = "0123456789ABCDEF";
     for (int i = 28; i >= 0; i -= 4)
         serial_putc(hx[(v >> i) & 0xF]);
@@ -151,7 +156,7 @@ static void serial_put_hex32(uint32_t v) {
  * storage drivers print capacities long before the network exists and
  * the single-translation-unit build made the order it happened to work
  * in look like a rule. */
-static void serial_put_dec(uint32_t val) {
+void serial_put_dec(uint32_t val) {
     char buf[12];
     int i = 0;
     if (val == 0) { serial_putc('0'); return; }
@@ -585,7 +590,7 @@ static inline void flush_tlb_page(uint64_t addr) {
 #define PTE_PWT      (1ULL << 3)  /* Page Write-Through */
 #define PTE_PCD      (1ULL << 4)  /* Page Cache Disable (for MMIO) */
 #define PTE_HUGE     (1ULL << 7)
-#define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+/* PTE_ADDR_MASK moved to include/kernel_shared.h. */
 
 /* Resolve a kernel virtual address to physical by walking CR3 */
 static uint64_t kern_virt_to_phys(void *virt) {

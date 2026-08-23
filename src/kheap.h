@@ -32,6 +32,7 @@
  */
 
 #include <stdint.h>
+#include "kernel_shared.h"
 #include <stddef.h>
 #include "pmm.h"
 
@@ -58,9 +59,9 @@
  * arrangement Windows uses and for the same reason: the caller knows
  * which kind it needs and nothing else can work it out afterwards.
  */
-#define KPOOL_NONPAGED 0
-#define KPOOL_PAGED    1
-#define KPOOL_COUNT    2
+/* KPOOL_NONPAGED, KPOOL_PAGED, KPOOL_COUNT and the kmalloc wrapper
+ * moved to include/kernel_shared.h — scheduler.o allocates thread
+ * control blocks, which must come from the non-paged pool. */
 
 #define KHEAP_MAX_SLAB     2048
 #define KHEAP_HDR_BYTES    64
@@ -148,7 +149,7 @@ static void kheap_link(kslab_t *s) {
     kheap_partial[s->pool][s->cls] = s;
 }
 
-static void *kmalloc_pool(uint64_t n, int pool) {
+void *kmalloc_pool(uint64_t n, int pool) {
     if (n == 0) return 0;
     if (pool < 0 || pool >= KPOOL_COUNT) pool = KPOOL_NONPAGED;
     uint64_t flags = spin_lock_irq(&kheap_lock);
@@ -195,14 +196,11 @@ static void *kmalloc_pool(uint64_t n, int pool) {
  * wrong: memory that could have been paged and was not costs residency,
  * memory that should not have been paged and was costs a fault in a
  * handler that cannot take one. */
-static inline void *kmalloc(uint64_t n) {
-    return kmalloc_pool(n, KPOOL_NONPAGED);
-}
 static inline void *kmalloc_paged(uint64_t n) {
     return kmalloc_pool(n, KPOOL_PAGED);
 }
 
-static void kfree(void *p) {
+void kfree(void *p) {
     if (!p) return;
     uint64_t flags = spin_lock_irq(&kheap_lock);
 

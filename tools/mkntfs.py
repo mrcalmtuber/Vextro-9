@@ -13,8 +13,8 @@ That means formatting is mostly a bootstrapping problem -- the MFT has
 to contain a record describing the MFT, in a place the MFT's own record
 says it is -- and it is the reason this exists rather than shelling out
 to mkntfs(8): the build has to run on a Mac, where there is no such
-tool, and the layout has to be one the kernel's driver in src/ntfs.h
-and src/ntfswrite.h agrees with byte for byte.
+tool, and the layout has to be one the kernel's driver in ntfs_ops.c
+and ntfs_ops.c agrees with byte for byte.
 
 What this produces is a real NTFS volume: a Linux or Windows machine
 mounts it and reads the files. What it deliberately does *not* produce
@@ -219,7 +219,7 @@ def index_root(entries):
     Real NTFS spills into $INDEX_ALLOCATION once the root exceeds what
     fits in an MFT record. This formatter keeps every directory small
     enough that it does not have to -- the kernel's writer in
-    src/ntfswrite.h is the half that has to cope with growth, and it
+    ntfs_ops.c is the half that has to cope with growth, and it
     reports rather than corrupts when a root fills.
     """
     body = b"".join(entries) + index_end_entry()
@@ -365,7 +365,7 @@ def main():
     # transaction journal whose restart and redo record formats are not
     # publicly specified, so what a real one contains cannot be written
     # from documentation. The kernel journals its own metadata writes
-    # instead -- see ntfs_journal_* in src/ntfswrite.h -- and this file
+    # instead -- see ntfs_journal_* in ntfs_ops.c -- and this file
     # exists so that a Windows chkdsk sees a well-formed volume rather
     # than a missing system file.
     records[2] = mft_record(2, 1, [

@@ -4,8 +4,8 @@
 /*
  * src/ntfs_hostshim.h — the kernel, reduced to what a filesystem needs.
  *
- * src/ntfs.h and src/ntfswrite.h reach for four things outside
- * themselves: read sectors, write sectors, flush, and print. On the
+ * src/fs/ntfs/ntfs_ops.c reaches for four things outside
+ * itself: read sectors, write sectors, flush, and print. On the
  * build machine those are a file and stdout, which is what this
  * supplies -- so tools/ntfs_test.c exercises the identical source that
  * runs in the kernel, against an image made by tools/mkntfs.py.

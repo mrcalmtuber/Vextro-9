@@ -117,7 +117,7 @@ void sys_sem_signal(sys_sem_t *sem) {
  * drift.
  *
  * The check and the parking are one atomic step: see the note on the
- * lost-wakeup race in src/sched.h. Doing it the obvious way instead
+ * lost-wakeup race in src/sched/scheduler.c. Doing it the obvious way instead
  * hangs roughly one connection in a few thousand, at a point in the
  * handshake that looks like a network fault.
  */

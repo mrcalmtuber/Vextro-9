@@ -10,7 +10,8 @@
 #include "kheap.h"
 #include "klibc.h"
 #include "syscall.h"
-#include "sched.h"
+#include "apic.h"
+#include "sched/sched.h"
 #include "trap.h"
 #include "mouse.h"
 #include "keyboard.h"
@@ -30,6 +31,7 @@
  * htons() macro away from the one netstack.h has always had. */
 #include "vxport.h"
 #include "vxnet.h"
+#include "fs/ntfs/ntfs.h"
 #include "ntcrypto.h"
 #include "cryptoswitch.h"
 /* The radio. Below vxport.h because it needs vx_random() for its
@@ -2118,6 +2120,11 @@ void kmain(void) {
     /* Policy lives beside the accounts and is enforced in the loader, so
      * it has to be in memory before anything can be launched. */
     policy_load();
+    /* Compile the signature table into its matching automaton. Doing it
+     * here rather than on first use keeps the cost off the first program
+     * launch and puts the state in the boot log, where a pool that
+     * overflowed is visible instead of merely slow. */
+    av_init();
     if (user_count == 0 && users_migrate_keycode())
         serial_puts("[vextro] users: migrated /keycode.sys to 'admin'\n");
 

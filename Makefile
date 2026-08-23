@@ -33,7 +33,7 @@ HOSTCC  := cc
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
             -msse -msse2 -mfpmath=sse -fno-math-errno -mno-red-zone \
-            -Isrc -Ikernel/include -Ivxfmt $(EXTRA)
+            -Isrc -Iinclude -Ikernel/include -Ivxfmt $(EXTRA)
 
 # --- Preflight ---
 #
@@ -99,7 +99,7 @@ CFLAGS  += -DBUF_MAX_W=$(FB_MAX_W)  -DBUF_MAX_H=$(FB_MAX_H) \
 #
 # make compares timestamps, and a flag has none. Without this,
 # `make iso EXTRA=-DSTORAGE_SELFTEST` after an ordinary build leaves
-# kernel.o untouched and produces an ISO that does not contain the thing
+# the kernel objects untouched and produces an ISO without the thing
 # that was asked for — silently, so the tests then "pass" by not running.
 #
 # It happens at parse time, before any rule runs, and that placement is
@@ -112,7 +112,7 @@ CFLAGS  += -DBUF_MAX_W=$(FB_MAX_W)  -DBUF_MAX_H=$(FB_MAX_H) \
 # build/tp is in here too, and leaving it out cost an evening. lwIP and
 # Mbed TLS are configured entirely by preprocessor switches, so
 # `make iso EXTRA=-DVX_LWIP_DEBUG` changes what those files compile to
-# more than it changes kernel.o -- and with only the two objects below
+# more than it changes the kernel objects -- and with only the two below
 # being deleted, the debug build linked yesterday's silent lwIP and
 # printed nothing. Which reads as "the debug flag does not work", and is
 # really "the flag was never applied".
@@ -120,9 +120,8 @@ BUILD_FLAGS := $(CFLAGS)
 $(shell mkdir -p build; \
         [ "`cat build/.flags 2>/dev/null`" = "$(BUILD_FLAGS)" ] || \
         { printf '%s\n' "$(BUILD_FLAGS)" > build/.flags; \
-          rm -f build/kernel.o build/llm.o \
-                build/lwipglue.o build/tlsglue.o; \
-          rm -rf build/tp; })
+          rm -f build/llm.o build/lwipglue.o build/tlsglue.o; \
+          rm -rf build/tp build/core build/sched build/fs build/security; })
 
 LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
             -T linker.ld
@@ -199,7 +198,7 @@ all: os.iso disk.img
 test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test \
       build/ntcrypto_test build/aes_test build/krb5_test build/wifi_test \
       build/media_test build/rdp_test build/ntfs_test build/vmx_test \
-      build/mbedtls_test
+      build/av_test build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/profile_test
 	@./build/ttfhint_test
@@ -215,6 +214,7 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 a.txt=build/scratch/a.txt > /dev/null
 	@./build/ntfs_test build/scratch/ntfs.img
 	@./build/vmx_test
+	@./build/av_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
 	@python3 tools/linecount.py --check
 
@@ -381,10 +381,29 @@ build/rdp_test: tools/rdp_test.c src/net/rdpwire.h
 # that a cluster allocator hands the same run out twice. This compiles
 # the identical source the kernel runs against an image file, so being
 # wrong about NTFS costs nothing.
-build/ntfs_test: tools/ntfs_test.c src/ntfs.h src/ntfswrite.h \
-                 src/ntfs_hostshim.h
+build/ntfs_test: tools/ntfs_test.c src/fs/ntfs/ntfs_ops.c \
+                 src/fs/ntfs/ntfs.h src/fs/ntfs/ntfs_hostshim.h
 	@mkdir -p build
-	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function \
+	           -Isrc -Iinclude -o $@ $<
+
+# The scanner, against the search it replaced.
+#
+# src/security/anti_virus.c is an Aho-Corasick automaton where there used
+# to be a loop per signature. Both are still in the file -- the direct
+# search is the fallback if the node pool overflows -- so this runs them
+# side by side over twenty thousand generated buffers and requires they
+# agree. A matcher rewrite checked only by "it still finds EICAR" is a
+# matcher rewrite with no evidence behind it.
+#
+# Sanitisers on: the scan loop indexes a table with a byte from the
+# input, and reading one state off the end of that table is exactly the
+# bug that would not show up in the answers.
+build/av_test: tools/av_test.c src/security/anti_virus.c \
+               src/security/anti_virus.h include/kernel_shared.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -fsanitize=address,undefined \
+	           -Isrc -Iinclude -o $@ $<
 
 # VT-x, minus VT-x.
 #
@@ -680,17 +699,63 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(WINAPPS) $(
 	rm -rf build/initrd_staging
 
 # --- Kernel ---
-# The .c files under src/net and src/media are included into this
-# translation unit rather than compiled separately (they need the
-# drivers' static state), so they are dependencies of kernel.o and not
-# objects of their own. A wildcard covers them, because leaving one out
-# means make reports success having rebuilt nothing -- which reads as
-# "the fix did not work" and is really "the fix was never compiled".
-build/kernel.o: src/kernel.c $(wildcard src/*.h) \
-                $(wildcard src/net/*.h) $(wildcard src/net/*.c) \
-                $(wildcard src/media/*.h) $(wildcard src/media/*.c) \
-                build/res.stamp
-	@mkdir -p build
+#
+# Four objects, not one.
+#
+# src/core/main.c is the composition root: it includes the driver and
+# desktop headers, and those genuinely share static state -- one MMIO
+# map, one heap, one window list -- so they stay a single translation
+# unit. The .c files under src/net and src/media are included into it
+# for the same reason and are dependencies of that object rather than
+# objects of their own.
+#
+# The three modules below came out because their interfaces are narrow
+# enough to measure: the scheduler needs fifteen symbols and exports
+# twenty-four, NTFS needs nine and exports eight, the scanner needs five
+# and exports fourteen. Everything crossing those boundaries is declared
+# in include/kernel_shared.h.
+#
+# The rule that keeps this honest is that the three module sources
+# include only that seam header and their own declaration header. If one
+# of them ever includes a driver header directly it will compile, link,
+# and give that object a private copy of the driver's state -- so the
+# discipline is in the source, and the narrow dependency lines below are
+# what make a violation visible as a rebuild that should not have
+# happened.
+KERN_MODULES := src/sched/scheduler.c \
+                src/fs/ntfs/ntfs_ops.c \
+                src/security/anti_virus.c
+KERN_MODULE_OBJ := $(patsubst src/%.c,build/%.o,$(KERN_MODULES))
+
+# Wildcards over every directory that now holds kernel headers. Leaving
+# one out means make reports success having rebuilt nothing -- which
+# reads as "the fix did not work" and is really "the fix was never
+# compiled". That has cost this build two debugging sessions, once for
+# src/net and once for lwipopts.h, so the lists are deliberately wide.
+KERN_HDRS := $(wildcard src/*.h) $(wildcard include/*.h) \
+             $(wildcard src/net/*.h) $(wildcard src/media/*.h) \
+             $(wildcard src/sched/*.h) $(wildcard src/fs/ntfs/*.h) \
+             $(wildcard src/security/*.h)
+
+build/core/main.o: src/core/main.c $(KERN_HDRS) \
+                   $(wildcard src/net/*.c) $(wildcard src/media/*.c) \
+                   build/res.stamp
+	@mkdir -p build/core
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# One rule for all three modules. Each depends on the whole header set
+# rather than on its own two files: the seam header is shared, and a
+# change to it changes what every module compiles to.
+#
+# A *static* pattern rule, scoped to exactly these three objects. Written
+# as a plain `build/%.o: src/%.c` it would also match build/llm.o,
+# build/lwipglue.o and build/tlsglue.o, which have their own rules and
+# their own flags -- lwIP and Mbed TLS need -w and a stack of -I paths
+# that the kernel proper does not. Explicit rules do win over pattern
+# rules, so it would have worked; it would also have left a rule quietly
+# claiming to build three objects it must never build.
+$(KERN_MODULE_OBJ): build/%.o: src/%.c $(KERN_HDRS)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # The inference unit used to be the one place floats were allowed. It no
@@ -720,12 +785,17 @@ build/llm.o: src/llm.c src/llm.h
 # --- The network stack: lwIP 2.2.1 and Mbed TLS 3.6.4 ---
 #
 # Vendored under third_party/, compiled as their own translation units
-# and linked like build/llm.o. They cannot be included into kernel.c and
-# it is not a matter of effort: the kernel is one unit of `static`
-# functions, and `static` is exactly what makes them unreachable from
-# another file. lwIP also macro-defines htons() over the top of the one
-# in src/netstack.h, and declares a `struct sockaddr` and an `fd_set`
-# that a 74,000-line translation unit has no room for.
+# and linked like build/llm.o. They cannot be included into the
+# composition root and it is not a matter of effort: src/core/main.c is
+# still one large unit of `static` functions, and `static` is exactly
+# what makes them unreachable from another file. lwIP also macro-defines
+# htons() over the top of the one in src/netstack.h, and declares a
+# `struct sockaddr` and an `fd_set` that a translation unit this size has
+# no room for.
+#
+# The kernel-side split into four objects did not change any of that --
+# it moved three modules out from behind the same wall, through
+# include/kernel_shared.h rather than around it.
 #
 # So the seam is src/vxport.h -- twenty-odd functions, native types, no
 # foreign header -- and everything on the far side of it is compiled
@@ -793,8 +863,10 @@ NET_OBJ := $(TP_OBJ) build/lwipglue.o build/tlsglue.o
 # calls it.
 LIBGCC := $(shell $(CC) -print-libgcc-file-name)
 
-build/kernel: build/kernel.o build/llm.o $(NET_OBJ) linker.ld
-	$(LD) $(LDFLAGS) build/kernel.o build/llm.o $(NET_OBJ) $(LIBGCC) -o $@
+build/kernel: build/core/main.o $(KERN_MODULE_OBJ) build/llm.o \
+              $(NET_OBJ) linker.ld
+	$(LD) $(LDFLAGS) build/core/main.o $(KERN_MODULE_OBJ) build/llm.o \
+	      $(NET_OBJ) $(LIBGCC) -o $@
 
 # --- ISO root population ---
 $(ISO)/boot/kernel: build/kernel
@@ -809,7 +881,7 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 # framebuffer_width/height/bpp trio that used to live in limine.conf is
 # not part of the config format at all, so it was quietly ignored and the
 # mode came from whatever the display's EDID preferred.  Any size up to
-# the BUF_MAX_W x BUF_MAX_H back buffer in src/kernel.c works:
+# the BUF_MAX_W x BUF_MAX_H back buffer in src/core/main.c works:
 #     make run RES=1920x1080x32
 
 # make compares timestamps, and a variable has none — without recording
@@ -818,13 +890,13 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 #
 # EXTRA is recorded for the same reason and it bites harder, because the
 # symptom is silence: `make iso EXTRA=-DSTORAGE_SELFTEST` after an
-# ordinary build leaves kernel.o untouched, produces an ISO with no
+# ordinary build leaves the kernel objects untouched, produces an ISO with no
 # self-test in it, and says nothing at all. The tests then "pass" by not
 # running.
 # EXTRA really is recorded here now. It was not: the recipe wrote RES and
 # the framebuffer bounds and nothing else, so the failure described just
 # above was live rather than guarded against -- `make iso
-# EXTRA=-DSWAP_SELFTEST` after an ordinary build left kernel.o untouched,
+# EXTRA=-DSWAP_SELFTEST` after an ordinary build left the objects untouched,
 # produced an ISO with no self-test in it, and said nothing. The test then
 # "passed" by never running, which is the worst way for a test to pass.
 build/res.stamp: FORCE

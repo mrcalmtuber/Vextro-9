@@ -1218,9 +1218,11 @@ static int krb_get_service_ticket(const char *kdc_host, uint16_t port,
  * pattern src/trap.h uses for its structured-exception hook.
  */
 static void        profile_home(const char *name, char *out, int max);
-static int         fs_write_file(const char *path, const void *data, uint32_t len);
-static const void *fs_read_file(const char *filename, uint64_t *out_size);
 static int         fs_delete(const char *path);
+/* fs_write_file and fs_read_file are no longer forward-declared here:
+ * they are exported to the module objects now, so their prototypes come
+ * from include/kernel_shared.h and a local `static` one would be a
+ * conflicting declaration rather than a harmless repeat. */
 
 typedef struct {
     uint8_t magic[4];

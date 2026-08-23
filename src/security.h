@@ -1,6 +1,8 @@
 #ifndef VEXTRO_SECURITY_H
 #define VEXTRO_SECURITY_H
 
+#include "security/anti_virus.h"
+
 /*
  * src/security.h — archives, encrypted containers, and the three policies
  * that decide whether a program is allowed to run.
@@ -155,185 +157,22 @@ static void vault_verifier(const uint8_t key[32], uint8_t out[16]) {
     for (int i = 0; i < 16; i++) out[i] = d[i];
 }
 
-/* ===== 3. POLICY =====
+/* ===== 3. POLICY, THE SCANNER, AND POLICY PERSISTENCE =====
  *
- * Three settings, one file, read at login and enforced in the loader.
+ * Moved to src/security/anti_virus.c, which is compiled as its own
+ * object rather than included here. What went is everything consulted
+ * between "the user launched a program" and "the program started": the
+ * allowlist, the signature scanner and the UAC level. Its interface is
+ * src/security/anti_virus.h, included above.
  *
- * /etc/policy.cfg, one key per line, because a binary format for six
- * numbers would be harder to repair from a terminal than it is to parse.
+ * What stayed is storage — the tar writer above and the vault below —
+ * because both are about putting bytes in a container, and neither is
+ * on the launch path.
+ *
+ * The scanner also stopped being a loop per signature on the way out;
+ * it is an Aho-Corasick automaton now, and the reason is written down
+ * where it lives.
  */
-
-enum {                      /* how often privileged actions ask */
-    UAC_NEVER = 0,          /* never prompt (the old behaviour) */
-    UAC_ADMIN_TASKS,        /* prompt for administrator actions */
-    UAC_ALWAYS_INSTALL,     /* ...and for anything that installs software */
-    UAC_PARANOID,           /* ...and for every program launch */
-    UAC_LEVELS
-};
-
-static const char *const uac_level_names[UAC_LEVELS] = {
-    "Never notify",
-    "Administrator tasks",
-    "Installing software",
-    "Every program",
-};
-
-static int uac_level      = UAC_ADMIN_TASKS;
-static int allowlist_on   = 0;      /* only listed programs may run */
-static int scanner_on     = 1;      /* check binaries before running them */
-
-#define ALLOW_MAX  32
-#define ALLOW_NAME 32
-
-static char allow_names[ALLOW_MAX][ALLOW_NAME];
-static int  allow_count = 0;
-
-static int allow_permits(const char *name) {
-    if (!allowlist_on) return 1;
-    for (int i = 0; i < allow_count; i++)
-        if (str_eq(allow_names[i], name)) return 1;
-    return 0;
-}
-
-static int allow_add(const char *name) {
-    if (allow_count >= ALLOW_MAX) return 0;
-    for (int i = 0; i < allow_count; i++)
-        if (str_eq(allow_names[i], name)) return 1;
-    str_copy(allow_names[allow_count++], name, ALLOW_NAME);
-    return 1;
-}
-
-static int allow_remove(const char *name) {
-    for (int i = 0; i < allow_count; i++)
-        if (str_eq(allow_names[i], name)) {
-            for (int k = i; k + 1 < allow_count; k++)
-                str_copy(allow_names[k], allow_names[k + 1], ALLOW_NAME);
-            allow_count--;
-            return 1;
-        }
-    return 0;
-}
-
-/* ===== 4. THE SCANNER =====
- *
- * Signatures plus a small number of structural checks over a `.vx` image
- * before it is allowed to start.
- *
- * The signature list is deliberately tiny and the heuristics deliberately
- * few, because the honest description of this is "it catches what it
- * knows about", and a long list would imply otherwise. What it is
- * genuinely good at is the case that actually happens on a machine like
- * this one: a binary that has been altered since it was installed.
- */
-
-typedef struct {
-    const char *name;
-    const char *bytes;     /* NUL-terminated pattern */
-} scan_sig_t;
-
-static const scan_sig_t scan_sigs[] = {
-    /* The EICAR standard anti-malware test string: not malware, and
-     * designed precisely so a scanner can be shown to work without
-     * anyone having to keep a real sample on the disk. */
-    { "EICAR-Test-File", "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR" },
-    { "Vextro-Test-Marker", "VEXTRO-SCANNER-TEST-PATTERN" },
-    { 0, 0 }
-};
-
-#define SCAN_CLEAN     0
-#define SCAN_SIGNATURE 1
-#define SCAN_MALFORMED 2
-
-static char scan_detail[64];
-
-static int scan_buffer(const uint8_t *data, uint32_t len) {
-    scan_detail[0] = '\0';
-
-    for (int s = 0; scan_sigs[s].name; s++) {
-        const char *pat = scan_sigs[s].bytes;
-        int plen = 0;
-        while (pat[plen]) plen++;
-        if ((int)len < plen) continue;
-        for (uint32_t i = 0; i + (uint32_t)plen <= len; i++) {
-            int k = 0;
-            while (k < plen && data[i + k] == (uint8_t)pat[k]) k++;
-            if (k == plen) {
-                str_copy(scan_detail, scan_sigs[s].name, sizeof(scan_detail));
-                return SCAN_SIGNATURE;
-            }
-        }
-    }
-
-    /* Structural: a .vx that claims a section past its own end is either
-     * truncated or tampered with, and either way must not be executed. */
-    if (len >= 16) {
-        const uint32_t claimed = (uint32_t)data[8]
-                               | ((uint32_t)data[9] << 8)
-                               | ((uint32_t)data[10] << 16)
-                               | ((uint32_t)data[11] << 24);
-        if (claimed > len && claimed < 0x10000000u) {
-            str_copy(scan_detail, "declared size exceeds the file",
-                     sizeof(scan_detail));
-            return SCAN_MALFORMED;
-        }
-    }
-    return SCAN_CLEAN;
-}
-
-
-/* ===== 5. POLICY PERSISTENCE ===== */
-
-#define POLICY_PATH "/etc/policy.cfg"
-
-static void policy_save(void) {
-    char out[512];
-    char nb[12];
-    str_copy(out, "uac=", sizeof(out));
-    uint_to_str((uint32_t)uac_level, nb); str_append(out, nb, sizeof(out));
-    str_append(out, "\nallowlist=", sizeof(out));
-    str_append(out, allowlist_on ? "1" : "0", sizeof(out));
-    str_append(out, "\nscanner=", sizeof(out));
-    str_append(out, scanner_on ? "1" : "0", sizeof(out));
-    str_append(out, "\n", sizeof(out));
-    for (int i = 0; i < allow_count; i++) {
-        str_append(out, "allow=", sizeof(out));
-        str_append(out, allow_names[i], sizeof(out));
-        str_append(out, "\n", sizeof(out));
-    }
-    fs_mkdir("/etc");
-    fs_write_file(POLICY_PATH, out, (uint32_t)str_len(out));
-}
-
-static void policy_load(void) {
-    uint64_t n = 0;
-    const void *d = fs_read_file(POLICY_PATH, &n);
-    if (!d || !n) return;
-    const char *p = (const char *)d;
-    allow_count = 0;
-
-    uint64_t i = 0;
-    while (i < n) {
-        char line[96];
-        int k = 0;
-        while (i < n && p[i] != '\n' && k < (int)sizeof(line) - 1)
-            line[k++] = p[i++];
-        line[k] = '\0';
-        while (i < n && p[i] != '\n') i++;
-        if (i < n) i++;                       /* step over the newline */
-
-        if (str_starts_with(line, "uac=")) {
-            int v = line[4] - '0';
-            if (v >= 0 && v < UAC_LEVELS) uac_level = v;
-        } else if (str_starts_with(line, "allowlist=")) {
-            allowlist_on = (line[10] == '1');
-        } else if (str_starts_with(line, "scanner=")) {
-            scanner_on = (line[8] == '1');
-        } else if (str_starts_with(line, "allow=")) {
-            allow_add(line + 6);
-        }
-    }
-}
-
 /* ===== 6. SEALING A DIRECTORY =====
  *
  * The walk is breadth-first with a hard budget, the same shape as the

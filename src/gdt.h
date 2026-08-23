@@ -23,22 +23,13 @@
  */
 
 #include <stdint.h>
+#include "kernel_shared.h"
 #include "idt.h"
 #include "pci.h"          /* serial_puts */
 
-#define GDT_NULL     0x00
-#define GDT_KCODE    0x08
-#define GDT_KDATA    0x10
-#define GDT_UCODE32  0x18        /* SYSRET base — never loaded directly */
-#define GDT_UDATA    0x20
-#define GDT_UCODE    0x28
-#define GDT_TSS      0x30        /* 16 bytes: occupies 0x30 and 0x38 */
-
-#define GDT_ENTRIES  8
-
-/* Selectors as a user-mode thread sees them, RPL 3 included. */
-#define SEL_UCODE    (GDT_UCODE | 3)
-#define SEL_UDATA    (GDT_UDATA | 3)
+/* The selectors, GDT_ENTRIES and tss_t moved to
+ * include/kernel_shared.h: the scheduler loads SEL_UCODE/SEL_UDATA into
+ * a user thread's frame and writes tss.rsp0 on every switch. */
 
 /* What IA32_STAR wants: kernel CS in [47:32], SYSRET base in [63:48].
  * The base carries RPL 3 so that the selectors SYSRET derives from it
@@ -91,20 +82,9 @@ typedef struct {
  * vector 8 a stack that is known good no matter what the faulting thread
  * did to its own.
  */
-typedef struct {
-    uint32_t reserved0;
-    uint64_t rsp0;
-    uint64_t rsp1;
-    uint64_t rsp2;
-    uint64_t reserved1;
-    uint64_t ist[7];
-    uint64_t reserved2;
-    uint16_t reserved3;
-    uint16_t iomap_base;
-} __attribute__((packed)) tss_t;
-
 static gdt_entry_t gdt_table[GDT_ENTRIES] __attribute__((aligned(16)));
-static tss_t       tss __attribute__((aligned(16)));
+/* Not static: scheduler.o writes tss.rsp0 on every context switch. */
+tss_t              tss __attribute__((aligned(16)));
 
 /*
  * Stacks the processor switches to on its own. None is ever the stack of

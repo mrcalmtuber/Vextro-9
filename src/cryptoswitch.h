@@ -37,7 +37,7 @@
 
 #include <stdint.h>
 #include "aes.h"
-#include "sched.h"
+#include "sched/sched.h"
 
 static int cs_checks = 0;
 static int cs_fails  = 0;

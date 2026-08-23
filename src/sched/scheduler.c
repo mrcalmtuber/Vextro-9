@@ -1,120 +1,52 @@
-#ifndef SCHED_H
-#define SCHED_H
-
 /*
- * src/sched.h — threads, and the interrupt that switches between them.
+ * src/sched/scheduler.c — threads, and the interrupt that switches
+ * between them.
  *
- * What this replaces is not a scheduler. An application used to be run
- * by pointing the stack pointer at a static buffer and issuing a CALL;
- * the desktop then stopped existing until the program returned. A
- * Mandelbrot set that takes four seconds to draw froze the pointer, the
- * clock and the compositor for four seconds, and there was no way to
- * write a program that did not do that.
+ * This is the kernel's second-largest object and the one whose split
+ * from the composition root took the most care, because almost
+ * everything in the system calls into it: twenty-four symbols leave
+ * here and seventy-one files use at least one of them.
  *
- * Now a program is a thread with its own address space, its own kernel
- * stack, and its own copy of the floating-point state, and the APIC
- * timer takes the processor away from it a thousand times a second.
+ * What it needs *back* is only fifteen — the descriptor table, the page
+ * tables, the interrupt controller and the heap — and those are
+ * declared in include/kernel_shared.h. That ratio is the argument for
+ * the boundary: a great deal depends on the scheduler and the scheduler
+ * depends on very little.
  *
- * ---- how a switch actually happens ----
+ * Three things stayed in the header rather than moving here, and the
+ * reason in every case is that they are on a hot path and inlining them
+ * is load-bearing rather than an optimisation:
  *
- * The timer stub pushes every general-purpose register onto the stack of
- * whichever thread was interrupted, on top of the five words the
- * processor pushed. That block *is* the thread's saved state; the only
- * thing that has to be remembered separately is where it starts, so a
- * context switch is: write the current stack pointer into the current
- * thread, pick another thread, load its stack pointer, and return. The
- * IRETQ at the end of the stub then unwinds into whatever that other
- * thread was doing — user or kernel, the frame says which.
+ *   preempt_disable / preempt_enable   the compositor brackets every
+ *                                      frame with these
+ *   sched_yield                        raises the timer vector, and the
+ *                                      INT must be immediate
  *
- * The extended state does not fit in that trick, because FXSAVE writes
- * 512 bytes to a fixed address rather than pushing. So each thread
- * carries its own aligned area and the switch copies through it. This is
- * what makes floating point safe to use everywhere: two threads can both
- * be halfway through an expression involving XMM registers, and neither
- * can see the other's.
- *
- * ---- what is deliberately not preemptible ----
- *
- * The compositor mutates a great deal of shared state — the window list,
- * the terminal ring, the notification queue — and a syscall from another
- * thread can reach the same structures. Rather than lock each of them,
- * the frame is a critical section: the render loop raises the preemption
- * count while it draws and drops it before it sleeps. Applications get
- * the rest of the frame, which on this machine is most of it, in
- * millisecond slices.
+ * lapic_eoi moved to the seam header for the same reason and is
+ * still always_inline and general-regs-only: it is called from the
+ * timer stub below, inside the window where the extended state is
+ * half-saved, and a cross-object call there would be a new instruction
+ * sequence in the most delicate function in this kernel.
  */
 
 #include <stdint.h>
-#include "gdt.h"
-#include "vmm.h"
-#include "kheap.h"
-#include "apic.h"
-#include "syscall.h"
 
-#define SCHED_MAX_THREADS 64
-#define SCHED_NAME_LEN    24
-#define SCHED_KSTACK      (32 * 1024)
+/* The four subsystems a context switch touches. Note what is not here:
+ * src/gdt.h, src/vmm.h, src/apic.h and src/kheap.h themselves. Their
+ * bodies hold the descriptor table, the page-table roots, the APIC base
+ * pointer and the heap free lists; including any of them would give
+ * this object a private copy of that state, and a scheduler writing its
+ * own TSS while the processor reads another is a machine that takes one
+ * timer interrupt and stops. */
+#include "kernel_shared.h"
+#include "sched/sched.h"
 
-/* Higher runs first. The compositor sits above applications so that a
- * program in a tight loop can never cost the interface its frame. */
-#define PRIO_IDLE    0
-#define PRIO_NORMAL  4
-#define PRIO_UI      8
-#define PRIO_MAX     15
-
-typedef enum {
-    T_FREE = 0,
-    T_READY,
-    T_RUNNING,
-    T_SLEEPING,
-    T_ZOMBIE
-} thread_state_t;
-
-/*
- * The frame the timer stub builds. Field order is the push order
- * reversed, and the last five are the processor's own — which is why
- * `rsp` and `ss` are in here at all: in long mode IRET pops them
- * unconditionally, even when the privilege level is not changing.
- */
-typedef struct {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    uint64_t rip, cs, rflags, rsp, ss;
-} trap_frame_t;
-
-typedef struct thread {
-    uint64_t       rsp;                 /* saved kernel stack pointer     */
-    uint64_t       cr3;                 /* address space, physical        */
-    uint64_t       kstack_top;          /* what goes in TSS.RSP0          */
-    void          *kstack;              /* the allocation, for release    */
-    addr_space_t  *as;                  /* null for a kernel thread       */
-    uint32_t       pid;
-    uint32_t       prio;
-    thread_state_t state;
-    uint64_t       wake_at;             /* scheduler ticks, for sleepers  */
-    uint64_t       slices;              /* how much processor it has had  */
-    int            user;                /* runs in ring 3                 */
-    int            waits_frame;         /* asleep until the frame clock   */
-    /* What this thread is blocked on, or null. Any address will do as a
-     * channel -- a semaphore's own address is the usual one -- because
-     * nothing dereferences it; it is only ever compared. See
-     * sched_block_on. */
-    void          *wait_chan;
-    int            exit_code;
-    char           name[SCHED_NAME_LEN];
-    /* 512 bytes, sixteen-aligned, exactly as FXSAVE64 wants them. The
-     * attribute is on the member rather than the struct because the
-     * struct is heap-allocated and the heap's own alignment is a
-     * separate promise. */
-    uint8_t        fx[512] __attribute__((aligned(16)));
-} thread_t;
-
-static thread_t  *threads[SCHED_MAX_THREADS];
-static thread_t  *cur_thread   = 0;
+thread_t  *threads[SCHED_MAX_THREADS];
+thread_t  *cur_thread   = 0;
 static thread_t  *idle_thread  = 0;
 static uint32_t   sched_next_pid = 1;
-static volatile int32_t preempt_count = 0;
-static volatile uint64_t sched_ticks = 0;
+volatile int32_t preempt_count = 0;
+volatile uint64_t sched_ticks = 0;
 /*
  * Volatile for the same reason sched_ticks above is: this is written
  * inside sched_on_tick, which reaches normal code only through an
@@ -124,8 +56,8 @@ static volatile uint64_t sched_ticks = 0;
  * happened to the context-switch selftest in cryptoswitch.h, and would
  * happen to anything else that ever tried to measure switch rate.
  */
-static volatile uint64_t sched_switches = 0;
-static int        sched_running = 0;
+volatile uint64_t sched_switches = 0;
+int        sched_running = 0;
 static uint8_t    fx_template[512] __attribute__((aligned(16)));
 
 /*
@@ -154,7 +86,7 @@ static uint8_t    fx_template[512] __attribute__((aligned(16)));
  */
 static uint64_t   gs_base_live = 0;
 
-static void sched_set_gs_base(uint64_t va) {
+void sched_set_gs_base(uint64_t va) {
     if (gs_base_live == va) return;
     gs_base_live = va;
     wrmsr(0xC0000101u, va);
@@ -171,14 +103,8 @@ static void sched_set_gs_base(uint64_t va) {
  * count — which sleepers are timed against — depend on how often
  * programs happened to yield.
  */
-static volatile int sched_soft_yield = 0;
+volatile int sched_soft_yield = 0;
 
-static inline void preempt_disable(void) {
-    __atomic_add_fetch(&preempt_count, 1, __ATOMIC_SEQ_CST);
-}
-static inline void preempt_enable(void) {
-    __atomic_sub_fetch(&preempt_count, 1, __ATOMIC_SEQ_CST);
-}
 
 static int sched_slot(thread_t *t) {
     for (int i = 0; i < SCHED_MAX_THREADS; i++)
@@ -361,7 +287,7 @@ static int sched_register(thread_t *t) {
  * state, because the state is live in the registers, and it will be
  * written down the first time the timer takes the processor away.
  */
-static void sched_init(void) {
+void sched_init(void) {
     for (int i = 0; i < SCHED_MAX_THREADS; i++) threads[i] = 0;
 
     /* A known-good starting FPU state, taken once from a unit that has
@@ -411,8 +337,8 @@ static void sched_idle_loop(void) {
     for (;;) __asm__ volatile("hlt");
 }
 
-static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
-                                    uint32_t prio);
+thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
+                             uint32_t prio);
 
 /*
  * Start switching — but only if there is something to switch on.
@@ -424,7 +350,7 @@ static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
  * that draws one frame and stops. Better to keep the whole thing dormant
  * and let the render loop run exactly as it did before threads existed.
  */
-static void sched_start(void) {
+void sched_start(void) {
     if (!lapic_present) {
         serial_puts("[sched] no APIC timer: staying single-threaded\n");
         return;
@@ -473,7 +399,7 @@ static uint64_t sched_build_frame(thread_t *t, uint64_t entry,
  * before this existed, returning meant popping whatever happened to be
  * on the stack and jumping to it. Naming that is worth eight bytes.
  */
-static void sched_exit(int code);
+void sched_exit(int code);
 
 static void sched_thread_fell_off(void) {
     serial_puts("[sched] thread returned from its entry point\n");
@@ -538,8 +464,8 @@ static thread_t *sched_new(const char *name, uint32_t prio) {
 }
 
 /* A thread that runs in the kernel's own address space. */
-static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
-                                    uint32_t prio) {
+thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
+                             uint32_t prio) {
     thread_t *t = sched_new(name, prio);
     if (!t) return 0;
     t->user = 0;
@@ -575,8 +501,8 @@ static thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
  * tcpip thread is useless without it -- and so does anything else that
  * wants two workers running the same function over different state.
  */
-static thread_t *sched_spawn_kernel_arg(void (*fn)(void *), void *arg,
-                                        const char *name, uint32_t prio) {
+thread_t *sched_spawn_kernel_arg(void (*fn)(void *), void *arg,
+                                 const char *name, uint32_t prio) {
     thread_t *t = sched_new(name, prio);
     if (!t) return 0;
     t->user = 0;
@@ -601,9 +527,9 @@ static thread_t *sched_spawn_kernel_arg(void (*fn)(void *), void *arg,
 }
 
 /* A thread that runs in ring 3, in an address space of its own. */
-static thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
-                                  uint64_t user_stack, const char *name,
-                                  uint32_t prio) {
+thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
+                           uint64_t user_stack, const char *name,
+                           uint32_t prio) {
     thread_t *t = sched_new(name, prio);
     if (!t) return 0;
     t->user = 1;
@@ -634,7 +560,7 @@ static thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
  * Only from the SYSCALL door. The legacy gate does not put the return
  * address in RCX, so there would be nothing to build a frame from.
  */
-static thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
+thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
     if (!parent || !child_as || !syscall_cur_frame || !syscall_via_fast)
         return 0;
 
@@ -678,14 +604,8 @@ static thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
 
 /* Give up the rest of this slice. Software-generates the timer vector,
  * which means the one switch path is the only switch path. */
-static inline void sched_yield(void) {
-    uint64_t flags = irq_save();
-    sched_soft_yield = 1;
-    __asm__ volatile("int %0" :: "i"(APIC_VEC_TIMER) : "memory");
-    irq_restore(flags);
-}
 
-static void sched_sleep_ms(uint64_t ms) {
+void sched_sleep_ms(uint64_t ms) {
     if (!cur_thread || !sched_running) return;
     cur_thread->wake_at = sched_ticks + (ms ? ms : 1);
     cur_thread->state   = T_SLEEPING;
@@ -727,8 +647,8 @@ static void sched_sleep_ms(uint64_t ms) {
  * the flags here still disabled. Nothing can run in between because
  * nothing can interrupt.
  */
-static int sched_block_on_locked(void *chan, uint32_t timeout_ms,
-                                 uint64_t flags) {
+int sched_block_on_locked(void *chan, uint32_t timeout_ms,
+                          uint64_t flags) {
     if (!cur_thread || !sched_running) {
         irq_restore(flags);
         /* Before the scheduler exists there is nobody to wake us, so the
@@ -751,7 +671,7 @@ static int sched_block_on_locked(void *chan, uint32_t timeout_ms,
     return woken;
 }
 
-static int sched_block_on(void *chan, uint32_t timeout_ms) {
+int sched_block_on(void *chan, uint32_t timeout_ms) {
     return sched_block_on_locked(chan, timeout_ms, irq_save());
 }
 
@@ -759,7 +679,7 @@ static int sched_block_on(void *chan, uint32_t timeout_ms) {
  * Release what is parked on a channel. Safe from an interrupt: it only
  * writes two fields and never allocates.
  */
-static void sched_wake_chan(void *chan, int all) {
+void sched_wake_chan(void *chan, int all) {
     uint64_t flags = irq_save();
     for (int i = 0; i < SCHED_MAX_THREADS; i++) {
         thread_t *t = threads[i];
@@ -786,7 +706,7 @@ static void sched_wake_chan(void *chan, int all) {
  * scheduler ticks, so the interface stays locked to the display's clock
  * however the scheduler is tuned.
  */
-static void sched_wait_frame(void) {
+void sched_wait_frame(void) {
     if (!sched_running || !cur_thread) {
         __asm__ volatile("hlt");
         return;
@@ -801,7 +721,7 @@ static void sched_wait_frame(void) {
  * runnable; the next scheduler tick, at most a millisecond away, will
  * pick the highest-priority one of them. */
 __attribute__((target("general-regs-only")))
-static void sched_frame_pulse(void) {
+void sched_frame_pulse(void) {
     for (int i = 0; i < SCHED_MAX_THREADS; i++) {
         thread_t *t = threads[i];
         if (t && t->waits_frame) {
@@ -815,7 +735,7 @@ static void sched_frame_pulse(void) {
  * A thread ends here. It cannot free its own stack — it is standing on
  * it — so it becomes a zombie and the compositor collects it.
  */
-static void sched_exit(int code) {
+void sched_exit(int code) {
     if (!cur_thread) return;
     cur_thread->exit_code = code;
     cur_thread->state = T_ZOMBIE;
@@ -826,9 +746,11 @@ static void sched_exit(int code) {
  * Collect what has finished. Called from the compositor thread, which is
  * by construction not any of the threads being freed.
  */
-static void (*sched_reap_hook)(thread_t *t) = 0;
+/* Not static: kernel.c installs the desktop's reaper here, so that
+ * scheduler.o need not know what an application is. */
+void (*sched_reap_hook)(thread_t *t) = 0;
 
-static void sched_reap(void) {
+void sched_reap(void) {
     for (int i = 0; i < SCHED_MAX_THREADS; i++) {
         thread_t *t = threads[i];
         if (!t || t->state != T_ZOMBIE) continue;
@@ -861,7 +783,7 @@ static void sched_reap(void) {
  * very next tick is woken by the same scheduler pass that would have
  * switched away from it, and the two spin against each other.
  */
-static int sched_join(thread_t *t, uint32_t timeout_ms) {
+int sched_join(thread_t *t, uint32_t timeout_ms) {
     if (!t) return -1;
     /* Without a scheduler clock the deadline below never advances, so a
      * wait would be forever rather than bounded. */
@@ -881,11 +803,10 @@ static int sched_join(thread_t *t, uint32_t timeout_ms) {
     return t->exit_code;
 }
 
-static int sched_thread_count(void) {
+int sched_thread_count(void) {
     int n = 0;
     for (int i = 0; i < SCHED_MAX_THREADS; i++)
         if (threads[i] && threads[i]->state != T_FREE) n++;
     return n;
 }
 
-#endif /* SCHED_H */

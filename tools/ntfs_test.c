@@ -7,7 +7,7 @@
  * kernel has is the one it booted from, which is the worst possible
  * place to find out that an allocator is wrong.
  *
- * So this compiles src/ntfs.h and src/ntfswrite.h — the same source the
+ * So this compiles src/fs/ntfs/ntfs_ops.c — the same source the
  * kernel runs — against a file, formats a scratch volume with
  * tools/mkntfs.py, and exercises it. The checks that matter are the
  * ones that catch a writer which is self-consistently wrong:
@@ -28,8 +28,13 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "ntfs.h"
-#include "ntfswrite.h"
+/* The module itself, not a pair of headers. Including the .c is
+ * deliberate: the driver keeps its mount state and its journal in file
+ * statics, and the checks below read them directly to confirm that a
+ * write landed where it said it did. Linking the object instead would
+ * hide exactly the state a filesystem test needs to see — and this way
+ * the host suite and the kernel compile the same file. */
+#include "fs/ntfs/ntfs_ops.c"
 
 static int checks = 0;
 static int fails = 0;

@@ -125,7 +125,7 @@ static int blk_select(int idx) {
     return 0;
 }
 
-static int blk_present(void) { return blk_cur >= 0; }
+int blk_present(void) { return blk_cur >= 0; }
 
 static uint64_t blk_sectors(void) {
     return blk_cur >= 0 ? blk_devs[blk_cur].sectors : 0;
@@ -294,7 +294,7 @@ static void blk_cache_drop(uint64_t lba, uint32_t count) {
     }
 }
 
-static int blk_read(uint64_t lba, uint32_t count, void *buf) {
+int blk_read(uint64_t lba, uint32_t count, void *buf) {
     if (blk_cur < 0) return -1;
     const blk_dev_t *d = &blk_devs[blk_cur];
     if (lba + count > d->sectors) return -1;
@@ -368,7 +368,7 @@ static int blk_read(uint64_t lba, uint32_t count, void *buf) {
     return 0;
 }
 
-static int blk_write(uint64_t lba, uint32_t count, const void *buf) {
+int blk_write(uint64_t lba, uint32_t count, const void *buf) {
     if (blk_cur < 0) return -1;
     const blk_dev_t *d = &blk_devs[blk_cur];
     if (lba + count > d->sectors) return -1;
@@ -380,7 +380,7 @@ static int blk_write(uint64_t lba, uint32_t count, const void *buf) {
     return blk_write_raw(blk_remap_lookup(lba), count, buf);
 }
 
-static int blk_flush(void) {
+int blk_flush(void) {
     if (blk_cur < 0) return -1;
     const blk_dev_t *d = &blk_devs[blk_cur];
     switch (d->kind) {
