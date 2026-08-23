@@ -2,6 +2,7 @@
 #define VEXTRO_CHAMBER_H
 
 #include "hyper.h"
+#include "hyper_intel.h"
 
 /*
  * src/chamber.h — the window onto the hypervisor.

@@ -198,7 +198,8 @@ all: os.iso disk.img
 # inside the kernel, so it is checked here instead.
 test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test \
       build/ntcrypto_test build/aes_test build/krb5_test build/wifi_test \
-      build/media_test build/rdp_test build/ntfs_test build/mbedtls_test
+      build/media_test build/rdp_test build/ntfs_test build/vmx_test \
+      build/mbedtls_test
 	@./build/wikidoc_test
 	@./build/profile_test
 	@./build/ttfhint_test
@@ -213,6 +214,7 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	@printf "vextro ntfs scratch\\n" > build/scratch/a.txt
 	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 a.txt=build/scratch/a.txt > /dev/null
 	@./build/ntfs_test build/scratch/ntfs.img
+	@./build/vmx_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
 	@python3 tools/linecount.py --check
 
@@ -233,6 +235,14 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 # cannot print a backtrace.
 TLS_HOST ?=
 TLS_PORT ?=
+
+# Defined here rather than beside LWIP_DIR further down, because
+# MBED_HOST_OBJ below expands it immediately with := -- and with the
+# definition six hundred lines later the wildcard found nothing, so the
+# host test linked against zero Mbed TLS objects. It only ever worked
+# because a binary built before the bug existed was never relinked;
+# `make clean` deleted it and the failure appeared.
+MBED_DIR  := third_party/mbedtls
 
 MBED_HOST_OBJ := $(patsubst $(MBED_DIR)/library/%.c,build/mbedhost/%.o,\
                    $(wildcard $(MBED_DIR)/library/*.c))
@@ -376,6 +386,18 @@ build/ntfs_test: tools/ntfs_test.c src/ntfs.h src/ntfswrite.h \
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
 
+# VT-x, minus VT-x.
+#
+# QEMU TCG reports vmx = False, so no VMXON or VMLAUNCH in
+# src/hyper_intel.h can execute here. What this checks is the
+# arithmetic those instructions consume -- EPT entry format, control
+# negotiation against the capability MSRs, VMCS field encodings -- each
+# of which is a bit pattern hardware misreads silently rather than
+# rejecting.
+build/vmx_test: tools/vmx_test.c src/hyper_intel.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
 apps: $(REPO_BINS)
 
 pics: $(PIC_SCI)
@@ -413,7 +435,19 @@ ASSETS ?= ask
 # and the kernel falls back to qwen2.gguf when the volume has no
 # explain.gguf on it.
 ASSET_FILES := assets/wiki.zim assets/qwen2.gguf assets/explain.gguf
-ASSET_LIST  := build/assets.list
+
+# Outside build/, and that is the whole point.
+#
+# disk.img depends on this list, and `clean` deletes build/ -- so with
+# the list living there, `make clean && make` regenerated it, found it
+# newer than the volume, and repacked 8 GB. Which is slow, and worse
+# than slow: it resets the registry, so the account someone created and
+# every file they saved were gone because they asked for a clean build
+# of the *kernel*.
+#
+# Nothing else in the tree wants this file, it is rewritten only when
+# its contents change, and .gitignore covers it.
+ASSET_LIST  := .assets.list
 
 .PHONY: assets
 assets:
@@ -703,7 +737,6 @@ build/llm.o: src/llm.c src/llm.h
 # always ignored is a build with no warnings at all. The glue in src/ is
 # compiled with the kernel's full warning set.
 LWIP_DIR  := third_party/lwip
-MBED_DIR  := third_party/mbedtls
 
 NET_INC   := -Ithird_party/include \
              -I$(LWIP_DIR)/src/include -Ithird_party/lwip-port \

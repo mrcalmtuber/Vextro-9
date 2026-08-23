@@ -861,9 +861,9 @@ about the peer.
 
 ## What is actually in here
 
-**84,435 lines of C written here**, across 146 files, compiled as a
+**85,703 lines of C written here**, across 148 files, compiled as a
 single translation unit plus one for inference, over a user-space C
-library of its own. (88,050 counting the embedded typeface, the integer
+library of its own. (89,318 counting the embedded typeface, the integer
 sine table and Limine's own boot-protocol header — data and interface
 rather than logic.)
 

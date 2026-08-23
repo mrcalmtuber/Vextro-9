@@ -1179,6 +1179,19 @@ void kmain(void) {
     serial_puts(hv.status);
     serial_puts("\n");
 
+    /*
+     * And the Intel half, which is the same job on different hardware.
+     *
+     * The two are mutually exclusive in practice -- a processor has
+     * AMD-V or VT-x, never both -- so whichever one is not present
+     * probes, records why, and changes nothing. Running both probes
+     * unconditionally is what makes the boot log say which machine
+     * this is rather than which path was compiled in.
+     */
+    /* vmx_init logs its own outcome; printing status again here just
+     * says the same sentence twice. */
+    vmx_init();
+
     /* Initialize Tarfs from Limine boot module (initrd.tar) — read-only
      * fallback for ISO-only boots without a hard disk */
     if (mod_request.response != NULL &&

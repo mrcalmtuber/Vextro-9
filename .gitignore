@@ -53,3 +53,7 @@ build/train.log
 # Python bytecode from the host-side tools
 __pycache__/
 *.pyc
+
+# The asset stamp disk.img depends on. Deliberately outside build/ so
+# that `make clean` cannot trigger an 8 GB repack -- see the Makefile.
+.assets.list
