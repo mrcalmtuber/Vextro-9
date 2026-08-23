@@ -70,14 +70,35 @@ uint32_t vx_now_ms(void) { return (uint32_t)sched_ticks; }
 
 /* ===== the wire ===== */
 
-int  vx_nic_present(void) { return e1000_found; }
+/*
+ * Which link lwIP is actually sitting on.
+ *
+ * Two can exist at once. Ethernet wins when it is there, because a
+ * cable that is plugged in is up the moment the driver loads, whereas a
+ * radio is not usable until it has joined a network -- and a default
+ * route pointed at an unassociated radio is a machine that looks
+ * connected and reaches nothing.
+ *
+ * The choice is made per call rather than latched at boot so that
+ * joining a network after the stack is up works, and so does unplugging
+ * a cable. lwIP never learns that any of this happened: one netif, one
+ * MAC address, and frames that are Ethernet on this side of the seam
+ * whichever radio or wire carried them.
+ */
+static int vx_use_wifi(void) {
+    return !e1000_found && wifi_connected();
+}
+
+int  vx_nic_present(void) { return e1000_found || wifi_present(); }
 uint32_t vx_nic_mtu(void) { return 1500; }
 
 void vx_nic_mac(uint8_t out[6]) {
-    for (int i = 0; i < 6; i++) out[i] = e1000_mac[i];
+    const uint8_t *mac = vx_use_wifi() ? wifi_dev.mac : e1000_mac;
+    for (int i = 0; i < 6; i++) out[i] = mac[i];
 }
 
 int vx_nic_send(const uint8_t *frame, uint16_t len) {
+    if (vx_use_wifi()) return wifi_tx_eth(frame, len);
     if (!e1000_found) return -1;
     return e1000_transmit(frame, len);
 }
@@ -93,6 +114,11 @@ int vx_nic_send(const uint8_t *frame, uint16_t len) {
  * hardware writer on the other end.
  */
 int vx_nic_recv(uint8_t *out, uint16_t max, uint16_t *got) {
+    /* The wireless path copies and converts inside wifi_rx_eth(): what
+     * comes off the air is an 802.11 frame that may be encrypted, and
+     * management frames and the EAPOL rekeys are consumed there rather
+     * than being handed up to a stack that has nowhere to put them. */
+    if (vx_use_wifi()) return wifi_rx_eth(out, max, got);
     if (!e1000_found) return 0;
     uint8_t *buf = 0;
     uint16_t len = 0;
@@ -101,6 +127,58 @@ int vx_nic_recv(uint8_t *out, uint16_t max, uint16_t *got) {
     for (uint16_t i = 0; i < len; i++) out[i] = buf[i];
     *got = len;
     return 1;
+}
+
+/* ===== the certificate authority store =====
+ *
+ * Read once, on the first connection that asks, and kept. The bundle is
+ * a couple of hundred kilobytes of PEM and parsing it into X.509
+ * structures costs more than reading it, so Mbed TLS does that once too
+ * -- see vxsec_init() in tlsglue.c.
+ *
+ * A volume with no bundle is not a failure here. It is reported, and
+ * the layer above decides what to do about a connection that cannot be
+ * authenticated; what it must not do is proceed as though it had been.
+ */
+/* A full root store is a third of a megabyte of PEM and grows with
+ * every new authority; 320 KB was not enough for the bundle this build
+ * machine carries and the read was silently refused. */
+static uint8_t  vx_ca_buf[512 * 1024];
+static uint32_t vx_ca_len = 0;
+static int      vx_ca_tried = 0;
+
+uint32_t vx_ca_bundle(const uint8_t **out) {
+    if (!vx_ca_tried) {
+        uint64_t sz = 0;
+        const void *p;
+
+        /*
+         * Do not latch a failure that only means "too early".
+         *
+         * TLS starts before the volume is mounted -- the network comes
+         * up long before the disk -- so the first call here happens
+         * with no filesystem to read. Recording that as "no bundle"
+         * makes the store permanently absent on a machine that has one,
+         * which is exactly what it did: certificates went unverified
+         * because of an ordering detail rather than a missing file.
+         */
+        if (!fs_writable()) { *out = vx_ca_buf; return 0; }
+
+        vx_ca_tried = 1;
+        p = fs_read_file("/etc/ca-bundle.crt", &sz);
+        if (p && sz > 0 && sz < sizeof(vx_ca_buf) - 1) {
+            for (uint64_t i = 0; i < sz; i++)
+                vx_ca_buf[i] = ((const uint8_t *)p)[i];
+            /* Mbed TLS's PEM parser wants a NUL-terminated buffer and
+             * counts the terminator in the length it is given. A bundle
+             * passed without it parses the first certificate and then
+             * runs off the end of the allocation. */
+            vx_ca_buf[sz] = 0;
+            vx_ca_len = (uint32_t)sz + 1;
+        }
+    }
+    *out = vx_ca_buf;
+    return vx_ca_len;
 }
 
 /* ===== entropy =====

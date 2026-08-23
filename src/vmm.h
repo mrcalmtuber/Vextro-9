@@ -192,11 +192,43 @@ static uint64_t *vmm_walk(addr_space_t *as, uint64_t virt, int create) {
     return &table[(virt >> 12) & 0x1FF];
 }
 
+/*
+ * The pager, defined in swap.h and used from four places in this file.
+ *
+ * Declared rather than included because swap.h needs a block device and
+ * a mounted volume, and this file is compiled long before either
+ * exists. Every one of these is inert until swap_init() runs.
+ *
+ *   rmap_record   remembers which mapping owns a frame, which is the one
+ *                 thing the frame bitmap cannot say and the one thing an
+ *                 evictor has to know.
+ *   in_page       fetches a page back; 1 if it did.
+ *   is_swapped    reads a non-present entry's marker bit.
+ *   discard_pte   releases a slot without reading it back, for teardown.
+ */
+static void swap_rmap_record(uint64_t phys, addr_space_t *as, uint64_t virt);
+static int  swap_in_page(addr_space_t *as, uint64_t va);
+static inline int swap_pte_is_swapped(uint64_t e);
+static void swap_discard_pte(uint64_t e);
+
 static int vmm_map(addr_space_t *as, uint64_t virt, uint64_t phys,
                    uint64_t flags) {
     uint64_t *pte = vmm_walk(as, virt, 1);
     if (!pte) return -1;
     *pte = (phys & PTE_ADDR_MASK) | flags | PTE_PRESENT;
+
+    /*
+     * Only a user page is ever a candidate, so only a user page earns an
+     * entry. Filtering here rather than in the evictor means a frame
+     * that can never be chosen never occupies a slot in the table, and
+     * -- more usefully -- that a kernel or shared mapping laid over a
+     * frame that used to be a user page erases the old entry instead of
+     * leaving it to be caught later by revalidation.
+     */
+    if ((flags & PTE_USER) && !(flags & PTE_SHARED) && virt < USER_SPACE_END)
+        swap_rmap_record(phys, as, virt);
+    else
+        swap_rmap_record(phys, 0, 0);
     /* Kernel-half entries live in tables every address space shares, so
      * the mapping is visible immediately whatever CR3 holds -- but this
      * processor's TLB may be caching the absence of it. */
@@ -205,9 +237,27 @@ static int vmm_map(addr_space_t *as, uint64_t virt, uint64_t phys,
     return 0;
 }
 
+/*
+ * Physical address for a virtual one, or zero.
+ *
+ * The swap case is not an optimisation, it is a correctness fix. When
+ * the *kernel* reaches into a process's memory -- as_write() staging an
+ * image, a syscall copying a buffer out -- it does not go through the
+ * MMU and so it does not fault. It calls this. Without the branch below
+ * a swapped page simply reads as "not mapped", and the write fails or
+ * the read returns zeros, for a page that is perfectly intact and one
+ * disk read away. The program never gets a chance to fault it back in,
+ * because nothing ever executed an instruction against it.
+ */
 static uint64_t vmm_resolve(addr_space_t *as, uint64_t virt) {
     uint64_t *pte = vmm_walk(as, virt, 0);
-    if (!pte || !(*pte & PTE_PRESENT)) return 0;
+    if (!pte) return 0;
+    if (!(*pte & PTE_PRESENT)) {
+        if (!swap_pte_is_swapped(*pte)) return 0;
+        if (!swap_in_page(as, virt)) return 0;
+        pte = vmm_walk(as, virt, 0);
+        if (!pte || !(*pte & PTE_PRESENT)) return 0;
+    }
     return (*pte & PTE_ADDR_MASK) | (virt & PAGE_MASK);
 }
 
@@ -292,7 +342,15 @@ static void vmm_destroy(addr_space_t *as) {
                 uint64_t pt_phys = pd[k] & PTE_ADDR_MASK;
                 uint64_t *pt = (uint64_t *)(uintptr_t)phys_to_virt(pt_phys);
                 for (int l = 0; l < 512; l++) {
-                    if (!(pt[l] & PTE_PRESENT)) continue;
+                    /* A page this process had swapped out owns a slot in
+                     * the pagefile and no frame at all. Walking only
+                     * present entries would free the frame it does not
+                     * have and leak the slot it does -- invisible until
+                     * the pagefile fills and nothing can be evicted. */
+                    if (!(pt[l] & PTE_PRESENT)) {
+                        swap_discard_pte(pt[l]);
+                        continue;
+                    }
                     if (pt[l] & PTE_SHARED) continue;
                     pmm_free(pt[l] & PTE_ADDR_MASK);
                 }
@@ -565,10 +623,34 @@ static int vmm_fork(addr_space_t *dst, addr_space_t *src) {
                     phys_to_virt(pd[k] & PTE_ADDR_MASK);
                 for (int l = 0; l < 512; l++) {
                     uint64_t e = pt[l];
-                    if (!(e & PTE_PRESENT)) continue;
 
                     uint64_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                                   ((uint64_t)k << 21) | ((uint64_t)l << 12);
+
+                    /*
+                     * A swapped page has to come back before it can be
+                     * shared, and there is no third option.
+                     *
+                     * Copying the entry across as it stands would give
+                     * parent and child one pagefile slot between them:
+                     * whichever faulted first would read it, free it,
+                     * and leave the other pointing at a slot that has
+                     * since been handed to somebody else. Skipping it
+                     * would be quieter and no better -- the child would
+                     * simply not have the page, and would discover that
+                     * by faulting on an address its parent can read.
+                     *
+                     * So it is read in here, and then shared by exactly
+                     * the same rules as any other present page. The
+                     * clock is free to send it straight back out again.
+                     */
+                    if (!(e & PTE_PRESENT)) {
+                        if (!swap_pte_is_swapped(e)) continue;
+                        if (!swap_in_page(src, va)) return -1;
+                        e = pt[l];
+                        if (!(e & PTE_PRESENT)) continue;
+                    }
+
                     uint64_t phys = e & PTE_ADDR_MASK;
 
                     if (!(e & PTE_SHARED) && (e & PTE_WRITE)) {

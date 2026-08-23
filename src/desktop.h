@@ -292,6 +292,40 @@ static uint8_t fs_filebuf[FS_FILEBUF_MAX];
 static const char *fs_errstr = "";
 
 /*
+ * Two things from profile.h, which cannot be included until after
+ * users.h -- it asks who is signed in -- and users.h cannot be included
+ * until after this section, since it stores the account table through
+ * it. Declared here and defined there, the way security.h:129 already
+ * forward-declares xorshift32() out of login.h.
+ *
+ * They matter because this is the only place they can go. Every path
+ * that reaches a disk on a person's behalf passes through the eight
+ * functions below, so a check here is a check everywhere, and a check
+ * anywhere else would be one of a hundred that all have to agree.
+ *
+ *   fs_native  accepts the Windows spelling of a path -- backslashes,
+ *              and a drive letter -- and produces the one the drivers
+ *              parse. Note carefully that fs_abs() was never enough:
+ *              fs_write_file, fs_delete, fs_mkdir and fs_list handed the
+ *              caller's string straight to a driver without normalising
+ *              anything at all.
+ *   prof_may   1 if the account signed in may touch this path.
+ */
+static void fs_native(const char *in, char *out, int max);
+static int  prof_may(const char *path, int write);
+
+/*
+ * And one from swap.h, for the same reason and with a sharper
+ * consequence. The pager resolves the pagefile to a run of raw sectors
+ * once and writes to them directly for the rest of the boot, so deleting
+ * the file -- or overwriting it, which frees its clusters first -- hands
+ * those same clusters to the next file created while the pager is still
+ * writing pages into them. That is filesystem corruption with no
+ * symptom until something reads the other file back.
+ */
+static int swap_owns_path(const char *abs);
+
+/*
  * Try every disk the block layer found, in its order, and stop at the
  * first one carrying a volume we can read.
  *
@@ -346,11 +380,11 @@ static uint32_t fs_free_kb(void) {
     return 0;
 }
 
-/* Normalise to an absolute path in the caller's buffer. */
+/* Normalise to an absolute path in the caller's buffer. Separators and
+ * drive letters are fs_native's problem now, so that `\Documents and
+ * Settings\alice` and `/Documents and Settings/alice` are one path. */
 static void fs_abs(const char *in, char *out, int max) {
-    if (in[0] == '/') { str_copy(out, in, max); return; }
-    out[0] = '/';
-    str_copy(out + 1, in, max - 1);
+    fs_native(in, out, max);
 }
 
 /* Does the path exist, and what is it?  Replaces every direct driver
@@ -358,6 +392,7 @@ static void fs_abs(const char *in, char *out, int max) {
 static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 0)) return 0;
 
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
@@ -385,6 +420,7 @@ static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
 static const void *fs_read_file(const char *filename, uint64_t *out_size) {
     char abs[256];
     fs_abs(filename, abs, sizeof(abs));
+    if (!prof_may(abs, 0)) { if (out_size) *out_size = 0; return 0; }
 
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
@@ -427,6 +463,7 @@ static int fs_read_range(const char *path, uint64_t offset, void *buf,
     *got = 0;
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 0)) return -1;
 
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
@@ -466,10 +503,23 @@ typedef struct {
     char     path[160];
 } fs_file_t;
 
+/*
+ * The check has to be here rather than in fs_pread, and that is the
+ * whole reason this comment exists: fs_pread reads through the
+ * exf_dirent_t cached in the handle and never looks at a path again. A
+ * handle opened without a check is a key to the file for as long as it
+ * is held.
+ */
 static int fs_open(const char *path, fs_file_t *f) {
     f->valid = 0;
     f->kind = fs_kind;
     str_copy(f->path, path, sizeof(f->path));
+
+    {
+        char abs[256];
+        fs_abs(path, abs, sizeof(abs));
+        if (!prof_may(abs, 0)) return -1;
+    }
 
     if (fs_kind == FS_EXFAT) {
         char abs[256];
@@ -509,15 +559,23 @@ static int fs_pread(fs_file_t *f, uint64_t off, void *buf, uint32_t len,
 }
 
 static int fs_write_file(const char *path, const void *data, uint32_t len) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 1)) return -1;
+    if (swap_owns_path(abs)) {
+        fs_errstr = "the pagefile is in use";
+        return -1;
+    }
+
     if (fs_kind == FS_EXFAT) {
-        if (exf_write_file(path, (const uint8_t *)data, len) != 0) {
+        if (exf_write_file(abs, (const uint8_t *)data, len) != 0) {
             fs_errstr = exf_errstr;
             return -1;
         }
         return 0;
     }
     if (fs_kind == FS_FAT32) {
-        if (fat_write_file(path, (const uint8_t *)data, len) != 0) {
+        if (fat_write_file(abs, (const uint8_t *)data, len) != 0) {
             fs_errstr = fat_errstr;
             return -1;
         }
@@ -528,12 +586,20 @@ static int fs_write_file(const char *path, const void *data, uint32_t len) {
 }
 
 static int fs_delete(const char *path) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 1)) return -1;
+    if (swap_owns_path(abs)) {
+        fs_errstr = "the pagefile is in use";
+        return -1;
+    }
+
     if (fs_kind == FS_EXFAT) {
-        if (exf_delete(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        if (exf_delete(abs) != 0) { fs_errstr = exf_errstr; return -1; }
         return 0;
     }
     if (fs_kind == FS_FAT32) {
-        if (fat_delete(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        if (fat_delete(abs) != 0) { fs_errstr = fat_errstr; return -1; }
         return 0;
     }
     fs_errstr = "read-only filesystem (no disk attached)";
@@ -541,12 +607,16 @@ static int fs_delete(const char *path) {
 }
 
 static int fs_mkdir(const char *path) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 1)) return -1;
+
     if (fs_kind == FS_EXFAT) {
-        if (exf_mkdir(path) != 0) { fs_errstr = exf_errstr; return -1; }
+        if (exf_mkdir(abs) != 0) { fs_errstr = exf_errstr; return -1; }
         return 0;
     }
     if (fs_kind == FS_FAT32) {
-        if (fat_mkdir(path) != 0) { fs_errstr = fat_errstr; return -1; }
+        if (fat_mkdir(abs) != 0) { fs_errstr = fat_errstr; return -1; }
         return 0;
     }
     fs_errstr = "read-only filesystem (no disk attached)";
@@ -556,8 +626,12 @@ static int fs_mkdir(const char *path) {
 typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
 
 static int fs_list(const char *path, fs_list_cb cb) {
+    char abs[256];
+    fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 0)) return -1;
+
     if (fs_kind == FS_EXFAT) {
-        if (exf_list(path, (exf_list_cb)cb) != 0) {
+        if (exf_list(abs, (exf_list_cb)cb) != 0) {
             fs_errstr = exf_errstr;
             return -1;
         }
@@ -565,7 +639,7 @@ static int fs_list(const char *path, fs_list_cb cb) {
     }
     if (fs_kind == FS_FAT32) {
         fat_dirent_t d;
-        if (!fat_lookup(path, &d) || !(d.attr & FAT_ATTR_DIR)) {
+        if (!fat_lookup(abs, &d) || !(d.attr & FAT_ATTR_DIR)) {
             fs_errstr = "no such directory";
             return -1;
         }
@@ -587,6 +661,18 @@ static int fs_list(const char *path, fs_list_cb cb) {
 #include "sha256.h"
 #include "chacha20.h"
 #include "users.h"
+/* After users.h, because the isolation guard asks who is signed in, and
+ * before everything that stores anything: this is where fs_native() and
+ * prof_may() -- forward-declared above the filesystem layer -- are
+ * actually defined. */
+#include "profile.h"
+/*
+ * The pager. After the filesystem layer, because its area is a file it
+ * allocates through exFAT; before anything that runs, because from here
+ * on a user page may not be in memory at all. swap_init() is called from
+ * kernel.c once the volume is mounted.
+ */
+#include "swap.h"
 /* After users.h: the policies here are per-account. */
 #include "security.h"
 /*
@@ -946,6 +1032,58 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
          * function returning a pointer -- which is the natural way to
          * write it -- gets one without also reading the buffer. */
         return out[0];
+    }
+
+    case SYS_RANDOM: {
+        /*
+         * Fill a user buffer with hardware entropy.
+         *
+         * a0 is the buffer, a1 its length. Returns the number of bytes
+         * actually written, which the caller must check: a processor
+         * whose generator is drained returns fewer, and a program that
+         * assumes it got what it asked for is a program using a
+         * half-initialised key.
+         *
+         * The buffer is filled in the kernel and copied out in bounded
+         * chunks rather than written through the user pointer directly,
+         * so a length that straddles the end of a mapping is refused
+         * before any entropy is spent on it.
+         */
+        uint32_t want = (uint32_t)a1;
+        uint32_t done = 0;
+        uint8_t chunk[64];
+
+        if (!a0 || want == 0) return 0;
+        if (want > (1u << 20)) want = 1u << 20;
+
+        if (vmm_current && !user_range_mapped(vmm_current, a0, want, 1)) {
+            app_refuse("random: unwritable buffer");
+            return (uint64_t)-1;
+        }
+
+        while (done < want) {
+            uint32_t n = want - done;
+            uint32_t got;
+            if (n > sizeof(chunk)) n = sizeof(chunk);
+
+            got = vx_random(chunk, n);
+            if (got != n) {
+                /* Whatever was produced before the failure is real and
+                 * is reported; what was not produced is not invented. */
+                for (uint32_t i = 0; i < got; i++)
+                    ((uint8_t *)(uintptr_t)a0)[done + i] = chunk[i];
+                done += got;
+                break;
+            }
+            for (uint32_t i = 0; i < n; i++)
+                ((uint8_t *)(uintptr_t)a0)[done + i] = chunk[i];
+            done += n;
+        }
+
+        /* Do not leave key material in a kernel buffer that the next
+         * caller of this syscall will reuse. */
+        for (uint32_t i = 0; i < sizeof(chunk); i++) chunk[i] = 0;
+        return done;
     }
 
     case SYS_TTF_TEXT_WIDTH: {
@@ -1461,6 +1599,43 @@ static int as_poke64(addr_space_t *as, uint64_t va, uint64_t val) {
 }
 
 /*
+ * A NUL-terminated UTF-16LE string into a user address space. Returns
+ * the length in bytes, not counting the terminator -- which is what a
+ * UNICODE_STRING's Length field wants.
+ *
+ * Every character this is asked to write is ASCII by construction: the
+ * profile paths come from user_name_ok(), which admits lowercase letters
+ * and digits, and from our own spelling of the tree. So the high byte is
+ * always zero and there is no encoder here to get wrong.
+ */
+static uint32_t as_write_utf16(addr_space_t *as, uint64_t va, const char *s) {
+    uint32_t n = 0;
+    for (; s[n]; n++) {
+        uint16_t u = (uint16_t)(unsigned char)s[n];
+        if (as_write(as, va + n * 2, &u, 2) != 0) return 0;
+    }
+    uint16_t z = 0;
+    if (as_write(as, va + n * 2, &z, 2) != 0) return 0;
+    return n * 2;
+}
+
+/*
+ * Fill in a UNICODE_STRING at `at`, with its text at `buf`.
+ *
+ * MaximumLength counts the terminator and Length does not; getting that
+ * backwards is the classic way to have a runtime read one character too
+ * few off the end of a path.
+ */
+static int as_unistr(addr_space_t *as, uint64_t at, uint64_t buf,
+                     const char *s) {
+    uint32_t len = as_write_utf16(as, buf, s);
+    uint16_t l = (uint16_t)len, m = (uint16_t)(len + 2);
+    if (as_write(as, at + UNISTR_LENGTH,     &l, 2) != 0) return -1;
+    if (as_write(as, at + UNISTR_MAX_LENGTH, &m, 2) != 0) return -1;
+    return as_poke64(as, at + UNISTR_BUFFER, buf);
+}
+
+/*
  * Build the address space, map what a program is entitled to see, and
  * hand it to the scheduler.
  *
@@ -1728,8 +1903,8 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
      * Writable because a program sets its own last-error value, and NX
      * because it is data.
      */
-    if (vmm_alloc_range(as, WIN_TEB_VA, 2 * PAGE_SIZE,
-                        PTE_USER | PTE_WRITE | PTE_NX) != 2 * PAGE_SIZE)
+    if (vmm_alloc_range(as, WIN_TEB_VA, 3 * PAGE_SIZE,
+                        PTE_USER | PTE_WRITE | PTE_NX) != 3 * PAGE_SIZE)
         goto fail;
 
     as_poke64(as, WIN_TEB_VA + TEB_EXCEPTION_LIST, 0);
@@ -1741,7 +1916,55 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
 
     as_poke64(as, WIN_PEB_VA + PEB_IMAGE_BASE,     img->base);
     as_poke64(as, WIN_PEB_VA + PEB_LDR,            0);
-    as_poke64(as, WIN_PEB_VA + PEB_PROCESS_PARAMS, 0);
+
+    /*
+     * The process parameters, which used to be a literal zero.
+     *
+     * This is the other half of binding a session to a profile. The
+     * shell's working directory was always set at login; a Windows
+     * program never saw it, because the field it reads its own current
+     * directory out of did not exist. Now it starts in the profile of
+     * whoever launched it, with an environment block that names that
+     * profile, and it inherits both the same way it would on the system
+     * this is imitating.
+     *
+     * The directory is the Windows spelling -- `C:\Documents and
+     * Settings\<name>` -- because that is the form a program will
+     * concatenate a filename onto. fs_native() is what makes the result
+     * resolve when it comes back through fs_*.
+     */
+    {
+        const char *cwd = env_get("USERPROFILE");
+        if (!cwd) cwd = "C:\\";
+
+        as_poke64(as, WIN_PARAMS_VA + RUPP_MAX_LENGTH, PAGE_SIZE);
+        as_poke64(as, WIN_PARAMS_VA + RUPP_LENGTH,     RUPP_SIZE);
+
+        as_unistr(as, WIN_PARAMS_VA + RUPP_CURDIR_PATH,
+                  WIN_PARAMS_VA + WIN_PARAMS_CURDIR_OFF, cwd);
+        as_poke64(as, WIN_PARAMS_VA + RUPP_CURDIR_HANDLE, 0);
+
+        as_unistr(as, WIN_PARAMS_VA + RUPP_IMAGE_PATH,
+                  WIN_PARAMS_VA + WIN_PARAMS_IMAGE_OFF, name);
+        as_unistr(as, WIN_PARAMS_VA + RUPP_COMMAND_LINE,
+                  WIN_PARAMS_VA + WIN_PARAMS_CMDLINE_OFF, name);
+        as_unistr(as, WIN_PARAMS_VA + RUPP_DLL_PATH,
+                  WIN_PARAMS_VA + WIN_PARAMS_CURDIR_OFF, cwd);
+
+        /* Built into a kernel buffer first: as_write() walks page tables
+         * per call, and the block is one run of bytes that is better
+         * copied once than a character at a time. */
+        static uint8_t envblk[WIN_PARAMS_ENV_CAP];
+        uint32_t n = env_build_utf16(envblk, sizeof(envblk));
+        if (n && as_write(as, WIN_PARAMS_VA + WIN_PARAMS_ENV_OFF,
+                          envblk, n) == 0)
+            as_poke64(as, WIN_PARAMS_VA + RUPP_ENVIRONMENT,
+                      WIN_PARAMS_VA + WIN_PARAMS_ENV_OFF);
+        else
+            as_poke64(as, WIN_PARAMS_VA + RUPP_ENVIRONMENT, 0);
+
+        as_poke64(as, WIN_PEB_VA + PEB_PROCESS_PARAMS, WIN_PARAMS_VA);
+    }
     /* Version 5.1 build 2600: what this system is aiming at, and what a
      * program checking for "at least XP" wants to see. */
     as_poke64(as, WIN_PEB_VA + PEB_OS_MAJOR, 5);
@@ -4703,6 +4926,11 @@ static void session_end(void) {
     term_clear();
     str_copy(term_cwd, "/", sizeof(term_cwd));
 
+    /* The environment names the person who has just left -- their
+     * account, their profile path, their Desktop. It goes with the
+     * scrollback and the window thumbnails. */
+    env_clear();
+
     /* browser: history and current page */
     brw_hist_n = 0;
     brw_line_count = 0;
@@ -4738,9 +4966,25 @@ static void session_end(void) {
 static void session_begin(const char *name) {
     session_end();
 
-    char home[80];
-    str_copy(home, "/home/", sizeof(home));
-    str_append(home, name, sizeof(home));
+    /*
+     * Built here rather than asked for, and that is the upgrade path for
+     * every account made before profile.h existed: create_user_profile()
+     * is idempotent, so an account that already has a tree costs four
+     * stat calls and one that does not gets one on this login. Nothing
+     * is copied and /home is left where it is -- the guard treats an
+     * account's legacy directory as theirs too, so files written by an
+     * older build stay private without being moved.
+     */
+    char home[PROFILE_PATH_MAX];
+    profile_home(name, home, sizeof(home));
+    create_user_profile(name);
+
+    /*
+     * Bind the session to that tree. The working directory and the file
+     * browser were always set here; the environment is new, and it is
+     * what a process started from this session inherits.
+     */
+    profile_bind_env(name);
 
     /* Only if it is really there -- a volume that could not be written
      * when the account was made should land in / rather than somewhere

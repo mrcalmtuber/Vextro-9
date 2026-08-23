@@ -114,9 +114,17 @@
  * ACKs; much larger, on a stack whose receive path is a copy out of the
  * DMA ring, only buys retransmissions.
  */
+/*
+ * The send buffer is larger than the window because this stack now has
+ * a bulk *sender* in it as well as clients: the remote desktop in
+ * src/net/rdp.c pushes a two-megabyte screen refresh as fast as the
+ * link will take it. At eight segments the buffer held one screen tile
+ * and part of a second, so every third write met a full buffer and the
+ * session spent its time stalled rather than sending.
+ */
 #define TCP_MSS                     1460
 #define TCP_WND                     (8 * TCP_MSS)
-#define TCP_SND_BUF                 (8 * TCP_MSS)
+#define TCP_SND_BUF                 (24 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * TCP_SND_BUF) / TCP_MSS)
 #define TCP_QUEUE_OOSEQ             1
 #define LWIP_TCP_SACK_OUT           1

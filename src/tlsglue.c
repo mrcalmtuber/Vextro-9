@@ -38,6 +38,7 @@
 #include "mbedtls/platform.h"
 #include "mbedtls/threading.h"
 #include "mbedtls/error.h"
+#include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
 
 #include "vxport.h"
@@ -282,9 +283,95 @@ typedef struct {
 
 static vxsec_slot_t vxsec_slots[VXSEC_MAX];
 static int          vxsec_started = 0;
+
+/*
+ * The certificate authority store, parsed once at startup.
+ *
+ * One chain shared by every session: the certificates are read-only
+ * once parsed, Mbed TLS treats the CA chain as const during a
+ * handshake, and a per-connection copy would be a megabyte of X.509
+ * structures duplicated eight times for no benefit.
+ */
+static mbedtls_x509_crt vxsec_ca;
+static int              vxsec_ca_loaded = 0;
+static int              vxsec_ca_count = 0;
 static mbedtls_threading_mutex_t vxsec_pool_lock;
 
-int vxsec_verifies_certificates(void) { return 0; }
+/*
+ * Whether a connection opened now would be authenticated.
+ *
+ * This used to return a constant zero and was correct to. It is a
+ * question about the volume rather than about the code: with a bundle
+ * on disk the answer is yes, without one it is no, and everything that
+ * shows a padlock asks here rather than assuming.
+ */
+/*
+ * Load the certificate authority store, once, as late as possible.
+ *
+ * Not from vxsec_init(): TLS starts with the network, which is long
+ * before the volume is mounted, so there is no filesystem to read a
+ * bundle from at that point. Doing it there recorded "no CA store" on a
+ * machine that had one, and every connection after went unverified for
+ * a reason that had nothing to do with certificates.
+ *
+ * So it happens on the first connection instead, by which time the disk
+ * is up. Parsing is still once rather than per connection -- a few
+ * hundred roots is milliseconds of X.509 decoding, which on every
+ * request would be the most expensive part of the handshake.
+ *
+ * mbedtls_x509_crt_parse returns the number of certificates it could
+ * *not* parse, so a positive result is a partial success: real bundles
+ * carry the occasional expired or malformed entry and the rest of the
+ * store is still good. Only a negative result, or an empty chain, means
+ * there is nothing to verify against.
+ */
+static int vxsec_ca_attempted = 0;
+
+static void vxsec_load_ca(void) {
+    const uint8_t *pem = 0;
+    uint32_t len;
+
+    if (vxsec_ca_attempted) return;
+
+    len = vx_ca_bundle(&pem);
+    if (len == 0) {
+        /* Not latched: the volume may simply not be mounted yet, and
+         * vx_ca_bundle() distinguishes that from a volume with no
+         * bundle on it. Trying again next time costs one failed open. */
+        return;
+    }
+
+    vxsec_ca_attempted = 1;
+
+    {
+        int bad = mbedtls_x509_crt_parse(&vxsec_ca, pem, len);
+        if (bad < 0 || vxsec_ca.version == 0) {
+            vx_log("[tls] the CA bundle would not parse: certificates are "
+                   "NOT verified\n");
+            mbedtls_x509_crt_free(&vxsec_ca);
+            mbedtls_x509_crt_init(&vxsec_ca);
+            return;
+        }
+        vxsec_ca_loaded = 1;
+        vxsec_ca_count = 0;
+        for (mbedtls_x509_crt *p = &vxsec_ca; p; p = p->next)
+            vxsec_ca_count++;
+        vx_log("[tls] CA store loaded, ");
+        vx_log_u32((uint32_t)vxsec_ca_count);
+        vx_log(" roots; certificates ARE verified\n");
+        if (bad > 0) {
+            vx_log("[tls]   (");
+            vx_log_u32((uint32_t)bad);
+            vx_log(" entries in the bundle were unreadable)\n");
+        }
+    }
+}
+
+int vxsec_verifies_certificates(void) {
+    vxsec_load_ca();
+    return vxsec_ca_loaded;
+}
+int vxsec_ca_roots(void) { return vxsec_ca_count; }
 int vxsec_ready(void) { return vxsec_started; }
 
 /*
@@ -318,6 +405,8 @@ int vxsec_init(void) {
         return 0;
     }
 
+    mbedtls_x509_crt_init(&vxsec_ca);
+
     for (int i = 0; i < VXSEC_MAX; i++) vxsec_slots[i].used = 0;
     vxsec_started = 1;
 
@@ -325,7 +414,12 @@ int vxsec_init(void) {
            ", TLS 1.3 only, ");
     vx_log_u32(VXSEC_MAX);
     vx_log(" parallel connections\n");
-    vx_log("[tls] certificates are NOT verified: no CA store on this volume\n");
+    /* Whether certificates get verified is not known yet: the CA store
+     * lives on a volume that is not mounted at this point in the boot.
+     * The answer is logged by vxsec_load_ca() once the disk is up,
+     * rather than guessed here -- this line used to assert the
+     * unfavourable answer unconditionally and was wrong as soon as a
+     * bundle shipped. */
     return 1;
 }
 
@@ -469,10 +563,27 @@ int vxsec_open(const char *host, uint16_t port) {
                                      MBEDTLS_SSL_PRESET_DEFAULT);
     if (rc) goto fail;
 
-    /* No CA store on the volume. Stated at every layer rather than
-     * once, because this is the property a person is most likely to
-     * assume the other way. */
-    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    /*
+     * Verify the chain when there is something to verify it against.
+     *
+     * With a bundle loaded this is VERIFY_REQUIRED: the handshake fails
+     * if the server's chain does not lead to a root in the store, or if
+     * the leaf's names do not include the host that was asked for. That
+     * is the difference between a connection that is private and one
+     * that is merely encrypted -- without it, anything able to answer
+     * on the far end is indistinguishable from the site.
+     *
+     * With no bundle the behaviour is what it always was, and every
+     * layer above says so rather than showing a padlock it has not
+     * earned.
+     */
+    vxsec_load_ca();
+    if (vxsec_ca_loaded) {
+        mbedtls_ssl_conf_ca_chain(&c->conf, &vxsec_ca, 0);
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    } else {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
     mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->drbg);
     mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
     mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
@@ -515,11 +626,37 @@ int vxsec_open(const char *host, uint16_t port) {
 
 fail:
     c->err = rc;
+    /* vx_log_u32 prints decimal, so the "-0x" this used to carry was a
+     * lie that made every error code unsearchable: -0x9984 was really
+     * -9984, which is -0x2700, which is the certificate verify failure
+     * this line existed to report. */
     vx_log("[tls] handshake with ");
     vx_log(host);
-    vx_log(" failed, -0x");
+    vx_log(" failed, mbedtls -");
     vx_log_u32((uint32_t)(-rc));
     vx_log("\n");
+
+    /*
+     * If it was the certificate, say which part of it. "Verification
+     * failed" covers an expired leaf, a name that does not match, and a
+     * chain that leads nowhere -- three problems with three different
+     * answers, and the flags distinguish them.
+     */
+    if (rc == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+        uint32_t f = mbedtls_ssl_get_verify_result(&c->ssl);
+        vx_log("[tls]   certificate rejected:");
+        if (f & MBEDTLS_X509_BADCERT_EXPIRED)   vx_log(" expired");
+        if (f & MBEDTLS_X509_BADCERT_REVOKED)   vx_log(" revoked");
+        if (f & MBEDTLS_X509_BADCERT_CN_MISMATCH) vx_log(" wrong-host");
+        if (f & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+            vx_log(" chain-does-not-reach-a-known-root");
+        if (f & MBEDTLS_X509_BADCERT_FUTURE)    vx_log(" not-yet-valid");
+        if (f & MBEDTLS_X509_BADCERT_BAD_MD)    vx_log(" unsupported-digest");
+        if (f & MBEDTLS_X509_BADCERT_BAD_PK)    vx_log(" unsupported-key");
+        if (f & MBEDTLS_X509_BADCERT_BAD_KEY)   vx_log(" bad-key");
+        if (!f) vx_log(" (no flags: the chain was never checked)");
+        vx_log("\n");
+    }
     mbedtls_ssl_free(&c->ssl);
     mbedtls_ssl_config_free(&c->conf);
     mbedtls_ctr_drbg_free(&c->drbg);

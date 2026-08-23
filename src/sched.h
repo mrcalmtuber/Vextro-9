@@ -115,7 +115,16 @@ static thread_t  *idle_thread  = 0;
 static uint32_t   sched_next_pid = 1;
 static volatile int32_t preempt_count = 0;
 static volatile uint64_t sched_ticks = 0;
-static uint64_t   sched_switches = 0;
+/*
+ * Volatile for the same reason sched_ticks above is: this is written
+ * inside sched_on_tick, which reaches normal code only through an
+ * interrupt the compiler cannot see. Without it, a caller that samples
+ * the counter, does some work and samples again has both loads folded
+ * into one and measures a difference of exactly zero -- which is what
+ * happened to the context-switch selftest in cryptoswitch.h, and would
+ * happen to anything else that ever tried to measure switch rate.
+ */
+static volatile uint64_t sched_switches = 0;
 static int        sched_running = 0;
 static uint8_t    fx_template[512] __attribute__((aligned(16)));
 

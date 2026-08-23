@@ -169,6 +169,10 @@ static void serial_put_hex64(uint64_t v) {
  */
 static int (*trap_seh_hook)(uint64_t rip, int vector, uint64_t *resume) = 0;
 
+/* The pager. See the call site in exception_handle for why this is
+ * declared here and defined in swap.h. */
+static int swap_handle_fault(uint64_t cr2, uint64_t error);
+
 /* Where a killed user thread lands. It runs in ring 0 on its own kernel
  * stack with a frame the handler wrote, and never returns. */
 __attribute__((used))
@@ -199,6 +203,30 @@ void exception_handle(exc_frame_t *f) {
      */
     if (f->vector == 14 && (f->error & 1) && (f->error & 2)) {
         if (vmm_resolve_cow(vmm_current, cr2)) return;
+    }
+
+    /*
+     * Nor is a fault on a page that was swapped out. It is the pager
+     * being asked to do the one thing it exists for.
+     *
+     * The two conditions cannot overlap: copy-on-write is a *protection*
+     * fault, error bit 0 set, on a page that is present; this is bit 0
+     * clear, on a page that is not. The processor distinguishes them
+     * before either line runs.
+     *
+     * Checked here, before anything is printed, for the same reason the
+     * copy-on-write case is: on a machine that is paging this is the
+     * common outcome of a fault, not an error, and reporting each one
+     * would bury every genuine fault in a scroll of them.
+     *
+     * swap_handle_fault is a plain call rather than a hook because the
+     * pager is a static function in the same translation unit -- but it
+     * is declared and not defined here, since it needs a block device
+     * and a mounted volume and this file is compiled before either
+     * exists. It answers 0 until swap_init() has run.
+     */
+    if (f->vector == 14 && !(f->error & 1)) {
+        if (swap_handle_fault(cr2, f->error)) return;
     }
 
     /* A fault on the page below a kernel stack has exactly one cause,

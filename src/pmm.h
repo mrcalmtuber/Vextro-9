@@ -229,7 +229,20 @@ static void pmm_zero_frame(uint64_t phys) {
     for (uint64_t i = 0; i < PAGE_SIZE / 8; i++) p[i] = 0;
 }
 
-static uint64_t pmm_alloc(void) {
+/*
+ * Ask the pager to free a frame by writing one out to disk.
+ *
+ * Defined in swap.h, which is included far later -- it needs a mounted
+ * filesystem and a block device, neither of which exists this early.
+ * Zero until then, and zero forever on a machine with no volume to put
+ * a pagefile on, which is what keeps "there is no more memory" as the
+ * terminal answer rather than a hang.
+ */
+static int swap_reclaim(void);
+
+/* The bitmap search on its own: no reclaim, no retry. Split out because
+ * the retry below must not hold pmm_lock while a disk write happens. */
+static uint64_t pmm_alloc_once(void) {
     if (!pmm_ready) return 0;
     uint64_t flags = spin_lock_irq(&pmm_lock);
 
@@ -259,6 +272,27 @@ static uint64_t pmm_alloc(void) {
     uint64_t phys = frame << PAGE_SHIFT;
     pmm_zero_frame(phys);
     return phys;
+}
+
+/*
+ * A frame, or nothing.
+ *
+ * The bitmap first. If it is empty, one user page is written out to the
+ * pagefile and the search runs again -- outside the lock, because
+ * reclaim ends in a polled disk write and a spinlock held across
+ * milliseconds of I/O is one the timer finds held on every tick.
+ *
+ * Exactly one retry. Reclaim frees exactly one frame, so a second sweep
+ * that also comes back empty means something took it in between, and
+ * looping on that is how a memory shortage becomes a hang. Returning
+ * zero is still the terminal answer; there is just one more thing tried
+ * before it is given.
+ */
+static uint64_t pmm_alloc(void) {
+    uint64_t phys = pmm_alloc_once();
+    if (phys) return phys;
+    if (!swap_reclaim()) return 0;
+    return pmm_alloc_once();
 }
 
 /*

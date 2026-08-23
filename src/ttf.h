@@ -103,8 +103,24 @@ static inline uint32_t be32(uint32_t o) {
 
 /* ----- parsed table offsets / metrics ----- */
 static uint32_t T_loca, T_glyf, T_hmtx, T_cmap4;
+/* The hinting tables. Absent in a font with no bytecode, which is a
+ * perfectly ordinary thing for a font to be -- all three are checked
+ * before anything tries to run them. */
+static uint32_t T_cvt, T_fpgm, T_prep;
+static uint32_t L_cvt, L_fpgm, L_prep;
 static int F_upem, F_locLong, F_numGlyphs, F_numHM, F_ascent;
 static int F_ready = 0;
+
+/*
+ * Grid-fitting, on or off.
+ *
+ * On by default because the font asks for it: this face's gasp table
+ * requests grid-fitting and grayscale at every size. The switch exists
+ * so the two can be compared without rebuilding -- and because a font
+ * program is arbitrary code from a file, and being able to turn it off
+ * without recompiling is worth one integer.
+ */
+static int F_hinting = 1;
 
 /* ----- per-draw-call transform state (single threaded boot) ----- */
 static int32_t PENX, BASEY;   /* subpixel pen position / baseline */
@@ -210,6 +226,21 @@ static inline int floordiv(int a, int b) {
     return q;
 }
 
+/* The bytecode interpreter. After the byte readers and the table
+ * offsets it needs, before the glyph parsing that drives it. */
+#include "ttfhint.h"
+
+/*
+ * Hinting state that belongs to the parser rather than the interpreter.
+ *
+ * TT_prepped remembers which ppem the pre-program last ran at, because
+ * it must run again whenever the size changes and must *not* run once
+ * per glyph -- it is the expensive half.
+ */
+static int H_size_ready = 0;      /* prep has run for H_ppem            */
+static int H_ppem = -1;
+static int32_t H_scale16 = 0;     /* font units -> 26.6, as 16.16       */
+
 /* ----- table directory parse ----- */
 static int ttf_init(void) {
     FT = comicneue_ttf;
@@ -229,6 +260,11 @@ static int ttf_init(void) {
             case 0x6C6F6361: T_loca = off; break; /* 'loca' */
             case 0x676C7966: T_glyf = off; break; /* 'glyf' */
             case 0x686D7478: T_hmtx = off; break; /* 'hmtx' */
+            /* The hinting tables. 'cvt ' really does have a trailing
+             * space -- tags are four bytes and the name is three. */
+            case 0x63767420: T_cvt  = off; L_cvt  = be32(o + 12); break;
+            case 0x6670676D: T_fpgm = off; L_fpgm = be32(o + 12); break;
+            case 0x70726570: T_prep = off; L_prep = be32(o + 12); break;
             default: break;
         }
     }
@@ -255,8 +291,54 @@ static int ttf_init(void) {
     if (!T_cmap4) return 0;
 
     build_cov_curve();
+
+    /*
+     * The font program, once.
+     *
+     * It defines the functions every glyph and the pre-program call, so
+     * it has to succeed before any of them can run. If it does not --
+     * a truncated table, an opcode this interpreter does not implement --
+     * hinting is switched off for the whole face rather than left half
+     * initialised, and text renders exactly as it did before any of this
+     * existed.
+     */
+    if (F_hinting && T_fpgm && L_fpgm) {
+        if (!tt_run_fpgm(FT + T_fpgm, L_fpgm)) {
+            F_hinting = 0;
+            serial_puts("[ttf] the font program did not run; hinting off\n");
+        }
+    } else if (!T_fpgm) {
+        F_hinting = 0;                 /* nothing to run: an unhinted face */
+    }
+
     F_ready = 1;
     return 1;
+}
+
+/*
+ * Make sure the pre-program has run for this pixel size.
+ *
+ * Once per size, not once per glyph: it is where the font works out what
+ * its stems should measure at this ppem, and it writes those answers
+ * into the control value table for every glyph that follows to read.
+ */
+static void hint_prepare_size(int ppem) {
+    if (!F_hinting) return;
+    if (H_size_ready && H_ppem == ppem) return;
+
+    H_ppem = ppem;
+    /* Font units to 26.6 pixels, carried as 16.16 so the interpreter can
+     * rescale control values without a second division. */
+    H_scale16 = (int32_t)(((int64_t)ppem * 64 * 65536) / F_upem);
+
+    if (!tt_run_prep(FT + T_cvt, L_cvt,
+                     T_prep ? FT + T_prep : 0, T_prep ? L_prep : 0,
+                     ppem, H_scale16)) {
+        F_hinting = 0;
+        serial_puts("[ttf] the pre-program did not run; hinting off\n");
+        return;
+    }
+    H_size_ready = 1;
 }
 
 /* ----- cmap format 4: codepoint -> glyph id ----- */
@@ -351,6 +433,20 @@ static void flatten_quad(int32_t p0x, int32_t p0y, int32_t p1x, int32_t p1y,
     }
 }
 
+/*
+ * Whether S_xs/S_ys hold font units or finished device coordinates.
+ *
+ * Unhinted, they are font units and TX/TY scale them on the way out.
+ * Hinted, the interpreter has already produced positions in pixels and
+ * the composite offset has already been folded in, so the only thing
+ * left to do is emit them -- scaling a second time would undo the
+ * grid-fitting the whole exercise exists for.
+ */
+static int S_device = 0;
+
+static inline int32_t PXo(int32_t v, int o) { return S_device ? v : TX(v + o); }
+static inline int32_t PYo(int32_t v, int o) { return S_device ? v : TY(v + o); }
+
 /* ----- one contour (font-unit point range) -> edges ----- */
 static void contour_to_edges(int start, int end, int ox, int oy) {
     int n = end - start + 1;
@@ -373,32 +469,140 @@ static void contour_to_edges(int start, int end, int ox, int oy) {
     for (int i = 0; i < em; i++) if (X_on[i]) { r = i; break; }
     if (r < 0) return;                    /* degenerate all-offcurve contour */
 
-    int32_t Ax = TX(X_x[r] + ox), Ay = TY(X_y[r] + oy);
+    int32_t Ax = PXo(X_x[r], ox), Ay = PYo(X_y[r], oy);
     int i = 1;
     while (i <= em) {
         int idx = (r + i) % em;
         if (X_on[idx]) {
-            int32_t Bx = TX(X_x[idx] + ox), By = TY(X_y[idx] + oy);
+            int32_t Bx = PXo(X_x[idx], ox), By = PYo(X_y[idx], oy);
             push_edge(Ax, Ay, Bx, By);
             Ax = Bx; Ay = By; i++;
         } else {
             int nidx = (r + i + 1) % em;
-            int32_t Cx = TX(X_x[idx]  + ox), Cy = TY(X_y[idx]  + oy);
-            int32_t Ex = TX(X_x[nidx] + ox), Ey = TY(X_y[nidx] + oy);
+            int32_t Cx = PXo(X_x[idx],  ox), Cy = PYo(X_y[idx],  oy);
+            int32_t Ex = PXo(X_x[nidx], ox), Ey = PYo(X_y[nidx], oy);
             flatten_quad(Ax, Ay, Cx, Cy, Ex, Ey);
             Ax = Ex; Ay = Ey; i += 2;
         }
     }
 }
 
+/* ----- hinting: font units -> grid-fitted device coordinates -----
+ *
+ * The interpreter works in 26.6 -- sixty-fourths of a pixel -- and the
+ * rasteriser wants eighths, so the conversion is a divide by eight.
+ * That looks lossy and is exactly not, for the coordinates that matter:
+ * a point the program has snapped to a pixel boundary is a whole number
+ * of 64ths, so it is a whole number of 8ths, and it lands precisely on
+ * the boundary the rasteriser samples against. Rounding only affects
+ * points the program deliberately left off the grid.
+ */
+static inline int32_t h26_to_dev(f26 v) {
+    return (int32_t)(((int64_t)v * TTF_SS + 32) >> 6);
+}
+
+/* hmtx carries an advance and a left side bearing per glyph. The
+ * bearing is needed for the phantom points, which the specification
+ * appends to every glyph so that a program can read and move the
+ * metrics along with the outline. */
+static int left_bearing(int gid) {
+    if (gid >= F_numHM) {
+        /* Past the last full entry hmtx switches to bearings only. */
+        uint32_t base = T_hmtx + (uint32_t)F_numHM * 4;
+        return sbe16(base + (uint32_t)(gid - F_numHM) * 2);
+    }
+    return sbe16(T_hmtx + (uint32_t)gid * 4 + 2);
+}
+
+/*
+ * Stage a glyph's points into the interpreter, run it, and hand back
+ * device coordinates in S_xs/S_ys.
+ *
+ * Returns 1 if the outline is now hinted. Zero means use what was
+ * already in S_xs/S_ys, unchanged and in font units -- every failure
+ * path below leaves them exactly as they arrived.
+ */
+static int hint_glyph_points(int gid, int npts, int nc,
+                             uint32_t ins_off, uint32_t ins_len,
+                             int ox, int oy) {
+    if (!F_hinting || !H_size_ready) return 0;
+    if (ins_len == 0) return 0;
+    if (npts + 4 > TT_MAX_PTS || nc > TT_MAX_CONT) return 0;
+
+    /*
+     * Scale into the interpreter's two parallel copies. `org` is where
+     * the designer put the point and never changes; `cur` is what the
+     * program moves. Interpolation reads both -- that is how an
+     * untouched point knows where it sat relative to the ones that did
+     * move -- so keeping them separate is not an optimisation.
+     *
+     * A composite's component offset is folded in here, before hinting
+     * rather than after, so the component is hinted where it will
+     * actually sit rather than at the origin.
+     */
+    for (int i = 0; i < npts; i++) {
+        f26 x = (f26)(((int64_t)(S_xs[i] + ox) * H_scale16) >> 16);
+        f26 y = (f26)(((int64_t)(S_ys[i] + oy) * H_scale16) >> 16);
+        TH_org_x[i] = TH_cur_x[i] = x;
+        TH_org_y[i] = TH_cur_y[i] = y;
+        TH_tag[i] = (uint8_t)(S_flags[i] & 1);      /* on-curve; untouched */
+    }
+
+    /* The four phantom points: the two horizontal metrics and the two
+     * vertical ones. This face never moves them -- it hints in y and
+     * leaves the advance alone -- but a program may read them, and an
+     * out-of-range read is what would otherwise abort the glyph. */
+    {
+        uint32_t glen_unused;
+        int xmin = sbe16(glyf_offset(gid, &glen_unused) + 2);
+        int lsb  = left_bearing(gid);
+        int adv  = advance_width(gid);
+        int p    = npts;
+        int32_t pp1 = xmin - lsb + ox;
+
+        TH_org_x[p] = TH_cur_x[p] = (f26)(((int64_t)pp1 * H_scale16) >> 16);
+        TH_org_y[p] = TH_cur_y[p] = 0; TH_tag[p] = 0; p++;
+        TH_org_x[p] = TH_cur_x[p] = (f26)(((int64_t)(pp1 + adv) * H_scale16) >> 16);
+        TH_org_y[p] = TH_cur_y[p] = 0; TH_tag[p] = 0; p++;
+        TH_org_x[p] = TH_cur_x[p] = 0;
+        TH_org_y[p] = TH_cur_y[p] = (f26)(((int64_t)F_ascent * H_scale16) >> 16);
+        TH_tag[p] = 0; p++;
+        TH_org_x[p] = TH_cur_x[p] = 0;
+        TH_org_y[p] = TH_cur_y[p] = 0; TH_tag[p] = 0;
+    }
+
+    for (int c = 0; c < nc; c++) TH_ends[c] = S_ends[c];
+    TH_npts  = npts + 4;
+    TH_ncont = nc;
+
+    if (!tt_run_glyph(FT + ins_off, ins_len)) return 0;
+
+    /* Back out as device coordinates. The y axis flips here, exactly as
+     * TY() does: the font's y grows upward and the framebuffer's grows
+     * down, and a glyph hinted the right way up and blitted upside down
+     * is a spectacular way to discover that. */
+    for (int i = 0; i < npts; i++) {
+        S_xs[i] = PENX  + h26_to_dev(TH_cur_x[i]);
+        S_ys[i] = BASEY - h26_to_dev(TH_cur_y[i]);
+    }
+    return 1;
+}
+
 /* ----- simple glyph -> edges ----- */
-static void decode_simple(uint32_t go, int nc, int ox, int oy) {
+static void decode_simple(int gid, uint32_t go, int nc, int ox, int oy) {
     uint32_t p = go + 10;
     for (int i = 0; i < nc; i++) { S_ends[i] = be16(p); p += 2; }
     int npts = S_ends[nc - 1] + 1;
     if (npts > TTF_MAXPTS) return;
 
-    uint16_t instr = be16(p); p += 2 + instr;
+    /*
+     * The instructions. This used to read the length and step over the
+     * bytes -- `p += 2 + instr` and nothing else -- which is where all
+     * of the font's grid-fitting went.
+     */
+    uint16_t instr = be16(p);
+    uint32_t ins_off = p + 2;
+    p += 2 + instr;
 
     /* flags (with repeat) */
     int i = 0;
@@ -423,11 +627,22 @@ static void decode_simple(uint32_t go, int nc, int ox, int oy) {
         else if (!(f & 0x20))    { y += sbe16(p); p += 2; }
         S_ys[i] = y;
     }
+    /*
+     * Grid-fit, then emit.
+     *
+     * S_device tells contour_to_edges which space the points are in, and
+     * is restored afterwards so that a composite whose first component
+     * hinted and whose second did not still transforms each correctly.
+     */
+    int was_device = S_device;
+    S_device = hint_glyph_points(gid, npts, nc, ins_off, instr, ox, oy);
+
     int start = 0;
     for (int c = 0; c < nc; c++) {
         contour_to_edges(start, S_ends[c], ox, oy);
         start = S_ends[c] + 1;
     }
+    S_device = was_device;
 }
 
 /* ----- glyph (simple or composite) -> edges ----- */
@@ -437,7 +652,7 @@ static void decode_glyph(int gid, int ox, int oy, int depth) {
     if (glen == 0) return;                /* empty glyph (e.g. space) */
 
     int nc = sbe16(go);
-    if (nc >= 0) { decode_simple(go, nc, ox, oy); return; }
+    if (nc >= 0) { decode_simple(gid, go, nc, ox, oy); return; }
 
     /* composite */
     uint32_t p = go + 10;
@@ -661,10 +876,26 @@ static const glyph_slot_t *glyph_mask(int gid, int size) {
         if (s->key == key) return s->w ? s : 0;
         if (s->key != 0) continue;              /* occupied by someone else */
 
-        /* miss: rasterize once, at the canonical origin */
+        /*
+         * A miss: rasterise once, at the canonical origin.
+         *
+         * The pre-program runs here rather than per glyph. It is where
+         * the font decides what a stem measures at this ppem, the answer
+         * is the same for every glyph at that size, and it is the
+         * expensive half of hinting.
+         *
+         * The origin matters more than it did. Hinting positions points
+         * against the pixel grid, so it is only meaningful if the glyph
+         * is drawn where it was hinted -- which is why the pen is a
+         * whole pixel in ttf_draw_string and why the mask cache is keyed
+         * by size.
+         */
+        hint_prepare_size(size);
+
         PENX = 0;
         BASEY = 0;
         nedges = 0;
+        S_device = 0;
         decode_glyph(gid, 0, 0, 0);
         if (!rasterize_glyph()) {               /* blank, e.g. a space */
             s->key = key; s->w = s->h = 0;

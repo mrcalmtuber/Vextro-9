@@ -91,6 +91,35 @@ int vx_mbed_printf(const char *fmt, ...);
 #define MBEDTLS_SHA256_C
 #define MBEDTLS_SHA224_C
 #define MBEDTLS_MD_C
+
+/* ===== hash: SHA-384 and SHA-512, for certificates =====
+ *
+ * SHA-256 is enough for the TLS 1.3 record layer, which is all the
+ * original brief asked for. It is not enough to *read the certificates*:
+ * most current CA roots are signed with SHA-384, and Mbed TLS computes
+ * SHA-384 in its SHA-512 module.
+ *
+ * The measured effect of leaving this out was that 61 of the 128 roots
+ * in a normal bundle parsed and 67 did not, so any chain needing one of
+ * the 67 was rejected with "chain-does-not-reach-a-known-root". The
+ * store looked loaded, because the other 61 had loaded.
+ *
+ * library/sha512.c was one of the files removed when this copy of Mbed
+ * TLS was stripped, so enabling these used to compile and then fail to
+ * link. It has been restored from upstream v3.6.4, matching the version
+ * in build_info.h -- the AArch64 acceleration paths in it are guarded by
+ * MBEDTLS_SHA512_USE_A64_CRYPTO_* and __aarch64__, neither of which is
+ * true here, so what builds is the portable C.
+ *
+ * With it in place 87 of the 128 roots parse. The remaining 41 are
+ * exactly the roots signed sha1WithRSAEncryption, and they stay
+ * unreadable on purpose: MBEDTLS_SHA1_C is not enabled, SHA-1
+ * signatures have been considered forgeable since 2017, and a root that
+ * can only be validated by a broken hash is not a root worth trusting.
+ * Refusing them is the feature, not the gap.
+ */
+#define MBEDTLS_SHA512_C
+#define MBEDTLS_SHA384_C
 #define MBEDTLS_HKDF_C
 
 /* ===== random ===== */

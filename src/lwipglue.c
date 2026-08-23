@@ -638,6 +638,69 @@ int vxnet_connect(int s, const uint8_t ip[4], uint16_t port) {
     return lwip_connect(s, (struct sockaddr *)&sa, sizeof(sa));
 }
 
+/*
+ * The listening half.
+ *
+ * Everything above this was a client: the system opened connections and
+ * nothing opened connections to it. A remote desktop server is the
+ * other direction, and it needs three things lwIP has and this seam did
+ * not expose -- bind, listen and accept.
+ *
+ * SO_REUSEADDR is set because a server socket whose last connection is
+ * still in TIME_WAIT otherwise refuses to bind for two minutes, which
+ * turns "restart the service" into "wait, then restart the service".
+ */
+int vxnet_listen(uint16_t port, int backlog) {
+    struct sockaddr_in sa;
+    int s, on = 1;
+
+    if (!vx_netif_up) return -1;
+
+    s = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+
+    lwip_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+    for (unsigned i = 0; i < sizeof(sa); i++) ((uint8_t *)&sa)[i] = 0;
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = lwip_htons(port);
+    sa.sin_addr.s_addr = 0;             /* every interface */
+
+    if (lwip_bind(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        lwip_close(s);
+        return -1;
+    }
+    if (lwip_listen(s, backlog) != 0) {
+        lwip_close(s);
+        return -1;
+    }
+    return s;
+}
+
+/*
+ * Take the next connection. Blocks the calling thread, which is the
+ * shape a one-thread-per-connection server wants and the reason lwIP
+ * here runs with an operating system under it.
+ *
+ * `peer` receives the far end's address, so a server can say who
+ * connected rather than only that somebody did.
+ */
+int vxnet_accept(int s, uint8_t peer[4]) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+    int c;
+
+    for (unsigned i = 0; i < sizeof(sa); i++) ((uint8_t *)&sa)[i] = 0;
+    c = lwip_accept(s, (struct sockaddr *)&sa, &len);
+    if (c < 0) return -1;
+
+    if (peer) {
+        uint32_t a = sa.sin_addr.s_addr;    /* network order */
+        for (int i = 0; i < 4; i++) peer[i] = (uint8_t)((a >> (i * 8)) & 0xFF);
+    }
+    return c;
+}
+
 int vxnet_send(int s, const void *buf, int len) {
     return (int)lwip_send(s, buf, (size_t)len, 0);
 }
@@ -661,6 +724,21 @@ int vxnet_timeout(int s, uint32_t ms) {
     if (lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &v, sizeof(v)) != 0)
         return -1;
     return lwip_setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &v, sizeof(v));
+}
+
+/*
+ * Bound the read side only.
+ *
+ * vxnet_timeout() sets both directions, which is right for a client
+ * that talks and then waits. A server that must poll for input while
+ * pushing bulk output needs them apart: a short receive timeout so the
+ * poll returns promptly, and a long send timeout so a large write is
+ * allowed to drain. Sharing one value means either the poll blocks for
+ * seconds or every screen update larger than the send window fails.
+ */
+int vxnet_rcv_timeout(int s, uint32_t ms) {
+    int v = (int)ms;
+    return lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &v, sizeof(v));
 }
 
 int vxnet_nodelay(int s, int on) {

@@ -2,6 +2,7 @@
 #define NTCRYPTO_H
 
 #include <stdint.h>
+#include "aes.h"
 
 /*
  * src/ntcrypto.h — the old algorithms Windows networking is built on.
@@ -30,10 +31,29 @@
  *
  * These authenticate to a file server. They are not, and must never
  * become, the source of a key that protects anything: no cipher in this
- * file is used to encrypt data at rest, and RC4 here exists only
+ * *legacy* half is used to encrypt data, and RC4 here exists only
  * because NTLM's session sealing is defined in terms of it. Every
  * function is named for its protocol rather than its primitive, so a
  * call site reads as "the thing SMB needs" rather than "a hash".
+ *
+ * ---- the modern half ----
+ *
+ * The last section of this file is the exception to that paragraph, and
+ * the boundary between the two is worth stating rather than leaving to
+ * be inferred. AES-GCM and AES-CCM at the bottom are authenticated
+ * encryption, they do protect data, and they are what SMB 3.0 uses to
+ * turn a signed connection into an encrypted one.
+ *
+ * They live here rather than in aes.h because they are modes rather
+ * than a cipher -- aes.h owns the block function and its AES-NI and
+ * software paths, and this builds on whichever of those the processor
+ * turned out to have. They live here rather than in Mbed TLS for the
+ * reason above: the TLS config is stripped to TLS 1.3 and stays that
+ * way, and SMB's cipher suite is not TLS's to widen.
+ *
+ * Nothing in the legacy half above can reach them, and nothing here
+ * reaches back: an AEAD key comes from the SMB 3.0 key derivation, not
+ * from an NTLM session key directly.
  */
 
 /* ===== MD4 (RFC 1320) =====
@@ -413,6 +433,382 @@ static void ntlm_v2_hash(const char *user, const char *domain,
         buf[n++] = 0;
     }
     hmac_md5(nt_hash, 16, buf, n, out);
+}
+
+/* ===========================================================
+ * AES-GCM and AES-CCM — authenticated encryption
+ * ===========================================================
+ *
+ * Two modes, one block cipher, and the block cipher is the one aes.h
+ * already dispatches: AES-NI where the processor has it, the table-free
+ * software path where it does not. Nothing below knows or cares which
+ * ran, which is the point of putting the modes here rather than
+ * duplicating a cipher.
+ *
+ * Both are *authenticated* encryption, and the word is load-bearing.
+ * Encryption alone protects the contents of a message and nothing about
+ * its shape: an attacker who cannot read a frame can still flip bits in
+ * it and watch what breaks. Each of these produces a tag over the
+ * ciphertext *and* over the associated data that travels in clear
+ * beside it, so a modified frame is rejected rather than decrypted into
+ * something the sender never wrote.
+ *
+ * Which one SMB uses depends on the dialect and is decided in smb2.h,
+ * not here: 3.0 and 3.0.2 specify CCM, 3.1.1 negotiates and prefers
+ * GCM. Both are implemented in full because "or" in a specification is
+ * a choice the peer makes.
+ *
+ * Neither is constant-time in the AES-NI sense on the software path --
+ * aes.h says so itself about its S-box. What is constant-time is the
+ * tag comparison, which is where a timing signal would actually be
+ * usable: a byte-at-a-time memcmp against a tag turns forgery from
+ * 2^128 work into 16 x 256.
+ */
+
+/* Tag comparison that does not stop early. Local rather than borrowed
+ * from sha256.h's ct_equal, because this header is included well before
+ * that one and must not acquire an ordering dependency for four lines. */
+static int aead_ct_equal(const uint8_t *a, const uint8_t *b, uint32_t n) {
+    uint8_t d = 0;
+    for (uint32_t i = 0; i < n; i++) d = (uint8_t)(d | (a[i] ^ b[i]));
+    return d == 0;
+}
+
+/* ---- GCM ----
+ *
+ * Counter mode for confidentiality, GHASH for the tag. GHASH is
+ * multiplication in GF(2^128), and the awkward part is that GCM numbers
+ * the bits of a block the other way up from everything else: bit 0 is
+ * the *most* significant bit of the first byte, so the reduction
+ * polynomial shifts right and the carry lands in byte zero. Getting
+ * that backwards produces a mode that encrypts and decrypts
+ * consistently with itself and agrees with nobody.
+ */
+
+#define GCM_R0  0xE1     /* x^128 + x^7 + x^2 + x + 1, reflected */
+
+/* out = X . Y over GF(2^128). */
+static void gcm_gf_mul(uint8_t out[16], const uint8_t X[16],
+                       const uint8_t Y[16]) {
+    uint8_t Z[16], V[16];
+    for (int i = 0; i < 16; i++) { Z[i] = 0; V[i] = Y[i]; }
+
+    for (int i = 0; i < 128; i++) {
+        if ((X[i >> 3] >> (7 - (i & 7))) & 1)
+            for (int k = 0; k < 16; k++) Z[k] ^= V[k];
+
+        int lsb = V[15] & 1;
+        for (int k = 15; k > 0; k--)
+            V[k] = (uint8_t)((V[k] >> 1) | (uint8_t)(V[k - 1] << 7));
+        V[0] = (uint8_t)(V[0] >> 1);
+        if (lsb) V[0] ^= GCM_R0;
+    }
+    for (int i = 0; i < 16; i++) out[i] = Z[i];
+}
+
+/* Y <- (Y ^ block) . H, the GHASH step. Trailing partial blocks are
+ * zero-padded, which is what makes length encoding mandatory: without
+ * it "AB" and "AB\0" would hash alike. */
+static void gcm_ghash_blocks(uint8_t Y[16], const uint8_t H[16],
+                             const uint8_t *data, uint32_t len) {
+    uint32_t off = 0;
+    while (off < len) {
+        uint8_t b[16];
+        uint32_t n = len - off;
+        if (n > 16) n = 16;
+        for (uint32_t i = 0; i < 16; i++) b[i] = i < n ? data[off + i] : 0;
+        for (int i = 0; i < 16; i++) Y[i] ^= b[i];
+        gcm_gf_mul(Y, Y, H);
+        off += n;
+    }
+}
+
+static void gcm_put64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> ((7 - i) * 8));
+}
+
+static void gcm_inc32(uint8_t ctr[16]) {
+    for (int i = 15; i >= 12; i--)
+        if (++ctr[i]) break;
+}
+
+/* Counter-mode keystream over `in`, starting from `ctr` (which is
+ * incremented before the first block, per the specification). */
+static void gcm_ctr_xor(const aes_key_t *k, uint8_t ctr[16],
+                        const uint8_t *in, uint8_t *out, uint32_t len) {
+    uint8_t s[16];
+    uint32_t off = 0;
+    while (off < len) {
+        gcm_inc32(ctr);
+        aes_encrypt_block(k, ctr, s);
+        uint32_t n = len - off;
+        if (n > 16) n = 16;
+        for (uint32_t i = 0; i < n; i++) out[off + i] = (uint8_t)(in[off + i] ^ s[i]);
+        off += n;
+    }
+}
+
+/*
+ * J0, the pre-counter block.
+ *
+ * A 96-bit IV -- what every protocol that uses GCM sensibly picks, SMB
+ * included -- is used directly with a counter of 1 appended. Any other
+ * length has to be hashed down instead, which is supported here because
+ * an implementation that quietly mishandles a 13-byte IV is worse than
+ * one that refuses it, and refusing is not an option when the peer
+ * chooses.
+ */
+static void gcm_make_j0(const uint8_t H[16], const uint8_t *iv, uint32_t ivlen,
+                        uint8_t j0[16]) {
+    if (ivlen == 12) {
+        for (int i = 0; i < 12; i++) j0[i] = iv[i];
+        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+        return;
+    }
+    for (int i = 0; i < 16; i++) j0[i] = 0;
+    gcm_ghash_blocks(j0, H, iv, ivlen);
+    uint8_t len[16];
+    for (int i = 0; i < 8; i++) len[i] = 0;
+    gcm_put64(len + 8, (uint64_t)ivlen * 8);
+    for (int i = 0; i < 16; i++) j0[i] ^= len[i];
+    gcm_gf_mul(j0, j0, H);
+}
+
+/* The tag, over AAD and ciphertext with both lengths appended. */
+static void gcm_tag(const aes_key_t *k, const uint8_t H[16],
+                    const uint8_t j0[16],
+                    const uint8_t *aad, uint32_t aadlen,
+                    const uint8_t *ct, uint32_t ctlen,
+                    uint8_t *tag, uint32_t taglen) {
+    uint8_t S[16];
+    for (int i = 0; i < 16; i++) S[i] = 0;
+    gcm_ghash_blocks(S, H, aad, aadlen);
+    gcm_ghash_blocks(S, H, ct, ctlen);
+
+    uint8_t len[16];
+    gcm_put64(len,     (uint64_t)aadlen * 8);
+    gcm_put64(len + 8, (uint64_t)ctlen * 8);
+    for (int i = 0; i < 16; i++) S[i] ^= len[i];
+    gcm_gf_mul(S, S, H);
+
+    uint8_t ek[16], ctr[16];
+    for (int i = 0; i < 16; i++) ctr[i] = j0[i];
+    aes_encrypt_block(k, ctr, ek);
+    for (uint32_t i = 0; i < taglen && i < 16; i++) tag[i] = (uint8_t)(S[i] ^ ek[i]);
+}
+
+static int aes_gcm_encrypt(const uint8_t *key, int keybits,
+                           const uint8_t *iv, uint32_t ivlen,
+                           const uint8_t *aad, uint32_t aadlen,
+                           const uint8_t *pt, uint32_t ptlen,
+                           uint8_t *ct, uint8_t *tag, uint32_t taglen) {
+    if (ivlen == 0 || taglen < 4 || taglen > 16) return -1;
+    aes_key_t k;
+    if (aes_setkey(&k, key, keybits) != 0) return -1;
+
+    uint8_t H[16], zero[16];
+    for (int i = 0; i < 16; i++) zero[i] = 0;
+    aes_encrypt_block(&k, zero, H);
+
+    uint8_t j0[16], ctr[16];
+    gcm_make_j0(H, iv, ivlen, j0);
+    for (int i = 0; i < 16; i++) ctr[i] = j0[i];
+
+    gcm_ctr_xor(&k, ctr, pt, ct, ptlen);
+    gcm_tag(&k, H, j0, aad, aadlen, ct, ptlen, tag, taglen);
+    return 0;
+}
+
+/*
+ * Decrypt, and refuse to hand back anything that does not authenticate.
+ *
+ * The tag is checked *before* the caller sees a byte of plaintext, and
+ * the buffer is wiped on failure. Returning "here is the plaintext, by
+ * the way the tag was wrong" is how AEAD gets misused: the caller
+ * checks the return value on the happy path, forgets it on the error
+ * path, and processes attacker-chosen data.
+ */
+static int aes_gcm_decrypt(const uint8_t *key, int keybits,
+                           const uint8_t *iv, uint32_t ivlen,
+                           const uint8_t *aad, uint32_t aadlen,
+                           const uint8_t *ct, uint32_t ctlen,
+                           const uint8_t *tag, uint32_t taglen,
+                           uint8_t *pt) {
+    if (ivlen == 0 || taglen < 4 || taglen > 16) return -1;
+    aes_key_t k;
+    if (aes_setkey(&k, key, keybits) != 0) return -1;
+
+    uint8_t H[16], zero[16];
+    for (int i = 0; i < 16; i++) zero[i] = 0;
+    aes_encrypt_block(&k, zero, H);
+
+    uint8_t j0[16], ctr[16], want[16];
+    gcm_make_j0(H, iv, ivlen, j0);
+    gcm_tag(&k, H, j0, aad, aadlen, ct, ctlen, want, taglen);
+    if (!aead_ct_equal(want, tag, taglen)) return -1;
+
+    for (int i = 0; i < 16; i++) ctr[i] = j0[i];
+    gcm_ctr_xor(&k, ctr, ct, pt, ctlen);
+    return 0;
+}
+
+/* ---- CCM ----
+ *
+ * Counter with CBC-MAC: the tag is a CBC-MAC over a formatted header,
+ * the associated data and the payload; the payload is then encrypted in
+ * counter mode and the MAC masked with the counter-zero keystream.
+ *
+ * Older and more awkward than GCM, and required anyway -- SMB 3.0 and
+ * 3.0.2 specify it with no alternative. The awkwardness is in the
+ * formatting: the length of the payload is encoded into the first
+ * block, so unlike GCM this cannot stream, and the nonce length and the
+ * length field trade off against each other. L = 15 - noncelen, which
+ * is why an 11-byte nonce (SMB's choice) leaves four bytes of length
+ * and a 13-byte one (802.15.4's) leaves two.
+ */
+
+/* B0 and the counter blocks share their nonce placement; only the first
+ * byte and the trailing field differ. */
+static void ccm_block0(uint8_t b0[16], const uint8_t *nonce, uint32_t noncelen,
+                       uint32_t aadlen, uint32_t ptlen, uint32_t taglen) {
+    uint32_t L = 15 - noncelen;
+    b0[0] = (uint8_t)((aadlen ? 0x40 : 0x00) |
+                      (((taglen - 2) / 2) << 3) |
+                      (L - 1));
+    for (uint32_t i = 0; i < noncelen; i++) b0[1 + i] = nonce[i];
+    for (uint32_t i = 0; i < L; i++)
+        b0[15 - i] = (uint8_t)(ptlen >> (i * 8));
+}
+
+static void ccm_ctr_block(uint8_t a[16], const uint8_t *nonce,
+                          uint32_t noncelen, uint32_t counter) {
+    uint32_t L = 15 - noncelen;
+    a[0] = (uint8_t)(L - 1);
+    for (uint32_t i = 0; i < noncelen; i++) a[1 + i] = nonce[i];
+    for (uint32_t i = 0; i < L; i++)
+        a[15 - i] = (uint8_t)(counter >> (i * 8));
+}
+
+static void ccm_mac_update(const aes_key_t *k, uint8_t X[16],
+                           const uint8_t *data, uint32_t len) {
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t n = len - off;
+        if (n > 16) n = 16;
+        for (uint32_t i = 0; i < n; i++) X[i] ^= data[off + i];
+        aes_encrypt_block(k, X, X);
+        off += n;
+    }
+}
+
+/* The CBC-MAC over B0, the length-prefixed AAD, and the payload. */
+static void ccm_mac(const aes_key_t *k, const uint8_t *nonce, uint32_t noncelen,
+                    const uint8_t *aad, uint32_t aadlen,
+                    const uint8_t *pt, uint32_t ptlen, uint32_t taglen,
+                    uint8_t X[16]) {
+    uint8_t b[16];
+    ccm_block0(b, nonce, noncelen, aadlen, ptlen, taglen);
+    aes_encrypt_block(k, b, X);
+
+    if (aadlen) {
+        /* The length prefix is variable width, and the padding to a
+         * block boundary counts the prefix -- which is why this is one
+         * buffer rather than a prefix followed by ccm_mac_update. */
+        uint8_t hdr[22];
+        uint32_t hn = 0;
+        if (aadlen < 0xFF00u) {
+            hdr[hn++] = (uint8_t)(aadlen >> 8);
+            hdr[hn++] = (uint8_t)aadlen;
+        } else {
+            hdr[hn++] = 0xFF; hdr[hn++] = 0xFE;
+            hdr[hn++] = (uint8_t)(aadlen >> 24); hdr[hn++] = (uint8_t)(aadlen >> 16);
+            hdr[hn++] = (uint8_t)(aadlen >> 8);  hdr[hn++] = (uint8_t)aadlen;
+        }
+
+        uint32_t off = 0;
+        while (hn < 16 && off < aadlen) hdr[hn++] = aad[off++];
+        while (hn < 16) hdr[hn++] = 0;          /* pad if the AAD is short */
+        for (int i = 0; i < 16; i++) X[i] ^= hdr[i];
+        aes_encrypt_block(k, X, X);
+
+        if (off < aadlen) ccm_mac_update(k, X, aad + off, aadlen - off);
+    }
+
+    if (ptlen) ccm_mac_update(k, X, pt, ptlen);
+}
+
+static void ccm_ctr_xor(const aes_key_t *k, const uint8_t *nonce,
+                        uint32_t noncelen, const uint8_t *in, uint8_t *out,
+                        uint32_t len) {
+    uint8_t a[16], s[16];
+    uint32_t off = 0, counter = 1;
+    while (off < len) {
+        ccm_ctr_block(a, nonce, noncelen, counter++);
+        aes_encrypt_block(k, a, s);
+        uint32_t n = len - off;
+        if (n > 16) n = 16;
+        for (uint32_t i = 0; i < n; i++) out[off + i] = (uint8_t)(in[off + i] ^ s[i]);
+        off += n;
+    }
+}
+
+static int ccm_params_ok(uint32_t noncelen, uint32_t taglen) {
+    if (noncelen < 7 || noncelen > 13) return 0;
+    if (taglen < 4 || taglen > 16 || (taglen & 1)) return 0;
+    return 1;
+}
+
+static int aes_ccm_encrypt(const uint8_t *key, int keybits,
+                           const uint8_t *nonce, uint32_t noncelen,
+                           const uint8_t *aad, uint32_t aadlen,
+                           const uint8_t *pt, uint32_t ptlen,
+                           uint8_t *ct, uint8_t *tag, uint32_t taglen) {
+    if (!ccm_params_ok(noncelen, taglen)) return -1;
+    aes_key_t k;
+    if (aes_setkey(&k, key, keybits) != 0) return -1;
+
+    uint8_t X[16];
+    ccm_mac(&k, nonce, noncelen, aad, aadlen, pt, ptlen, taglen, X);
+
+    /* Counter zero masks the MAC; the payload starts at counter one. */
+    uint8_t a0[16], s0[16];
+    ccm_ctr_block(a0, nonce, noncelen, 0);
+    aes_encrypt_block(&k, a0, s0);
+    for (uint32_t i = 0; i < taglen; i++) tag[i] = (uint8_t)(X[i] ^ s0[i]);
+
+    ccm_ctr_xor(&k, nonce, noncelen, pt, ct, ptlen);
+    return 0;
+}
+
+static int aes_ccm_decrypt(const uint8_t *key, int keybits,
+                           const uint8_t *nonce, uint32_t noncelen,
+                           const uint8_t *aad, uint32_t aadlen,
+                           const uint8_t *ct, uint32_t ctlen,
+                           const uint8_t *tag, uint32_t taglen,
+                           uint8_t *pt) {
+    if (!ccm_params_ok(noncelen, taglen)) return -1;
+    aes_key_t k;
+    if (aes_setkey(&k, key, keybits) != 0) return -1;
+
+    /* Decrypt first -- CCM computes its MAC over the *plaintext*, so
+     * unlike GCM there is no way to check the tag without producing it.
+     * The plaintext is wiped below if it turns out not to be genuine,
+     * and no caller sees it in between. */
+    ccm_ctr_xor(&k, nonce, noncelen, ct, pt, ctlen);
+
+    uint8_t X[16];
+    ccm_mac(&k, nonce, noncelen, aad, aadlen, pt, ctlen, taglen, X);
+
+    uint8_t a0[16], s0[16], want[16];
+    ccm_ctr_block(a0, nonce, noncelen, 0);
+    aes_encrypt_block(&k, a0, s0);
+    for (uint32_t i = 0; i < taglen; i++) want[i] = (uint8_t)(X[i] ^ s0[i]);
+
+    if (!aead_ct_equal(want, tag, taglen)) {
+        for (uint32_t i = 0; i < ctlen; i++) pt[i] = 0;
+        return -1;
+    }
+    return 0;
 }
 
 #endif /* NTCRYPTO_H */

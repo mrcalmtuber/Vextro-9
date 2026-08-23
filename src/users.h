@@ -22,7 +22,28 @@
  * encrypted, and a `.vx` application runs with kernel privileges in a
  * shared address space, so anything already executing can do as it likes.
  * The administrator flag governs the user interface, not the hardware.
+ *
+ * That last sentence is now doing more work than it used to, and
+ * profile.h is where it is argued properly. The short version: the flag
+ * governs the user interface, and since there are no file syscalls, the
+ * user interface is the only way a person reaches the disk. So one
+ * account genuinely cannot read another's files. A program that is
+ * already running still can.
  */
+
+/*
+ * From profile.h, which is included immediately after this file and
+ * cannot be included before it -- its isolation guard asks which account
+ * is signed in, and that is user_current, declared below.
+ *
+ * profile_home() is what makes the layout a single decision rather than
+ * a literal repeated in four places: it answers with
+ * \Documents and Settings\<name> on exFAT and /home/<name> on a FAT32
+ * volume that cannot spell it.
+ */
+struct directory;
+static void profile_home(const char *name, char *out, int max);
+static struct directory *create_user_profile(const char *username);
 
 #define USER_MAX        8       /* accounts on one machine   */
 #define USER_NAME_MAX   9       /* 8 characters plus the NUL */
@@ -74,10 +95,16 @@ static int u_fromhex(const char *in, uint8_t *out, uint32_t n) {
 /*
  * Names are lowercase alphanumeric and at most eight characters.
  *
- * Not an arbitrary limit: a home directory is /home/<name>, and FAT32
- * file creation in this tree is 8.3-limited (fat32.h rejects anything
- * else). exFAT would allow far more, but one rule for both filesystems is
- * worth more than four extra characters on one of them.
+ * Not an arbitrary limit: the name becomes a directory, and FAT32 file
+ * creation in this tree is 8.3-limited (fat32.h rejects anything else).
+ * exFAT would allow far more, but one rule for both filesystems is worth
+ * more than four extra characters on one of them.
+ *
+ * The limit outlived the reason it was chosen and is still right. The
+ * profile tree is now \Documents and Settings\<name>, a name exFAT can
+ * hold and FAT32 cannot -- but a FAT32 volume still falls back to
+ * /home/<name>, so the eight-character rule is still what makes an
+ * account portable between the two. See profile.h.
  */
 static int user_name_ok(const char *n) {
     if (!n || !n[0]) { str_copy(user_err, "name cannot be empty", sizeof(user_err)); return 0; }
@@ -124,8 +151,7 @@ static const char *user_name_of(int idx) {
 }
 
 static void user_home(int idx, char *out, int max) {
-    str_copy(out, "/home/", max);
-    str_append(out, user_name_of(idx), max);
+    profile_home(user_name_of(idx), out, max);
 }
 
 /* ===== persistence ===== */
@@ -268,11 +294,14 @@ static int user_add(const char *name, const char *pw, int admin) {
 
     if (users_save() != 0) { user_count--; return -1; }
 
-    char home[64];
-    str_copy(home, "/home", sizeof(home));
-    fs_mkdir(home);
-    user_home(user_count - 1, home, sizeof(home));
-    fs_mkdir(home);
+    /*
+     * The account exists whether or not the tree could be built. A full
+     * or read-only volume is a reason to have no My Documents yet, not a
+     * reason to refuse someone an account they have just chosen a
+     * password for -- and session_begin() retries this on every login,
+     * so the profile appears as soon as the volume will take it.
+     */
+    create_user_profile(u->name);
     return user_count - 1;
 }
 

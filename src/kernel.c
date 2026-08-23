@@ -31,6 +31,15 @@
 #include "vxport.h"
 #include "vxnet.h"
 #include "ntcrypto.h"
+#include "cryptoswitch.h"
+/* The radio. Below vxport.h because it needs vx_random() for its
+ * nonces, and below ntcrypto.h because the 4-way handshake is built out
+ * of the same HMAC and AES this system already carries. */
+#include "net/wifi.c"
+/* The remote desktop. Below vxnet.h for the socket seam, and below
+ * keyboard.h and mouse.h because remote input is delivered into the
+ * same queues the local hardware feeds. */
+#include "net/rdp.c"
 #include "ldap.h"
 #include "kerberos.h"
 #include "ntlmssp.h"
@@ -38,6 +47,9 @@
 #include "gpo.h"
 #include "netstack.h"
 #include "igpu.h"
+/* The video decoder. Below igpu.h because it submits on that driver's
+ * media rings and allocates out of its GGTT window. */
+#include "media/decode.c"
 #include "llm.h"
 #include "desktop.h"
 #include "bootanim.h"
@@ -1074,6 +1086,19 @@ void kmain(void) {
         e1000_init(hhdm_request.response->offset);
     }
 
+    /*
+     * The radio, if there is one.
+     *
+     * Probed after the wired NIC and deliberately not instead of it: a
+     * machine with both keeps Ethernet as the default route, because a
+     * cable that is plugged in is a better link than a network that has
+     * not been joined yet. wifi_init() returns 0 on every machine with
+     * no wireless hardware -- which includes QEMU, whose device model
+     * has no 802.11 part at all -- and changes nothing about the path
+     * above.
+     */
+    wifi_init();
+
     /* Audio: HD Audio if this machine has it, AC'97 if it does not.
      * Nothing above this line names either. */
     audio_init();
@@ -1100,6 +1125,19 @@ void kmain(void) {
 
     if (vxnet_init()) {
         vxsec_init();
+#ifdef RDP_AUTOSTART
+        /*
+         * Start the remote desktop without being asked.
+         *
+         * Off by default and never in a release build, for the same
+         * reason AUTO_LOGIN is: this server has no encryption and no
+         * authentication, so starting it is a decision about the
+         * network the machine is on. It exists so tools/rdp_probe.py
+         * can drive a real connection against a booted system.
+         */
+        serial_puts("[vextro] RDP_AUTOSTART: starting the remote desktop\n");
+        rdp_start();
+#endif
 #ifdef NET_SELFTEST
         vxnet_selftest();
 #endif
@@ -1163,6 +1201,195 @@ void kmain(void) {
     blk_selftest();
 #endif
     fs_mount();
+
+    /*
+     * Now that there is a volume, find out whether it carries a
+     * certificate authority store.
+     *
+     * This is asked here rather than left until the first connection so
+     * that the boot log states the machine's actual security posture --
+     * whether an https:// connection will be authenticated or merely
+     * encrypted. It is the kind of property that is easy to assume the
+     * favourable way, and the log is where somebody looks to find out.
+     */
+    if (vxsec_ready()) {
+        if (!vxsec_verifies_certificates())
+            serial_puts("[tls] no CA store on the volume: connections are "
+                        "encrypted but NOT authenticated\n");
+    }
+
+#ifdef TLS_FETCH_TEST
+    /*
+     * One real HTTPS request, for a headless harness.
+     *
+     * A CA store that parses proves the bundle is readable; it does not
+     * prove a handshake against a live server verifies against it. This
+     * fetches over TLS 1.3 with VERIFY_REQUIRED in force, so a chain
+     * that does not lead to one of those roots fails here rather than
+     * on somebody's screen later.
+     */
+    {
+        static uint8_t body[8192];
+        int n;
+        serial_puts("[tlstest] GET https://" TLS_FETCH_TEST "/\n");
+        n = vxsec_https_get(TLS_FETCH_TEST, "/", body, sizeof(body));
+        if (n > 0) {
+            serial_puts("[tlstest] ok, ");
+            serial_put_dec((uint32_t)n);
+            serial_puts(" body bytes over a verified connection\n");
+        } else {
+            serial_puts("[tlstest] FAILED (");
+            serial_put_dec((uint32_t)(-n));
+            serial_puts(")\n");
+        }
+    }
+#endif
+
+    /*
+     * The pagefile, now that there is a volume to put it on and before
+     * anything large is loaded -- which is the point of doing it here
+     * rather than lazily. Allocating 256 MB at the moment memory runs
+     * out means asking the filesystem for a contiguous run exactly when
+     * the machine is least able to give one, and doing it from inside
+     * the page-fault handler at that.
+     *
+     * A failure is not fatal and is not silent: swap stays off, every
+     * allocation behaves as it did before this existed, and the reason
+     * is on the wire.
+     */
+    if (swap_init() != 0) {
+        serial_puts("[swap] off: ");
+        serial_puts(swap_errstr);
+        serial_putc('\n');
+    }
+#ifdef SWAP_SELFTEST
+    swap_selftest();
+#endif
+#ifdef KRB_CC_SELFTEST
+    /*
+     * The credential cache, without a network.
+     *
+     * What "survives a reboot" means operationally is: write it, lose
+     * everything in memory, read it back, and find the same bytes. That
+     * is exactly the sequence below, and it needs neither a KDC nor a
+     * login screen -- so it is checkable here rather than only by
+     * rebooting a machine and squinting at whether authentication still
+     * works.
+     */
+    {
+        serial_puts("\n[krbcc] selftest\n");
+        int checks = 0, bad = 0;
+        #define CC_OK(what, cond) do { checks++; \
+            if (cond) { serial_puts("[krbcc]   ok   " what "\n"); } \
+            else { bad++; serial_puts("[krbcc]   FAIL " what "\n"); } } while (0)
+
+        /* A profile to put it in. The cache lives inside one, and on a
+         * first boot there are no accounts at all. */
+        create_user_profile("ccuser");
+
+        CC_OK("a fresh cache binds and finds nothing",
+              krb_cc_login("ccuser", "correct horse") == 0);
+
+        /* A credential that is not going to expire this century. */
+        krb.tgt.valid = 1;
+        str_copy(krb.tgt.realm, "VEXTRO.TEST", sizeof krb.tgt.realm);
+        krb.tgt.nsname = 2;
+        str_copy(krb.tgt.sname[0], "krbtgt", sizeof krb.tgt.sname[0]);
+        str_copy(krb.tgt.sname[1], "VEXTRO.TEST", sizeof krb.tgt.sname[1]);
+        str_copy(krb.tgt.endtime, "20370913024805Z", sizeof krb.tgt.endtime);
+        krb.tgt.flags = 0x40000000u;
+        krb.tgt.session.etype = 18;
+        krb.tgt.session.len = 32;
+        for (int i = 0; i < 32; i++) krb.tgt.session.data[i] = (uint8_t)(i * 5 + 1);
+        krb.tgt.tlen = 1200;
+        for (uint32_t i = 0; i < krb.tgt.tlen; i++)
+            krb.tgt.ticket[i] = (uint8_t)((i * 31 + 7) & 0xFF);
+
+        /* And one that expired in 1999, which must not come back. */
+        krb.svc.valid = 1;
+        str_copy(krb.svc.realm, "VEXTRO.TEST", sizeof krb.svc.realm);
+        krb.svc.nsname = 2;
+        str_copy(krb.svc.sname[0], "cifs", sizeof krb.svc.sname[0]);
+        str_copy(krb.svc.sname[1], "files", sizeof krb.svc.sname[1]);
+        str_copy(krb.svc.endtime, "19990101000000Z", sizeof krb.svc.endtime);
+        krb.svc.session.etype = 17;
+        krb.svc.session.len = 16;
+        krb.svc.tlen = 64;
+
+        CC_OK("an expired credential is recognised",
+              krb_cc_expired("19990101000000Z"));
+        CC_OK("an unexpired one is not",
+              !krb_cc_expired("20370913024805Z"));
+
+        CC_OK("the cache writes", krb_cc_save() == 0);
+
+        /* Everything in memory goes, as a reboot would take it. */
+        uint8_t want_key[32];
+        for (int i = 0; i < 32; i++) want_key[i] = krb.tgt.session.data[i];
+        krb.tgt.valid = 0; krb.svc.valid = 0;
+        for (int i = 0; i < 32; i++) krb.tgt.session.data[i] = 0;
+        for (uint32_t i = 0; i < krb.tgt.tlen; i++) krb.tgt.ticket[i] = 0;
+
+        /* A different password must not open it. */
+        CC_OK("a wrong password loads nothing",
+              krb_cc_login("ccuser", "wrong horse") == 0);
+        CC_OK("  and leaves the tickets alone", !krb.tgt.valid);
+
+        /* The right one must. */
+        CC_OK("the right password loads exactly the unexpired one",
+              krb_cc_login("ccuser", "correct horse") == 1);
+        CC_OK("  the TGT is back", krb.tgt.valid);
+        CC_OK("  the expired service ticket is not", !krb.svc.valid);
+        CC_OK("  the realm came back",
+              str_eq(krb.tgt.realm, "VEXTRO.TEST"));
+        CC_OK("  the expiry came back",
+              str_eq(krb.tgt.endtime, "20370913024805Z"));
+        CC_OK("  the flags came back", krb.tgt.flags == 0x40000000u);
+
+        int key_ok = (krb.tgt.session.len == 32 && krb.tgt.session.etype == 18);
+        for (int i = 0; i < 32 && key_ok; i++)
+            if (krb.tgt.session.data[i] != want_key[i]) key_ok = 0;
+        CC_OK("  the session key is byte-for-byte what went in", key_ok);
+
+        int tkt_ok = (krb.tgt.tlen == 1200);
+        for (uint32_t i = 0; i < 1200 && tkt_ok; i++)
+            if (krb.tgt.ticket[i] != (uint8_t)((i * 31 + 7) & 0xFF)) tkt_ok = 0;
+        CC_OK("  and so is the ticket itself", tkt_ok);
+
+        /* The file must not be readable as plaintext: a cache that
+         * happens to hold a session key in the clear would pass every
+         * check above. */
+        {
+            char p[288];
+            krb_cc_path("ccuser", p, sizeof p);
+            uint64_t n = 0;
+            const void *d = fs_read_file(p, &n);
+            int leaked = 0;
+            if (d && n > 64) {
+                const uint8_t *b = (const uint8_t *)d;
+                for (uint64_t i = 64; i + 32 <= n && !leaked; i++) {
+                    int m = 1;
+                    for (int k = 0; k < 32; k++)
+                        if (b[i + k] != want_key[k]) { m = 0; break; }
+                    if (m) leaked = 1;
+                }
+            }
+            CC_OK("the session key does not appear in the file", !leaked);
+        }
+
+        CC_OK("purging removes it", krb_cc_purge() == 0);
+        CC_OK("  and then there is nothing to load",
+              krb_cc_login("ccuser", "correct horse") == 0);
+
+        krb_cc_logout();
+        serial_puts("\n[krbcc] ");
+        serial_put_dec((uint32_t)checks);
+        serial_puts(" checks, ");
+        serial_put_dec((uint32_t)bad);
+        serial_puts(" failures\n\n");
+        #undef CC_OK
+    }
+#endif
 
     /* Settings, in one tree with an atomic commit. Everything that
      * follows can read and write it. */
@@ -1499,6 +1726,30 @@ void kmain(void) {
         if (smb2_signed())
             serial_puts("[smb2]   ok   the session is signed\n");
         else { bad++; serial_puts("[smb2]   FAIL the session is unsigned\n"); }
+
+        /*
+         * And, against a 3.0 server, encrypted.
+         *
+         * Asserted conditionally on the dialect rather than
+         * unconditionally, because this same test is run against
+         * `smbserver.py --no-smb3` to prove the fallback: a client that
+         * has learned to encrypt must still talk to a 2.1 server, and a
+         * test that demanded encryption everywhere would hide exactly
+         * the regression worth catching.
+         */
+        checks++;
+        if (smb2_dialect() == SMB2_DIALECT_300) {
+            if (smb2_encrypted())
+                serial_puts("[smb2]   ok   3.0 negotiated and the session "
+                            "is encrypted\n");
+            else { bad++; serial_puts("[smb2]   FAIL 3.0 but not encrypted\n"); }
+        } else {
+            if (!smb2_encrypted())
+                serial_puts("[smb2]   ok   pre-3.0 dialect, signed and not "
+                            "encrypted, as it should be\n");
+            else { bad++; serial_puts("[smb2]   FAIL encrypting on a dialect "
+                                      "that cannot\n"); }
+        }
 
         if (smb2.open) {
             checks++;
@@ -1922,6 +2173,21 @@ void kmain(void) {
     /* Unmask hardware interrupts */
     __asm__ volatile("sti" ::: "memory");
 
+#ifdef CRYPTO_SWITCH_SELFTEST
+    /*
+     * After sti, and that placement is the whole point.
+     *
+     * This test asserts that a thread preempted by the APIC timer gets
+     * its XMM state back intact. Run before interrupts are unmasked --
+     * where the other selftests live -- the timer cannot fire, no
+     * preemption occurs, and the test passes by never exercising the
+     * thing it is named after. It measured zero ticks across a
+     * two-hundred-million-iteration spin, which is what that looks
+     * like from the outside.
+     */
+    crypto_switch_selftest();
+#endif
+
     /*
      * The compositor is a thread now, and the frame is its critical
      * section.
@@ -2094,6 +2360,16 @@ void kmain(void) {
             serial_put_dec((uint32_t)wm_stack_n);
             serial_puts("\n");
 #endif
+            /*
+             * Before anything else: the session keys and the key that
+             * decrypts the cache. A session key is a bearer token, and
+             * leaving one resident after its owner has walked away is
+             * the whole problem the cache's own comment describes. The
+             * file on disk stays -- it is encrypted under a key nobody
+             * still at the keyboard can derive.
+             */
+            krb_cc_logout();
+
             user_current = -1;
             desktop_mode = 0;
             login_stage = LOGIN_PASSWORD;
@@ -2117,6 +2393,20 @@ void kmain(void) {
             /* Read then subtract, rather than read then zero, so a notch
              * that lands between the two is carried into the next frame
              * instead of being dropped. */
+            /*
+             * Remote input, applied here rather than where it arrives.
+             *
+             * The RDP thread parses input PDUs off the socket and puts
+             * them in a ring; this is the other end of that ring, on
+             * the thread that owns the desktop's state. Draining before
+             * the render means a remote click is reflected in the frame
+             * that same tick rather than the next one.
+             */
+            rdp_pump_input();
+
+            /* Read then subtract, rather than read then zero, so a notch
+             * that lands between the two is carried into the next frame
+             * instead of being dropped. */
             int32_t wheel = mouse_wheel;
             if (wheel) {
                 mouse_wheel -= wheel;
@@ -2134,6 +2424,13 @@ void kmain(void) {
             desktop_render(backbuf, w, h, mouse_x, mouse_y, mouse_buttons);
             uint64_t t1 = cycle_now();
             vga_flip(vram, w, h, pitch_px);
+            /*
+             * The same frame the screen just got, offered to whoever is
+             * watching remotely. This only records the pointer and bumps
+             * a counter -- the diffing and encoding happen on the RDP
+             * thread, so a slow remote link cannot slow the display.
+             */
+            rdp_frame_ready(backbuf, w, h);
             uint64_t t2 = cycle_now();
             frame_render_cy += t1 - t0;
             frame_flip_cy   += t2 - t1;
@@ -2256,10 +2553,25 @@ void kmain(void) {
                     frame_idle();
                     continue;
                 }
-                typed_len = 0;
-                typed_text[0] = '\0';
                 user_current = login_sel;
                 session_begin(user_name_of(user_current));
+
+                /*
+                 * Kerberos credentials from the last session.
+                 *
+                 * Here rather than anywhere else because this is the one
+                 * moment the password exists in this system: it is about
+                 * to be wiped two lines below, and the credential cache
+                 * is encrypted under a key derived from it. After this
+                 * call the key is held and the password is gone.
+                 *
+                 * session_begin() has already run, so the profile tree
+                 * the cache lives in exists even on a first login.
+                 */
+                krb_cc_login(user_name_of(user_current), typed_text);
+
+                typed_len = 0;
+                typed_text[0] = '\0';
                 desktop_mode = 1;
 #ifdef USER_SELFTEST
                 /*

@@ -55,10 +55,21 @@ void     vxnet_log_ip(uint32_t addr_net_order);
  */
 int      vxnet_socket(void);
 int      vxnet_connect(int s, const uint8_t ip[4], uint16_t port);
+
+/* ===== the listening half =====
+ *
+ * A server socket, for the one thing in this system that is a server:
+ * the remote desktop in src/net/rdp.c. vxnet_accept() blocks until
+ * somebody connects and hands back a socket that behaves exactly like
+ * a connected one from vxnet_connect(). */
+int      vxnet_listen(uint16_t port, int backlog);
+int      vxnet_accept(int s, uint8_t peer[4]);
+
 int      vxnet_send(int s, const void *buf, int len);
 int      vxnet_recv(int s, void *buf, int len);
 void     vxnet_close(int s);
 int      vxnet_timeout(int s, uint32_t ms);
+int      vxnet_rcv_timeout(int s, uint32_t ms);
 int      vxnet_nodelay(int s, int on);
 int      vxnet_resolve(const char *host, uint8_t out[4]);
 

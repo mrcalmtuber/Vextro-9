@@ -196,13 +196,23 @@ all: os.iso disk.img
 # runs on the host. The property it exists for -- that a link must not end
 # the line -- cannot be seen in a screenshot and is awkward to assert from
 # inside the kernel, so it is checked here instead.
-test: build/wikidoc_test build/crypto_test build/ntcrypto_test build/aes_test \
-      build/krb5_test build/mbedtls_test
+test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test \
+      build/ntcrypto_test build/aes_test build/krb5_test build/wifi_test \
+      build/media_test build/rdp_test build/ntfs_test build/mbedtls_test
 	@./build/wikidoc_test
+	@./build/profile_test
+	@./build/ttfhint_test
 	@./build/crypto_test
 	@./build/ntcrypto_test
 	@./build/aes_test
 	@./build/krb5_test
+	@./build/wifi_test
+	@./build/media_test
+	@./build/rdp_test
+	@mkdir -p build/scratch
+	@printf "vextro ntfs scratch\\n" > build/scratch/a.txt
+	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 a.txt=build/scratch/a.txt > /dev/null
+	@./build/ntfs_test build/scratch/ntfs.img
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
 	@python3 tools/linecount.py --check
 
@@ -242,6 +252,25 @@ build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
 
+# The profile isolation guard, against the ways around it rather than
+# against itself. Denying "/Documents and Settings/bob" proves nothing;
+# what has to be denied is every spelling of it -- backslashes, a drive
+# letter, doubled slashes, the wrong case, a `..` -- while an account
+# whose name merely starts the same way is still kept out.
+build/profile_test: tools/profile_test.c src/profile.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -o $@ $<
+
+# The TrueType bytecode interpreter, measured rather than asserted.
+# Every failure path in src/ttfhint.h falls back to the unhinted
+# outline, so an interpreter that errors on every glyph still draws
+# readable text -- "it builds and looks fine" cannot tell that apart
+# from one that works. This counts how often a hinted outline lands on
+# a pixel boundary and compares it with how often chance does.
+build/ttfhint_test: tools/ttfhint_test.c src/ttfhint.h src/ttf.h src/comicneue_ttf.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
 # The cipher is checked against the RFC's published vectors, not against
 # itself: an implementation that is merely self-consistent round-trips
 # perfectly and protects nothing.
@@ -278,6 +307,72 @@ build/aes_test: tools/aes_test.c src/aes.h
 # password is wrong, and means it, because the key it derived does not
 # match the one this end derived.
 build/krb5_test: tools/krb5_test.c src/krb5crypto.h src/aes.h src/ntcrypto.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# The wireless stack, minus the radio.
+#
+# There is no wireless device in QEMU and the chipset back-ends need
+# proprietary firmware, so nothing in src/net/wifi.c can be exercised on
+# the machines this is built on. What can be, and is here, is every part
+# a single wrong byte would break silently: the PMK against 802.11i's
+# published passphrase vectors, the group key wrap against RFC 3394,
+# CCMP's authentication of the frame header, and the whole 4-way
+# handshake driven against an authenticator written separately in the
+# test from the same standard.
+#
+# The handshake is the reason this matters. A wrong PTK does not fail
+# visibly -- it associates, exchanges four messages, and then every
+# encrypted frame is discarded by the access point with no diagnostic
+# on either side.
+build/wifi_test: tools/wifi_test.c src/net/wpa2.h src/net/ieee80211.h \
+                 src/aes.h src/ntcrypto.h src/sha256.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# The video decoder, minus the video engine.
+#
+# QEMU models no Intel GPU, so igpu_init() finds nothing and everything
+# from the VCS ring downward is unreachable on the machines this is
+# built on. The MFX command encodings in src/media/mfx.h come from
+# Intel's public documentation and have never touched silicon.
+#
+# What this checks is the two ends that surround them: the H.264 header
+# parsing that produces the hardware state, and the surface geometry and
+# colour conversion that turn its output into window pixels. Both are
+# places where a wrong constant produces a picture that is subtly wrong
+# rather than absent -- a mis-parsed crop offset shifts every frame by a
+# few pixels, and the wrong colour matrix tints the whole video.
+build/media_test: tools/media_test.c src/media/h264.h src/media/csc.h \
+                  src/media/mfx.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# The RDP wire format.
+#
+# Unlike the wireless and video work in this tree, the remote desktop
+# runs on the machines it is built on -- it is software over TCP and the
+# network stack is up in QEMU. This checks the encoders against the
+# bytes the specification prescribes; tools/rdp_probe.py drives a real
+# connection against a booted system and checks the replies.
+#
+# Worth having separately because RDP writes lengths four different ways
+# in one packet, and a length in the wrong encoding makes a client close
+# the socket with no diagnostic at either end.
+build/rdp_test: tools/rdp_test.c src/net/rdpwire.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
+
+# The NTFS driver, against a volume made by tools/mkntfs.py.
+#
+# A filesystem reader can be checked by reading. A writer can only be
+# checked by writing and reading back, and the only volume the kernel
+# has is the one it booted from -- which is the worst place to discover
+# that a cluster allocator hands the same run out twice. This compiles
+# the identical source the kernel runs against an image file, so being
+# wrong about NTFS costs nothing.
+build/ntfs_test: tools/ntfs_test.c src/ntfs.h src/ntfswrite.h \
+                 src/ntfs_hostshim.h
 	@mkdir -p build
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function -Isrc -o $@ $<
 
@@ -371,7 +466,30 @@ MUSIC_FLAC  := build/music/bell.flac
 $(MUSIC_WAV) $(MUSIC_FLAC): tools/mkwav.py
 	@python3 tools/mkwav.py build/music
 
-disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC)
+# The certificate authority store.
+#
+# Copied from whatever the build machine trusts rather than downloaded,
+# so the build stays offline and the roots are ones already vouched for
+# by a system somebody maintains. Without it TLS still works and still
+# encrypts -- it just cannot prove who is on the far end, which is what
+# vxsec_verifies_certificates() reports and what the browser says
+# instead of showing a padlock.
+CA_CANDIDATES := /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt \
+                 /usr/local/etc/openssl/cert.pem \
+                 /opt/homebrew/etc/openssl@3/cert.pem
+CA_BUNDLE := $(firstword $(foreach c,$(CA_CANDIDATES),$(wildcard $(c))))
+
+build/ca-bundle.crt:
+	@mkdir -p build
+	@if [ -n "$(CA_BUNDLE)" ]; then \
+	    cp "$(CA_BUNDLE)" $@; \
+	    echo "  CA     $(CA_BUNDLE) -> $@ ($$(grep -c 'BEGIN CERT' $@) roots)"; \
+	else \
+	    : > $@; \
+	    echo "  CA     no host CA bundle found; TLS will not verify peers"; \
+	fi
+
+disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -381,6 +499,7 @@ disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(P
 		apps/about.txt apps/notes.txt build/hello build/faulter \
 		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \
+		build/ca-bundle.crt:etc/ca-bundle.crt \
 		$$big \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
 		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci) \
@@ -527,7 +646,16 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(WINAPPS) $(
 	rm -rf build/initrd_staging
 
 # --- Kernel ---
-build/kernel.o: src/kernel.c $(wildcard src/*.h) build/res.stamp
+# The .c files under src/net and src/media are included into this
+# translation unit rather than compiled separately (they need the
+# drivers' static state), so they are dependencies of kernel.o and not
+# objects of their own. A wildcard covers them, because leaving one out
+# means make reports success having rebuilt nothing -- which reads as
+# "the fix did not work" and is really "the fix was never compiled".
+build/kernel.o: src/kernel.c $(wildcard src/*.h) \
+                $(wildcard src/net/*.h) $(wildcard src/net/*.c) \
+                $(wildcard src/media/*.h) $(wildcard src/media/*.c) \
+                build/res.stamp
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -588,7 +716,13 @@ MBED_SRC  := $(wildcard $(MBED_DIR)/library/*.c)
 TP_SRC    := $(LWIP_SRC) $(MBED_SRC) third_party/vxport.c
 TP_OBJ    := $(patsubst third_party/%.c,build/tp/%.o,$(TP_SRC))
 
-build/tp/%.o: third_party/%.c
+# lwIP and Mbed TLS are configured entirely by their headers, so a
+# change to lwipopts.h or vextro_config.h changes what every one of
+# these objects compiles to. Without naming them here, editing a buffer
+# size rebuilds nothing and the old value stays linked -- which reads as
+# "the tuning had no effect" and is really "the tuning was never built".
+build/tp/%.o: third_party/%.c third_party/lwip-port/lwipopts.h \
+              $(MBED_DIR)/vextro_config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(NET_FLAGS) -w -c $< -o $@
 
@@ -654,10 +788,16 @@ $(ISO)/boot/initrd.tar: build/initrd.tar
 # ordinary build leaves kernel.o untouched, produces an ISO with no
 # self-test in it, and says nothing at all. The tests then "pass" by not
 # running.
+# EXTRA really is recorded here now. It was not: the recipe wrote RES and
+# the framebuffer bounds and nothing else, so the failure described just
+# above was live rather than guarded against -- `make iso
+# EXTRA=-DSWAP_SELFTEST` after an ordinary build left kernel.o untouched,
+# produced an ISO with no self-test in it, and said nothing. The test then
+# "passed" by never running, which is the worst way for a test to pass.
 build/res.stamp: FORCE
 	@mkdir -p build
-	@echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H)' | cmp -s - $@ || \
-	  echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H)' > $@
+	@echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H) $(EXTRA)' | cmp -s - $@ || \
+	  echo '$(RES) $(FB_MAX_W)x$(FB_MAX_H) $(EXTRA)' > $@
 
 $(ISO)/boot/limine/limine.conf: limine.conf build/res.stamp
 	@mkdir -p $(ISO)/boot/limine

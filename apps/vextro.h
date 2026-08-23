@@ -150,4 +150,34 @@ static inline uint32_t *os_canvas(int *out_w, int *out_h) {
     return (uint32_t *)(uintptr_t)info[0];
 }
 
+/*
+ * ---- Syscall 25: sys_random ----
+ * Hardware entropy, without touching supervisor memory.
+ *
+ * Returns the number of bytes actually written, which is not always the
+ * number asked for: the generator behind this can fail under load, and
+ * a short read is reported rather than padded with something that looks
+ * random and is not. A caller that needs all of it must check.
+ *
+ *     uint8_t key[32];
+ *     if (os_random(key, sizeof key) != sizeof key)
+ *         give_up();          // do NOT proceed with a partial key
+ *
+ * Uses SYSCALL rather than the legacy gate because it has to return a
+ * count; see the note on syscall_dispatch_legacy in src/syscall.h for
+ * why `int 0x80` cannot.
+ */
+static inline long os_random(void *buf, unsigned long len) {
+    long rc;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(rc)
+        : "a"((unsigned long)25), "D"(buf), "S"(len)
+        : "rcx", "r11", "memory",
+          "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7",
+          "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
+    );
+    return rc;
+}
+
 #endif /* VEXTRO_H */

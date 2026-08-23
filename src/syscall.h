@@ -54,6 +54,23 @@
 #define SYS_GFX_RECT        22
 #define SYS_FORK            23
 #define SYS_MEMINFO         24
+/*
+ * Entropy, for ring 3.
+ *
+ * RDRAND is not a privileged instruction, so a program could execute it
+ * itself -- but not every processor has it, and the ones that do can
+ * legitimately fail it under load. Getting that right means a retry
+ * loop and a fallback decision in every program that wants a random
+ * number, which is how one of them ends up seeding from the tick count
+ * and nobody notices.
+ *
+ * So the kernel answers instead, from the same source TLS uses, and a
+ * short read is reported rather than padded. The alternative that was
+ * *not* chosen is mapping a kernel entropy pool into user space: a
+ * shared page that several processes read is a side channel between
+ * them, and this door costs a syscall to avoid it.
+ */
+#define SYS_RANDOM          25
 
 /*
  * Every register a user thread had, in the order the entry stubs push

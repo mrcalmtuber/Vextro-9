@@ -52,6 +52,10 @@
  */
 #define WIN_TEB_VA   0x00007FFF00000000ULL
 #define WIN_PEB_VA   (WIN_TEB_VA + 0x1000)
+/* A third page: the process parameters the PEB points at, and the
+ * strings and environment block they in turn point at. See the
+ * RTL_USER_PROCESS_PARAMETERS offsets below. */
+#define WIN_PARAMS_VA (WIN_PEB_VA + 0x1000)
 
 /* ---- TEB offsets, as everything compiled for Windows expects them ----
  *
@@ -77,6 +81,45 @@
 #define PEB_OS_MAJOR         0x118
 #define PEB_OS_MINOR         0x11C
 #define PEB_OS_BUILD         0x120
+
+/* ---- RTL_USER_PROCESS_PARAMETERS ----
+ *
+ * What PEB_PROCESS_PARAMS points at, and what this system used to write
+ * as a literal zero. It is where a process's current directory and its
+ * environment actually live: GetCurrentDirectory and GetEnvironmentVariable
+ * read through here, and a null pointer is why neither could ever have
+ * answered.
+ *
+ * Published offsets for x86-64, not ours to choose. CurrentDirectory is
+ * a CURDIR -- a UNICODE_STRING at 0x38 followed by a handle at 0x48 --
+ * which is why DllPath starts at 0x50 and not 0x48.
+ */
+#define RUPP_MAX_LENGTH      0x00
+#define RUPP_LENGTH          0x04
+#define RUPP_FLAGS           0x08
+#define RUPP_CURDIR_PATH     0x38   /* UNICODE_STRING */
+#define RUPP_CURDIR_HANDLE   0x48
+#define RUPP_DLL_PATH        0x50   /* UNICODE_STRING */
+#define RUPP_IMAGE_PATH      0x60   /* UNICODE_STRING */
+#define RUPP_COMMAND_LINE    0x70   /* UNICODE_STRING */
+#define RUPP_ENVIRONMENT     0x80   /* PVOID          */
+#define RUPP_SIZE            0x90
+
+/* A UNICODE_STRING is { USHORT Length; USHORT MaximumLength; ULONG pad;
+ * PWSTR Buffer; } -- sixteen bytes, the pointer eight in. Length counts
+ * bytes and excludes the terminator; MaximumLength includes it. */
+#define UNISTR_LENGTH        0x00
+#define UNISTR_MAX_LENGTH    0x02
+#define UNISTR_BUFFER        0x08
+
+/* Where inside the parameters page each variable-length part is put.
+ * Fixed rather than packed, because a layout computed at load time is a
+ * layout that has to be recomputed to be checked. */
+#define WIN_PARAMS_CURDIR_OFF  0x0100
+#define WIN_PARAMS_IMAGE_OFF   0x0300
+#define WIN_PARAMS_CMDLINE_OFF 0x0500
+#define WIN_PARAMS_ENV_OFF     0x0700
+#define WIN_PARAMS_ENV_CAP     0x0900   /* to the end of the page */
 
 /* ---- the exception directory ---- */
 

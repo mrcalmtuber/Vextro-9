@@ -40,8 +40,18 @@
  */
 
 #include <stdint.h>
+#ifdef NTFS_HOST_TEST
+/* The block layer and the partition scanner are the only things this
+ * file needs from the kernel, and both are a handful of functions. The
+ * host test supplies them over a file so that the *same* source that
+ * mounts a disk in the kernel can be run against an image on the build
+ * machine -- which is the only way to check a filesystem writer without
+ * risking a volume that matters. */
+#include "ntfs_hostshim.h"
+#else
 #include "blk.h"
 #include "part.h"
+#endif
 
 #define NTFS_ATTR_STANDARD_INFO 0x10
 #define NTFS_ATTR_ATTRIBUTE_LIST 0x20
@@ -148,7 +158,8 @@ static uint8_t  ntfs_clu[65536];
  */
 static int ntfs_apply_fixups(uint8_t *rec, uint32_t size, uint32_t sector) {
     ntfs_record_t *h = (ntfs_record_t *)rec;
-    if (h->fixup_count == 0 || h->fixup_offset + h->fixup_count * 2 > size)
+    if (h->fixup_count == 0 ||
+        (uint32_t)h->fixup_offset + (uint32_t)h->fixup_count * 2u > size)
         return -1;
 
     const uint16_t *fix = (const uint16_t *)(rec + h->fixup_offset);
@@ -211,8 +222,12 @@ static int ntfs_next_run(const uint8_t **p, const uint8_t *end,
         delta |= (int64_t)(uint64_t)(*(*p)++) << (i * 8);
     /* Sign-extend from the width the run actually used. */
     int bits = off_size * 8;
+    /* Sign-extend by ORing in the high bits, built unsigned. Shifting a
+     * negative value left is undefined, and the obvious -1LL << bits is
+     * exactly that -- it happens to work on every compiler this has met
+     * and is still not something to leave in a filesystem. */
     if (bits < 64 && (delta & (1LL << (bits - 1))))
-        delta |= -1LL << bits;
+        delta |= (int64_t)(~0ULL << bits);
 
     *prev_lcn += delta;
     out->sparse = 0;

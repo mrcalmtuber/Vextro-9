@@ -46,6 +46,65 @@ static char  brw_title[BRW_TITLE_MAX] = "Vextro Browser";
 static int   brw_scroll = 0;         /* px */
 static int   brw_total_h = 0;        /* px */
 static int   brw_loading = 0;
+
+/* ===== the secure fetch =====
+ *
+ * https:// used to print "this kernel does not have TLS", which stopped
+ * being true once Mbed TLS went in and stayed on screen anyway. What
+ * kept the browser off it was not the crypto but the threading:
+ * vxsec_https_get() blocks from the DNS lookup to the last body byte,
+ * and the browser is drawn on the compositor thread, so calling it here
+ * would stop the desktop for as long as the page took.
+ *
+ * So the fetch runs on a thread of its own and hands the result back
+ * through these. `brw_tls_state` is the handshake between the two and is
+ * the only variable either side writes while the other might read: the
+ * worker fills the buffer and *then* publishes the state, the compositor
+ * reads the state and only then touches the buffer.
+ */
+#define BRW_TLS_IDLE  0
+#define BRW_TLS_RUN   1
+#define BRW_TLS_DONE  2
+#define BRW_TLS_ERR   3
+
+#define BRW_TLS_MAX   (192 * 1024)
+
+static volatile int brw_tls_state = BRW_TLS_IDLE;
+static volatile int brw_tls_len   = 0;
+static char         brw_tls_host[128];
+static char         brw_tls_path[256];
+static char         brw_tls_err[96];
+static uint8_t      brw_tls_buf[BRW_TLS_MAX];
+
+static void brw_tls_thread(void) {
+    int n = vxsec_https_get(brw_tls_host, brw_tls_path,
+                            brw_tls_buf, BRW_TLS_MAX);
+
+    if (n > 0) {
+        brw_tls_len = n;
+        __asm__ volatile("" ::: "memory");   /* body, then the state */
+        brw_tls_state = BRW_TLS_DONE;
+        return;
+    }
+
+    /*
+     * A failure here is most often the certificate, now that the chain
+     * is actually checked -- so say which it was rather than "could not
+     * connect", because the two want completely different responses
+     * from whoever is reading.
+     */
+    if (!vxsec_verifies_certificates())
+        str_copy(brw_tls_err, "the connection failed (certificates are "
+                              "not being verified on this volume)",
+                 sizeof(brw_tls_err));
+    else
+        str_copy(brw_tls_err, "the connection failed, or the server's "
+                              "certificate did not verify",
+                 sizeof(brw_tls_err));
+
+    __asm__ volatile("" ::: "memory");
+    brw_tls_state = BRW_TLS_ERR;
+}
 static char  brw_status[80] = "Ready";
 static int   brw_hover_line = -1;
 static int   brw_wrap_px = 700;      /* recomputed from window width */
@@ -607,8 +666,21 @@ static void brw_page_home(void) {
     brw_add_text("vextro://about", BS_LINK, "vextro://about");
     brw_line_flush();
     brw_line_flush();
-    brw_add_text("https:// sites will not load - there is no TLS on bare", BS_DIM, 0);
-    brw_add_text("metal (yet). Plain http only.", BS_DIM, 0);
+    if (!vxsec_ready()) {
+        brw_add_text("https:// will not load: TLS did not start, because "
+                     "this", BS_DIM, 0);
+        brw_add_text("machine has no hardware random source.", BS_DIM, 0);
+    } else if (vxsec_verifies_certificates()) {
+        brw_add_text("https:// works, over TLS 1.3, and the server's "
+                     "certificate", BS_DIM, 0);
+        brw_add_text("is checked against the roots in /etc/ca-bundle.crt.",
+                     BS_DIM, 0);
+    } else {
+        brw_add_text("https:// works, over TLS 1.3 - but this volume "
+                     "carries no", BS_DIM, 0);
+        brw_add_text("/etc/ca-bundle.crt, so nothing proves who is at the "
+                     "far end.", BS_DIM, 0);
+    }
     brw_doc_finish();
 }
 
@@ -795,9 +867,62 @@ static void brw_navigate_no_hist(const char *url) {
     }
 
     if (str_starts_with(url_buf, "https://")) {
+        char host[128], path[256];
+        uint16_t port = 443;
+
         brw_set_addr(url_buf);
-        brw_page_error("https:// needs TLS, which this kernel does not have. Try the http:// version.");
-        brw_set_status("Error: no TLS");
+
+        if (!http_parse_url(url_buf, host, sizeof(host), &port,
+                            path, sizeof(path))) {
+            brw_page_error("That does not look like a valid URL.");
+            brw_set_status("Error: bad URL");
+            return;
+        }
+
+        if (!vxnet_up()) {
+            brw_page_error("The network is not up.");
+            brw_set_status("Error: no network");
+            return;
+        }
+        if (!vxsec_ready()) {
+            brw_page_error("TLS did not start. Without a hardware random "
+                           "source there is no safe way to make a session "
+                           "key, so secure connections are disabled rather "
+                           "than made with a predictable one.");
+            brw_set_status("Error: no TLS");
+            return;
+        }
+        if (brw_tls_state == BRW_TLS_RUN) {
+            brw_set_status("A secure request is already in flight");
+            return;
+        }
+
+        str_copy(brw_tls_host, host, sizeof(brw_tls_host));
+        str_copy(brw_tls_path, path[0] ? path : "/", sizeof(brw_tls_path));
+
+        brw_doc_reset();
+        brw_add_text("Connecting securely", BS_H3, 0);
+        brw_add_text(url_buf, BS_DIM, 0);
+        brw_doc_finish();
+
+        brw_tls_len   = 0;
+        brw_tls_state = BRW_TLS_RUN;
+        brw_loading   = 1;
+        brw_set_status("TLS handshake...");
+
+        /*
+         * On a thread of its own, because vxsec_https_get() blocks from
+         * the DNS lookup through the handshake to the last byte of the
+         * body -- seconds, on a slow site. This function runs on the
+         * compositor thread, so doing it here would freeze the whole
+         * desktop until the page arrived.
+         */
+        if (!sched_spawn_kernel(brw_tls_thread, "brw-tls", PRIO_NORMAL)) {
+            brw_tls_state = BRW_TLS_IDLE;
+            brw_loading = 0;
+            brw_page_error("Could not start the secure fetch.");
+            brw_set_status("Error: no thread");
+        }
         return;
     }
 
@@ -858,6 +983,52 @@ static void brw_back(void) {
 
 static void brw_poll(void) {
     if (!brw_loading) return;
+
+    /* The secure fetch, if one is in flight. Checked before the plain
+     * HTTP state because the two are independent and a stale HTTP_DONE
+     * from a previous navigation would otherwise be picked up here. */
+    if (brw_tls_state == BRW_TLS_DONE) {
+        int len = brw_tls_len;
+        int is_html = 0;
+
+        brw_tls_state = BRW_TLS_IDLE;
+        brw_loading = 0;
+
+        for (int i = 0; i < len && i < 64; i++) {
+            if (brw_tls_buf[i] == '<') { is_html = 1; break; }
+            if (brw_tls_buf[i] > ' ') break;
+        }
+
+        if (is_html) brw_parse_html(brw_tls_buf, len);
+        else         brw_parse_plain(brw_tls_buf, len);
+
+        {
+            char st[96], nb[16];
+            str_copy(st, vxsec_verifies_certificates()
+                             ? "Done - TLS 1.3, certificate verified, "
+                             : "Done - TLS 1.3, NOT verified, ",
+                     sizeof(st));
+            uint_to_str((uint32_t)(len / 1024), nb);
+            str_append(st, nb, sizeof(st));
+            str_append(st, " KB", sizeof(st));
+            brw_set_status(st);
+        }
+        brw_note_recent();
+        return;
+    }
+
+    if (brw_tls_state == BRW_TLS_ERR) {
+        char msg[128];
+        brw_tls_state = BRW_TLS_IDLE;
+        brw_loading = 0;
+        str_copy(msg, "Could not load the page: ", sizeof(msg));
+        str_append(msg, brw_tls_err, sizeof(msg));
+        brw_page_error(msg);
+        brw_set_status("Error: TLS");
+        return;
+    }
+
+    if (brw_tls_state == BRW_TLS_RUN) return;   /* still working */
 
     if (http_state == HTTP_DONE) {
         brw_loading = 0;

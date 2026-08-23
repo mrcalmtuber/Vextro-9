@@ -164,8 +164,10 @@ nothing else here needed.
 be in flight at once.</td>
 <td><b>Browser</b> — <code>info.cern.ch</code>, the first website, fetched
 and rendered on bare metal. <code>https://</code> works now too, over
-TLS 1.3 — though nothing verifies the certificate, and the browser says
-so rather than showing a padlock it has not earned.</td>
+TLS 1.3, on a thread of its own so a slow site never freezes the desktop
+— and the server's chain is checked against the roots in
+<code>/etc/ca-bundle.crt</code>. The status line says which of the two
+it got rather than showing a padlock it has not earned.</td>
 </tr>
 <tr>
 <td><img src="docs/wikipedia.png" alt="Wikipedia search"></td>
@@ -812,11 +814,56 @@ Point it elsewhere with `store repo <url>`.
 
 ---
 
+## NTFS, read and write
+
+There is a full NTFS **writer** in `src/ntfswrite.h`, and a formatter in
+`tools/mkntfs.py` that produces volumes Linux and Windows both mount.
+What it implements is the part that actually allocates:
+
+| | |
+|---|---|
+| `$Bitmap` | first-fit cluster allocation, persisted before the caller sees the run |
+| `$MFT` | record allocation past the sixteen system files |
+| data runs | signed-delta encoding, checked against the reader's decoder |
+| `$INDEX_ROOT` | ordered insert and remove of `$FILE_NAME` entries |
+| `$UsnJrnl` | change records in the documented v2 format |
+| journal | a write-ahead redo log: payload, then commit, then the write |
+
+**It is not the boot volume.** `disk.img` is still exFAT. The write path
+is exercised by `tools/ntfs_test.c` — 72 checks against a scratch image,
+compiling the same source the kernel runs — and until a volume that
+matters has nothing to lose, that is where it stays.
+
+What is deliberately absent is listed at the top of `src/ntfswrite.h`
+rather than discovered later: `$INDEX_ALLOCATION` (a directory that
+outgrows its record is refused, not split into a B-tree),
+`$ATTRIBUTE_LIST`, compression, and NTFS's own `$LogFile` — whose redo
+record format is not publicly specified, so what protects writes here is
+this system's journal and not one Windows would replay.
+
+## Certificates are verified now
+
+TLS 1.3 has worked for a while. What it did not do was establish *who*
+was on the far end — `MBEDTLS_SSL_VERIFY_NONE`, no CA store, and the
+README said so.
+
+The volume now carries `/etc/ca-bundle.crt`, copied at build time from
+whatever the build machine already trusts. `vxsec_init()` parses it once
+into a shared `mbedtls_x509_crt` chain and switches the config to
+`VERIFY_REQUIRED`, so a chain that does not lead to a known root — or a
+leaf whose names do not include the host asked for — fails the handshake
+instead of completing it.
+
+`vxsec_verifies_certificates()` returns whether that happened rather
+than a constant, and a build on a machine with no CA bundle still works,
+still encrypts, and still says plainly that it cannot prove anything
+about the peer.
+
 ## What is actually in here
 
-**65,495 lines of C written here**, across 125 files, compiled as a
+**84,435 lines of C written here**, across 146 files, compiled as a
 single translation unit plus one for inference, over a user-space C
-library of its own. (69,110 counting the embedded typeface, the integer
+library of its own. (88,050 counting the embedded typeface, the integer
 sine table and Limine's own boot-protocol header — data and interface
 rather than logic.)
 
@@ -841,15 +888,19 @@ the counts are kept apart on purpose.
 | **Network** | lwIP 2.2.1: IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP — reassembly, retransmission with backoff, window scaling, delayed ACKs — behind the sockets API, with eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP. Intel e1000 driver |
 | **Directory** | LDAP v3 client: simple bind, subtree search with equality and presence filters, BER written by hand and parsed with a bounded reader that refuses the indefinite-length form. Tested against `tools/ldap_server.py`, which decodes independently and rejects encodings that are only nearly right |
 | **Domain authentication** | Kerberos v5: the AS exchange with PA-ENC-TIMESTAMP pre-authentication, the TGS exchange, and AP-REQ construction — aes256-cts-hmac-sha1-96 and aes128-cts, and deliberately not rc4-hmac, which is what makes Kerberoasting work. RFC 3961's n-fold, DK and PBKDF2 string-to-key checked against the RFCs' own vectors. AES from AESENC where the processor has it, a portable fallback where it does not, and a boot-time check that the two agree. Proved end to end against `tools/kdc.py`, which verifies the client's authenticator checksum over the exact request body it received |
+| **Credential cache** | Tickets survive a reboot: the credential a ticket is built from — the Ticket as the KDC issued it, the session key, the expiry — is written into the user's profile tree and reloaded at the next login. Not the AP-REQ, which carries a timestamp and would be rejected as a replay. The file is encrypted under a key derived from the login password, which exists at exactly the moment the cache needs reading, so a stolen volume yields ciphertext; logging out wipes the key and the resident session keys but leaves the file. Expired credentials are discarded on load rather than presented |
 | **File sharing** | SMB2 client, dialects 2.0.2 and 2.1 — negotiate, session setup, tree connect, create, read, write, close and directory enumeration, with every message signed by HMAC-SHA256. Authenticates with NTLMv2 over NTLMSSP inside a SPNEGO wrapper, including RC4 key exchange so two sessions by the same user do not share a signing key. SMB1 is absent by construction: the code to speak it does not exist, so the connection cannot be talked down to it. Proved against `tools/smbserver.py`, which recomputes the NTLMv2 proof and every signature itself |
+| **SMB 3.0 encryption** | Dialect 0x0300, with the whole message — header and all — carried as the ciphertext of an AES-128-CCM transform frame, and the transform header itself as associated data so a frame retargeted at another session fails its tag rather than decrypting. Keys from SP 800-108 counter-mode derivation over the session key; signing moves from HMAC-SHA256 to AES-128-CMAC, which is the difference a client that merely bumps the dialect number gets wrong. AES-GCM is implemented alongside CCM and checked against the same vectors. Backward compatibility is tested rather than assumed: `tools/smbserver.py --no-smb3` is a 2.1-only server, and the same suite passes against it signed and unencrypted |
 | **Group Policy** | Machine policy fetched from a domain controller's SYSVOL share over the SMB2 client and applied through the registry. GPT.INI version parsing (two counters packed into one word, and they move independently), and Registry.pol in PReg format — where every bracket and semicolon is a UTF-16 character rather than a byte. The whole file is validated before a single value is written, and the writes go inside one registry transaction, so a malformed policy leaves nothing behind |
 | **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology split into packages, cores and threads from CPUID leaf 0x0B; microcode revision read and updates applied if present |
 | **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; structured exception handling -- `__try`/`__except` dispatched from the trap handler through .pdata and .xdata; Thread and Process Environment Blocks reachable through GS; string resources read out of .rsrc; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
 | **Transport security** | Mbed TLS 3.6.4, stripped to TLS 1.3 with SHA-256 and AES-GCM, allocating through the kernel heap and seeded from RDRAND; eight parallel secure sessions. Also `src/tls.h`, written here, with X25519, ChaCha20-Poly1305 and HKDF checked against RFC 7748, 8439 and 5869. Neither verifies certificates, and every layer says so |
 | **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage, alpha-blended drop shadows with radial corners, spring-driven window motion, Intel Gen9 blitter with batched command buffers and hang capture, firmware framebuffer fallback |
+| **Font hinting** | A TrueType bytecode interpreter: the font program, the pre-program and every glyph's own instructions, executed rather than skipped. Stack machine with functions, control flow, storage, the twilight zone, the control value table and delta exceptions — 26.6 fixed point throughout, no floating point anywhere in it. Grid-fitting is measured rather than claimed: on-curve coordinates land on a whole pixel boundary 1% of the time unscaled and 18% hinted, and at 11 px the three bars of an 'E' go from smeared across two rows each to one solid row each. Comic Neue is ttfautohint output and carries no horizontal instructions, so vertical stems are unhinted — the machinery for them is implemented and a face that hints in x would get it |
 | **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
 | **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
 | **Memory** | Bitmap frame allocator over the firmware map; per-process PML4 with the kernel half shared by reference; slab and page-run kernel heap; W^X on every loaded image |
+| **Paging** | Demand paging to a 256 MB contiguous `pagefile.sys`, resolved to one raw extent at boot so no filesystem code runs inside a fault. Clock replacement over a reverse map from frame back to mapping, revalidated against the page tables before anything is evicted. A swapped page is recorded in its own page table entry — bit 10 of a non-present entry, which the processor ignores and which cannot alias the copy-on-write bit that shares it. Only user pages: kernel memory, page tables and shared frames never leave RAM |
 | **Processes** | Ring 3 with its own GDT and TSS, SYSCALL/SYSRET and a DPL-3 `int 0x80` gate, preemptive priority round-robin on the APIC timer at 1 kHz, per-thread FPU state, faults that kill a thread instead of the machine |
 | **Userland** | `.vx` container format, two syscall ABIs, a C library (string.h, stdio.h, malloc over sbrk), a package store, five shipped apps |
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |

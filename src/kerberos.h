@@ -5,6 +5,12 @@
 #include "vxnet.h"
 #include "ber.h"
 #include "krb5crypto.h"
+/* For the credential cache at the bottom of this file: SHA-256 is the
+ * password KDF, ChaCha20 encrypts the cache. Both are self-contained and
+ * carry their own guards, so including them here costs nothing when
+ * desktop.h includes them again later. */
+#include "sha256.h"
+#include "chacha20.h"
 
 /*
  * src/kerberos.h — proving who you are without sending your password.
@@ -62,9 +68,15 @@
  * rather than merely deprioritised.
  *
  * Not here: cross-realm referrals, renewal and forwarding of tickets,
- * PKINIT, and the credential cache. Tickets live in memory for the life
- * of the boot and are not written to disk, which is a limitation and
- * also means there is no ccache file for anything to steal.
+ * and PKINIT.
+ *
+ * The credential cache *is* here now, at the bottom of this file, and it
+ * replaces a sentence this comment used to end on -- that tickets never
+ * touched the disk, "which is a limitation and also means there is no
+ * ccache file for anything to steal." Half of that was a genuine
+ * security property and giving it up needs an argument rather than a
+ * changelog entry; the argument is at the head of that section, with
+ * what was done instead.
  *
  * One connection at a time. The buffers below are single instances, the
  * same way src/ldap.h has one connection -- a machine that needs two
@@ -162,6 +174,12 @@ typedef struct {
 } krb_ctx_t;
 
 static krb_ctx_t krb;
+
+/* Defined with the credential cache at the bottom of this file, and
+ * called by both exchanges as soon as they succeed -- so a machine that
+ * loses power between acquiring a ticket and shutting down cleanly still
+ * comes back holding it. */
+static int krb_cc_save(void);
 
 static const char *krb_error_name(int code) {
     switch (code) {
@@ -895,6 +913,7 @@ static int krb_get_tgt(const char *kdc_host, uint16_t port, const char *realm,
     serial_puts(c->tgt.endtime);
     serial_puts("\n");
     krb_disconnect();
+    krb_cc_save();
     return 0;
 }
 
@@ -1111,7 +1130,539 @@ static int krb_get_service_ticket(const char *kdc_host, uint16_t port,
     serial_puts(c->svc.endtime);
     serial_puts("\n");
     krb_disconnect();
+    krb_cc_save();
     return 0;
+}
+
+/* ===========================================================
+ * the credential cache — tickets that survive a reboot
+ * ===========================================================
+ *
+ * ---- what is stored, and why it is not an AP-REQ ----
+ *
+ * An AP-REQ cannot be cached, and the comment above krb_make_ap_req
+ * says why in the course of explaining something else: it wraps an
+ * Authenticator encrypted under the session key carrying the *current
+ * time*, and "a recorded AP-REQ can be replayed, and will be rejected
+ * as too old." Writing one to disk and presenting it after a reboot
+ * would fail against any correct server, and against an incorrect one
+ * it would be a replay.
+ *
+ * What survives a reboot is the credential the AP-REQ is built *from*,
+ * and that is what every credential cache in existence actually holds:
+ * the Ticket exactly as the KDC issued it -- opaque here, encrypted
+ * under the service's own key -- together with the session key, the
+ * expiry and the flags. From those, krb_make_ap_req() mints a fresh
+ * AP-REQ with a current timestamp each time one is needed. So the
+ * tickets persist and the authenticators never do, which is the correct
+ * division and also the only one that works.
+ *
+ * ---- the part that needs justifying ----
+ *
+ * The header of this file used to end with: "Tickets live in memory for
+ * the life of the boot and are not written to disk, which is a
+ * limitation and also means there is no ccache file for anything to
+ * steal." That sentence was true and it was a real security property.
+ * This removes it, so something has to take its place.
+ *
+ * A session key is a bearer token. Anyone who can read it can
+ * impersonate the user to the services the ticket names, with no
+ * password and no further checks, until it expires. MIT krb5 writes
+ * /tmp/krb5cc_<uid> and protects it with file permissions alone;
+ * Windows keeps its cache in LSA process memory and never writes it at
+ * all. Neither of those is available here, so this does two things:
+ *
+ *   1. The file lives inside the user's profile tree, which src/swap.h's
+ *      neighbour src/profile.h now genuinely protects: fs_* refuses a
+ *      non-administrator any path under another account's profile. That
+ *      is the MIT model and it has the MIT model's limits -- an
+ *      administrator, or anyone holding the disk image, walks past it.
+ *
+ *   2. The file is encrypted under a key derived from the *login*
+ *      password, which closes exactly the gap that (1) leaves open. The
+ *      password is available at precisely one moment -- when the person
+ *      types it to log in -- and that is the moment the requirement
+ *      calls for the cache to be read. So the derived key is taken
+ *      then, held for the session, and wiped at logout. An attacker
+ *      with the volume has an encrypted file and no key; an attacker
+ *      with the running machine had the session anyway.
+ *
+ * What this deliberately does not do is encrypt under a key stored
+ * beside the file. That would look like protection and provide none,
+ * and a security property that is really obfuscation is worse than an
+ * admitted absence, because it stops people asking.
+ *
+ * ---- what is still true ----
+ *
+ * A stolen cache plus a stolen password is a full compromise, and so is
+ * a stolen cache within its lifetime if the password is guessed: the
+ * KDF here is iterated SHA-256, not a memory-hard function, for the
+ * reason chacha20.h already gives. Ticket lifetimes are the KDC's
+ * policy and are typically ten hours, which bounds it.
+ */
+
+#define KRB_CC_MAGIC0  'V'
+#define KRB_CC_MAGIC1  'X'
+#define KRB_CC_MAGIC2  'K'
+#define KRB_CC_MAGIC3  '1'
+#define KRB_CC_HDR     64
+#define KRB_CC_MAX     24576        /* two credentials with AD-sized PACs */
+#define KRB_CC_FILE    "/krb5cc.dat"
+
+/*
+ * From the filesystem and profile layers, which are compiled after this
+ * file -- kernel.c reaches kerberos.h at line 35 and desktop.h at 42.
+ * Declared rather than included: pulling desktop.h in here would invert
+ * the include order of half the system to reach four functions, and a
+ * static declared ahead of its definition costs four lines. The same
+ * pattern src/trap.h uses for its structured-exception hook.
+ */
+static void        profile_home(const char *name, char *out, int max);
+static int         fs_write_file(const char *path, const void *data, uint32_t len);
+static const void *fs_read_file(const char *filename, uint64_t *out_size);
+static int         fs_delete(const char *path);
+
+typedef struct {
+    uint8_t magic[4];
+    uint8_t version;
+    uint8_t count;
+    uint8_t salt[16];
+    uint8_t nonce[12];
+    uint8_t verifier[16];
+    uint8_t plain_len[4];       /* little-endian */
+    uint8_t reserved[10];
+} __attribute__((packed)) krb_cc_hdr_t;
+
+/* The key derived from the login password, held for the session so that
+ * a ticket acquired at three in the afternoon can be written without
+ * asking for the password again. Wiped by krb_cc_logout(). */
+static uint8_t krb_cc_key[CC20_KEY_BYTES];
+static uint8_t krb_cc_salt[16];
+static int     krb_cc_bound = 0;
+static char    krb_cc_user[64] = "";
+
+static uint8_t krb_cc_buf[KRB_CC_MAX];
+
+/*
+ * A second, domain-separated hash of the key.
+ *
+ * ChaCha20 has no idea whether it was given the right key: decrypting
+ * with the wrong one produces plausible bytes, and a "loaded" cache of
+ * noise would mean a session key of noise and authentication failures
+ * with no explanation. Same reasoning, and the same construction, as
+ * the vault in src/security.h.
+ */
+static void krb_cc_verifier(const uint8_t key[CC20_KEY_BYTES], uint8_t out[16]) {
+    uint8_t tmp[CC20_KEY_BYTES + 8];
+    for (int i = 0; i < CC20_KEY_BYTES; i++) tmp[i] = key[i];
+    const char *tag = "vxkrbcc1";
+    for (int i = 0; i < 8; i++) tmp[CC20_KEY_BYTES + i] = (uint8_t)tag[i];
+    uint8_t d[32];
+    sha256(tmp, CC20_KEY_BYTES + 8, d);
+    for (int i = 0; i < 16; i++) out[i] = d[i];
+}
+
+static void krb_cc_path(const char *user, char *out, int max) {
+    profile_home(user, out, max);
+    int n = 0;
+    while (out[n]) n++;
+    const char *suffix = KRB_CC_FILE;
+    for (int i = 0; suffix[i] && n < max - 1; i++) out[n++] = suffix[i];
+    out[n] = '\0';
+}
+
+/*
+ * Has this credential expired?
+ *
+ * Both times are "YYYYMMDDHHMMSSZ", fixed width and most-significant
+ * field first, which is the one property that makes a string compare a
+ * correct chronological compare. No parsing, no arithmetic, and nothing
+ * to get wrong about month lengths.
+ *
+ * A wrong clock produces a wrong answer in the safe direction more
+ * often than not: a machine whose RTC reads earlier than reality keeps
+ * a ticket the KDC has already retired, and the server rejects it. A
+ * machine reading later discards a good one and asks for another. Both
+ * are recoverable; neither is silent.
+ */
+static int krb_cc_expired(const char *endtime) {
+    char now[16];
+    krb_now(now);
+    for (int i = 0; i < 14; i++) {
+        if (!endtime[i]) return 1;            /* truncated: treat as expired */
+        if (endtime[i] != now[i])
+            return endtime[i] < now[i];
+    }
+    return 0;                                  /* expiring this very second */
+}
+
+/* ---- serialisation ---- */
+
+static uint32_t kcc_put16(uint8_t *p, uint32_t off, uint16_t v) {
+    p[off] = (uint8_t)v; p[off + 1] = (uint8_t)(v >> 8);
+    return off + 2;
+}
+static uint32_t kcc_put32(uint8_t *p, uint32_t off, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[off + i] = (uint8_t)(v >> (i * 8));
+    return off + 4;
+}
+static uint16_t kcc_get16(const uint8_t *p, uint32_t off) {
+    return (uint16_t)(p[off] | (p[off + 1] << 8));
+}
+static uint32_t kcc_get32(const uint8_t *p, uint32_t off) {
+    uint32_t v = 0;
+    for (int i = 3; i >= 0; i--) v = (v << 8) | p[off + i];
+    return v;
+}
+
+static uint32_t kcc_put_str(uint8_t *p, uint32_t off, const char *s, uint32_t cap) {
+    uint32_t n = 0;
+    while (s[n]) n++;
+    if (off + 2 + n > cap) return cap + 1;         /* overflow, caught by caller */
+    off = kcc_put16(p, off, (uint16_t)n);
+    for (uint32_t i = 0; i < n; i++) p[off + i] = (uint8_t)s[i];
+    return off + n;
+}
+
+static uint32_t kcc_get_str(const uint8_t *p, uint32_t off, uint32_t len,
+                            char *out, uint32_t max) {
+    if (off + 2 > len) return len + 1;
+    uint32_t n = kcc_get16(p, off);
+    off += 2;
+    if (off + n > len) return len + 1;
+    uint32_t k = 0;
+    for (; k < n && k < max - 1; k++) out[k] = (char)p[off + k];
+    out[k] = '\0';
+    return off + n;
+}
+
+static uint32_t krb_cc_encode_cred(const krb_cred_t *c, uint8_t *p,
+                                   uint32_t off, uint32_t cap) {
+    off = kcc_put_str(p, off, c->realm, cap);
+    if (off > cap) return cap + 1;
+
+    if (off + 1 > cap) return cap + 1;
+    p[off++] = (uint8_t)c->nsname;
+    for (int i = 0; i < c->nsname; i++) {
+        off = kcc_put_str(p, off, c->sname[i], cap);
+        if (off > cap) return cap + 1;
+    }
+
+    off = kcc_put_str(p, off, c->endtime, cap);
+    if (off > cap) return cap + 1;
+
+    if (off + 12 + c->session.len + 4 + c->tlen > cap) return cap + 1;
+    off = kcc_put32(p, off, c->flags);
+    off = kcc_put32(p, off, (uint32_t)c->session.etype);
+    off = kcc_put32(p, off, c->session.len);
+    for (uint32_t i = 0; i < c->session.len; i++) p[off + i] = c->session.data[i];
+    off += c->session.len;
+
+    off = kcc_put32(p, off, c->tlen);
+    for (uint32_t i = 0; i < c->tlen; i++) p[off + i] = c->ticket[i];
+    return off + c->tlen;
+}
+
+static uint32_t krb_cc_decode_cred(const uint8_t *p, uint32_t off, uint32_t len,
+                                   krb_cred_t *c) {
+    c->valid = 0;
+
+    off = kcc_get_str(p, off, len, c->realm, sizeof c->realm);
+    if (off > len) return len + 1;
+
+    if (off + 1 > len) return len + 1;
+    int ns = p[off++];
+    if (ns < 0 || ns > KRB_MAX_NAME) return len + 1;
+    c->nsname = ns;
+    for (int i = 0; i < ns; i++) {
+        off = kcc_get_str(p, off, len, c->sname[i], sizeof c->sname[i]);
+        if (off > len) return len + 1;
+    }
+
+    off = kcc_get_str(p, off, len, c->endtime, sizeof c->endtime);
+    if (off > len) return len + 1;
+
+    if (off + 12 > len) return len + 1;
+    c->flags        = kcc_get32(p, off); off += 4;
+    c->session.etype = (int)kcc_get32(p, off); off += 4;
+    c->session.len  = kcc_get32(p, off); off += 4;
+    if (c->session.len > sizeof c->session.data) return len + 1;
+    if (off + c->session.len > len) return len + 1;
+    for (uint32_t i = 0; i < c->session.len; i++) c->session.data[i] = p[off + i];
+    off += c->session.len;
+
+    if (off + 4 > len) return len + 1;
+    c->tlen = kcc_get32(p, off); off += 4;
+    if (c->tlen > KRB_MAX_TKT) return len + 1;
+    if (off + c->tlen > len) return len + 1;
+    for (uint32_t i = 0; i < c->tlen; i++) c->ticket[i] = p[off + i];
+    off += c->tlen;
+
+    c->valid = 1;
+    return off;
+}
+
+/* ---- the file ---- */
+
+/*
+ * Write whatever is currently held and unexpired.
+ *
+ * Called after each successful exchange, so the cache tracks the
+ * session rather than being written once at logout -- a machine that
+ * loses power between acquiring a ticket and shutting down cleanly
+ * should still come back with it.
+ *
+ * Silently does nothing when no key is bound, which is the case for a
+ * machine nobody has logged into and for the headless self-tests. That
+ * is deliberate: acquiring a ticket must not start failing because
+ * there is nowhere to cache it.
+ */
+static int krb_cc_save(void) {
+    if (!krb_cc_bound) return 0;
+
+    const krb_cred_t *creds[2] = { &krb.tgt, &krb.svc };
+    uint32_t off = 0;
+    int count = 0;
+
+    for (int i = 0; i < 2; i++) {
+        if (!creds[i]->valid) continue;
+        if (krb_cc_expired(creds[i]->endtime)) continue;
+        uint32_t next = krb_cc_encode_cred(creds[i], krb_cc_buf, off, KRB_CC_MAX);
+        if (next > KRB_CC_MAX) {
+            serial_puts("[krb5] credential too large to cache; skipped\n");
+            continue;
+        }
+        off = next;
+        count++;
+    }
+
+    char path[288];
+    krb_cc_path(krb_cc_user, path, sizeof path);
+
+    if (count == 0) {                    /* nothing worth keeping */
+        fs_delete(path);
+        return 0;
+    }
+
+    static uint8_t out[KRB_CC_HDR + KRB_CC_MAX];
+    krb_cc_hdr_t h;
+    h.magic[0] = KRB_CC_MAGIC0; h.magic[1] = KRB_CC_MAGIC1;
+    h.magic[2] = KRB_CC_MAGIC2; h.magic[3] = KRB_CC_MAGIC3;
+    h.version = 1;
+    h.count   = (uint8_t)count;
+    for (int i = 0; i < 16; i++) h.salt[i] = krb_cc_salt[i];
+    if (vx_random(h.nonce, 12) != 12) return -1;
+    krb_cc_verifier(krb_cc_key, h.verifier);
+    for (int i = 0; i < 4; i++) h.plain_len[i] = (uint8_t)(off >> (i * 8));
+    for (int i = 0; i < 10; i++) h.reserved[i] = 0;
+
+    const uint8_t *hp = (const uint8_t *)&h;
+    for (uint32_t i = 0; i < KRB_CC_HDR; i++)
+        out[i] = i < sizeof h ? hp[i] : 0;
+    for (uint32_t i = 0; i < off; i++) out[KRB_CC_HDR + i] = krb_cc_buf[i];
+
+    /* A fresh nonce every write, so two saves under the same key never
+     * share a keystream -- which for a stream cipher would xor two
+     * ticket blobs together and leak both. */
+    cc20_xor(krb_cc_key, h.nonce, 0, out + KRB_CC_HDR, off);
+
+    int rc = fs_write_file(path, out, KRB_CC_HDR + off);
+
+    /* The plaintext staging buffer is a copy of every session key held.
+     * It does not get to outlive the call. */
+    for (uint32_t i = 0; i < off; i++) krb_cc_buf[i] = 0;
+
+    if (rc != 0) {
+        serial_puts("[krb5] could not write the credential cache\n");
+        return -1;
+    }
+    serial_puts("[krb5] cached ");
+    serial_put_dec((uint32_t)count);
+    serial_puts(" credential(s) to the profile\n");
+    return 0;
+}
+
+/*
+ * Read the cache and adopt anything still valid.
+ *
+ * Returns the number of credentials loaded. Every failure below is
+ * quiet and returns zero: a missing cache is the ordinary first-login
+ * case, and a cache that will not decrypt is what a changed password
+ * looks like. Neither is an error worth stopping a login for.
+ */
+static int krb_cc_load(void) {
+    if (!krb_cc_bound) return 0;
+
+    char path[288];
+    krb_cc_path(krb_cc_user, path, sizeof path);
+
+    uint64_t len = 0;
+    const void *raw = fs_read_file(path, &len);
+    if (!raw || len < KRB_CC_HDR + 8) return 0;
+
+    const uint8_t *p = (const uint8_t *)raw;
+    const krb_cc_hdr_t *h = (const krb_cc_hdr_t *)p;
+    if (h->magic[0] != KRB_CC_MAGIC0 || h->magic[1] != KRB_CC_MAGIC1 ||
+        h->magic[2] != KRB_CC_MAGIC2 || h->magic[3] != KRB_CC_MAGIC3 ||
+        h->version != 1)
+        return 0;
+
+    uint32_t plain = 0;
+    for (int i = 3; i >= 0; i--) plain = (plain << 8) | h->plain_len[i];
+    if (plain == 0 || plain > KRB_CC_MAX || KRB_CC_HDR + plain > len) return 0;
+
+    /*
+     * The key comes from the password and the salt in this file, not
+     * from the salt held in memory -- a cache written under a previous
+     * password has a different one, and deriving with the wrong salt is
+     * how a wrong-password load turns into garbage rather than a clean
+     * refusal.
+     */
+    uint8_t key[CC20_KEY_BYTES], want[16];
+    for (int i = 0; i < 16; i++) krb_cc_salt[i] = h->salt[i];
+    for (int i = 0; i < CC20_KEY_BYTES; i++) key[i] = krb_cc_key[i];
+    krb_cc_verifier(key, want);
+    if (!cc20_equal(want, h->verifier, 16)) {
+        serial_puts("[krb5] the cached credentials are not this password's; "
+                    "leaving them alone\n");
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < plain; i++) krb_cc_buf[i] = p[KRB_CC_HDR + i];
+    cc20_xor(key, h->nonce, 0, krb_cc_buf, plain);
+
+    int loaded = 0, expired = 0;
+    uint32_t off = 0;
+    for (int i = 0; i < h->count && off < plain; i++) {
+        krb_cred_t c;
+        uint32_t next = krb_cc_decode_cred(krb_cc_buf, off, plain, &c);
+        if (next > plain) {
+            serial_puts("[krb5] the credential cache is malformed; "
+                        "ignoring the rest\n");
+            break;
+        }
+        off = next;
+
+        if (krb_cc_expired(c.endtime)) { expired++; continue; }
+
+        /*
+         * A ticket whose first name component is "krbtgt" is the
+         * ticket-granting ticket; anything else is a service ticket.
+         * That is how it is told apart on the wire and it is how it is
+         * told apart here, rather than by the order it was written in.
+         */
+        int is_tgt = 1;
+        {
+            const char *want = "krbtgt";
+            if (c.nsname < 1) is_tgt = 0;
+            else for (int k = 0; k < 7; k++)
+                if (c.sname[0][k] != want[k]) { is_tgt = 0; break; }
+        }
+        if (is_tgt) krb.tgt = c; else krb.svc = c;
+
+        /* The realm the client belongs to comes back with the TGT, so a
+         * reloaded session knows who it is without another AS exchange. */
+        if (is_tgt) {
+            for (uint32_t k = 0; k < sizeof krb.realm; k++)
+                krb.realm[k] = c.realm[k < sizeof c.realm ? k : 0];
+            krb.realm[sizeof krb.realm - 1] = '\0';
+        }
+        loaded++;
+    }
+
+    for (uint32_t i = 0; i < plain; i++) krb_cc_buf[i] = 0;
+
+    if (loaded || expired) {
+        serial_puts("[krb5] credential cache: ");
+        serial_put_dec((uint32_t)loaded);
+        serial_puts(" loaded, ");
+        serial_put_dec((uint32_t)expired);
+        serial_puts(" expired and discarded\n");
+    }
+    if (expired && !loaded) fs_delete(path);
+    return loaded;
+}
+
+/*
+ * Bind the cache to whoever has just logged in, and read it.
+ *
+ * The password is used here and nowhere else, and is not retained --
+ * only the key derived from it, which cannot be turned back into the
+ * password and cannot be used to log in.
+ */
+static int krb_cc_login(const char *user, const char *password) {
+    krb_cc_bound = 0;
+    if (!user || !user[0] || !password) return 0;
+
+    int n = 0;
+    for (; user[n] && n < (int)sizeof(krb_cc_user) - 1; n++)
+        krb_cc_user[n] = user[n];
+    krb_cc_user[n] = '\0';
+
+    /*
+     * A salt for the case where there is no cache yet. If one exists,
+     * krb_cc_load() replaces this with the file's own -- which is why
+     * the key is derived twice on the path where a cache is found, and
+     * why that is not worth avoiding: it happens once per login.
+     */
+    if (vx_random(krb_cc_salt, 16) != 16) return 0;
+
+    char pw[128];
+    int k = 0;
+    for (; password[k] && k < (int)sizeof(pw) - 1; k++) pw[k] = password[k];
+    pw[k] = '\0';
+
+    /* Peek at the file's salt first, so the common path derives once. */
+    char path[288];
+    krb_cc_path(krb_cc_user, path, sizeof path);
+    uint64_t len = 0;
+    const void *raw = fs_read_file(path, &len);
+    if (raw && len >= KRB_CC_HDR) {
+        const krb_cc_hdr_t *h = (const krb_cc_hdr_t *)raw;
+        if (h->magic[0] == KRB_CC_MAGIC0 && h->magic[1] == KRB_CC_MAGIC1 &&
+            h->magic[2] == KRB_CC_MAGIC2 && h->magic[3] == KRB_CC_MAGIC3)
+            for (int i = 0; i < 16; i++) krb_cc_salt[i] = h->salt[i];
+    }
+
+    cc20_derive_key(pw, krb_cc_salt, krb_cc_key);
+    for (int i = 0; i < (int)sizeof(pw); i++) pw[i] = 0;
+    krb_cc_bound = 1;
+
+    return krb_cc_load();
+}
+
+/*
+ * Logging out.
+ *
+ * The key goes, and so do the tickets in memory -- leaving a session
+ * key resident after the person who owns it has left is exactly the
+ * bearer-token problem this file spent a page describing. The *file*
+ * stays: that is the point of it, and it is encrypted under a key
+ * nobody present can now derive.
+ */
+static void krb_cc_logout(void) {
+    for (int i = 0; i < CC20_KEY_BYTES; i++) krb_cc_key[i] = 0;
+    for (int i = 0; i < 16; i++) krb_cc_salt[i] = 0;
+    krb_cc_user[0] = '\0';
+    krb_cc_bound = 0;
+
+    for (uint32_t i = 0; i < sizeof krb.tgt.session.data; i++)
+        krb.tgt.session.data[i] = 0;
+    for (uint32_t i = 0; i < sizeof krb.svc.session.data; i++)
+        krb.svc.session.data[i] = 0;
+    krb.tgt.valid = 0;
+    krb.svc.valid = 0;
+    for (uint32_t i = 0; i < sizeof krb.ckey.data; i++) krb.ckey.data[i] = 0;
+}
+
+/* Throw the cache away without logging out -- `kdestroy`, in effect. */
+static int krb_cc_purge(void) {
+    if (!krb_cc_bound) return -1;
+    char path[288];
+    krb_cc_path(krb_cc_user, path, sizeof path);
+    krb.tgt.valid = 0;
+    krb.svc.valid = 0;
+    return fs_delete(path);
 }
 
 static int krb_have_tgt(void)     { return krb.tgt.valid; }

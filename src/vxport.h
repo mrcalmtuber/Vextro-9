@@ -121,6 +121,22 @@ uint32_t vx_nic_mtu(void);
  */
 uint32_t vx_random(uint8_t *out, uint32_t len);
 
+/* ===== the certificate authority store =====
+ *
+ * Mbed TLS is compiled as its own translation unit and cannot reach the
+ * filesystem -- fs_read_file lives in the kernel unit, behind the
+ * profile permission checks. So the bundle crosses the seam the same
+ * way everything else does: the kernel reads it once at startup and
+ * hands over the bytes.
+ *
+ * Returns the length, or zero if the volume carries no bundle. Zero is
+ * not an error to be papered over: it is the difference between a
+ * connection that is authenticated and one that is merely encrypted,
+ * and vxsec_verifies_certificates() reports it upward for exactly that
+ * reason.
+ */
+uint32_t vx_ca_bundle(const uint8_t **out);
+
 /* ===== diagnostics ===== */
 void     vx_log(const char *s);
 void     vx_log_u32(uint32_t v);

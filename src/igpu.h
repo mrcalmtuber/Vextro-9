@@ -665,6 +665,359 @@ static int igpu_screen_fill(int x, int y, int w, int h, uint32_t color) {
     return rc;
 }
 
+/* ===========================================================
+ * MEDIA COMMAND STREAMERS (VCS / VECS)
+ * ===========================================================
+ *
+ * The blitter above is one of four command streamers on a Gen9 part.
+ * The other three that matter here are:
+ *
+ *   VCS   0x12000   video decode/encode -- the MFX fixed-function
+ *                   block, which is what "Quick Sync" names
+ *   VCS2  0x1C000   a second video engine on some GT3/GT4 parts
+ *   VECS  0x1A000   the video enhancement box: colour space
+ *                   conversion, denoise, deinterlace -- "Clear Video"
+ *
+ * They are programmed exactly like the BCS: a ring buffer in memory,
+ * a GGTT mapping for it, head/tail/start/ctl registers at the engine's
+ * base, and a breadcrumb written by the engine when it has drained the
+ * ring. What differs is the forcewake domain -- the media wells are
+ * gated separately from the blitter, and MMIO to a sleeping well reads
+ * back zeroes and drops writes without faulting, which looks exactly
+ * like a dead engine.
+ *
+ * ---- why this is a separate structure and BCS was left alone ----
+ *
+ * The blitter path above is verified at boot by a self-test that reads
+ * back every pixel of a GPU-filled tile. Retrofitting it onto this
+ * abstraction to save a hundred lines would put the one graphics path
+ * that is known to work on this machine through an untested rewrite,
+ * to no benefit. The new engines get the general form; BCS keeps the
+ * one that has been proven.
+ */
+
+#define IGPU_VCS_BASE           0x12000
+#define IGPU_VCS2_BASE          0x1C000
+#define IGPU_VECS_BASE          0x1A000
+
+/* Gen9 forcewake domains (i915 intel_uncore.c) */
+#define IGPU_FORCEWAKE_MEDIA    0xA270
+#define IGPU_FW_ACK_MEDIA       0x0D88
+
+#define IGPU_ENG_RING_PAGES     4
+#define IGPU_ENG_RING_BYTES     (IGPU_ENG_RING_PAGES * 4096)
+
+typedef struct {
+    const char *name;
+    uint32_t    base;            /* command streamer MMIO base        */
+    uint32_t    fw_reg, fw_ack;  /* its forcewake domain              */
+
+    uint32_t   *ring;            /* CPU view of the ring pages        */
+    uint32_t    ring_gpu;        /* and the GPU address of the same   */
+    uint32_t    tail;            /* byte offset of the next dword     */
+
+    uint8_t    *hws;             /* hardware status page              */
+    uint32_t    hws_gpu;
+    volatile uint32_t *status;   /* breadcrumb page                   */
+    uint32_t    status_gpu;
+
+    uint32_t    seqno;
+    int         ready;
+    uint32_t    hangs;
+} igpu_engine_t;
+
+static int igpu_engine_fw_get(const igpu_engine_t *e) {
+    igpu_write(e->fw_reg, (IGPU_FW_KERNEL_BIT << 16) | IGPU_FW_KERNEL_BIT);
+    for (int i = 0; i < 1000000; i++) {
+        if (igpu_read(e->fw_ack) & IGPU_FW_KERNEL_BIT) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+
+static void igpu_engine_fw_put(const igpu_engine_t *e) {
+    igpu_write(e->fw_reg, IGPU_FW_KERNEL_BIT << 16);
+}
+
+/*
+ * Bring an engine's ring up in legacy (non-execlist) mode.
+ *
+ * Gen9 still honours the legacy tail-pointer doorbell on every engine,
+ * which is what makes this tractable without a GuC: execlist submission
+ * would need a context image, a logical ring context descriptor and a
+ * hardware status page layout for each engine, and none of that buys
+ * anything for a single-client decoder.
+ */
+static int igpu_engine_ring_setup(igpu_engine_t *e) {
+    igpu_write_masked(e->base + IGPU_ENG_GFX_MODE, IGPU_GFX_MODE_EXECLIST, 0);
+    igpu_write_masked(e->base + IGPU_ENG_MI_MODE,
+                      IGPU_MI_MODE_STOP_RING, IGPU_MI_MODE_STOP_RING);
+
+    igpu_write(e->base + IGPU_RING_CTL, 0);
+    igpu_write(e->base + IGPU_RING_HEAD, 0);
+    igpu_write(e->base + IGPU_RING_TAIL, 0);
+    igpu_write(e->base + IGPU_RING_START, e->ring_gpu);
+    igpu_write(e->base + IGPU_RING_CTL,
+               ((IGPU_ENG_RING_PAGES - 1) << 12) | IGPU_RING_CTL_VALID);
+
+    igpu_write_masked(e->base + IGPU_ENG_MI_MODE, IGPU_MI_MODE_STOP_RING, 0);
+
+    if (!(igpu_read(e->base + IGPU_RING_CTL) & IGPU_RING_CTL_VALID))
+        return -1;
+
+    e->tail  = 0;
+    e->seqno = 0;
+    return 0;
+}
+
+static void igpu_engine_emit(igpu_engine_t *e, const uint32_t *dw, int n) {
+    for (int i = 0; i < n; i++) {
+        e->ring[e->tail / 4] = dw[i];
+        e->tail = (e->tail + 4) % IGPU_ENG_RING_BYTES;
+    }
+}
+
+/*
+ * Submit a command stream and wait for it to retire.
+ *
+ * The breadcrumb is an MI_STORE_DWORD_IMM into the engine's own status
+ * page, exactly as on the blitter. A decode is not fast -- a 1080p
+ * frame is a few milliseconds of fixed-function work -- so the timeout
+ * here is generous, but it is still bounded: a media engine that has
+ * faulted stops retiring and never says so, and an unbounded spin in a
+ * kernel thread takes the desktop with it.
+ */
+static int igpu_engine_exec(igpu_engine_t *e, const uint32_t *cmds, int ndw) {
+    uint32_t need = (uint32_t)(ndw + 12) * 4;
+
+    if (!e->ready) return -1;
+
+    if (e->tail + need >= IGPU_ENG_RING_BYTES) {
+        while (e->tail != 0) {
+            e->ring[e->tail / 4] = MI_NOOP_CMD;
+            e->tail = (e->tail + 4) % IGPU_ENG_RING_BYTES;
+        }
+    }
+
+    igpu_engine_emit(e, cmds, ndw);
+
+    e->seqno++;
+    {
+        uint32_t tail_cmds[9] = {
+            MI_FLUSH_DW_CMD, 0, 0, 0,
+            MI_STORE_DWORD_IMM_CMD,
+            e->status_gpu + 0x40, 0,
+            e->seqno,
+            MI_NOOP_CMD,
+        };
+        int tail_n = ((ndw + 8) & 1) ? 9 : 8;
+        igpu_engine_emit(e, tail_cmds, tail_n);
+    }
+
+    __asm__ volatile("sfence" ::: "memory");
+    igpu_write(e->base + IGPU_RING_TAIL, e->tail);
+
+    for (int i = 0; i < 40000000; i++) {
+        if (e->status[0x40 / 4] == e->seqno) return 0;
+        __asm__ volatile("pause");
+    }
+
+    e->hangs++;
+    serial_puts("[igpu] *** hang on ");
+    serial_puts(e->name);
+    serial_puts(" ***\n");
+    igpu_log_reg("  IPEHR ", igpu_read(e->base + IGPU_ENG_IPEHR));
+    igpu_log_reg("  ACTHD ", igpu_read(e->base + IGPU_ENG_ACTHD));
+    igpu_log_reg("  HEAD  ", igpu_read(e->base + IGPU_RING_HEAD));
+    igpu_log_reg("  TAIL  ", igpu_read(e->base + IGPU_RING_TAIL));
+
+    if (e->hangs >= 3) {
+        e->ready = 0;
+        igpu_log("  engine disabled after repeated hangs");
+    }
+    return -1;
+}
+
+/* ===========================================================
+ * A GGTT window for media surfaces
+ * ===========================================================
+ *
+ * The blitter's window is 64 pages, which is ample for a ring, a status
+ * page and a 64x64 test tile. A decoder is a different shape: one 1080p
+ * NV12 surface is 3 MB, and H.264 allows sixteen reference frames plus
+ * the one being decoded, so a decoded picture buffer is tens of
+ * megabytes and every byte of it has to be reachable by the engine.
+ *
+ * So the media window is its own region, allocated *below* the
+ * blitter's rather than by growing it -- the blitter's base slot is
+ * baked into a self-test that passes, and moving it to make room would
+ * risk the working path to benefit the new one.
+ *
+ * Allocation is a bump pointer with no free. A decoder allocates its
+ * surfaces once when the stream's dimensions become known and holds
+ * them until it is torn down; a general-purpose GPU virtual address
+ * allocator would be more code than the thing it serves.
+ */
+
+#define IGPU_MEDIA_SLOTS    16384        /* 64 MB of GPU address space */
+
+static struct {
+    uint32_t base_slot;
+    uint32_t next_slot;
+    uint32_t limit_slot;
+    int      ready;
+} igpu_media_gtt;
+
+/*
+ * Map a physically contiguous run into the media window and return the
+ * GPU address it now answers to.
+ *
+ * Returns 0 on exhaustion rather than wrapping, because a surface that
+ * silently aliased another would decode into the wrong picture and
+ * produce corruption that looks like a codec bug.
+ */
+static uint32_t igpu_media_map(uint64_t phys, uint32_t pages) {
+    uint32_t slot, gpu;
+
+    if (!igpu_media_gtt.ready) return 0;
+    if (igpu_media_gtt.next_slot + pages > igpu_media_gtt.limit_slot) return 0;
+
+    slot = igpu_media_gtt.next_slot;
+    for (uint32_t i = 0; i < pages; i++)
+        igpu_ggtt_set(slot + i, phys + (uint64_t)i * 4096);
+
+    igpu_media_gtt.next_slot += pages;
+    gpu = slot * 4096;
+    igpu_ggtt_flush();
+    return gpu;
+}
+
+/* Map a run of pages that are contiguous in kernel virtual space but
+ * not necessarily in physical space -- which is what a large static
+ * kernel array is, and what the window canvas is. */
+static uint32_t igpu_media_map_virt(void *va, uint32_t bytes) {
+    uint32_t pages = (bytes + 4095) / 4096;
+    uint32_t slot, gpu;
+
+    if (!igpu_media_gtt.ready) return 0;
+    if (igpu_media_gtt.next_slot + pages > igpu_media_gtt.limit_slot) return 0;
+
+    slot = igpu_media_gtt.next_slot;
+    for (uint32_t i = 0; i < pages; i++)
+        igpu_ggtt_set(slot + i,
+                      kern_virt_to_phys((uint8_t *)va + (uint64_t)i * 4096));
+
+    igpu_media_gtt.next_slot += pages;
+    gpu = slot * 4096;
+    igpu_ggtt_flush();
+    return gpu;
+}
+
+/* ===== the two media engines ===== */
+
+static uint32_t igpu_vcs_ring[IGPU_ENG_RING_BYTES / 4]
+                    __attribute__((aligned(4096)));
+static uint8_t  igpu_vcs_hws[4096]    __attribute__((aligned(4096)));
+static uint8_t  igpu_vcs_status[4096] __attribute__((aligned(4096)));
+
+static uint32_t igpu_vecs_ring[IGPU_ENG_RING_BYTES / 4]
+                    __attribute__((aligned(4096)));
+static uint8_t  igpu_vecs_hws[4096]    __attribute__((aligned(4096)));
+static uint8_t  igpu_vecs_status[4096] __attribute__((aligned(4096)));
+
+static igpu_engine_t igpu_vcs = {
+    "VCS (video decode)", IGPU_VCS_BASE,
+    IGPU_FORCEWAKE_MEDIA, IGPU_FW_ACK_MEDIA,
+    igpu_vcs_ring, 0, 0,
+    igpu_vcs_hws, 0, (volatile uint32_t *)igpu_vcs_status, 0,
+    0, 0, 0
+};
+
+static igpu_engine_t igpu_vecs = {
+    "VECS (video enhance)", IGPU_VECS_BASE,
+    IGPU_FORCEWAKE_MEDIA, IGPU_FW_ACK_MEDIA,
+    igpu_vecs_ring, 0, 0,
+    igpu_vecs_hws, 0, (volatile uint32_t *)igpu_vecs_status, 0,
+    0, 0, 0
+};
+
+/*
+ * Bring the media engines up.
+ *
+ * Called after the blitter is known good, because everything here
+ * depends on the GGTT and the MMIO mapping that step established. A
+ * failure is not fatal to anything: the blitter keeps working, the
+ * desktop keeps compositing, and the decoder reports that it has no
+ * hardware rather than producing a picture some other way and calling
+ * it accelerated.
+ */
+static int igpu_media_init(void) {
+    if (!igpu.active || !igpu.mmio) return -1;
+
+    /* The media window sits directly below the blitter's. The bound is
+     * checked before the subtraction, not after: base_slot is unsigned,
+     * so a GGTT smaller than the window would wrap to an enormous slot
+     * number and the first mapping would write PTEs past the end of the
+     * aperture. */
+    if (igpu.base_slot < IGPU_MEDIA_SLOTS) {
+        igpu_media_gtt.ready = 0;
+        igpu_log("GGTT too small for a media window");
+        return -1;
+    }
+
+    igpu_media_gtt.base_slot  = igpu.base_slot - IGPU_MEDIA_SLOTS;
+    igpu_media_gtt.next_slot  = igpu_media_gtt.base_slot;
+    igpu_media_gtt.limit_slot = igpu.base_slot;
+    igpu_media_gtt.ready      = 1;
+
+    if (igpu_engine_fw_get(&igpu_vcs) != 0) {
+        igpu_log("media forcewake ack timeout - no video engines");
+        igpu_media_gtt.ready = 0;
+        return -1;
+    }
+
+    /* Ring, status and hardware status pages for each engine. */
+    igpu_vcs.ring_gpu = igpu_media_map_virt(igpu_vcs_ring,
+                                            IGPU_ENG_RING_BYTES);
+    igpu_vcs.hws_gpu    = igpu_media_map_virt(igpu_vcs_hws, 4096);
+    igpu_vcs.status_gpu = igpu_media_map_virt(igpu_vcs_status, 4096);
+
+    igpu_vecs.ring_gpu = igpu_media_map_virt(igpu_vecs_ring,
+                                             IGPU_ENG_RING_BYTES);
+    igpu_vecs.hws_gpu    = igpu_media_map_virt(igpu_vecs_hws, 4096);
+    igpu_vecs.status_gpu = igpu_media_map_virt(igpu_vecs_status, 4096);
+
+    if (!igpu_vcs.ring_gpu || !igpu_vecs.ring_gpu) {
+        igpu_engine_fw_put(&igpu_vcs);
+        igpu_media_gtt.ready = 0;
+        igpu_log("could not map media rings into the GGTT");
+        return -1;
+    }
+
+    for (int i = 0; i < 1024; i++) {
+        ((volatile uint32_t *)igpu_vcs_status)[i]  = 0;
+        ((volatile uint32_t *)igpu_vecs_status)[i] = 0;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+
+    if (igpu_engine_ring_setup(&igpu_vcs) == 0) {
+        igpu_vcs.ready = 1;
+        igpu_log("VCS ring enabled (MFX video decode)");
+    } else {
+        igpu_log("VCS ring did not report valid");
+    }
+
+    if (igpu_engine_ring_setup(&igpu_vecs) == 0) {
+        igpu_vecs.ready = 1;
+        igpu_log("VECS ring enabled (colour space conversion)");
+    } else {
+        igpu_log("VECS ring did not report valid");
+    }
+
+    igpu_engine_fw_put(&igpu_vcs);
+    return (igpu_vcs.ready || igpu_vecs.ready) ? 0 : -1;
+}
+
 /* ===== INITIALIZATION ===== */
 
 static void igpu_fail(const char *why) {
@@ -875,6 +1228,11 @@ static void igpu_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h,
     igpu_forcewake_put();
     igpu.active = 1;
     igpu.status = "active - blitter self-test passed";
+
+    /* The video engines, now that the GGTT and the MMIO window they
+     * both depend on are known good. Failure here costs nothing that
+     * was working a moment ago. */
+    igpu_media_init();
 }
 
 #endif /* IGPU_H */

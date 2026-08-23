@@ -532,7 +532,15 @@ static void term_cmd_mouse(void) {
 static void term_cmd_net(void) {
     char buf[24];
     if (!e1000_found) {
-        term_print_c("no network adapter detected\n", 2);
+        /* There may still be a radio. This command reports the wired
+         * adapter, so it says where the other one is rather than
+         * claiming the machine has no networking at all. */
+        if (wifi_present()) {
+            term_print_c("no wired adapter; a wireless one is present\n", 3);
+            term_print("  try `wifi` for its state\n");
+        } else {
+            term_print_c("no network adapter detected\n", 2);
+        }
         return;
     }
     term_print("  adapter   Intel 82540EM (e1000)\n");
@@ -561,6 +569,312 @@ static void term_cmd_net(void) {
     term_print("  link      ");
     if (status & E1000_STATUS_LU) term_print_c("up\n", 4);
     else                          term_print_c("down\n", 2);
+}
+
+/*
+ * `wifi` — the radio, from the terminal.
+ *
+ * The whole wireless stack is reachable from here and nowhere else yet:
+ * joining a network is a decision with a password in it, so it does not
+ * happen automatically at boot the way DHCP does on a cable. Once a
+ * network is joined, lwIP moves onto it without being told -- see
+ * vx_use_wifi() in vxport_impl.h -- and the browser, the package store
+ * and everything else above the socket layer carry on unaware.
+ */
+static void term_cmd_wifi(int argc, char **argv) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    if (!wifi_present()) {
+        term_print_c("no wireless adapter\n", 2);
+        /* Worth saying which of the two reasons it is: a machine with
+         * no radio and a radio that could not be started look the same
+         * from here and want completely different responses. */
+        if (wifi_dev.ops) {
+            term_print("  ");
+            term_print(wifi_dev.ops->name);
+            term_print(" found but stopped at: ");
+            term_print(wifi_state_name(wifi_dev.state));
+            term_putc('\n');
+            if (wifi_dev.state == WIFI_STATE_NO_FIRMWARE)
+                term_print_c("  this part needs a firmware image; see "
+                             "src/net/wifi.c\n", 3);
+        }
+        return;
+    }
+
+    if (argc >= 2 && str_eq(argv[1], "scan")) {
+        int n = wifi_scan(20);
+        if (n <= 0) { term_print_c("no networks found\n", 2); return; }
+
+        term_print("  SSID                              CH  SIGNAL  SECURITY\n");
+        for (int i = 0; i < n; i++) {
+            const wifi_bss_t *b = &wifi_bss_list[i];
+            char num[8];
+            int pad;
+
+            term_print("  ");
+            term_print(b->ssid_len ? b->ssid : "(hidden)");
+            pad = 32 - (b->ssid_len ? b->ssid_len : 8);
+            for (int j = 0; j < pad; j++) term_putc(' ');
+
+            uint_to_str(b->channel, num);
+            term_print_c(num, 3);
+            pad = 4 - str_len(num);
+            for (int j = 0; j < pad; j++) term_putc(' ');
+
+            /* RSSI is negative dBm; print it as a magnitude with the
+             * sign written out, because uint_to_str cannot. */
+            term_print("-");
+            uint_to_str((uint32_t)(-b->rssi), num);
+            term_print(num);
+            term_print(" dBm  ");
+
+            term_print_c(wifi_security_name(b->security),
+                         b->security == WIFI_SEC_OPEN ? 2 : 4);
+            term_putc('\n');
+        }
+        return;
+    }
+
+    if (argc >= 2 && str_eq(argv[1], "connect")) {
+        if (argc < 3) {
+            term_print_c("usage: wifi connect <ssid> [passphrase]\n", 2);
+            return;
+        }
+        term_print("joining ");
+        term_print(argv[2]);
+        term_print(" ...\n");
+
+        if (wifi_connect(argv[2], argc >= 4 ? argv[3] : "") == 0) {
+            term_print_c("connected\n", 4);
+            if (wpa_sm_complete(&wifi_sm))
+                term_print("  link is encrypted with CCMP\n");
+        } else {
+            term_print_c("could not join: ", 2);
+            term_print(wifi_state_name(wifi_dev.state));
+            term_putc('\n');
+        }
+        return;
+    }
+
+    if (argc >= 2 && str_eq(argv[1], "disconnect")) {
+        wifi_disconnect();
+        term_print("disconnected\n");
+        return;
+    }
+
+    /* No sub-command: report where things stand. */
+    term_print("  adapter   ");
+    term_print(wifi_dev.ops->name);
+    term_putc('\n');
+
+    {
+        char mac[20];
+        int p = 0;
+        for (int i = 0; i < 6; i++) {
+            if (i) mac[p++] = ':';
+            mac[p++] = hex[(wifi_dev.mac[i] >> 4) & 0xF];
+            mac[p++] = hex[wifi_dev.mac[i] & 0xF];
+        }
+        mac[p] = '\0';
+        term_print("  mac       "); term_print(mac); term_putc('\n');
+    }
+
+    term_print("  state     ");
+    term_print_c(wifi_state_name(wifi_dev.state),
+                 wifi_connected() ? 4 : 3);
+    term_putc('\n');
+
+    if (wifi_connected()) {
+        char num[8];
+        term_print("  network   ");
+        term_print(wifi_target.ssid);
+        term_putc('\n');
+        term_print("  channel   ");
+        uint_to_str(wifi_dev.channel, num);
+        term_print(num);
+        term_putc('\n');
+        term_print("  cipher    ");
+        term_print(wpa_sm_complete(&wifi_sm) ? "CCMP (AES)" : "none");
+        term_putc('\n');
+        term_print("  group key ");
+        term_print(wifi_sm.gtk_valid ? "installed" : "none");
+        term_putc('\n');
+    }
+
+    term_print("\n  wifi scan | wifi connect <ssid> <pass> | wifi disconnect\n");
+}
+
+/*
+ * `video` — the hardware decoder, from the terminal.
+ *
+ * With no argument it reports what the machine has. With a file it
+ * decodes an Annex B H.264 elementary stream into this window's canvas
+ * -- which, because the canvas is the same memory Ring 3 has mapped, is
+ * the decoder writing straight into a user-visible framebuffer.
+ */
+static void term_cmd_video(int argc, char **argv) {
+    char num[16];
+
+    if (argc < 2) {
+        term_print("  engine    ");
+        term_print_c(vdec_status(), vdec_hw_available() ? 4 : 3);
+        term_putc('\n');
+
+        term_print("  gpu       ");
+        term_print(igpu.active ? (igpu.name ? igpu.name : "Intel") : "none");
+        term_putc('\n');
+
+        if (igpu.active) {
+            term_print("  VCS ring  ");
+            term_print(igpu_vcs.ready ? "up" : "down");
+            term_putc('\n');
+            term_print("  VECS ring ");
+            term_print(igpu_vecs.ready ? "up" : "down");
+            term_putc('\n');
+        }
+
+        if (vdec.open) {
+            term_print("  stream    ");
+            uint_to_str(vdec.width, num);  term_print(num);
+            term_print("x");
+            uint_to_str(vdec.height, num); term_print(num);
+            term_putc('\n');
+            term_print("  decoded   ");
+            uint_to_str(vdec.frames_decoded, num); term_print(num);
+            term_print(" frames, ");
+            uint_to_str(vdec.frames_failed, num); term_print(num);
+            term_print(" failed\n");
+            term_print("  colour    ");
+            term_print(vdec.hw_path ? "VEBOX (hardware)"
+                                     : "integer conversion");
+            term_putc('\n');
+        }
+
+        if (!vdec_hw_available())
+            term_print_c("\n  no Quick Sync path on this machine; see"
+                         " src/media/decode.c\n", 3);
+        term_print("\n  video <file.h264>   decode into this window\n");
+        return;
+    }
+
+    if (!vdec_hw_available()) {
+        term_print_c("no hardware video engine on this machine\n", 2);
+        return;
+    }
+
+    {
+        char abs[256];
+        uint64_t fsize = 0;
+        const void *data;
+        int frames;
+
+        term_resolve(argv[1], abs);
+        data = fs_read_file(abs, &fsize);
+        if (!data) {
+            term_print_c("video: file not found: ", 2);
+            term_print_c(abs, 2);
+            term_putc('\n');
+            return;
+        }
+
+        if (vdec_open() != 0) {
+            term_print_c("video: decoder would not open\n", 2);
+            return;
+        }
+
+        /* The canvas: the pixels this window shows and the pixels a
+         * Ring 3 program sees through os_canvas(). */
+        vdec_set_target(app_canvas, APP_CANVAS_W, APP_CANVAS_H,
+                         APP_CANVAS_W);
+
+        frames = vdec_feed((const uint8_t *)data, (uint32_t)fsize);
+        if (frames < 0) {
+            term_print_c("video: nothing decodable in that file\n", 2);
+            return;
+        }
+
+        uint_to_str((uint32_t)frames, num);
+        term_print("decoded ");
+        term_print(num);
+        term_print(" pictures\n");
+    }
+}
+
+/*
+ * `rdp` — the remote desktop service.
+ *
+ * Off by default and started by hand, deliberately: this server has no
+ * encryption and no authentication, so starting it is a decision about
+ * the network the machine is on rather than something that should
+ * happen at boot.
+ */
+static void term_cmd_rdp(int argc, char **argv) {
+    char num[16];
+
+    if (argc >= 2 && str_eq(argv[1], "start")) {
+        if (rdp_running()) {
+            term_print("already running\n");
+            return;
+        }
+        term_print_c("warning: RDP here is plaintext and unauthenticated.\n", 2);
+        term_print_c("  keystrokes and the screen cross the network in the "
+                     "clear,\n", 2);
+        term_print_c("  and nothing proves this machine is who it says.\n", 2);
+        if (rdp_start() != 0) {
+            term_print_c("could not start: ", 2);
+            term_print(rdp_status());
+            term_putc('\n');
+            return;
+        }
+        term_print_c("\nlistening on port 3389\n", 4);
+        return;
+    }
+
+    if (argc >= 2 && str_eq(argv[1], "stop")) {
+        rdp_stop();
+        term_print("stopped\n");
+        return;
+    }
+
+    term_print("  service   ");
+    term_print_c(rdp_status(), rdp_running() ? 4 : 3);
+    term_putc('\n');
+    term_print("  port      3389\n");
+    term_print("  security  ");
+    term_print_c(rdp_is_encrypted() ? "encrypted" : "none (plaintext)", 2);
+    term_putc('\n');
+
+    if (rdp_running()) {
+        term_print("  state     ");
+        term_print(rdp_state_name(rdp.state));
+        term_putc('\n');
+
+        if (rdp_connected()) {
+            term_print("  client    ");
+            for (int i = 0; i < 4; i++) {
+                uint_to_str(rdp.peer[i], num);
+                term_print(num);
+                if (i != 3) term_print(".");
+            }
+            term_putc('\n');
+            term_print("  desktop   ");
+            uint_to_str(rdp.frame_w, num); term_print(num);
+            term_print("x");
+            uint_to_str(rdp.frame_h, num); term_print(num);
+            term_print(" at 16bpp\n");
+            term_print("  sent      ");
+            uint_to_str(rdp.tiles_sent, num); term_print(num);
+            term_print(" tiles, ");
+            uint_to_str(rdp.bytes_sent / 1024, num); term_print(num);
+            term_print(" KB\n");
+            term_print("  input     ");
+            uint_to_str(rdp.events_in, num); term_print(num);
+            term_print(" events\n");
+        }
+    }
+
+    term_print("\n  rdp start | rdp stop\n");
 }
 
 static void term_cmd_arp(void) {
@@ -625,6 +939,9 @@ static void term_cmd_help(void) {
     term_print("  run <program>     execute an ELF app\n");
     term_print("  date / uptime / mem / uname / mouse   system info\n");
     term_print("  net / arp / ping / dns / fetch       networking\n");
+    term_print("  wifi [scan|connect|disconnect]      wireless\n");
+    term_print("  video [file.h264]                   hardware decode\n");
+    term_print("  rdp [start|stop]                    remote desktop\n");
     term_print("  img <file.sci>    decode and show a compressed image\n");
     term_print("  peek <f> <off> [n]  read a window from a huge file\n");
     term_print("  zim open <f> | info | main | ls | find/get <path>\n");
@@ -639,6 +956,9 @@ static void term_cmd_help(void) {
     term_print("  open <app>        terminal browser files settings\n");
     term_print("                    paint sysmon matrix about\n");
     term_print("  whoami / users / passwd / logout\n");
+    term_print("  env [name]                       this session's profile\n");
+    term_print("  swap                             pagefile and paging counters\n");
+    term_print("  tickets [purge]                  cached Kerberos credentials\n");
     term_print("  useradd <name> <pw> [admin] / userdel <name>   (admin)\n");
     term_print("  history / clear / reboot / shutdown\n");
     term_print("  Any command's output can be redirected:  ls > list.txt\n");
@@ -1515,6 +1835,12 @@ static void term_exec(char *cmdline) {
         term_cmd_mouse();
     } else if (str_eq(cmd, "net") || str_eq(cmd, "ifconfig")) {
         term_cmd_net();
+    } else if (str_eq(cmd, "wifi") || str_eq(cmd, "wlan")) {
+        term_cmd_wifi(argc, argv);
+    } else if (str_eq(cmd, "video")) {
+        term_cmd_video(argc, argv);
+    } else if (str_eq(cmd, "rdp")) {
+        term_cmd_rdp(argc, argv);
     } else if (str_eq(cmd, "arp")) {
         term_cmd_arp();
     } else if (str_eq(cmd, "history")) {
@@ -2106,6 +2432,111 @@ static void term_exec(char *cmdline) {
             term_print_c(ai_enabled == 1 ? "on" : "off", ai_enabled == 1 ? 4 : 3);
             term_print("   (ai on | ai off)\n");
         }
+    } else if (str_eq(cmd, "tickets")) {
+        /*
+         * klist, in effect. A credential cache that cannot be listed is
+         * a credential cache nobody can reason about -- "am I still
+         * authenticated" and "what is on my disk" are the two questions
+         * it raises and neither was answerable before this.
+         */
+        if (argc >= 2 && str_eq(argv[1], "purge")) {
+            if (krb_cc_purge() != 0)
+                term_print_c("tickets: nothing cached to remove\n", 2);
+            else
+                term_print_c("cached credentials destroyed\n", 3);
+            return;
+        }
+        if (argc >= 2) {
+            term_print_c("usage: tickets [purge]\n", 2);
+            return;
+        }
+        if (!krb_cc_bound) {
+            term_print_c("no Kerberos session (no account signed in)\n", 2);
+            return;
+        }
+        term_print_c("Kerberos credentials\n", 1);
+        term_print("  cache      ");
+        { char p[288]; krb_cc_path(krb_cc_user, p, sizeof p); term_print(p); }
+        term_print("\n");
+        if (!krb_have_tgt() && !krb_have_service()) {
+            term_print("  none held\n");
+            return;
+        }
+        if (krb_have_tgt()) {
+            term_print("  TGT        ");
+            term_print(krb.tgt.realm);
+            term_print("  until ");
+            term_print(krb.tgt.endtime);
+            term_print(krb_cc_expired(krb.tgt.endtime) ? "  EXPIRED\n" : "\n");
+        }
+        if (krb_have_service()) {
+            const krb_cred_t *s = krb_service_cred();
+            term_print("  service    ");
+            for (int i = 0; i < s->nsname; i++) {
+                if (i) term_print("/");
+                term_print(s->sname[i]);
+            }
+            term_print("  until ");
+            term_print(s->endtime);
+            term_print(krb_cc_expired(s->endtime) ? "  EXPIRED\n" : "\n");
+        }
+        term_print("\nThe cache is encrypted under a key derived from your\n"
+                   "login password. Logging out wipes the key, not the file.\n");
+    } else if (str_eq(cmd, "swap")) {
+        /*
+         * A pager that is thrashing and one that has never been needed
+         * look identical from outside -- the machine is just slow, or
+         * it is not -- and the difference is the whole diagnosis. So the
+         * counters are readable rather than only reachable from serial.
+         */
+        if (!swap_ready) {
+            term_print_c("swap is off: ", 2);
+            term_print_c(swap_errstr[0] ? swap_errstr : "not started", 2);
+            term_putc('\n');
+            return;
+        }
+        char nb[16];
+        term_print_c("Pagefile\n", 1);
+        term_print("  file       " SWAP_PATH "\n  size       ");
+        uint_to_str(SWAP_MB, nb);          term_print(nb);
+        term_print(" MB\n  slots      ");
+        uint_to_str(swap_slots_used, nb);  term_print(nb);
+        term_print(" of ");
+        uint_to_str(swap_slot_count, nb);  term_print(nb);
+        term_print(" in use\n  paged out  ");
+        uint_to_str((uint32_t)swap_outs, nb);  term_print(nb);
+        term_print("\n  paged in   ");
+        uint_to_str((uint32_t)swap_ins, nb);   term_print(nb);
+        term_print("\n  refused    ");
+        uint_to_str((uint32_t)swap_fails, nb); term_print(nb);
+        term_print("\n  frames scanned by the clock  ");
+        uint_to_str((uint32_t)swap_scans, nb); term_print(nb);
+        term_print("\n\nOnly user pages are swappable. Kernel memory, page\n"
+                   "tables and shared frames never leave RAM.\n");
+    } else if (str_eq(cmd, "env")) {
+        /*
+         * Here so that "the environment is bound to the profile" is a
+         * claim someone can check rather than one they have to take on
+         * faith. Same table a Windows process is handed at startup.
+         */
+        if (argc >= 2) {
+            const char *v = env_get(argv[1]);
+            if (!v) { term_print_c("not set\n", 2); return; }
+            term_print(v);
+            term_putc('\n');
+            return;
+        }
+        if (env_count == 0) {
+            term_print_c("the environment is empty -- no account is "
+                         "signed in\n", 3);
+            return;
+        }
+        for (int i = 0; i < env_count; i++) {
+            term_print_c(env_vars[i].name, 1);
+            term_print("=");
+            term_print(env_vars[i].value);
+            term_putc('\n');
+        }
     } else if (str_eq(cmd, "whoami")) {
         if (user_current < 0) { term_print("nobody\n"); return; }
         term_print(user_name_of(user_current));
@@ -2143,10 +2574,15 @@ static void term_exec(char *cmdline) {
             term_print_c(user_err, 2);
             term_putc('\n');
         } else {
+            /* The path is asked for rather than spelled, because it is
+             * not /home/<name> any more and there is exactly one place
+             * that knows what it is instead. */
+            char home[PROFILE_PATH_MAX];
+            profile_home(argv[1], home, sizeof(home));
             term_print("created ");
             term_print(argv[1]);
-            term_print(" with /home/");
-            term_print(argv[1]);
+            term_print(" with ");
+            term_print(home);
             term_putc('\n');
         }
     } else if (str_eq(cmd, "userdel")) {
@@ -2162,7 +2598,7 @@ static void term_exec(char *cmdline) {
         } else {
             term_print("deleted ");
             term_print(argv[1]);
-            term_print_c("   (their /home is left in place)\n", 3);
+            term_print_c("   (their profile is left in place)\n", 3);
         }
     } else if (str_eq(cmd, "logout")) {
         term_print_c("logging out...\n", 1);
