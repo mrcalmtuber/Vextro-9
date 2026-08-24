@@ -13,141 +13,230 @@
   <img alt="lines" src="https://img.shields.io/badge/kernel-87k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
-  <a href="https://github.com/mrcalmtuber/vextro-arm64"><img alt="arm64 port" src="https://img.shields.io/badge/also%20on-aarch64-d4af37?style=flat-square"></a>
 </p>
 
 <p align="center">
   <img src="docs/desktop.png" width="90%" alt="The Vextro 9 desktop">
 </p>
 
-> **There is an ARM64 port** —
-> **[vextro-arm64](https://github.com/mrcalmtuber/vextro-arm64)**.
-> Same desktop, same browser, same Wikipedia, same language model, on
-> aarch64: virtio devices, a GICv2 and the generic timer instead of the PIC
-> and the PIT, and Raspberry Pi 4 drivers. On Apple silicon it runs under
-> hardware virtualisation rather than emulation, which is the difference
-> between a language model answering in seconds and in minutes. That
-> repository documents the machine layer; this one documents the system.
-
----
-
-## Building it
-
-A bare-metal kernel cannot be built with the compiler that targets your
-own operating system, so this needs an **`x86_64-elf` cross toolchain**.
-On macOS that is four Homebrew formulae:
-
-```
-brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu
-```
-
-On Linux, `xorriso` and `qemu-system-x86` are packaged everywhere; the
-cross toolchain generally is not, and `gcc-x86-64-linux-gnu` is *not* a
-substitute — it targets Linux rather than bare metal. Build one, or, if
-your host toolchain already emits ELF, `make CC=gcc LD=ld` may do.
-
-`python3` builds the disk images and fetches the assets. Nothing else is
-needed — the boot animation is computed by the kernel rather than decoded
-from a video, so there is no ffmpeg and no media file in the repository.
-`make` names everything missing at once rather than stopping at the first
-one.
-
-You will want about **11 GB free**: an 8 GB sparse volume plus 1.4 GB of
-downloads.
-
-```
-git clone https://github.com/mrcalmtuber/vextro
-cd vextro
-make            # builds the ISO and the 8 GB volume
-make run
-```
-
-The first build offers to fetch the two things the repository cannot
-carry: **Simple English Wikipedia** (~980 MB) and a **Qwen2 0.5B**
-language model (~380 MB). GitHub refuses any file over 100 MB, so they are
-downloaded from Kiwix and Hugging Face and written into `disk.img`.
-
-Both are optional and the download never fails the build:
-
-```
-make ASSETS=1     # take them without asking (what CI wants)
-make ASSETS=0     # skip entirely
-make assets       # fetch later, or after saying no
-```
-
-Without them the system still boots and runs — the Wikipedia window
-reports no archive, and the prompt after login has nothing to offer. Say
-no now and `make assets` later, and the next `make` notices and rebuilds
-the volume around them; nothing has to be cleaned by hand.
-
 ---
 
 ## The short version
 
 It boots on a real machine, draws a windowed desktop with anti-aliased type,
-talks to the internet over its own TCP/IP stack, reads a complete offline
-Wikipedia, installs applications from a package store, and **runs a
-transformer language model on the CPU** — all with no operating system
-underneath it and no C library beside it.
+talks to the internet over its own TCP/IP stack with verified TLS, reads a
+complete offline Wikipedia, installs applications from a package store, runs
+them **in ring 3 in address spaces of their own**, pages them to disk under
+memory pressure, and **runs a transformer language model on the CPU** — with
+no operating system underneath it and no C library beside it.
 
-Every layer that a normal application takes for granted had to be built
-first. There is a TrueType rasteriser because there was no way to draw a
-letter. There is a Zstandard decompressor because Wikipedia archives are
-compressed with it. There is an NVMe driver because a modern machine has
-nowhere else to keep a 900 MB encyclopedia.
+Every layer a normal application takes for granted had to be built first.
+There is a TrueType rasteriser because there was no way to draw a letter.
+There is a Zstandard decompressor because Wikipedia archives are compressed
+with it. There is an NVMe driver because a modern machine has nowhere else
+to keep a 900 MB encyclopedia.
+
+**87,071 lines of C written here**, across 153 files, built as four kernel
+objects plus one for inference, over a user-space C library of its own.
+614 host checks across 14 suites on every build.
 
 ---
 
-## First light
+## Quick start
 
-<p align="center">
-  <img src="docs/boot.png" width="90%" alt="The boot animation: the dragon breathing fire, and the burn front eating the screen">
-</p>
+```sh
+git clone https://github.com/mrcalmtuber/vextro
+cd vextro
+make            # ISO + an 8 GB sparse system volume
+make run        # QEMU, full screen, networking up
+```
 
-**The boot animation is not a video.** The dragon off the desktop wallpaper
-draws breath and sets fire to the screen, the screen burns away to nothing,
-and then you log in.
+No flags, no arguments, no manual steps. Pre-built ISOs are under
+[**Releases**](../../releases) if you would rather not build a cross-compiler.
 
-It is the same dragon. `wall_dragon()` takes a centre and a scale, so the
-wallpaper draws it full size in the middle and the boot draws it half size
-and left of centre, from one set of polygons — rather than a second dragon
-that has to be kept in step with the first.
+A bare-metal kernel cannot be built by the compiler that targets your own
+operating system, so this needs an **`x86_64-elf` cross toolchain**:
 
-Two fields do the work, and they are deliberately different mechanisms
-because they are different things:
+```sh
+brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu   # macOS
+```
 
-**The fire is advected.** Each cell pulls heat from the cell to its left and
-the ones below, so the flame streams away from the mouth and rises. The mix
-shifts over the sequence: the jet leaves the mouth almost flat, and once the
-breath stops what is left of it stands up and gutters out.
+On Linux, `xorriso` and `qemu-system-x86` are packaged everywhere; the cross
+toolchain generally is not, and `gcc-x86-64-linux-gnu` is *not* a substitute —
+it targets Linux rather than bare metal. Build one, or, if your host toolchain
+already emits ELF, `make CC=gcc LD=ld` may do. `python3` builds the disk
+images. Nothing else — the boot animation is computed by the kernel rather
+than decoded, so there is no ffmpeg and no media file in the tree. `make`
+names everything missing at once rather than stopping at the first.
 
-**The burn is a front.** Fire is not what destroys the screen — what fire
-leaves behind is — so the char is a separate field that ignites where the
-jet lands and then eats outward on its own, ember rim ahead of cold char. It
-spreads in a distance metric squashed hard downrange, so it runs out ahead
-of itself the way the breath went; a front that spreads evenly is a circle,
-and a circle expanding out of a dragon's mouth reads as a shockwave rather
-than as something catching light.
+You want about **11 GB free**: an 8 GB sparse volume plus 1.4 GB of optional
+downloads — **Simple English Wikipedia** (~980 MB) and a **Qwen2 0.5B** model
+(~380 MB), fetched from Kiwix and Hugging Face because GitHub refuses any file
+over 100 MB.
 
-Neither needs a square root. The front compares squared distance against a
-squared radius, perturbed per cell by a tiled noise field, which is what
-makes its edge ragged. Integer throughout, on the same 360-entry sine table
-the login screen uses, because this runs *before* the floating-point unit is
-switched on — before the interrupt table exists, before a single driver has
-been probed.
+```sh
+make ASSETS=1     # take them without asking (what CI wants)
+make ASSETS=0     # skip entirely
+make assets       # fetch later, or after saying no
+```
 
-It used to be a recording, and recordings are heavy: 121 frames of 320×240
-RGB565 is **18.5 MB of raw pixels**, linked into the kernel *and* copied into
-the ISO, generated from a 6.8 MB `.mp4` by ffmpeg — a build dependency
-nothing else here needed.
+Without them the system still boots — the Wikipedia window reports no archive.
+`disk.img` is created **once** and then left alone, so your files survive
+rebuilds; `make clean` does not touch it and `make cleandisk` resets it.
 
-| | before | after |
-|---|---:|---:|
-| ISO | 40 MB | **4.6 MB** |
-| in the repository | 6.8 MB of video | **none** |
-| ffmpeg | required | **not used at all** |
+---
 
-`src/bootanim.h` is 373 lines and byte-identical on both architectures.
+# Architecture
+
+## The kernel is four objects
+
+For most of this system's life the kernel was one translation unit: ninety-odd
+headers of `static` functions, 69,000 lines seen by the compiler at once. That
+was not laziness — `static` is what let each driver keep its ring buffers and
+MMIO map private with no risk of two identically named tables colliding at
+link time. It is also what makes naive splitting dangerous: compile two objects
+that both include `kheap.h` and each gets **its own free list**. It compiles,
+it links, it boots, and it is wrong.
+
+So the split is measured rather than assumed. Three modules had interfaces
+narrow enough to write down:
+
+| source | exports | imports | what the object is |
+|---|---:|---:|---|
+| `src/core/main.c` | — | — | composition root: boot, drivers, desktop, render loop |
+| `src/sched/scheduler.c` | 28 | 14 | threads, the 1 kHz timer ISR, the context switch |
+| `src/fs/ntfs/ntfs_ops.c` | 8 | 9 | NTFS, read and write |
+| `src/security/anti_virus.c` | 14 | 5 | allowlist, signature automaton, UAC policy |
+
+Everything crossing those boundaries is declared in
+**`include/kernel_shared.h`**, and the rule that keeps it honest is that the
+three module sources include only that header and their own. Around **60
+symbols** lost their `static` to make this work — not 2,979. That ratio is the
+evidence the seam is real: a de-static'd symbol defined twice fails at link,
+where a `static` one defined twice succeeds and hands each object a private
+copy.
+
+The composition root keeps the driver and desktop headers because they
+genuinely share state — one MMIO map, one heap, one window list — and
+separating them would be a rewrite wearing a refactor's clothes.
+
+## The multi-instance scheduler
+
+Applications used to run by pointing the stack pointer at a static buffer and
+issuing a `CALL`; the desktop stopped existing until the program returned. A
+Mandelbrot that took four seconds froze the pointer, the clock and the
+compositor for four seconds.
+
+Now a program is a **thread**, with its own address space, its own 32 KB
+kernel stack and its own copy of the floating-point state, and the APIC timer
+takes the processor away from it **a thousand times a second**.
+
+- **Strict-priority round-robin** over 64 thread slots — `PRIO_IDLE`,
+  `PRIO_NORMAL` (4), `PRIO_UI` (8), `PRIO_MAX` (15). The compositor sits above
+  applications, so a program in a tight loop can never cost the interface
+  its frame.
+- **The switch is the stack pointer.** The timer stub pushes every
+  general-purpose register onto the interrupted thread's stack, on top of the
+  five words the processor pushed. That block *is* the saved state; switching
+  is writing the current stack pointer into the current thread, picking
+  another, loading its pointer, and returning. `IRETQ` unwinds into whatever
+  that thread was doing — the frame says whether it was ring 0 or ring 3.
+- **Extended state does not fit that trick**, because `FXSAVE` writes 512
+  bytes to a fixed address rather than pushing. Each thread carries its own
+  16-byte-aligned area, and interrupt handlers are compiled
+  `general-regs-only` so they cannot disturb what the switch is moving. This
+  is what makes floating point safe everywhere: two threads can both be
+  halfway through an XMM expression and neither can see the other's.
+- **The frame is a critical section.** Rather than lock the window list, the
+  terminal ring and the notification queue individually, the render loop
+  raises a preemption count while it draws and drops it before it sleeps.
+  Applications get the rest of the frame, which is most of it, in
+  millisecond slices.
+- **Yielding raises the timer vector by instruction**, so there is exactly
+  one piece of code in this kernel that knows how to change threads.
+
+`crypto_switch_selftest` is the proof rather than the claim: it holds a
+pattern in XMM5 across **182 measured context switches** and requires it back
+byte-for-byte, runs four concurrent AES threads to completion, and counts the
+switches underneath them. It runs *after* `sti` — run before, the timer cannot
+fire and the test passes by never exercising the thing it is named after.
+
+## Ring 3 hardware isolation
+
+An application is a thread **in ring 3, in page tables of its own**. The lower
+half of its address space maps four things: its image, its stack, one page of
+syscall trampolines, and the pixels of its own window. Everything else in the
+machine — the kernel, the framebuffer, the disk cache, every other process —
+is either in the half its descriptors forbid or is not mapped at all.
+
+- Text pages are read-and-execute, data pages writable and never executable —
+  **W^X on every loaded image**.
+- **Page zero is deliberately absent**, so a null dereference faults instead
+  of reading whatever the image starts with.
+- The kernel half is shared **by reference**, so a process switch is one CR3
+  write and no table copying.
+
+**Two doors in, and they are not interchangeable.** `int 0x80` is the old one,
+kept because binaries emitting it are installed on real disks, and it
+preserves *every* register including RAX — which is not a nicety. GCC compiles
+two `os_print`s in a row into one `mov eax, 1` and two interrupts, so a gate
+that returned a value in RAX would silently turn the second call into a no-op.
+That was found by a program appearing to skip a line. Anything needing an
+answer back uses `SYSCALL`. Both land on a kernel stack, build one register
+frame, and check every pointer that crosses.
+
+**A fault in ring 3 is an ordinary event.** The handler prints the vector, the
+decoded error code, the faulting address and the thread, then kills that
+thread by rewriting its exception frame to return into the kernel — and the
+desktop keeps drawing. `/faulter` is on the volume and exists to prove it: it
+writes through a null pointer on purpose, because the interesting property of
+a protected system is not that correct programs run.
+
+## Page swapping
+
+Demand paging to a **256 MB `pagefile.sys`**, 65,536 slots, resolved to one
+raw extent at boot so that **no filesystem code runs inside a page fault** —
+a fault that had to walk exFAT to find its own backing store would deadlock
+the first time it faulted on the filesystem's buffers.
+
+- **Clock replacement** over a reverse map from physical frame back to the
+  mapping that owns it, revalidated against the page tables before anything
+  is evicted.
+- A swapped page is recorded **in its own page table entry** — bit 10 of a
+  non-present entry, which the processor ignores and which cannot alias the
+  copy-on-write bit that shares the field.
+- **User pages only.** Kernel memory, page tables and shared frames never
+  leave RAM. A page the fault handler itself might touch is not a candidate.
+
+## Hardware drivers
+
+Three storage buses, probed newest first, behind **one 512-byte sector view**:
+**NVMe**, **AHCI/SATA**, legacy **ATA PIO**, plus **USB mass storage**. A
+machine bought in the last ten years has no IDE controller at all, so without
+the first two the OS boots and finds nothing.
+
+Two details easy to skip and expensive to get wrong:
+
+- **Physical contiguity.** A DMA engine is handed physical addresses, and a
+  buffer that is one array to C is one array to the device only if its pages
+  happen to be adjacent. They are, under this bootloader — which is exactly
+  how a driver works on the machine it was written on and corrupts memory on
+  the next one. Buffers are resolved page by page and coalesced.
+- **Block size.** NVMe namespaces are increasingly not 512 bytes, and every
+  filesystem above expects that they are. The translation includes the
+  read-modify-write a partial write needs; without it, writing one sector on
+  a 4K drive destroys the seven either side, silently.
+
+**xHCI** carries HID boot protocol, mass storage over Bulk-Only Transport with
+SCSI, and hubs five tiers deep with route strings and transaction
+translators — all hot-pluggable. **HD Audio** walks the codec graph, with
+AC'97 as the fallback and an eight-voice mixer above both. **Intel Gen9**
+drives the blitter through a private GGTT window and the BCS ring, and when a
+submission's breadcrumb never lands it latches the i915-style error state —
+EIR/ESR, the exact command header that broke the pipeline decoded by name,
+ACTHD, INSTDONE, GGTT faults, the ring contents around the parse point —
+attempts an engine reset, and falls back to CPU rendering after repeated
+hangs. `gpu error` prints the report.
 
 ---
 
@@ -159,58 +248,51 @@ nothing else here needed.
 <td width="50%"><img src="docs/browser.png" alt="Browser"></td>
 </tr>
 <tr>
-<td><b>Shell</b> — a real filesystem, and <code>ping</code> and
-<code>fetch</code> going out over lwIP, with eight conversations able to
-be in flight at once.</td>
-<td><b>Browser</b> — <code>info.cern.ch</code>, the first website, fetched
-and rendered on bare metal. <code>https://</code> works now too, over
-TLS 1.3, on a thread of its own so a slow site never freezes the desktop
-— and the server's chain is checked against the roots in
-<code>/etc/ca-bundle.crt</code>. The status line says which of the two
-it got rather than showing a padlock it has not earned.</td>
+<td><b>Shell</b> — 161 commands over a real filesystem, with <code>ping</code>
+and <code>fetch</code> going out over lwIP and eight conversations able to be
+in flight at once.</td>
+<td><b>Browser</b> — <code>info.cern.ch</code>, the first website, fetched and
+rendered on bare metal. <code>https://</code> works over TLS 1.3, on a thread
+of its own so a slow site never freezes the desktop, and the server's chain is
+<b>verified</b> against the roots in <code>/etc/ca-bundle.crt</code>.</td>
 </tr>
 <tr>
 <td><img src="docs/wikipedia.png" alt="Wikipedia search"></td>
 <td><img src="docs/article.png" alt="An article"></td>
 </tr>
 <tr>
-<td><b>Offline Wikipedia</b> — live prefix search across
-<b>399,853 entries</b>, answered by binary search over the archive's sorted
-path list. About twenty reads, and it barely slows as the archive grows.</td>
-<td><b>Articles</b> render in the Wikipedia window itself, through a
-layout engine with a run-based line model — so a sentence full of links
-stays one sentence. Internal links resolve back into the archive, and Back
-restores your reading position.</td>
+<td><b>Offline Wikipedia</b> — live prefix search across <b>399,853
+entries</b>, answered by binary search over the archive's sorted path list.
+About twenty reads, and it barely slows as the archive grows.</td>
+<td><b>Articles</b> render through a layout engine with a run-based line
+model, so a sentence full of links stays one sentence. Internal links resolve
+back into the archive, and Back restores your reading position.</td>
 </tr>
 <tr>
 <td><img src="docs/store.png" alt="Ingot app store"></td>
 <td><img src="docs/store-app.png" alt="An installed app running"></td>
 </tr>
 <tr>
-<td><b>Ingot</b> — the app store. It lists every application on the
-machine, built-in and installable alike, so the storefront answers "what
-is on this machine" and not merely "what else could be". Install writes a
-validated payload to the system volume and records it in a registry, so
-installed apps survive a reboot.</td>
-<td><b>…and they run.</b> Installed apps join the dock and open in their own
-window — in ring 3, in an address space of their own, on a thread the
-scheduler preempts a thousand times a second. This Mandelbrot is computed
-in double precision and written straight into the window's pixels, which
-are mapped into the process.</td>
+<td><b>Ingot</b> — the app store lists every application on the machine,
+built-in and installable alike, so it answers "what is on this machine" and
+not merely "what else could be". Install writes a validated payload and
+records it in a registry, so installed apps survive a reboot.</td>
+<td><b>…and they run.</b> In ring 3, in an address space of their own, on a
+thread the scheduler preempts a thousand times a second. This Mandelbrot is
+computed in double precision straight into the window's pixels, which are
+mapped into the process.</td>
 </tr>
 <tr>
 <td><img src="docs/solid.png" alt="Solid, shading through the g3d API"></td>
 <td><img src="docs/chamber.png" alt="Chamber, a guest running under AMD-V"></td>
 </tr>
 <tr>
-<td><b>Solid</b> — 3D through <code>g3d</code>. The panel is the API
-reporting on itself: which backend is live, how many triangles survived
-culling, how many fragments were shaded, and the compiled size of the
-shader running them.</td>
-<td><b>Chamber</b> — a guest on AMD-V. The green line was written by
-guest code storing to <code>0xB8000</code>, translated by nested page
-tables; every exit in the log is a real VMEXIT at an address that matches
-the disassembly.</td>
+<td><b>Solid</b> — 3D through <code>g3d</code>. The panel is the API reporting
+on itself: which backend is live, how many triangles survived culling, how
+many fragments were shaded, and the compiled size of the shader.</td>
+<td><b>Chamber</b> — a guest on AMD-V. The green line was written by guest
+code storing to <code>0xB8000</code>, translated by nested page tables; every
+exit in the log is a real VMEXIT at an address matching the disassembly.</td>
 </tr>
 <tr>
 <td><img src="docs/photos.png" alt="Photos"></td>
@@ -221,14 +303,12 @@ the disassembly.</td>
 over an LZMA stream. The status bar is not marketing, it is the file:
 <b>623 KB → 12 KB</b>.</td>
 <td><b>Login</b> — real accounts. Salted SHA-256 iterated 4,096 times,
-compared in constant time, with per-user home directories. A wrong
-password melts the screen.</td>
+compared in constant time, with per-user home directories. A wrong password
+melts the screen.</td>
 </tr>
 </table>
 
----
-
-## The desktop
+### The desktop
 
 <table>
 <tr>
@@ -236,208 +316,206 @@ password melts the screen.</td>
 <td width="50%"><img src="docs/snap.png" alt="A window snapped to half the screen"></td>
 </tr>
 <tr>
-<td><b>Peek and previews</b> — click the Show Desktop tab at the end of
-the taskbar and every window fades towards what is behind it, leaving its
-outline; click again, or click any window, to bring the stack back. It is
-a latch, not a hover, so crossing the taskbar never dissolves your work.
-The preview above a button is the window itself, captured out of the
-compositor.</td>
-<td><b>Snap</b> — drag a window to an edge and it takes half the work
-area; drag it to the top and it fills it. The target is previewed while
-the button is held, so the gesture can be abandoned.</td>
+<td><b>Peek and previews</b> — click Show Desktop and every window fades
+towards what is behind it, leaving its outline. It is a latch, not a hover, so
+crossing the taskbar never dissolves your work. The preview above a button is
+the window itself, captured out of the compositor.</td>
+<td><b>Snap</b> — drag a window to an edge and it takes half the work area;
+to the top and it fills it. The target is previewed while the button is held,
+so the gesture can be abandoned.</td>
 </tr>
 <tr>
 <td><img src="docs/search.png" alt="Start menu search"></td>
 <td><img src="docs/calculator.png" alt="Calculator"></td>
 </tr>
 <tr>
-<td><b>Search</b> — type in the start menu and it looks through the
-applications, the things each app was recently pointed at, and the volume
-itself, breadth-first under a budget so it cannot cost a frame.</td>
-<td><b>Calculator</b> — three modes, and not one floating-point
-instruction. Values are 64-bit integers scaled by a million, so 12.5 × 8
-is exactly 100 and 1000 mm is exactly 1 m.</td>
+<td><b>Search</b> — type in the start menu and it looks through applications,
+what each app was recently pointed at, and the volume itself, breadth-first
+under a budget so it cannot cost a frame.</td>
+<td><b>Calculator</b> — three modes, not one floating-point instruction.
+Values are 64-bit integers scaled by a million, so 12.5 × 8 is exactly 100 and
+1000 mm is exactly 1 m.</td>
 </tr>
 </table>
 
-**Windows.** Minimize, maximize and snap share one saved rectangle rather
-than three that could disagree. Shake a window — four direction changes
-inside half a second, counting only strokes long enough not to be a hand
-holding still — and everything else gets out of the way; shake it again
-and the desk comes back.
+**Windows.** Minimize, maximize and snap share one saved rectangle rather than
+three that could disagree. Shake a window — four direction changes inside half
+a second, counting only strokes long enough not to be a hand holding still —
+and everything else gets out of the way.
 
 **Taskbar.** Pinned launchers that become window buttons once something is
-running: click the focused one to put it away, click again to bring it
-back. Right-click opens a jump list of what that app was last pointed at.
+running; right-click opens a jump list of what that app was last pointed at.
+**Gadgets** — a clock, a system meter and a network panel, the CPU meter fed
+by the render loop's own cycle counters, because a meter driven by a counter
+that ticks whether or not anything is happening is decoration rather than
+instrumentation. **Action Center** — the last sixteen things the system did,
+none of which steal focus.
 
-**Gadgets.** A clock, a system meter and a network panel, drawn on the
-desktop under the window stack. The CPU meter is fed by the render loop's
-own cycle counters — a meter driven by a counter that ticks whether or not
-anything is happening would be decoration, not instrumentation.
-
-**Action Center.** A flag on the menubar with an unread count, and a panel
-listing the last sixteen things the system did: signing in, an app being
-installed, the language model being enabled, the network link changing.
-Nothing in it steals focus or blocks.
-
-**Power.** The render loop parks the core between frames rather than
-spinning through them. After ninety seconds without a pointer move, click
-or keystroke the screen fades down, and comes back four times as fast as
-it went — once the fade settles every frame equals the last, so the flip's
-row diff finds nothing to send to the panel.
+**Power.** The render loop parks the core between frames. After ninety seconds
+idle the screen fades down and comes back four times as fast as it went — once
+the fade settles every frame equals the last, so the flip's row diff finds
+nothing to send to the panel.
 
 ---
 
-## Security, and exactly what it is worth
+## First light
 
-**Encrypted containers.** `vault seal <dir> <file> <passphrase>` puts a
-directory into one file: ustar, then ChaCha20 over the archive. The
-header carries the salt and nonce in the clear — they are not secrets —
-and a *verifier* that is not the key. That last part is the one that
-matters. A stream cipher cannot tell a wrong key from a right one; it
-decrypts to garbage either way. Without the verifier, a mistyped
-passphrase would cheerfully write noise over a home directory and call it
-a restore. It says `wrong passphrase` and writes nothing.
+<p align="center">
+  <img src="docs/boot.png" width="90%" alt="The boot animation: the dragon breathing fire, and the burn front eating the screen">
+</p>
 
-The cipher is ChaCha20 rather than AES for a reason specific to this
-machine: it is add, xor and rotate on 32-bit words and nothing else. AES
-without AES-NI means a table-driven implementation whose timing depends
-on the key, which is worse than useless. It is checked against the
-published RFC 8439 vectors, not against itself — an implementation that
-is merely self-consistent round-trips perfectly and protects nothing.
+**The boot animation is not a video.** The dragon off the desktop wallpaper
+draws breath and sets fire to the screen, the screen burns away, and then you
+log in. It is the same dragon — `wall_dragon()` takes a centre and a scale, so
+the wallpaper draws it full size and the boot draws it half size and left of
+centre, from one set of polygons.
 
-**Backup and restore.** `backup <file> <passphrase>` seals this account's
-home directory; `restore` puts it back. `make test` covers the cipher;
-the round trip was exercised on the machine.
+Two fields do the work, deliberately different mechanisms because they are
+different things. **The fire is advected**: each cell pulls heat from the cell
+to its left and the ones below, so the flame streams away from the mouth and
+rises. **The burn is a front**: fire is not what destroys the screen, what
+fire leaves behind is, so the char is a separate field that ignites where the
+jet lands and eats outward on its own, ember rim ahead of cold char. It
+spreads in a distance metric squashed hard downrange — a front that spreads
+evenly is a circle, and a circle expanding out of a dragon's mouth reads as a
+shockwave rather than as something catching light.
 
-**Allow list, scanner, prompt levels.** Three settings in
-`/etc/policy.cfg`, read before anything can be launched and enforced at
-the single point every program passes through. A refusal is announced on
-the serial line, in the terminal, and in the Action Center — a program
-that simply fails to start, with no reason given, is indistinguishable
-from a broken one. The scanner's signature list includes the EICAR
-standard test string, which exists precisely so a scanner can be
-demonstrated without keeping a real sample on the disk; what it is
-genuinely good at is catching a binary altered since it was installed.
+Neither needs a square root. Integer throughout, on the same 360-entry sine
+table the login screen uses, because this runs *before* the floating-point
+unit is switched on — before the interrupt table exists, before a single
+driver has been probed.
 
-**What none of this is.** It decides whether a program starts. It does
-not constrain one that is running. That sentence used to end with "and it
-is not a kernel enforcement boundary", and stood for a long time, because
-applications ran with the kernel's own privileges out of a static buffer.
-That part is no longer true.
+It used to be a recording, and recordings are heavy: 121 frames of 320×240
+RGB565 is **18.5 MB of raw pixels**, linked into the kernel *and* copied into
+the ISO, generated from a 6.8 MB `.mp4` by ffmpeg.
 
-### The boundary itself
-
-An application is a **thread in ring 3**, in page tables of its own. The
-lower half of its address space maps four things: its image, its stack,
-one page of syscall trampolines, and the pixels of its own window.
-Everything else in the machine — the kernel, the framebuffer, the disk
-cache, every other process — is either in the half its descriptors forbid
-or is not mapped at all. Text pages are read-and-execute, data pages are
-writable and never executable, and page zero is deliberately absent so a
-null dereference faults instead of reading whatever the image starts
-with.
-
-There are two doors in and they are not interchangeable. `int 0x80` is
-the old one, kept because binaries emitting it are installed on real
-disks, and it preserves **every** register including RAX — which is not a
-nicety: GCC compiles two `os_print`s in a row into one `mov eax, 1` and
-two interrupts, so a gate that returned a value in RAX would silently
-turn the second call into a no-op. That was found by a program appearing
-to skip a line. Anything that needs an answer back uses `SYSCALL`, which
-has no such history. Both land on a kernel stack, build one register
-frame, and check every pointer that crosses.
-
-A fault in ring 3 is an ordinary event. The handler prints the vector,
-the decoded error code, the faulting address and the thread, then kills
-that thread by rewriting its exception frame to return into the kernel —
-and the desktop keeps drawing. `/faulter` is on the volume and exists to
-prove it: it writes through a null pointer, on purpose, because the
-interesting property of a protected system is not that correct programs
-run.
-
-**What is still not here.** No `fork`, no signals, no file descriptors
-beyond the console, and one address space per program rather than per
-instance. Applications cannot reach each other's memory, but they share
-one window each and one canvas each, and the policy layer above is still
-policy.
+| | before | after |
+|---|---:|---:|
+| ISO | 40 MB | **4.6 MB** |
+| in the repository | 6.8 MB of video | **none** |
+| ffmpeg | required | **not used at all** |
 
 ---
 
-## Fuzzing the loader
+# What is built
 
-`vx_validate()` is the only thing between a `.vx` payload downloaded over
-plain HTTP and a loader that runs it with kernel privileges in a shared
-address space, so it is fuzzed rather than trusted.
+| | |
+|---|---|
+| **Kernel** | Four objects behind one seam header; bitmap frame allocator over the firmware map; slab and page-run heap with paged and non-paged pools; per-process PML4 with the kernel half shared by reference |
+| **Scheduler** | Preemptive strict-priority round-robin over 64 threads on the APIC timer at 1 kHz; per-thread FPU state through `fxsave64`/`fxrstor64`; `general-regs-only` handlers; sleep, join, block-on-channel and a frame clock |
+| **Processes** | Ring 3 with its own GDT and TSS, `SYSCALL`/`SYSRET` and a DPL-3 `int 0x80` gate, W^X on every image, absent page zero, faults that kill a thread instead of the machine |
+| **Paging** | Demand paging to a 256 MB contiguous `pagefile.sys` resolved to one raw extent at boot; clock replacement over a frame-to-mapping reverse map; swap slot recorded in bit 10 of the non-present PTE; user pages only |
+| **Filesystem** | **NTFS read *and* write** — `$MFT` record allocation, `$Bitmap` first-fit clusters, signed-delta run lists, `$INDEX_ROOT` insert/remove, `$UsnJrnl` v2 records, write-ahead redo journal. exFAT read/write with 64-bit sizes, FAT32 fallback, ustar ramdisk, GPT and MBR, 8.3 short names, ACLs and SIDs, share modes, change notification |
+| **Storage** | NVMe, AHCI/SATA, ATA PIO and USB mass storage behind one 512-byte sector view; physical-contiguity resolution and 4K-block read-modify-write |
+| **Network** | lwIP 2.2.1 — IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP with reassembly, backoff, window scaling and delayed ACKs — behind the sockets API, eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP, Intel e1000 |
+| **Wireless** | 802.11 frame layer and a complete WPA2 supplicant: PBKDF2 PMK, the 4-way handshake, PTK/GTK derivation, RFC 3394 key wrap and CCMP — all checked against published vectors. Intel and Realtek PCIe back-ends do the probe, reset, APM sequence, DMA rings and firmware-load protocol *(see the caveat below)* |
+| **Transport security** | Mbed TLS 3.6.4 stripped to TLS 1.3, allocating through the kernel heap, seeded from RDRAND, eight parallel sessions — and **certificates are verified**: `VERIFY_REQUIRED`, hostname checked, **87 of 128 roots** parsed from `/etc/ca-bundle.crt`. The other 41 are exactly the roots signed `sha1WithRSAEncryption`, and they stay unreadable on purpose — SHA-1 signatures have been forgeable since 2017, so refusing them is the feature rather than the gap |
+| **Remote desktop** | RDP server on port 3389: X.224, MCS domain and channel binding, licensing, capability exchange, compositor damage encoded as bitmap updates, input decoded into the system task queue *(plaintext — see below)* |
+| **Directory** | LDAP v3: simple bind, subtree search with equality and presence filters, BER written by hand and parsed with a bounded reader that refuses the indefinite-length form |
+| **Domain auth** | Kerberos v5 — AS exchange with PA-ENC-TIMESTAMP, TGS exchange, AP-REQ; aes256-cts-hmac-sha1-96 and aes128-cts, and deliberately **not** rc4-hmac, which is what makes Kerberoasting work. RFC 3961 n-fold, DK and string-to-key against the RFCs' own vectors. Tickets survive a reboot, encrypted under a key derived from the login password |
+| **File sharing** | SMB2 dialects 2.0.2, 2.1 and **3.0** — every message signed by HMAC-SHA256, or AES-128-CMAC and whole-message AES-128-CCM encryption at 3.0, with the transform header as associated data so a frame retargeted at another session fails its tag. NTLMv2 over NTLMSSP inside SPNEGO. SMB1 is absent *by construction* — the code to speak it does not exist, so the connection cannot be talked down to it |
+| **Group Policy** | Machine policy fetched from SYSVOL over SMB2 and applied through the registry; GPT.INI version parsing and Registry.pol in PReg format, validated whole before a single value is written, inside one registry transaction |
+| **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; structured exception handling — `__try`/`__except` dispatched from the trap handler through `.pdata`/`.xdata`; TEB and PEB through GS; `.rsrc` strings; a registry with typed values and transactional commit; Microsoft-ABI trampolines preserving the twelve registers System V does not |
+| **Virtualisation** | AMD-V: VMCB, nested paging, a 32-bit guest that runs on the processor. Intel VT-x: VMXON/VMCS/VMWRITE, capability-MSR control negotiation, EPT in its own entry format, and a **64-bit long-mode guest** with its own page tables *(see below)* |
+| **Media** | H.264 bitstream parser, Gen9 MFX command builders and VEBOX/CPU colour conversion writing NV12→BGRA **straight into a ring-3 window's mapped pixels** — no copy, no syscall in the path. FLAC, IMA ADPCM and G.711, all integer |
+| **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage; a full **bytecode hinting interpreter** — font program, pre-program and per-glyph instructions actually executed, 26.6 fixed point throughout; alpha-blended shadows with radial corners, spring-driven window motion, Gen9 blitter with hang capture, firmware framebuffer fallback |
+| **3D** | `g3d`: pipelines, vertex and index buffers, matrices, a command buffer — and **G3SL**, a shader language with a tokeniser, precedence parser, static type checker and stack machine, compiled from text at run time. Integer software rasteriser underneath: 16.16 fixed point, perspective divide once per vertex, 1/z depth buffer, backface culling |
+| **Compression** | Zstandard (RFC 8878) and LZMA/LZMA2/xz, both written from the specifications; ZIM archive reader that never loads a cluster it does not need |
+| **Inference** | GGUF parsing, byte-level BPE tokeniser, dequantisation for every weight type used, transformer forward pass — two models resident at once, checking each other |
+| **Security** | Ring 3 isolation (above); ChaCha20 against RFC 8439 vectors; encrypted containers with a passphrase verifier; encrypted backup and restore; per-account allowlist; **Aho-Corasick signature scanner**; UAC prompt levels |
+| **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories and profile trees, administrator rights, logout that clears session state |
+| **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology from CPUID leaf 0x0B; microcode revision read and updates applied |
+| **Applications** | Terminal (161 commands), browser, file manager, offline Wikipedia with chat, image viewer, paint, system monitor, app store, calculator, media player, 3D viewer, CHIP-8, hypervisor console, settings |
+| **Userland** | `.vx` container format, two syscall ABIs, a C library (`string.h`, `stdio.h`, malloc over sbrk), a package store, five shipped apps |
+| **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; an animation the kernel computes rather than plays back |
 
-```sh
-cd vxfmt/fuzz && make
-AFL_MAP_SIZE=65536 afl-fuzz -i in -o out -m none -- ./harness @@
-```
+### The scanner is an automaton
 
-The harness calls `vx_validate()` and returns. It deliberately does not go
-through `vx_run`'s `main()`, which after validating goes on to `mmap`,
-`mprotect` and **call the image's entry point** — a fuzzer that reached
-that would be executing attacker bytes rather than testing the check meant
-to stop them.
+The signature scanner used to search the buffer **once per signature**. It is
+now **Aho-Corasick**: the signatures compile into a deterministic automaton and
+matching is one table lookup per input byte, *independent of how many
+signatures there are*. A hundred cost what two cost, so adding to the table no
+longer costs anything at launch time.
 
-Last run: **33,644 executions, 71.2% edge coverage, 100% stability, zero
-crashes and zero hangs** under AddressSanitizer.
-
-Two things that reading found and the fuzzer would not, both still open
-and written up in `vxfmt/fuzz/README.md`:
-
-- `vx_run.c` `malloc`s exactly `file_size` bytes and then unconditionally
-  `memcpy`s 80 of them *before* validating, so any file of 1–79 bytes is a
-  heap over-read. The kernel's own loader checks the size first — the two
-  loaders disagree and the POSIX one is wrong.
-- The import table is outside everything `vx_validate()` looks at.
-  `vx_resolve_imports()` reads a `count` from the loaded image and walks
-  that many entries; its bounds live in the resolver, not the validator.
+Both matchers are kept — the direct search is the fallback if the node pool
+overflows, and it is what `tools/av_test.c` compares against over **20,000
+generated buffers**, including near-misses like `X5O!X5O!P%@AP…` which is
+exactly where a trie without failure links breaks. One subtlety preserved
+deliberately: the old loop reported by *table* order and an automaton finds
+*buffer* order, so the scan collects the lowest index across the whole pass
+rather than stopping at the first hit. The same signature is named as before,
+every time.
 
 ---
 
-## What is not here
+# Verification
 
-Vextro is one person's operating system, and the honest list of what it
-cannot do is longer than the list of what it can. These are the things
-most often assumed to be present:
+`make test` runs **614 checks across 14 suites** on the host, every build.
+The bar is not "it agrees with itself" — an implementation that is merely
+self-consistent round-trips perfectly and proves nothing:
+
+| suite | what it proves |
+|---|---|
+| `ntcrypto`, `aes`, `krb5` | AES against FIPS-197, RFC 3961 n-fold/DK/string-to-key against the RFCs' own vectors, AESENC and the portable path made to agree |
+| `wifi` | PMK against IEEE 802.11i's passphrase vectors, key wrap against RFC 3394, CCMP against RFC 3610, the 4-way handshake against a synthetic authenticator |
+| `ntfs` | 72 checks against a scratch volume — run-list encoder against the *decoder*, every mutation followed by a fresh mount, the journal replayed against a deliberately interrupted write |
+| `av` | the automaton against the brute-force search it replaced, over 20,000 buffers, under ASan and UBSan |
+| `vmx` | EPT entry format, capability-MSR negotiation, VMCS field encodings decoded against their width/type structure |
+| `media`, `rdp` | bitstream parsing and surface geometry; RDP wire encoders against the bytes the specification prescribes |
+| `crypto`, `mbedtls` | ChaCha20/X25519/HKDF against RFC 7748, 8439 and 5869; a real TLS 1.3 handshake when a server is given |
+| `ttfhint`, `wikidoc`, `profile` | grid-fitting measured rather than claimed; layout and profile round-trips |
+
+Three checks run **in the kernel**, because they cannot run anywhere else:
+`crypto_switch_selftest` proves XMM survives preemption across 182 real
+context switches; the AES selftest is the only place AESENC and the portable
+implementation both exist; and the loader is **fuzzed** rather than trusted —
+`vx_validate()` under AFL++ and AddressSanitizer, last run **33,644
+executions, 71.2% edge coverage, 100% stability, zero crashes**.
+
+---
+
+# Written, but not exercised on hardware
+
+Stated separately because the distinction is invisible from the code, and
+because a repository that blurs it is not worth reading.
+
+| | what runs | what does not |
+|---|---|---|
+| **Wi-Fi / WPA2** | The frame layer and the whole WPA2 engine, verified against published vectors on every build. The PCIe probe, BAR mapping, device reset, APM power sequence, DMA rings and firmware-load protocol are real register programming. | Both Intel iwlwifi-class and Realtek PCIe parts are **firmware-driven**: the silicon has no usable MAC until a signed microcode image is DMA'd in and booted through an ALIVE handshake, and scanning and association are firmware commands rather than register writes. That image is a proprietary blob, is not in this tree, and cannot be written from the specification. Without it the driver probes, resets, maps, then stops at `WIFI_STATE_NO_FIRMWARE` and says so. QEMU also emulates no wireless device at all. |
+| **Hardware video decode** | The H.264 bitstream parser, surface geometry and colour conversion, all host-verified. The zero-copy design is the substance: the decoder's output surface *is* the window, because the same physical pages are in both the process's page tables and the GPU's GGTT. | **No machine this is built or tested on has an Intel GPU.** QEMU models none, so `igpu_init()` reports "no Intel display controller" and everything from the VCS ring downward is unreachable. The MFX command encodings come from Intel's public documentation; they have not touched silicon, and a misplaced field would show up as an engine hang only hardware can reveal. |
+| **Intel VT-x** | The arithmetic those instructions consume: EPT entry format, control negotiation against the capability MSRs, VMCS field encodings, the long-mode guest's own page tables. 46 host checks. | `query-cpu-model-expansion max` on this QEMU reports **`vmx = False`**, so no `VMXON` or `VMLAUNCH` here has executed or can be made to. It also stops short of `VMLAUNCH` deliberately — entering a guest with no host-resume stub would be worse than not entering one. `vmx_init()` reports *"no VT-x on this processor"* and stays out of the way; the AMD path still says `ready`. |
+| **RDP** | This one *does* run — it is software over TCP and the stack is up in QEMU. `tools/rdp_probe.py` drives a real connection through all eight handshake stages from the host. | The session is **plaintext**: it negotiates `PROTOCOL_RDP` with `ENCRYPTION_METHOD_NONE`, which is legal and real clients support it, but keystrokes, the login password and the screen contents are in the clear, and there is no server authentication. `rdp_is_encrypted()` returns 0 and the terminal says so before anyone starts the service. Sustained bitmap streaming is not proven — the encoders are correct and unit-tested, but long sessions have stalled on this transport and that has not been root-caused. |
+| **NTFS** | Read and write, 72 checks against scratch images, and it is compiled into the kernel with the kernel's own flags. | **It is not the boot volume** — `disk.img` is still exFAT, and until a volume that matters has nothing to lose, that is where it stays. `$INDEX_ALLOCATION` is absent (a directory that outgrows its record is refused, not split into a B-tree), as are `$ATTRIBUTE_LIST`, compression, and NTFS's own `$LogFile` — whose redo format is not publicly specified, so what protects writes here is this system's journal and not one Windows would replay. |
+
+## Not implemented
 
 | | Why not |
 |---|---|
-| **Hardware-rasterised 3D** | There *is* a 3D API now — `src/g3d.h`: pipelines, buffers, matrices, a command buffer, and a shader language with a real compiler (see below). What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work and the backend dispatches only clears to the GPU. Solid reports which backend is live. |
-| **H.264, AAC, DivX** | Compressed *audio* is here — FLAC, IMA ADPCM and G.711, in `src/flac.h` and `src/adpcm.h`. Compressed *video* is not: H.264 alone is months of work, and there is no video container, no frame scheduler and no colour-space conversion to hang it on. |
-| **A hypervisor on ARM64** | x86 has one — `src/hyper.h` runs a guest on AMD-V with nested paging. The ARM64 port does not: it reaches EL2 only under TCG emulation with a VHE-capable core (HVF refuses to provide EL2 at all, and Limine panics on an ARMv8.0 one). The prerequisite is measured and reported rather than assumed; the hypervisor itself is not written. |
-| **Enterprise networking** | LDAP, Kerberos, SMB2 and Group Policy are all here, each proved against a server written independently of the client. What is not: remote desktop. No VPN and no branch caching either. Two limits worth stating: Kerberos holds tickets in memory only, so nothing survives a reboot; and SMB2 signs but does not encrypt — SMB 3.0 encryption is not implemented. |
-| **Certificate verification** | TLS 1.3 works and `https://` is no longer refused. What is missing is the part that makes it mean something: there is no certificate authority store on the volume, so the chain is parsed and the server's signature checked against the key in its own leaf, and nothing establishes that the leaf belongs to the host that was asked for. That stops an eavesdropper. It does not stop a machine in the middle, and every layer says so. |
-| **Full-disk encryption** | Individual directories can be sealed into encrypted containers (below); the volume itself is not encrypted, so filenames and free space are in the clear. |
-| **Application sandboxing** | `.vx` applications run with full kernel privileges in a shared address space. The allow list and scanner decide whether a program *starts*; nothing constrains what it does once running. The account system buys identity and separate workspaces — it is **not** a security boundary, and the About panel says so. |
-| **Device management, biometrics, multi-touch** | No hardware to drive: this configuration exposes no fingerprint reader and no touch digitiser. |
-| **TV recording, media streaming to network devices** | No tuner driver, and no streaming protocol. |
+| **Hardware-rasterised 3D** | There *is* a 3D API with a real shader compiler. What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work. Solid reports which backend is live. |
+| **`fork`, signals, file descriptors** | One address space per program rather than per instance, and no descriptors beyond the console. Applications cannot reach each other's memory; they simply cannot do much else either. |
+| **Full-disk encryption** | Individual directories seal into encrypted containers; the volume itself is not encrypted, so filenames and free space are in the clear. |
+| **Sandboxing beyond ring 3** | Hardware isolation is real now — a program cannot read the kernel or another process. What is still only *policy* is which programs may start: the allowlist and scanner decide that, and nothing constrains what a program does within its own address space. |
+| **VPN, branch caching, SMB Direct** | Not written. Kerberos also holds tickets encrypted on disk rather than in a kernel keyring. |
+| **Biometrics, multi-touch, TV tuners** | No hardware to drive in this configuration, and no streaming protocol. |
 
 ---
 
-## Things that are more interesting than they sound
+# Things that are more interesting than they sound
 
 ### A language model, on the metal
 
-`src/llm.c` is a complete transformer: byte-level BPE tokeniser, GGUF
-parsing, dequantisation for every weight type the model uses, and the
-forward pass. Drop a Qwen2 GGUF on the volume and the Wikipedia app grows a
-chat panel that retrieves an article and answers from it.
+`src/llm.c` is a complete transformer: byte-level BPE tokeniser, GGUF parsing,
+dequantisation for every weight type the model uses, and the forward pass.
 
 <p align="center">
   <img src="docs/llm.png" width="88%" alt="The transformer running a token at a time">
 </p>
 
 The prediction sharpens as context arrives — `The` → ` following`,
-`The capital` → ` city`, `The capital of France` → ` is`, and then
-**` Paris`**. That is a real forward pass, not a lookup: 24 layers, 14 query
-heads over 2 key/value heads, a 151,936-token vocabulary, and 373 MB of
-weights resident, on a machine with no libc and no GPU.
-
-And it is not just predicting tokens in the abstract — the Wikipedia window
-puts the whole thing together:
+`The capital` → ` city`, `The capital of France` → ` is`, and then **` Paris`**.
+That is a real forward pass, not a lookup: 24 layers, 14 query heads over 2
+key/value heads, a 151,936-token vocabulary, 373 MB of weights resident, on a
+machine with no libc and no GPU.
 
 <p align="center">
   <img src="docs/chat.png" width="88%" alt="The Wikipedia window answering a question about photosynthesis from a retrieved article">
@@ -447,127 +525,63 @@ Asked *what is photosynthesis*, it pulled the distinctive words out of the
 question, binary-searched 399,853 sorted titles, read
 `[context: Photosynthesis]` off a 980 MB archive, and answered from that
 article — retrieval-augmented generation with no index, no database and no
-network. The wording is the model's own, mangled grammar and all; a 0.5B
-model running a token at a time on bare metal sounds like that, and tidying
-it up here would misrepresent it.
+network. The wording is the model's own, mangled grammar and all; tidying it
+up here would misrepresent it. The model loads **by itself, in the
+background**, while the desktop stays live.
 
-That capture is from the **arm64** build under hardware virtualisation,
-which is the honest reason the port exists. The same question on the x86_64
-build under full emulation was still consuming the prompt five minutes
-later.
-
-The model loads **by itself, in the background**, while the desktop stays
-live — there is nothing to type and nothing to wait for. Dequantisation is
-checked against an independently written reference decoder for every type
-the model uses, and `llm probe` compares intermediate tensors to the digit.
-
-That check exists because of a bug worth recording. The model answered
-fluent nonsense for a long time, and the suspicion was on K-quant
-dequantisation — which this model does not use at all. Three of its
-tensors are **Q5_1**, `quant_block` knew the type so the file loaded
-cleanly, and `dequant_block` had no case for it, so every such block
-returned −1 and the matmul quietly returned zero. All three are
-`ffn_down`, in layers 0, 1 and 10. Layer 0 corrupts the residual stream
-before anything else runs, which is exactly how you get logits that carry
-no signal. Two tables disagreeing about which formats exist was the whole
-defect; they agree now, and a type that is missing fails loudly at load
+That check exists because of a bug worth recording. The model answered fluent
+nonsense for a long time, and the suspicion was on K-quant dequantisation —
+which this model does not use at all. Three of its tensors are **Q5_1**,
+`quant_block` knew the type so the file loaded cleanly, and `dequant_block`
+had no case for it, so every such block returned −1 and the matmul quietly
+returned zero. All three are `ffn_down`, in layers 0, 1 and 10. Layer 0
+corrupts the residual stream before anything else runs, which is exactly how
+you get logits carrying no signal. **Two tables disagreeing about which
+formats exist** was the whole defect; a missing type now fails loudly at load
 rather than silently at inference.
-
-It used to be the one translation unit in the build allowed to touch the
-FPU, with everything else compiled `-mno-sse -mno-80387` so that no
-interrupt handler could quietly acquire a floating-point dependency. That
-ban is gone: threads carry 512 bytes of extended state through
-`fxsave64`/`fxrstor64` on every context switch, and handlers are compiled
-`general-regs-only` so they cannot disturb it. What has *not* changed is
-that `-ffast-math` stays banned here — reassociation was measured, bought
-nothing, and made the batched and unbatched paths disagree bit for bit.
-
-### A shader language, compiled at run time
-
-`src/g3d.h` is the 3D API — pipelines, vertex and index buffers, matrices,
-uniforms, a command buffer recorded and submitted as a frame — and the part
-that makes it an API rather than a renderer is **G3SL**: a small language
-with a real compiler. A tokeniser, a recursive-descent parser with operator
-precedence, static type checking over scalars and `vec3`, and a stack
-machine to run the result.
-
-```
-# a lambert term, and a rim light on the silhouette
-d   = sat(dot(n, l));
-rim = sat(1.0 - dot(n, e));
-color = base * (0.18 + 0.82 * d) + gold * (rim * rim * 0.55);
-```
-
-Type errors are compile errors with a line number — `dot` of two scalars,
-a `vec3` where a scalar belongs, a variable changing type — and the Solid
-window prints the message rather than drawing something strange. Programs
-compile from text at run time, so switching shaders visibly changes the
-picture. Every value inside is 16.16 fixed point, because a float would
-fail to link.
 
 ### A model trained here, to answer only from the archive
 
-`assets/explain.gguf` is 135M parameters, fine-tuned in this repository
-on 42,495 examples built out of the encyclopedia itself. Nothing in the
-target text is invented, by construction — a dataset written by a larger
-model would teach this one to sound like that model, including when it
-is wrong.
+`assets/explain.gguf` is 135M parameters, fine-tuned in this repository on
+42,495 examples built out of the encyclopedia itself. Nothing in the target
+text is invented, by construction — a dataset written by a larger model would
+teach this one to sound like that model, including when it is wrong.
 
-Not trained from scratch, and the arithmetic is why. A 200M model wants
-roughly four billion tokens to be worth its size; Simple English
-Wikipedia is about three hundred million, and a properly-fed run is days
-of compute. That produces a model *weaker* than the 0.5B it was meant to
-improve on. Fine-tuning a well-trained small base on the exact task is
-the version of this that works.
+Not trained from scratch, and the arithmetic is why. A 200M model wants roughly
+four billion tokens to be worth its size; Simple English Wikipedia is about
+three hundred million. That produces a model *weaker* than the 0.5B it was
+meant to improve on.
 
-A fifth of the set is **refusals** — a question whose passage does not
-answer it, with "Not in the archive." as the target. Without them a small
-model learns that an answer is always available and produces one from
-nowhere.
-
-Measured on held-out examples:
+A fifth of the set is **refusals** — a question whose passage does not answer
+it, with "Not in the archive." as the target. Without them a small model learns
+that an answer is always available and produces one from nowhere.
 
 | | grounded | refusal correct | token-F1 |
 |---|---:|---:|---:|
 | SmolLM2-135M, as downloaded | 35.0% | 26.1% | 0.318 |
 | **fine-tuned here** | **77.0%** | **100.0%** | **0.993** |
 
-The difference is the one that matters:
-
 > **base** — "Don Sandburg was an American television writer, actor and producer. *He died at the age of 87.*" — the death invented
 >
 > **tuned** — "Don Sandburg (1930 – October 6, 2018) was an American television writer, actor, and producer."
 
-In the kernel it answers in 20 seconds against the 0.5B's 43, at a
-quarter the size. `llm use qwen2` switches back.
-
-Running it needed one real fix. Rotary embeddings pair each dimension
-with a partner, and there are two incompatible conventions: half-split
-(`i` with `i + head_dim/2`, which qwen2 uses in GGUF) and interleaved
-(`2i` with `2i+1`, which llama uses, because llama.cpp permutes the q and
-k weights for it). Choosing wrong leaves attention working and the text
-fluent while the numbers are wrong. It surfaced by running the kernel's
-own transformer on the host — `tools/llm_infer_test.c` — and finding the
-q projection to be the reference's values at every other position. With
-the convention selected by architecture, every logit matches a reference
-implementation to three decimals.
-
-<p align="center">
-  <img src="docs/explainer.png" width="88%" alt="The fine-tuned model answering from the archive">
-</p>
+Running it needed one real fix. Rotary embeddings pair each dimension with a
+partner, and there are two incompatible conventions: half-split (`i` with
+`i + head_dim/2`, which qwen2 uses in GGUF) and interleaved (`2i` with `2i+1`,
+which llama uses, because llama.cpp permutes the q and k weights for it).
+Choosing wrong leaves attention working and the text fluent **while the numbers
+are wrong**. It surfaced by running the kernel's own transformer on the host
+and finding the q projection to be the reference's values at every other
+position. With the convention selected by architecture, every logit matches to
+three decimals.
 
 ### Both models, at once, checking each other
 
-The two models are resident together — `llm.c` keeps everything that
-belongs to *a* model in one struct and there are two of them, so
-switching is an index rather than a reload. They share the arena, which
-is what lets the second load continue where the first stopped instead of
-overwriting it.
-
-A question goes to both. The tuned model answers; the 0.5B answers the
-same prompt, re-encoded, because its tokenizer is a different vocabulary
-entirely. Then the deterministic verifier checks each against the entry,
-and the transcript reports how much of the same ground they covered:
+Both are resident together — `llm.c` keeps everything belonging to *a* model in
+one struct and there are two of them, so switching is an index rather than a
+reload. A question goes to both; the 0.5B answers the same prompt re-encoded,
+because its tokenizer is a different vocabulary entirely. Then a deterministic
+verifier checks each against the entry:
 
 ```
 AI: Gravity, or gravitation is one of the fundamental forces of the
@@ -578,214 +592,178 @@ Checked twice: a second reading of the same entry agreed on 58% of
     the same facts.
 ```
 
-The answer stands on its own. Nothing cites the entry it came from and
-nothing names the models, because where an answer came from is a
-property of how it was produced rather than part of what was said — and
-a citation on every line turned two clauses into a paragraph of
-provenance. The grounding is untouched: retrieval, the single-passage
-rule and the verifier still decide whether there is an answer at all,
-and every source is on the serial log for anyone auditing it.
-
-What survives on screen is what the reader is owed regardless: that part
-of the draft was discarded, and that a second reading did or did not
-reach the same facts.
-
-That run is a fair illustration of what the check is worth. The 0.5B
-wrote "it keeps planets in orbit around their stars" — plausible, absent
-from the passage, and dropped by the verifier rather than by the other
+The 0.5B wrote "it keeps planets in orbit around their stars" — plausible,
+absent from the passage, and dropped by the verifier rather than by the other
 model. Agreement is not proof, because both can be wrong about the same
-passage; **disagreement is the useful signal**, and it is reported rather
-than resolved silently. `llm check off` turns it off; the answer then
-comes from one reading in half the time.
-
-<p align="center">
-  <img src="docs/crosscheck.png" width="88%" alt="Two models answering and being compared">
-</p>
+passage; **disagreement is the useful signal**, and it is reported rather than
+resolved silently.
 
 ### A guest that runs on the processor
 
-`src/hyper.h` is a type-1 hypervisor on AMD-V. Not an interpreter: the
-guest's instructions execute natively and only what the host intercepts
-traps back — CPUID, I/O, MSR access, HLT and the hypercall.
-
-AMD-V rather than VT-x for a checkable reason. QEMU's TCG interpreter
-implements SVM with nested paging and does not implement VMX at all:
+`src/hyper.h` is a type-1 hypervisor on AMD-V. Not an interpreter: the guest's
+instructions execute natively and only what the host intercepts traps back —
+CPUID, I/O, MSR access, HLT and the hypercall. AMD-V rather than VT-x for a
+checkable reason:
 
 ```
 query-cpu-model-expansion max  ->  svm = True, npt = True, vmx = False
 ```
 
-so the AMD path is the one that can actually be run here, and the Intel
-path would be code nobody could execute. The guest is 32-bit protected
-mode with paging off — under nested paging it needs no page tables of its
-own — and it gets one megabyte of guest-physical that the nested page
-table maps and nothing else. It writes to a text screen at `0xB8000`,
-makes hypercalls, reads the hypervisor CPUID leaf, and does an I/O write.
-
 Every exit address in Chamber's log matches the disassembly: `VMMCALL` at
 `0x1023`, `CPUID` at `0x1030`, `IOIO` at `0x104F` carrying port `0x3F8` in
-`EXITINFO1`. NRIP-save is absent under TCG, so exits advance the
-instruction pointer by known lengths and use the processor's next-RIP
-where it provides one.
+`EXITINFO1`. NRIP-save is absent under TCG, so exits advance the instruction
+pointer by known lengths and use the processor's next-RIP where it provides one.
+
+`src/hyper_intel.h` is the Intel path beside it, and the two barely overlap: a
+VMCB is a struct you assign to, a VMCS is opaque and every field goes through
+`VMWRITE`, and Intel's controls must be **negotiated** against capability MSRs
+saying which bits must be 1 and which may be. **EPT entries are not page-table
+entries** — no present bit, read/write/execute in bits 0–2, and a write-back
+memory type required on leaves. Leaving those zero selects uncacheable, which
+is legal, boots, and runs the guest about a hundred times slower: a bug that
+reads as "virtualisation is slow" rather than as a defect. Its guest is 64-bit,
+and long mode has no unpaged form, so there are **two** levels of translation —
+guest page tables and EPT, four levels each, different formats, both walked by
+the processor.
 
 ### A decoder you can check exactly
 
-`src/flac.h` decodes FLAC: constant, verbatim, fixed and LPC subframes,
-Rice partitions with both parameter widths and the raw escape, all four
-channel decorrelations, 8/16/24 bits, with CRC-8 on each frame header and
-CRC-16 on each frame. It is integer from end to end, which is what makes
-it exactly checkable — the samples that come back are the samples that
-went in, not the samples that went in to within a rounding error.
+`src/flac.h` decodes FLAC: constant, verbatim, fixed and LPC subframes, Rice
+partitions with both parameter widths and the raw escape, all four channel
+decorrelations, 8/16/24 bits, CRC-8 on each frame header and CRC-16 on each
+frame. Integer end to end, which is what makes it exactly checkable — the
+samples that come back are the samples that went in, not the samples that went
+in to within a rounding error.
 
-Lossless is the point. A lossy decoder can only be judged by ear; this one
-is compressed with the reference encoder at its densest setting and the
-samples must come back **identical**. Nine signals chosen to reach
-different parts of the decoder — silence for constant subframes, a ramp
-for the fixed predictors, noise for the Rice escape, correlated channels
-for mid/side — all exact.
-
-That caught a real bug: the Rice partitioning is defined over the whole
-block, not over the residual. Sizing it over the residual is invisible at
-partition order 0, which is what short frames use, and only appears once
-an encoder picks a real partition order.
-
-### Wikipedia, offline, from the raw archive
-
-`src/zim.h` reads Kiwix ZIM files straight off the disk, a window at a
-time — nothing is loaded whole, and only one decompressed cluster is ever
-in memory. Since 2021 those archives are Zstandard, which meant writing
-`src/zstd.h`: FSE/tANS, Huffman, sequence reconstruction with repeat
-offsets, from RFC 8878. Older xz clusters work too, through a complete
-LZMA2 decoder in `src/lzma.h`.
-
-Verified against a real 937 MB Simple English dump: the kernel lands on the
-same clusters and byte counts as a host-side reference run.
-
-### Storage that works on hardware built this decade
-
-Three buses, probed newest first: **NVMe**, **AHCI/SATA**, and legacy ATA
-PIO. A machine bought in the last ten years has no IDE controller at all,
-so without the first two the OS boots and finds nothing.
-
-Two details that are easy to skip and expensive to get wrong:
-
-- **Physical contiguity.** A DMA engine is handed physical addresses, and a
-  buffer that is one array to C is one array to the device only if its
-  pages happen to be adjacent. They are, under this bootloader — which is
-  exactly how a driver works on the machine it was written on and corrupts
-  memory on the next one. Buffers are resolved page by page and coalesced.
-- **Block size.** NVMe namespaces are increasingly not 512 bytes, and every
-  filesystem above expects that they are. The translation includes the
-  read-modify-write a partial write needs; without it, writing one sector
-  on a 4K drive destroys the seven either side, silently.
+That caught a real bug: the Rice partitioning is defined over the whole block,
+not over the residual. Sizing it over the residual is invisible at partition
+order 0, which is what short frames use, and only appears once an encoder picks
+a real partition order.
 
 ### Type, without a font library
 
-`src/ttf.h` is a TrueType rasteriser with no font library under it —
-glyph outlines, quadratic Béziers, anti-aliasing, no GPU. Baselines and
-glyph origins snap to whole pixels (leave them fractional and a 13px
-baseline lands on a half-pixel and fringes every letter), and each
-glyph's coverage mask is cached per size rather than re-rasterised every
-frame.
+`src/ttf.h` is a TrueType rasteriser with no font library under it — glyph
+outlines, quadratic Béziers, anti-aliasing, no GPU. Baselines snap to whole
+pixels (leave them fractional and a 13px baseline lands on a half-pixel and
+fringes every letter), and each glyph's coverage mask is cached per size.
 
-It was entirely fixed point until the FPU arrived, and that left two
-marks. Curves were flattened into exactly eight segments whatever size
-they were drawn at, because choosing a count from a curve's deviation
-needs a square root — generous at 13px, plainly faceted at 40. And
-horizontal coverage was counted in subpixel columns, eight per pixel, so
-a near-vertical diagonal stepped between eight shades. Both are gone:
-segments come from the curve's own deviation in device pixels, and
-coverage is the exact overlap between the filled span and the pixel,
-computed as a real number. None of it costs a frame, because a glyph is
-rasterised once per size and blitted thereafter.
+`src/ttfhint.h` is the bytecode interpreter above it: the font program, the
+pre-program and every glyph's own instructions, **executed rather than
+skipped** — stack machine with functions, control flow, storage, the twilight
+zone, the control value table and delta exceptions, 26.6 fixed point
+throughout. Grid-fitting is measured rather than claimed: on-curve coordinates
+land on a whole pixel boundary 1% of the time unscaled and **18% hinted**, and
+at 11 px the three bars of an 'E' go from smeared across two rows each to one
+solid row each.
 
 ### Its own executable format
 
-Store packages are `.vx` images: an 80-byte header, page-separated text
-and data, no relocations. The same `vx_validate()` runs in the host
-packer, the kernel loader and the store's download path — one validator,
-three consumers, so a payload cannot be accepted by one and rejected by
-another.
-
-`vxfmt/vx_run.c` is a POSIX loader for the same format, which means an
-image can be checked on your laptop before it is ever handed to the kernel.
-Text and data never share a page, so `mprotect()` can give them different
-protections and **W^X holds** — and on hosts with pages coarser than 4 KB
-it refuses rather than silently mapping RWX.
-
-### A GPU driver that reports its own failures
-
-`src/igpu.h` drives the Intel Gen9 blitter: a private GGTT window, the BCS
-ring in legacy submission mode, `XY_COLOR_BLT` packets, and a CPU-verified
-self-test at boot. When a submission's breadcrumb never lands it latches
-the i915-style error state — EIR/ESR, the exact command header that broke
-the pipeline decoded by name, ACTHD, INSTDONE, GGTT faults, the ring
-contents around the parse point — attempts an engine reset, and falls back
-to CPU rendering after repeated hangs. `gpu error` prints the report.
+Store packages are `.vx` images: an 80-byte header, page-separated text and
+data, no relocations. The same `vx_validate()` runs in the host packer, the
+kernel loader and the store's download path — one validator, three consumers,
+so a payload cannot be accepted by one and rejected by another.
+`vxfmt/vx_run.c` is a POSIX loader for the same format, so an image can be
+checked on your laptop before the kernel ever sees it. Text and data never
+share a page, so `mprotect()` can give them different protections and **W^X
+holds**; on hosts with pages coarser than 4 KB it refuses rather than silently
+mapping RWX.
 
 ---
 
-## Try it
+# Source layout
 
-```sh
-make          # builds the ISO and an 8 GB sparse exFAT system disk
-make run      # QEMU, full screen, networking up
+```
+include/
+  kernel_shared.h   The seam: everything that crosses an object boundary
+src/
+  core/main.c       Entry point, boot, hardware init, render loop, login
+  sched/            scheduler.c  threads, the 1 kHz ISR, the switch
+                    sched.h      thread_t, priorities, the inline hot path
+  fs/ntfs/          ntfs_ops.c   NTFS read + write, $MFT, journal
+  security/         anti_virus.c Aho-Corasick scanner, allowlist, UAC
+  net/              wifi.c  ieee80211.h  wpa2.h   802.11 + WPA2 supplicant
+                    rdp.c   rdpwire.h            RDP server + wire encoders
+  media/            decode.c h264.h mfx.h csc.h  H.264 → GPU → window pixels
+
+  --- memory and protection ---
+  pmm.h  vmm.h  kheap.h  swap.h    frames, page tables, heap, pagefile
+  gdt.h  idt.h  apic.h  trap.h     descriptors, vectors, the local APIC
+  syscall.h  winproc.h  pe.h       two ABIs, PE loading, SEH
+
+  --- storage and filesystems ---
+  blk.h  nvme.h  ahci.h  ata.h  usbmsc.h   one sector view, four buses
+  exfat.h  fat32.h  part.h  fsmeta.h       volumes, partitions, metadata
+  registry.h  users.h  profile.h           hives, accounts, profile trees
+
+  --- network and security ---
+  netstack.h  netx.h  e1000.h  vxport.h    IPv4/TCP, firewall, NIC, seam
+  tls.h  ntcrypto.h  aes.h  sha256.h  chacha20.h
+  ldap.h  kerberos.h  krb5crypto.h  ntlmssp.h  smb2.h  gpo.h  ber.h
+  security.h                               vault, tar writer
+
+  --- graphics, audio, compute ---
+  gfx.h  ttf.h  ttfhint.h  font.h          drawing, type, hinting
+  igpu.h  g3d.h  solid.h                   Gen9 blitter, 3D API, G3SL
+  hda.h  ac97.h  audio.h  flac.h  adpcm.h  codecs and the mixer
+  hyper.h  hyper_intel.h  chamber.h        AMD-V, VT-x, the console
+  llm.h llm.c                              transformer inference
+  zim.h  zstd.h  lzma.h  sci.h             archives and compression
+
+  --- the desktop ---
+  desktop.h  term.h  browser.h  apps.h  store.h  media.h  calc.h  chip8.h
+  bootanim.h  login.h  coreutils.h  shell.h  wikidoc.h
+
+vxfmt/          The .vx format, its packer, a POSIX loader, an AFL harness
+apps/           Userland source, store packages, seed files, pictures
+tools/          Formatters, test suites, an LDAP server, a KDC, an SMB
+                server, an RDP probe — every protocol proved against an
+                independently written peer
+third_party/    lwIP 2.2.1 and Mbed TLS 3.6.4, vendored unmodified
 ```
 
-Pre-built ISOs are under [**Releases**](../../releases) if you would rather
-not build a cross-compiler.
+Underneath the network sit two libraries **not** written here: lwIP 2.2.1 and
+Mbed TLS 3.6.4, **230,081 lines vendored unmodified** at their release tags,
+reached through a 1,180-line port — the `sys_arch` layer on this scheduler, the
+netif on the e1000, the platform hooks on the kernel heap. That port is ours;
+the 230,081 lines are not, and the counts are kept apart on purpose.
 
-First boot asks you to choose a keycode; it is saved to the volume. Then:
+---
+
+# Try it
 
 ```
 open browser                    or click the globe in the dock
 store install mandel            then look at the dock, and reboot
 ping 10.0.2.2
-fetch http://example.com
+fetch https://example.com       TLS 1.3, chain verified
 echo hello disk > hi.txt
 mkdir projects && cp hi.txt projects/copy.txt
 cat projects/copy.txt           still there after a reboot
 ```
 
-**Just move the mouse.** The pointer is absolute — no click-to-grab, no
-capture to escape. A PS/2 mouse can only report *relative* motion, which a
-host cannot turn into a position without capturing the real cursor first,
-so the guest asks for the VMware backdoor pointer and falls back to PS/2
-only when there is no hypervisor to ask.
+**Just move the mouse.** The pointer is absolute — no click-to-grab, no capture
+to escape. A PS/2 mouse can only report *relative* motion, which a host cannot
+turn into a position without capturing the real cursor, so the guest asks for
+the VMware backdoor pointer and falls back to PS/2 only when there is no
+hypervisor to ask.
 
 <details>
-<summary><b>Building from source</b></summary>
-
-| Tool | Why |
-|------|-----|
-| `x86_64-elf-gcc` / `x86_64-elf-ld` | Bare-metal cross toolchain |
-| `xorriso` | ISO creation |
-| `qemu-system-x86_64` | Running it |
-| `python3` + `opencv-python` + `numpy` | Only if `boot.mp4` changes |
+<summary><b>Build options</b></summary>
 
 ```sh
-brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu
-pip3 install opencv-python numpy
-make
+make run RES=1920x1080x32   # display mode, up to the back buffer's bound
+make run NATIVE=1           # render at the panel's own resolution
+make cleandisk              # reset disk.img to factory contents
+make test                   # 614 host checks
+make repo                   # serve the package repository on :8000
 ```
 
-`make` compiles the kernel, the userland app and the store packages (each
-linked to ELF64 then repacked as `.vx`), converts the boot video to raw
-RGB565 frames, assembles `os.iso`, and creates `disk.img` — an 8 GB sparse
-exFAT volume seeded with the starter files, the package repository and the
-sample pictures.
+`make clean` removes build products and the ISO. It deliberately does **not**
+touch `disk.img` — the asset stamp lives outside `build/` precisely so that a
+clean rebuild of the kernel cannot cost you your account and your files.
 
-`disk.img` is created **once** and then left alone, so your files survive
-rebuilds. `make cleandisk` resets it to factory contents.
-
-The display mode is 1280x800 by default, up to the back buffer's bound:
-
-```sh
-make run RES=1920x1080x32
-```
-
-`disk.img` is a standard image — mount it on your host to exchange files
-with the OS, including dropping in a multi-gigabyte archive:
+`disk.img` is a standard image — mount it on your host to exchange files,
+including dropping in a multi-gigabyte archive:
 
 ```sh
 hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img   # macOS
@@ -794,181 +772,13 @@ hdiutil attach -imagekey diskimage-class=CRawDiskImage disk.img   # macOS
 </details>
 
 <details>
-<summary><b>Serving the package repository over the network</b></summary>
+<summary><b>Serving the package repository</b></summary>
 
-The store's **Refresh** button queries an HTTP repository. To run one:
-
-```sh
-make repo
-```
-
-That stages and serves the compiled packages on port 8000. QEMU maps the
-host to `10.0.2.2`, which is the store's default repository URL, so
-**Refresh** just works — it picks up `voronoi`, which is deliberately *not*
-on the disk, and installing it downloads the payload over the kernel's own
-TCP stack.
-
-Point it elsewhere with `store repo <url>`.
-
-</details>
-
----
-
-## NTFS, read and write
-
-There is a full NTFS **writer** in `src/fs/ntfs/ntfs_ops.c`, and a formatter in
-`tools/mkntfs.py` that produces volumes Linux and Windows both mount.
-What it implements is the part that actually allocates:
-
-| | |
-|---|---|
-| `$Bitmap` | first-fit cluster allocation, persisted before the caller sees the run |
-| `$MFT` | record allocation past the sixteen system files |
-| data runs | signed-delta encoding, checked against the reader's decoder |
-| `$INDEX_ROOT` | ordered insert and remove of `$FILE_NAME` entries |
-| `$UsnJrnl` | change records in the documented v2 format |
-| journal | a write-ahead redo log: payload, then commit, then the write |
-
-**It is not the boot volume.** `disk.img` is still exFAT. The write path
-is exercised by `tools/ntfs_test.c` — 72 checks against a scratch image,
-compiling the same source the kernel runs — and until a volume that
-matters has nothing to lose, that is where it stays.
-
-It is, however, *in* the kernel now. Before the module split the writer
-was included by nothing but that test, so twelve hundred lines of it
-compiled only on the build machine; giving NTFS a declaration header
-put it in the image, where it is built with the kernel's own flags and
-warning set on every build rather than only when the suite runs.
-
-What is deliberately absent is listed inside `src/fs/ntfs/ntfs_ops.c`
-rather than discovered later: `$INDEX_ALLOCATION` (a directory that
-outgrows its record is refused, not split into a B-tree),
-`$ATTRIBUTE_LIST`, compression, and NTFS's own `$LogFile` — whose redo
-record format is not publicly specified, so what protects writes here is
-this system's journal and not one Windows would replay.
-
-## Certificates are verified now
-
-TLS 1.3 has worked for a while. What it did not do was establish *who*
-was on the far end — `MBEDTLS_SSL_VERIFY_NONE`, no CA store, and the
-README said so.
-
-The volume now carries `/etc/ca-bundle.crt`, copied at build time from
-whatever the build machine already trusts. `vxsec_init()` parses it once
-into a shared `mbedtls_x509_crt` chain and switches the config to
-`VERIFY_REQUIRED`, so a chain that does not lead to a known root — or a
-leaf whose names do not include the host asked for — fails the handshake
-instead of completing it.
-
-`vxsec_verifies_certificates()` returns whether that happened rather
-than a constant, and a build on a machine with no CA bundle still works,
-still encrypts, and still says plainly that it cannot prove anything
-about the peer.
-
-## What is actually in here
-
-**87,071 lines of C written here**, across 153 files, compiled as four
-kernel objects plus one for inference, over a user-space C library of
-its own. (90,686 counting the embedded typeface, the integer sine table
-and Limine's own boot-protocol header — data and interface rather than
-logic.)
-
-The four are `src/core/main.o`, which composes the drivers and the
-desktop; `src/sched/scheduler.o`; `src/fs/ntfs/ntfs_ops.o`; and
-`src/security/anti_virus.o`. The composition root is still one large
-translation unit because the driver headers genuinely share state — one
-MMIO map, one heap, one window list — and what came out of it are the
-three modules whose interfaces were narrow enough to write down:
-fourteen symbols in and twenty-eight out for the scheduler, nine and
-eight for NTFS, five and fourteen for the scanner. Everything crossing those
-boundaries is declared in `include/kernel_shared.h`, which explains the
-one rule that keeps the arrangement honest.
-
-Underneath the network sit two libraries that were **not** written here:
-lwIP 2.2.1 and Mbed TLS 3.6.4, 228,969 lines vendored unmodified at
-their release tags. They are reached through a 3,093-line port — the
-`sys_arch` layer on this scheduler, the netif on the e1000, the platform
-hooks on the kernel heap, and a freestanding C library for code that
-expects a hosted one. That port is ours; the 228,969 lines are not, and
-the counts are kept apart on purpose.
-
-| | |
-|---|---|
-| **Desktop** | Window manager with minimize, maximize, snap-to-edge, shake-to-clear and a latched Show Desktop peek; taskbar with live window previews and jump lists; desktop gadgets; start-menu search over apps, recent items and the volume; Action Center; five wallpaper themes with an optional slideshow; idle dimming |
-| **Applications** | Terminal with 38 Unix commands, browser, file manager, offline Wikipedia reader, image viewer, paint, system monitor, app store, calculator, media player, 3D viewer, CHIP-8, hypervisor console, settings |
-| **Audio** | HD Audio with codec graph walking, AC'97 as the fallback, an eight-voice mixer; FLAC, IMA ADPCM and G.711 decoders, all integer |
-| **USB** | xHCI: HID boot protocol, mass storage, and hubs five tiers deep with route strings and transaction translators — all hot-pluggable |
-| **3D** | `g3d`: pipelines, vertex and index buffers, matrices, a command buffer, and G3SL — a shader language with a tokeniser, precedence parser, type checker and stack machine |
-| **Virtualisation** | AMD-V hypervisor on x86: VMCB, nested paging, and a 32-bit guest that runs on the processor |
-| **Filesystem** | NTFS read-only: $MFT records, per-sector fixups, resident and non-resident data, signed run lists; GPT and MBR partition tables; case-insensitive matching, 8.3 short names, security identifiers and access control lists, open-handle share modes, directory change notification; read/write exFAT with 64-bit sizes, FAT32 fallback, ustar ramdisk, MBR partitions, range reads out of files too big to buffer |
-| **Storage** | NVMe, AHCI/SATA, ATA PIO and USB mass storage (Bulk-Only Transport with SCSI) — behind one 512-byte sector view |
-| **Network** | lwIP 2.2.1: IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP — reassembly, retransmission with backoff, window scaling, delayed ACKs — behind the sockets API, with eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP. Intel e1000 driver |
-| **Directory** | LDAP v3 client: simple bind, subtree search with equality and presence filters, BER written by hand and parsed with a bounded reader that refuses the indefinite-length form. Tested against `tools/ldap_server.py`, which decodes independently and rejects encodings that are only nearly right |
-| **Domain authentication** | Kerberos v5: the AS exchange with PA-ENC-TIMESTAMP pre-authentication, the TGS exchange, and AP-REQ construction — aes256-cts-hmac-sha1-96 and aes128-cts, and deliberately not rc4-hmac, which is what makes Kerberoasting work. RFC 3961's n-fold, DK and PBKDF2 string-to-key checked against the RFCs' own vectors. AES from AESENC where the processor has it, a portable fallback where it does not, and a boot-time check that the two agree. Proved end to end against `tools/kdc.py`, which verifies the client's authenticator checksum over the exact request body it received |
-| **Credential cache** | Tickets survive a reboot: the credential a ticket is built from — the Ticket as the KDC issued it, the session key, the expiry — is written into the user's profile tree and reloaded at the next login. Not the AP-REQ, which carries a timestamp and would be rejected as a replay. The file is encrypted under a key derived from the login password, which exists at exactly the moment the cache needs reading, so a stolen volume yields ciphertext; logging out wipes the key and the resident session keys but leaves the file. Expired credentials are discarded on load rather than presented |
-| **File sharing** | SMB2 client, dialects 2.0.2 and 2.1 — negotiate, session setup, tree connect, create, read, write, close and directory enumeration, with every message signed by HMAC-SHA256. Authenticates with NTLMv2 over NTLMSSP inside a SPNEGO wrapper, including RC4 key exchange so two sessions by the same user do not share a signing key. SMB1 is absent by construction: the code to speak it does not exist, so the connection cannot be talked down to it. Proved against `tools/smbserver.py`, which recomputes the NTLMv2 proof and every signature itself |
-| **SMB 3.0 encryption** | Dialect 0x0300, with the whole message — header and all — carried as the ciphertext of an AES-128-CCM transform frame, and the transform header itself as associated data so a frame retargeted at another session fails its tag rather than decrypting. Keys from SP 800-108 counter-mode derivation over the session key; signing moves from HMAC-SHA256 to AES-128-CMAC, which is the difference a client that merely bumps the dialect number gets wrong. AES-GCM is implemented alongside CCM and checked against the same vectors. Backward compatibility is tested rather than assumed: `tools/smbserver.py --no-smb3` is a 2.1-only server, and the same suite passes against it signed and unencrypted |
-| **Group Policy** | Machine policy fetched from a domain controller's SYSVOL share over the SMB2 client and applied through the registry. GPT.INI version parsing (two counters packed into one word, and they move independently), and Registry.pol in PReg format — where every bracket and semicolon is a UTF-16 character rather than a byte. The whole file is validated before a single value is written, and the writes go inside one registry transaction, so a malformed policy leaves nothing behind |
-| **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology split into packages, cores and threads from CPUID leaf 0x0B; microcode revision read and updates applied if present |
-| **Windows layer** | PE/PE32+ loader with base relocations, import binding and per-section protections; structured exception handling -- `__try`/`__except` dispatched from the trap handler through .pdata and .xdata; Thread and Process Environment Blocks reachable through GS; string resources read out of .rsrc; a registry with typed values and transactional commit; Microsoft-ABI trampolines that preserve the twelve registers System V does not |
-| **Transport security** | Mbed TLS 3.6.4, stripped to TLS 1.3 with SHA-256 and AES-GCM, allocating through the kernel heap and seeded from RDRAND; eight parallel secure sessions. Also `src/tls.h`, written here, with X25519, ChaCha20-Poly1305 and HKDF checked against RFC 7748, 8439 and 5869. Neither verifies certificates, and every layer says so |
-| **Graphics** | TrueType rasteriser with adaptive curve flattening and exact-area coverage, alpha-blended drop shadows with radial corners, spring-driven window motion, Intel Gen9 blitter with batched command buffers and hang capture, firmware framebuffer fallback |
-| **Font hinting** | A TrueType bytecode interpreter: the font program, the pre-program and every glyph's own instructions, executed rather than skipped. Stack machine with functions, control flow, storage, the twilight zone, the control value table and delta exceptions — 26.6 fixed point throughout, no floating point anywhere in it. Grid-fitting is measured rather than claimed: on-curve coordinates land on a whole pixel boundary 1% of the time unscaled and 18% hinted, and at 11 px the three bars of an 'E' go from smeared across two rows each to one solid row each. Comic Neue is ttfautohint output and carries no horizontal instructions, so vertical stems are unhinted — the machinery for them is implemented and a face that hints in x would get it |
-| **Compression** | Zstandard (RFC 8878), LZMA/LZMA2/xz, both written from the specifications |
-| **Inference** | GGUF parsing, BPE tokeniser, dequantisation, transformer forward pass |
-| **Memory** | Bitmap frame allocator over the firmware map; per-process PML4 with the kernel half shared by reference; slab and page-run kernel heap; W^X on every loaded image |
-| **Paging** | Demand paging to a 256 MB contiguous `pagefile.sys`, resolved to one raw extent at boot so no filesystem code runs inside a fault. Clock replacement over a reverse map from frame back to mapping, revalidated against the page tables before anything is evicted. A swapped page is recorded in its own page table entry — bit 10 of a non-present entry, which the processor ignores and which cannot alias the copy-on-write bit that shares it. Only user pages: kernel memory, page tables and shared frames never leave RAM |
-| **Processes** | Ring 3 with its own GDT and TSS, SYSCALL/SYSRET and a DPL-3 `int 0x80` gate, preemptive priority round-robin on the APIC timer at 1 kHz, per-thread FPU state, faults that kill a thread instead of the machine |
-| **Userland** | `.vx` container format, two syscall ABIs, a C library (string.h, stdio.h, malloc over sbrk), a package store, five shipped apps |
-| **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories, administrator rights, logout that clears session state |
-| **Audio** | AC97 bus-master playback out of a descriptor list, verified by capturing the guest's output to a WAV on the host and measuring it — 438.3 Hz against 440 requested |
-| **3D** | Integer software rasteriser: 16.16 fixed point, perspective divide once per vertex, 1/z depth buffer, backface culling, flat shading from cross-product normals with a bit-by-bit integer square root |
-| **Emulation** | A complete CHIP-8 interpreter — all 35 opcodes, 4 KB address space masked on every access, collision flag on sprite XOR |
-| **Security** | ChaCha20 checked against the RFC vectors, encrypted containers with a passphrase verifier, ustar writer, encrypted backup and restore, per-account allow list, signature and structural scanner, prompt levels. Isolation is no longer only policy: an application runs in ring 3, in page tables that map its own image, stack, heap, one trampoline page and its own window's pixels, and nothing else |
-| **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; a boot animation the kernel computes rather than plays back — an advected fire simulation and a separate burn front, in integer arithmetic, before the FPU is even initialised |
-
-<details>
-<summary><b>Source layout</b></summary>
-
-```
-src/
-  kernel.c      Entry point, render loop, login flow, syscalls
-  desktop.h     Window manager, menu bar, dock, wallpaper, loader
-  term.h        Terminal: commands, history, scrollback, redirection
-  browser.h     HTML renderer, navigation, links
-  apps.h        Files / Settings / Photos / Wikipedia + chat / About
-  store.h       Ingot: catalog, installer, registry, storefront
-  llm.h llm.c   Transformer inference (the one FPU translation unit)
-                qwen2 and llama architectures, both rotary conventions
-  zim.h         ZIM archive reader (offline Wikipedia)
-  zstd.h        Zstandard decompressor
-  lzma.h        LZMA / LZMA2 / xz decompressor
-  sci.h         Compressed image format + decoder
-  flac.h        FLAC decoder     adpcm.h  IMA ADPCM + G.711
-  ac97.h        AC97 codec + bus-master playback
-  media.h       Media Player: track list, transport, decode dispatch
-  g3d.h         3D API + G3SL shader compiler   solid.h  its client app
-  hyper.h       AMD-V hypervisor  chamber.h  the window onto it
-  chip8.h       CHIP-8 interpreter
-  ttf.h         TrueType rasteriser        gfx.h  Drawing primitives
-  netstack.h    IPv4 / ICMP / UDP / DNS / TCP / HTTP
-  e1000.h       Intel NIC driver
-  blk.h         Block layer: one sector view over three buses
-  nvme.h        NVMe: admin + I/O queues, PRP lists, 4K blocks
-  ahci.h        AHCI/SATA: command lists, PRDT scatter/gather
-  ata.h         ATA PIO + LBA48 (legacy fallback)
-  exfat.h       exFAT read/write      fat32.h  FAT32 fallback
-  pci.h         PCI enumeration, BAR sizing, MMIO mapper
-  igpu.h        Intel Gen9 blitter + GPU hang capture
-  keyboard.h    PS/2 keyboard         mouse.h  Pointer + wheel
-  vmmouse.h     VMware backdoor (absolute pointer, no grab)
-  xhci.h        USB HID — incomplete, off by default, honest about it
-vxfmt/         The .vx executable format, its packer and a POSIX loader
-apps/           Userland source, store packages, seed files, pictures
-tools/          exFAT/FAT32 formatters, image and video converters,
-                package repository server, QEMU test driver
-limine-binary/  Pre-built bootloader
-```
+`make repo` stages and serves the compiled packages on port 8000. QEMU maps the
+host to `10.0.2.2`, which is the store's default repository URL, so **Refresh**
+just works — it picks up `voronoi`, deliberately *not* on the disk, and
+installing it downloads the payload over the kernel's own TCP stack. Point it
+elsewhere with `store repo <url>`.
 
 </details>
 
@@ -980,4 +790,4 @@ Source released under the [Apache License 2.0](LICENSE).
 Comic Neue is under the [SIL Open Font License 1.1](assets/OFL.txt).
 Limine is [BSD 2-Clause](https://github.com/limine-bootloader/limine).
 
-<p align="center"><sub>There is also an <a href="https://github.com/mrcalmtuber/vextro-arm64">ARM64 port</a>, which runs under hardware virtualisation on Apple silicon.</sub></p>
+<p align="center"><sub>An <a href="https://github.com/mrcalmtuber/vextro-arm64">aarch64 port</a> exists and runs under hardware virtualisation on Apple silicon. This repository is the x86_64 system.</sub></p>
