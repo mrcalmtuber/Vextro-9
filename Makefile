@@ -177,7 +177,7 @@ PIC_SRC     := $(wildcard apps/pics/*.png)
 PIC_SCI     := $(patsubst apps/pics/%.png,build/pics/%.sci,$(PIC_SRC))
 PIC_NAMES   := $(notdir $(basename $(PIC_SRC)))
 
-.PHONY: all iso run clean cleandisk apps repo vxtools pics test FORCE
+.PHONY: verifydisk all iso run clean cleandisk apps repo vxtools pics test FORCE
 
 # Say which target a bare `make` builds, rather than letting it fall to
 # whichever rule happens to appear first. It fell to FORCE -- a real
@@ -211,8 +211,16 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	@./build/rdp_test
 	@mkdir -p build/scratch
 	@printf "vextro ntfs scratch\\n" > build/scratch/a.txt
-	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 a.txt=build/scratch/a.txt > /dev/null
-	@./build/ntfs_test build/scratch/ntfs.img
+	@printf "hello from a subdirectory\\n" > build/scratch/b.txt
+	@head -c 300000 /dev/urandom > build/scratch/big.bin
+	@rm -f build/scratch/ntfs.img build/scratch/tree.img
+	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 \
+	         build/scratch/a.txt > /dev/null
+	@python3 tools/mkntfs.py build/scratch/tree.img 2048 \
+	         build/scratch/a.txt \
+	         build/scratch/b.txt:docs/readme.txt \
+	         build/scratch/big.bin:store/pkg/big.bin > /dev/null
+	@./build/ntfs_test build/scratch/ntfs.img build/scratch/tree.img
 	@./build/vmx_test
 	@./build/av_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
@@ -387,6 +395,39 @@ build/ntfs_test: tools/ntfs_test.c src/fs/ntfs/ntfs_ops.c \
 	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function \
 	           -Isrc -Iinclude -o $@ $<
 
+# The volume the build produced, read by the driver that will boot it.
+#
+# Not part of `make test`, because it needs disk.img -- which is 8 GB and
+# is not built on a machine that only wants the unit checks. It is the
+# gate before trusting a formatter change:
+#
+#     make verifydisk
+#
+# mkntfs.py writes NTFS; ntfs_ops.c reads it. They were written from the
+# same specification but they are not the same code, and a formatter is
+# only trustworthy when a different implementation agrees about what it
+# produced. This mounts the real image on the host and checks every
+# seeded file byte for byte, including the 937 MB archive through the
+# ranged-read path a running system actually uses.
+build/ntfs_verify: tools/ntfs_verify.c src/fs/ntfs/ntfs_ops.c \
+                   src/fs/ntfs/ntfs.h src/fs/ntfs/ntfs_hostshim.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -Wall -Wextra -std=gnu11 -Wno-unused-function \
+	           -Isrc -Iinclude -o $@ $<
+
+verifydisk: build/ntfs_verify disk.img
+	@./build/ntfs_verify disk.img \
+	    /about.txt=apps/about.txt \
+	    /notes.txt=apps/notes.txt \
+	    /hello=build/hello \
+	    /faulter=build/faulter \
+	    /docs/welcome.txt=apps/welcome.txt \
+	    /etc/ca-bundle.crt=build/ca-bundle.crt \
+	    $(foreach a,$(STORE_APPS),/store/pkg/$(a).vx=build/store/$(a).vx) \
+	    $(foreach p,$(PIC_NAMES),/pics/$(p).sci=build/pics/$(p).sci) \
+	    $(foreach t,$(MUSIC_NAMES),/music/$(t).wav=build/music/$(t).wav) \
+	    $(foreach f,$(ASSET_FILES),/$(notdir $(f))=$(f))
+
 # The scanner, against the search it replaced.
 #
 # src/security/anti_virus.c is an Aho-Corasick automaton where there used
@@ -542,13 +583,22 @@ build/ca-bundle.crt:
 	    echo "  CA     no host CA bundle found; TLS will not verify peers"; \
 	fi
 
+# The system volume is NTFS.
+#
+# It was exFAT for as long as there was a filesystem, and the driver for
+# it is still here and still mounts -- what changed is what `make` lays
+# down. The formatter preallocates pagefile.sys as one contiguous run,
+# because src/swap.h resolves its backing store to a single absolute LBA
+# at boot and cannot use a fragmented one; and it allocates every file
+# sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
+# archive's run list would not fit in its own MFT record.
 disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
 	    if [ -f "$$f" ]; then big="$$big $$f"; fi; \
 	done; \
-	cmd="python3 tools/mkexfat.py disk.img $(DISK_MB) \
+	cmd="python3 tools/mkntfs.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello build/faulter \
 		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \

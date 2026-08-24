@@ -483,7 +483,8 @@ static void term_cmd_df(void) {
     term_print(blk_bus_name());          /* NVMe, SATA or IDE — whichever
                                           * bus the volume was found on */
     term_print(" (");
-    uint_to_str(fs_kind == FS_EXFAT ? exf_vol.cluster_count
+    uint_to_str(fs_kind == FS_NTFS  ? (uint32_t)ntfs_total_clusters()
+              : fs_kind == FS_EXFAT ? exf_vol.cluster_count
                                     : fat_vol.nclusters, nb);
     term_print(nb);
     term_print(" clusters)\n  device    ");

@@ -1211,11 +1211,163 @@ void kmain(void) {
     blk_init();
     blk_cache_init();
     part_scan();
-    ntfs_mount();
 #ifdef STORAGE_SELFTEST
     blk_selftest();
 #endif
     fs_mount();
+
+#ifdef FS_SELFTEST
+    /*
+     * Writing to the volume the system just mounted, and reading it
+     * back.
+     *
+     * This exists because the boot volume moved from exFAT to NTFS, and
+     * the interesting question about a filesystem writer is not whether
+     * it returns success -- it is whether what it wrote is still there,
+     * and still right, after the volume has been forgotten and mounted
+     * again.
+     *
+     * So it runs in two halves across two boots. The first boot finds
+     * nothing, writes a set of files, and says so. The second finds them
+     * and checks every byte. Run it as:
+     *
+     *     make iso EXTRA=-DFS_SELFTEST && make run     (twice)
+     *
+     * and the volume can also be checked from the host in between with
+     * tools/ntfs_verify.c, which reads it with the same driver but
+     * outside the machine that wrote it.
+     */
+    {
+        static const char *const dirpath  = "/fstest";
+        static const char *const filepath = "/fstest/inner.bin";
+        static const char *const toppath  = "/fstest-top.txt";
+        static const char text[] = "vextro filesystem selftest, one line\n";
+        static uint8_t pattern[9000];
+        uint64_t sz = 0;
+        int is_dir = 0;
+
+        for (uint32_t i = 0; i < sizeof(pattern); i++)
+            pattern[i] = (uint8_t)(i * 7 + (i >> 8));
+
+        serial_puts("[fstest] volume is ");
+        serial_puts(fs_name());
+        serial_putc('\n');
+
+        if (fs_stat(filepath, &sz, &is_dir)) {
+            /* ---- second boot: everything must still be here ---- */
+            int bad = 0;
+            const void *d;
+            uint64_t got = 0;
+
+            serial_puts("[fstest] found the previous boot's files\n");
+
+            d = fs_read_file(toppath, &got);
+            if (!d || got != sizeof(text) - 1) {
+                serial_puts("[fstest] FAIL top-level file wrong length\n");
+                bad = 1;
+            } else {
+                const char *p = (const char *)d;
+                for (uint32_t i = 0; i < got; i++)
+                    if (p[i] != text[i]) { bad = 1; break; }
+                if (bad) serial_puts("[fstest] FAIL top-level bytes differ\n");
+            }
+
+            d = fs_read_file(filepath, &got);
+            if (!d || got != sizeof(pattern)) {
+                serial_puts("[fstest] FAIL nested file wrong length\n");
+                bad = 1;
+            } else {
+                const uint8_t *p = (const uint8_t *)d;
+                for (uint32_t i = 0; i < sizeof(pattern); i++)
+                    if (p[i] != pattern[i]) {
+                        serial_puts("[fstest] FAIL nested bytes differ\n");
+                        bad = 1;
+                        break;
+                    }
+            }
+
+            /* A ranged read part-way in, which is the path the archive
+             * reader uses and a different one from the whole-file read
+             * above. */
+            {
+                static uint8_t win[512];
+                uint32_t n = 0;
+                if (fs_read_range(filepath, 4090, win, sizeof(win), &n) != 0 ||
+                    n != sizeof(win)) {
+                    serial_puts("[fstest] FAIL ranged read short\n");
+                    bad = 1;
+                } else {
+                    for (uint32_t i = 0; i < n; i++)
+                        if (win[i] != pattern[4090 + i]) {
+                            serial_puts("[fstest] FAIL ranged bytes differ\n");
+                            bad = 1;
+                            break;
+                        }
+                }
+            }
+
+            if (fs_stat(dirpath, &sz, &is_dir) && is_dir)
+                serial_puts("[fstest] the directory survived too\n");
+            else {
+                serial_puts("[fstest] FAIL the directory is gone\n");
+                bad = 1;
+            }
+
+            serial_puts(bad ? "[fstest] FAILED across the reboot\n"
+                            : "[fstest] every byte survived the reboot\n");
+        } else {
+            /* ---- first boot: write them ---- */
+            serial_puts("[fstest] first run: writing\n");
+
+            if (fs_write_file(toppath, text, sizeof(text) - 1) != 0) {
+                serial_puts("[fstest] FAIL top-level write: ");
+                serial_puts(fs_errstr);
+                serial_putc('\n');
+            }
+            if (fs_mkdir(dirpath) != 0) {
+                serial_puts("[fstest] FAIL mkdir: ");
+                serial_puts(fs_errstr);
+                serial_putc('\n');
+            }
+            if (fs_write_file(filepath, pattern, sizeof(pattern)) != 0) {
+                serial_puts("[fstest] FAIL nested write: ");
+                serial_puts(fs_errstr);
+                serial_putc('\n');
+            }
+
+            /* Read back immediately, before any remount: a writer that
+             * cannot satisfy its own read has failed before durability
+             * is even a question. */
+            {
+                uint64_t got = 0;
+                const void *d = fs_read_file(filepath, &got);
+                serial_puts(d && got == sizeof(pattern)
+                            ? "[fstest] wrote and read back in this boot\n"
+                            : "[fstest] FAIL cannot read back what it wrote\n");
+            }
+
+            /* Overwrite, which on NTFS is delete-then-create and is the
+             * operation the registry and the account table do on every
+             * change. */
+            if (fs_write_file(toppath, text, sizeof(text) - 1) != 0) {
+                serial_puts("[fstest] FAIL overwrite: ");
+                serial_puts(fs_errstr);
+                serial_putc('\n');
+            } else {
+                serial_puts("[fstest] overwrote an existing file\n");
+            }
+
+            serial_puts("[fstest] reboot to check it survived\n");
+        }
+
+        /* What the volume says about itself, either way. */
+        serial_puts("[fstest] ");
+        serial_put_dec(fs_free_kb() / 1024);
+        serial_puts(" MB free of ");
+        serial_put_dec(fs_total_kb() / 1024);
+        serial_puts(" MB\n");
+    }
+#endif
 
     /*
      * Now that there is a volume, find out whether it carries a

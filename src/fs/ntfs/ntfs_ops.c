@@ -455,7 +455,7 @@ static int ntfs_try(uint64_t part_lba) {
     if (ntfs_read_record(0, ntfs_rec) != 0) return 0;
 
     ntfs.mounted = 1;
-    ntfs.status  = "mounted read-only";
+    ntfs.status  = "mounted read/write";
     return 1;
 }
 
@@ -476,7 +476,29 @@ done:
     serial_put_dec(ntfs.bytes_per_cluster);
     serial_puts(" byte clusters, ");
     serial_put_dec(ntfs.bytes_per_record);
-    serial_puts(" byte MFT records, read-only\n");
+    serial_puts(" byte MFT records, read/write\n");
+
+    /*
+     * The journal, before anything reads the volume.
+     *
+     * A committed-but-unapplied record is a write that was durable and
+     * then interrupted, and until it is replayed the volume is in the
+     * state the interrupted operation left: a directory entry pointing
+     * at a record that was never written, or clusters marked in use
+     * that nothing owns. Replaying first means every read after this
+     * point sees a consistent volume rather than the moment the power
+     * went.
+     */
+    {
+        int applied;
+        ntfs_journal_init(ntfs.part_lba, 0);
+        applied = ntfs_journal_replay();
+        if (applied > 0) {
+            serial_puts("[ntfs] journal: replayed ");
+            serial_put_dec((uint32_t)applied);
+            serial_puts(" record(s) from an interrupted write\n");
+        }
+    }
 
     /* Name the root, which is the cheapest end-to-end proof that record
      * reading, fixups and attribute walking all work. */
@@ -545,15 +567,11 @@ done:
  * listed above, and chkdsk has never been run against one.
  */
 
-#define NTFS_W_OK            0
-#define NTFS_W_NOSPACE      -1
-#define NTFS_W_IO           -2
-#define NTFS_W_EXISTS       -3
-#define NTFS_W_NOTFOUND     -4
-#define NTFS_W_TOOBIG       -5
-#define NTFS_W_READONLY     -6
+/* The NTFS_W_* return codes moved to fs/ntfs/ntfs.h, which this file
+ * includes: the filesystem dispatch compares against them now, and two
+ * copies of a set of error codes is two copies that can drift. */
 
-static const char *ntfs_w_errstr = "";
+const char *ntfs_w_errstr = "";
 
 /* Scratch. One operation is in flight at a time -- the filesystem lock
  * above this layer guarantees it -- so these are shared rather than
@@ -1020,6 +1038,20 @@ static void ntfs_put32(uint8_t *p, uint32_t v) {
 static void ntfs_put64(uint8_t *p, uint64_t v) {
     ntfs_put32(p, (uint32_t)(v & 0xFFFFFFFFu));
     ntfs_put32(p + 4, (uint32_t)(v >> 32));
+}
+
+/* The reading half. Byte at a time rather than a cast, because NTFS
+ * structures are packed and an index entry lands wherever the previous
+ * one ended -- a uint64_t read through an unaligned pointer is undefined
+ * behaviour that happens to work on x86 and does not survive being
+ * compiled for anything else. */
+static uint32_t ntfs_get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t ntfs_get64(const uint8_t *p) {
+    return (uint64_t)ntfs_get32(p) | ((uint64_t)ntfs_get32(p + 4) << 32);
 }
 
 static uint32_t ntfs_align8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -1784,3 +1816,469 @@ int ntfs_mkdir_at(uint64_t dir_record, const char *name) {
     return NTFS_W_OK;
 }
 
+
+/* ==================================================================
+ * PART THREE -- THE FILESYSTEM SURFACE
+ * ==================================================================
+ *
+ * Parts one and two read and write NTFS *by MFT record number*, which
+ * is the format's own way of naming a file and is what the write engine
+ * and its host tests are built on. What the rest of the system speaks
+ * is paths, directory listings and byte ranges.
+ *
+ * This is the layer between the two, and it exists because NTFS became
+ * the boot volume. While NTFS was a validated writer with no callers,
+ * record numbers were enough; a volume the desktop mounts has to answer
+ * "what is at /etc/policy.cfg", "what is in /store/pkg", and "give me
+ * sixty-four kilobytes from four hundred megabytes into wiki.zim".
+ *
+ * Everything here is read-side and reuses parts one and two rather than
+ * duplicating them -- the directory walk is the same $INDEX_ROOT scan
+ * ntfs_index_remove does, and the ranged read is ntfs_read_file's run
+ * walk with a seek in front of it.
+ *
+ * The static-buffer discipline is the one from src/exfat.h, deliberately
+ * and not by accident: the fs layer above is not re-entrant, holds one
+ * file buffer, and the system is built around that. A directory walk
+ * gets its own record buffer rather than sharing ntfs_rec, because a
+ * lookup runs *while* a caller is holding a record it read earlier --
+ * that is a real aliasing bug and not a hypothetical one.
+ */
+
+static uint8_t ntfs_dirrec[4096];       /* directory records, during a walk */
+
+/* The $FILE_NAME attribute value, whose layout every index entry
+ * embeds. Named rather than open-coded because four functions below
+ * index into it and a wrong offset reads a timestamp as a size. */
+#define NTFS_FN_PARENT      0x00
+#define NTFS_FN_ALLOC_SIZE  0x28
+#define NTFS_FN_REAL_SIZE   0x30
+#define NTFS_FN_FLAGS       0x38
+#define NTFS_FN_NAME_LEN    0x40
+#define NTFS_FN_NAMESPACE   0x41
+#define NTFS_FN_NAME        0x42
+
+#define NTFS_FA_DIRECTORY   0x10000000u
+
+/* An index entry, once the header is past. */
+#define NTFS_IE_REF         0x00        /* child MFT reference, 8 bytes */
+#define NTFS_IE_LEN         0x08        /* entry length,        2 bytes */
+#define NTFS_IE_FNLEN       0x0A        /* $FILE_NAME length,   2 bytes */
+#define NTFS_IE_FLAGS       0x0C        /* bit 1 = last entry           */
+#define NTFS_IE_VALUE       0x10        /* the $FILE_NAME value         */
+
+/*
+ * The name out of an index entry, as ASCII.
+ *
+ * NTFS names are UTF-16. Everything above this driver -- the terminal,
+ * the file manager, the loader -- is byte strings, exactly as it is over
+ * exFAT, whose driver folds the same way. A code point that does not fit
+ * in a byte becomes '?' rather than being silently truncated to its low
+ * half, which would turn two different names into one.
+ */
+static void ntfs_name_to_ascii(const uint8_t *utf16, uint32_t chars,
+                               char *out, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < chars && n + 1 < cap; i++) {
+        const uint16_t c = (uint16_t)(utf16[i * 2] | (utf16[i * 2 + 1] << 8));
+        out[n++] = (c && c < 0x80) ? (char)c : '?';
+    }
+    out[n] = '\0';
+}
+
+/*
+ * Walk one directory's resident $INDEX_ROOT.
+ *
+ * Returns 0 and stops early if `cb` returns non-zero; the callback's
+ * return is passed back so a search can say "found". The record must
+ * already be in `rec` with its fixups applied.
+ *
+ * Entries with the 0x02 flag are the end marker rather than a file, and
+ * the DOS-namespace duplicates (namespace 2) are skipped so an 8.3 alias
+ * does not appear beside the long name it stands for.
+ */
+typedef int (*ntfs_index_cb_t)(void *ctx, const uint8_t *entry,
+                              const char *name);
+
+static int ntfs_index_walk(const uint8_t *rec, ntfs_index_cb_t cb, void *ctx) {
+    const ntfs_attr_t *ir = ntfs_find_attr(rec, NTFS_ATTR_INDEX_ROOT);
+    const uint8_t *root, *node, *p, *end;
+    char name[256];
+
+    if (!ir || ir->non_resident) return 0;
+
+    root = (const uint8_t *)ir + ir->u.res.value_offset;
+    node = root + 16;
+    p = node + (uint32_t)(node[0] | (node[1] << 8) | (node[2] << 16) |
+                          ((uint32_t)node[3] << 24));
+    end = node + (uint32_t)(node[4] | (node[5] << 8) | (node[6] << 16) |
+                            ((uint32_t)node[7] << 24));
+
+    while (p + NTFS_IE_VALUE <= end) {
+        const uint16_t elen  = (uint16_t)(p[NTFS_IE_LEN] |
+                                          (p[NTFS_IE_LEN + 1] << 8));
+        const uint16_t fnlen = (uint16_t)(p[NTFS_IE_FNLEN] |
+                                          (p[NTFS_IE_FNLEN + 1] << 8));
+        const uint32_t flags = (uint32_t)(p[NTFS_IE_FLAGS] |
+                                          (p[NTFS_IE_FLAGS + 1] << 8) |
+                                          (p[NTFS_IE_FLAGS + 2] << 16) |
+                                    ((uint32_t)p[NTFS_IE_FLAGS + 3] << 24));
+
+        if (elen < NTFS_IE_VALUE || p + elen > end) break;
+        if (flags & 0x02) break;                       /* the end marker */
+
+        if (fnlen >= NTFS_FN_NAME) {
+            const uint8_t *fn = p + NTFS_IE_VALUE;
+            const uint32_t chars = fn[NTFS_FN_NAME_LEN];
+
+            /* Bounds: the name has to be inside the entry it claims to
+             * be in. A record with a length that says otherwise is
+             * corrupt, and reading past it is how a corrupt volume
+             * becomes a fault rather than an error message. */
+            if (NTFS_IE_VALUE + NTFS_FN_NAME + chars * 2 <= elen &&
+                fn[NTFS_FN_NAMESPACE] != 2) {          /* skip 8.3 aliases */
+                int r;
+                ntfs_name_to_ascii(fn + NTFS_FN_NAME, chars,
+                                   name, sizeof(name));
+                r = cb(ctx, p, name);
+                if (r) return r;
+            }
+        }
+        p += elen;
+    }
+    return 0;
+}
+
+/* ---- finding one name in one directory ---- */
+
+typedef struct {
+    const char *want;
+    uint64_t    ref;
+    uint64_t    size;
+    int         is_dir;
+    int         found;
+} ntfs_find_ctx_t;
+
+static int ntfs_find_cb(void *vctx, const uint8_t *entry, const char *name) {
+    ntfs_find_ctx_t *c = (ntfs_find_ctx_t *)vctx;
+    const uint8_t *fn = entry + NTFS_IE_VALUE;
+    uint32_t i = 0;
+
+    /* Case-insensitive, to match ntfs_name_cmp and the exFAT dispatch
+     * this replaces. A volume where /Etc and /etc are different
+     * directories would be correct NTFS and wrong for every caller
+     * above, all of which were written against a folding filesystem. */
+    while (c->want[i] && name[i]) {
+        char a = c->want[i], b = name[i];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+        if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+        if (a != b) return 0;
+        i++;
+    }
+    if (c->want[i] || name[i]) return 0;
+
+    c->ref    = ntfs_get64(entry + NTFS_IE_REF) & 0x0000FFFFFFFFFFFFULL;
+    c->size   = ntfs_get64(fn + NTFS_FN_REAL_SIZE);
+    c->is_dir = (ntfs_get32(fn + NTFS_FN_FLAGS) & NTFS_FA_DIRECTORY) ? 1 : 0;
+    c->found  = 1;
+    return 1;
+}
+
+/*
+ * Resolve an absolute path to an MFT record.
+ *
+ * Component by component from record 5, which is always the root. Each
+ * step reads the directory into ntfs_dirrec and scans its index; a
+ * component that names a file when there is more path left is an error
+ * rather than something to walk through.
+ *
+ * `out_parent` is the record holding the last component, which is what
+ * every write operation needs and what a second lookup would otherwise
+ * have to go and find again.
+ */
+int ntfs_lookup(const char *path, uint64_t *out_record, uint64_t *out_parent,
+                int *out_is_dir, uint64_t *out_size) {
+    uint64_t cur = NTFS_MFT_ROOT, parent = NTFS_MFT_ROOT;
+    int is_dir = 1;
+    uint64_t size = 0;
+    uint32_t i = 0;
+
+    if (!ntfs.mounted || !path) return -1;
+    while (path[i] == '/') i++;
+
+    while (path[i]) {
+        char comp[256];
+        uint32_t n = 0;
+        ntfs_find_ctx_t c;
+
+        while (path[i] && path[i] != '/' && n + 1 < sizeof(comp))
+            comp[n++] = path[i++];
+        comp[n] = '\0';
+        while (path[i] == '/') i++;
+
+        if (n == 0) break;
+        if (!is_dir) return -1;         /* a file cannot have children */
+
+        if (ntfs_read_record(cur, ntfs_dirrec) != 0) return -1;
+
+        c.want = comp;
+        c.found = 0; c.ref = 0; c.size = 0; c.is_dir = 0;
+        ntfs_index_walk(ntfs_dirrec, ntfs_find_cb, &c);
+        if (!c.found) return -1;
+
+        parent = cur;
+        cur    = c.ref;
+        is_dir = c.is_dir;
+        size   = c.size;
+    }
+
+    if (out_record) *out_record = cur;
+    if (out_parent) *out_parent = parent;
+    if (out_is_dir) *out_is_dir = is_dir;
+    if (out_size)   *out_size   = size;
+    return 0;
+}
+
+/* ---- listing ---- */
+
+typedef struct {
+    ntfs_list_cb_t cb;
+    void          *ctx;
+} ntfs_list_ctx_t;
+
+static int ntfs_list_adapt(void *vctx, const uint8_t *entry, const char *name) {
+    ntfs_list_ctx_t *l = (ntfs_list_ctx_t *)vctx;
+    const uint8_t *fn = entry + NTFS_IE_VALUE;
+    const uint64_t size = ntfs_get64(fn + NTFS_FN_REAL_SIZE);
+    const int is_dir = (ntfs_get32(fn + NTFS_FN_FLAGS) & NTFS_FA_DIRECTORY)
+                       ? 1 : 0;
+
+    /* The system files occupy records 0-15 and are not things a user put
+     * on the volume; $MFT and $Bitmap appearing in a directory listing
+     * would be true and useless. */
+    if (name[0] == '$') return 0;
+
+    l->cb(l->ctx, name, size, is_dir);
+    return 0;
+}
+
+/*
+ * Enumerate a directory by path. Returns 0, or -1 if the path is not a
+ * directory on this volume.
+ */
+int ntfs_list(const char *path, ntfs_list_cb_t cb, void *ctx) {
+    uint64_t rec;
+    int is_dir;
+    ntfs_list_ctx_t l;
+
+    if (ntfs_lookup(path, &rec, 0, &is_dir, 0) != 0) return -1;
+    if (!is_dir) return -1;
+    if (ntfs_read_record(rec, ntfs_dirrec) != 0) return -1;
+
+    l.cb = cb; l.ctx = ctx;
+    ntfs_index_walk(ntfs_dirrec, ntfs_list_adapt, &l);
+    return 0;
+}
+
+/*
+ * A byte range out of a file.
+ *
+ * This is what makes a 937 MB encyclopedia readable on a machine that
+ * cannot hold one: the ZIM reader asks for a window at a time and never
+ * for the whole file. ntfs_read_file above cannot serve that -- it
+ * starts at zero and fills a buffer -- so the run walk here carries a
+ * virtual cluster number and skips whole runs until it reaches the one
+ * containing `offset`.
+ *
+ * Returns bytes read, which may be short at end of file, or -1.
+ */
+int64_t ntfs_read_range(uint64_t record, uint64_t offset,
+                        void *buf, uint64_t len) {
+    const ntfs_attr_t *d;
+    uint8_t *out = (uint8_t *)buf;
+
+    if (!ntfs.mounted) return -1;
+    if (ntfs_read_record(record, ntfs_rec) != 0) return -1;
+
+    d = ntfs_find_attr(ntfs_rec, NTFS_ATTR_DATA);
+    if (!d) return -1;
+
+    /* Resident: the whole file is inside the record, so the range is a
+     * bounds check and a copy. */
+    if (!d->non_resident) {
+        const uint32_t total = d->u.res.value_length;
+        const uint8_t *src = (const uint8_t *)d + d->u.res.value_offset;
+        uint64_t n;
+
+        if (offset >= total) return 0;
+        n = total - offset;
+        if (n > len) n = len;
+        for (uint64_t i = 0; i < n; i++) out[i] = src[offset + i];
+        return (int64_t)n;
+    }
+
+    {
+        const uint64_t real = d->u.nonres.real_size;
+        const uint8_t *p = (const uint8_t *)d + d->u.nonres.run_offset;
+        const uint8_t *end = (const uint8_t *)d + d->length;
+        const uint32_t cbytes = ntfs.bytes_per_cluster;
+        int64_t prev = 0;
+        uint64_t vcn = 0;               /* cluster index within the file */
+        uint64_t want, done = 0;
+        ntfs_run_t run;
+
+        if (offset >= real) return 0;
+        want = real - offset;
+        if (want > len) want = len;
+
+        while (done < want && ntfs_next_run(&p, end, &prev, &run)) {
+            const uint64_t run_bytes = run.length * (uint64_t)cbytes;
+            const uint64_t run_start = vcn * (uint64_t)cbytes;
+            uint64_t skip, avail, lcn;
+
+            vcn += run.length;
+
+            /* Entirely before the range asked for. */
+            if (run_start + run_bytes <= offset + done) continue;
+
+            /* How far into this run the next wanted byte is. */
+            skip  = (offset + done > run_start) ? (offset + done - run_start)
+                                                : 0;
+            avail = run_bytes - skip;
+            if (avail > want - done) avail = want - done;
+
+            if (run.sparse) {
+                for (uint64_t i = 0; i < avail; i++) out[done + i] = 0;
+                done += avail;
+                continue;
+            }
+
+            /* Read cluster-aligned and copy from the offset inside the
+             * first cluster: a range rarely starts on a cluster boundary
+             * and the block layer only moves whole sectors. */
+            lcn = run.lcn + skip / cbytes;
+            {
+                uint64_t within = skip % cbytes;
+                uint64_t left = avail;
+                while (left) {
+                    uint32_t chunk = sizeof(ntfs_clu);
+                    uint32_t clusters, usable;
+                    if ((uint64_t)chunk > within + left)
+                        chunk = (uint32_t)(within + left);
+                    clusters = (chunk + cbytes - 1) / cbytes;
+                    if (ntfs_read_clusters(lcn, clusters, ntfs_clu) != 0)
+                        return -1;
+                    usable = (uint32_t)(clusters * (uint64_t)cbytes - within);
+                    if ((uint64_t)usable > left) usable = (uint32_t)left;
+                    for (uint32_t i = 0; i < usable; i++)
+                        out[done + i] = ntfs_clu[within + i];
+                    done  += usable;
+                    left  -= usable;
+                    lcn   += clusters;
+                    within = 0;
+                }
+            }
+        }
+        return (int64_t)done;
+    }
+}
+
+/*
+ * How much of the volume is in use.
+ *
+ * Counted out of $Bitmap rather than tracked, because a count that is
+ * maintained separately from the thing it counts is a count that drifts.
+ * One pass over the bitmap is a few hundred kilobytes on an 8 GB volume
+ * and this is asked for by `df` and the settings panel, not by anything
+ * on a hot path.
+ */
+int ntfs_space(uint64_t *out_total, uint64_t *out_free) {
+    uint64_t free_clusters = 0;
+
+    if (!ntfs.mounted) return -1;
+    if (!ntfs_bmp.loaded && ntfs_bitmap_load() != 0) return -1;
+
+    for (uint64_t chunk = 0; chunk < ntfs_bmp.clusters; chunk++) {
+        if (ntfs_read_clusters(ntfs_bmp.lcn + chunk, 1, ntfs_w_clu) != 0)
+            return -1;
+        for (uint32_t i = 0; i < ntfs.bytes_per_cluster; i++) {
+            uint8_t b = ntfs_w_clu[i];
+            /* Kernighan's count, on the complement: bits that are zero
+             * are clusters that are free. */
+            b = (uint8_t)~b;
+            while (b) { free_clusters++; b &= (uint8_t)(b - 1); }
+        }
+    }
+
+    /* The bitmap is rounded up to a whole cluster, so the tail past the
+     * volume's real cluster count reads as free and is not. */
+    {
+        const uint64_t mapped = ntfs_bmp.clusters *
+                                (uint64_t)ntfs.bytes_per_cluster * 8;
+        if (mapped > ntfs_bmp.total_clusters)
+            free_clusters -= (mapped - ntfs_bmp.total_clusters);
+    }
+
+    if (out_total) *out_total = ntfs_bmp.total_clusters;
+    if (out_free)  *out_free  = free_clusters;
+    return 0;
+}
+
+/* The cluster size, for callers reporting geometry. */
+uint32_t ntfs_cluster_bytes(void) { return ntfs.bytes_per_cluster; }
+
+/* Whether a volume is mounted, and what the mount decided. The state
+ * itself stays private -- the filesystem dispatch needs the answer, not
+ * the structure. */
+int ntfs_mounted(void) { return ntfs.mounted; }
+const char *ntfs_status(void) { return ntfs.status; }
+uint64_t ntfs_total_clusters(void) { return ntfs_bmp.total_clusters; }
+
+/*
+ * Where a file's data physically starts, and whether it is one run.
+ *
+ * This exists for the pagefile and for nothing else. src/swap.h resolves
+ * its backing store to one absolute LBA at boot so that no filesystem
+ * code runs inside a page fault -- a fault that had to walk the MFT to
+ * find its own backing store would deadlock the first time it faulted on
+ * a buffer the MFT walk was using.
+ *
+ * Returns 0 only when the file is exactly one non-sparse run of at least
+ * `need_bytes`. Anything else -- fragmented, sparse, resident, short --
+ * is refused rather than partially accepted, because a swapper that
+ * silently used the first run of a fragmented file would write pages
+ * over whatever came after it.
+ */
+int ntfs_single_extent(uint64_t record, uint64_t need_bytes,
+                       uint64_t *out_lba, uint64_t *out_bytes) {
+    const ntfs_attr_t *d;
+
+    if (!ntfs.mounted) return -1;
+    if (ntfs_read_record(record, ntfs_rec) != 0) return -1;
+
+    d = ntfs_find_attr(ntfs_rec, NTFS_ATTR_DATA);
+    if (!d || !d->non_resident) return -1;
+    if (d->u.nonres.real_size < need_bytes) return -1;
+
+    {
+        const uint8_t *p = (const uint8_t *)d + d->u.nonres.run_offset;
+        const uint8_t *end = (const uint8_t *)d + d->length;
+        int64_t prev = 0;
+        ntfs_run_t run, second;
+
+        if (!ntfs_next_run(&p, end, &prev, &run)) return -1;
+        if (run.sparse) return -1;
+        if (run.length * (uint64_t)ntfs.bytes_per_cluster < need_bytes)
+            return -1;
+        /* A second run means the file is fragmented, however long the
+         * first one is. */
+        if (ntfs_next_run(&p, end, &prev, &second)) return -1;
+
+        if (out_lba)
+            *out_lba = ntfs.part_lba +
+                       run.lcn * (uint64_t)ntfs.sectors_per_cluster;
+        if (out_bytes)
+            *out_bytes = run.length * (uint64_t)ntfs.bytes_per_cluster;
+    }
+    return 0;
+}

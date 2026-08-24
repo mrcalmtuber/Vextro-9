@@ -23,7 +23,12 @@ security descriptors beyond a default, and no $UsnJrnl until the kernel
 creates one. Those are noted where they occur.
 
 Usage:
-    python3 tools/mkntfs.py <image> <size-MB> [name=path ...]
+    python3 tools/mkntfs.py <image> <size-MB> [src[:dest] ...]
+
+`src` alone puts the file in the root under its own basename; `src:dest`
+puts it at `dest`, creating directories along the way. That is the same
+convention tools/mkexfat.py takes, so the disk.img rule in the Makefile
+did not have to change shape when the boot volume moved.
 """
 
 import os
@@ -33,8 +38,30 @@ import sys
 SECTOR = 512
 SPC = 8                       # sectors per cluster -> 4 KB clusters
 CLUSTER = SECTOR * SPC
-MFT_REC = 1024                # bytes per MFT record
+# 4096-byte MFT records rather than the 1024 Windows uses by default.
+#
+# A directory here lives entirely in its resident $INDEX_ROOT -- the
+# driver does not build $INDEX_ALLOCATION, so a directory holds as many
+# entries as fit in one record and then reports ENOSPC. At 1024 bytes
+# that is about six entries, which is not a filesystem. At 4096 it is
+# about thirty, which is enough for the volume this seeds and for what a
+# session adds to it.
+#
+# 4096 is the ceiling, not a preference: the kernel reads a record into
+# a 4096-byte static buffer and ntfs_try() refuses a volume claiming
+# more. Raising it further means raising that buffer, and beyond 4096
+# the format stops being one other implementations expect.
+MFT_REC = 4096                # bytes per MFT record
 MFT_RECS_RESERVED = 16        # the system files occupy 0..15
+
+# The pagefile, preallocated here rather than by the kernel.
+#
+# src/swap.h resolves its backing store to one absolute LBA at boot so
+# that no filesystem code runs inside a page fault. That requires the
+# file to be exactly one run, and the only place a single run can be
+# guaranteed is a formatter laying out empty space in order.
+PAGEFILE_NAME = "pagefile.sys"
+PAGEFILE_MB = 256
 
 # Attribute types
 AT_STANDARD_INFORMATION = 0x10
@@ -282,6 +309,68 @@ def mft_record(number, seq, attrs, is_dir=False, link_count=1):
 
 
 # -------------------------------------------------------------- main
+#
+# The volume is laid out in one pass, in order, and that ordering is
+# load-bearing rather than tidy:
+#
+#   boot | $MFT | $MFTMirr | $Bitmap | pagefile.sys | file data...
+#
+# Every file gets a single contiguous run because the allocator here
+# only ever moves forward. That is not an optimisation. Without
+# $ATTRIBUTE_LIST -- which this driver does not write -- a file's whole
+# run list has to fit in its own MFT record, and a 937 MB archive broken
+# into a few thousand fragments would not. Sequential allocation makes
+# every run list exactly one entry, whatever the file's size.
+
+
+class Node:
+    """A file or a directory in the tree being built."""
+
+    def __init__(self, name, src=None):
+        self.name = name
+        self.src = src              # None for a directory
+        self.children = {}          # name -> Node, for directories
+        self.record = None          # assigned MFT record number
+        self.lcn = 0                # first cluster of the data
+        self.clusters = 0
+        self.size = 0
+
+    @property
+    def is_dir(self):
+        return self.src is None and not self.is_pagefile
+
+    is_pagefile = False
+
+    def child(self, name):
+        """Get or create a subdirectory, case-insensitively."""
+        for key, node in self.children.items():
+            if key.lower() == name.lower():
+                return node
+        node = Node(name)
+        self.children[name] = node
+        return node
+
+
+class Pagefile(Node):
+    is_pagefile = True
+
+    def __init__(self, name, size):
+        Node.__init__(self, name)
+        self.size = size
+
+    @property
+    def is_dir(self):
+        return False
+
+
+def walk(node):
+    """Every node under `node`, parents before children."""
+    for child in node.children.values():
+        yield child
+        if child.is_dir:
+            for grandchild in walk(child):
+                yield grandchild
+
 
 def main():
     if len(sys.argv) < 3:
@@ -290,150 +379,182 @@ def main():
 
     path = sys.argv[1]
     size_mb = int(sys.argv[2])
-    files = []
+
+    # --- build the tree ---
+    root = Node("")
     for spec in sys.argv[3:]:
-        if "=" not in spec:
-            print(f"  skipping {spec!r}: expected name=path")
-            continue
-        name, src = spec.split("=", 1)
+        src, _, dest = spec.partition(":")
+        if not dest:
+            dest = os.path.basename(src)
         if not os.path.isfile(src):
-            print(f"  skipping {name}: {src} not found")
+            print(f"  skipping {dest}: {src} not found")
             continue
-        files.append((name, src))
+        parts = dest.strip("/").split("/")
+        d = root
+        for p in parts[:-1]:
+            d = d.child(p)
+        leaf = Node(parts[-1], src)
+        leaf.size = os.path.getsize(src)
+        d.children[parts[-1]] = leaf
+
+    # The pagefile is part of the layout rather than content, so it is
+    # added here rather than being passed in by the Makefile.
+    #
+    # Only when the volume has room to spare for it. The scratch images
+    # the host tests format are tens of megabytes, and a formatter that
+    # insisted on a 256 MB pagefile would refuse to make one -- so the
+    # rule is that a volume must be several times the pagefile before it
+    # gets one, and a volume without one boots with swap disabled and
+    # says so rather than failing.
+    pagefile_mb = PAGEFILE_MB if size_mb >= PAGEFILE_MB * 4 else 0
+    if pagefile_mb:
+        root.children[PAGEFILE_NAME] = Pagefile(PAGEFILE_NAME,
+                                                pagefile_mb * 1024 * 1024)
+
+    nodes = list(walk(root))
+    dirs = [n for n in nodes if n.is_dir]
+    files = [n for n in nodes if not n.is_dir]
 
     total_sectors = size_mb * 1024 * 1024 // SECTOR
     total_clusters = total_sectors // SPC
 
-    # --- layout ---
-    # cluster 0        boot
-    # cluster 4        $MFT   (grows upward)
-    # then             file data
+    # --- assign MFT records ---
+    #
+    # Reserved for the system files, then one per node, then headroom.
+    # The headroom is what a running system creates into: ntfs_mft_alloc
+    # searches up to $MFT's allocated size and stops, so a table sized
+    # exactly to the seed would refuse the first file anyone made.
+    next_record = MFT_RECS_RESERVED
+    for n in nodes:
+        n.record = next_record
+        next_record += 1
+
+    # Headroom, scaled to the volume.
+    #
+    # A record is one cluster here, so headroom is a direct cost in
+    # space: 2048 spare records is 8 MB, which is nothing on the 8 GB
+    # boot volume and half of a 16 MB scratch image. Sizing it against
+    # the volume keeps both sensible -- the test images stay mostly
+    # free space, and the real one can take a couple of thousand files.
+    runtime_records = min(2048, max(32, total_clusters // 64))
+    mft_records = next_record + runtime_records
+    mft_clusters = max(1, align(mft_records * MFT_REC, CLUSTER) // CLUSTER)
+
+    # --- lay out the volume ---
     mft_lcn = 4
-    mft_clusters = 64                       # 64 KB of records: 256 records
     mftmirr_lcn = mft_lcn + mft_clusters
-    data_start = mftmirr_lcn + 1
+    lcn = mftmirr_lcn + 1
 
-    # Place each file's data.
-    placed = []
-    lcn = data_start
-    for name, src in files:
-        size = os.path.getsize(src)
-        n = max(1, align(size, CLUSTER) // CLUSTER)
-        placed.append((name, src, size, lcn, n))
-        lcn += n
-    data_end = lcn
+    bitmap_bytes_len = align(total_clusters, 8) // 8
+    bitmap_clusters = max(1, align(bitmap_bytes_len, CLUSTER) // CLUSTER)
+    bitmap_lcn = lcn
+    lcn += bitmap_clusters
 
-    if data_end >= total_clusters:
-        raise SystemExit("content does not fit in the requested volume")
+    for n in files:
+        n.clusters = max(1, align(n.size, CLUSTER) // CLUSTER)
+        n.lcn = lcn
+        lcn += n.clusters
+    volume_end = lcn
 
-    # --- the bitmap: one bit per cluster ---
-    bitmap = bytearray(align(total_clusters, 8) // 8)
+    if volume_end >= total_clusters:
+        raise SystemExit(
+            f"content does not fit: needs {volume_end} clusters of "
+            f"{CLUSTER}, volume has {total_clusters}")
 
-    def mark(start, count):
-        for c in range(start, start + count):
-            bitmap[c >> 3] |= 1 << (c & 7)
-
-    mark(0, data_end)                       # everything laid out above
+    # --- the bitmap ---
+    bitmap = bytearray(bitmap_bytes_len)
+    for c in range(volume_end):
+        bitmap[c >> 3] |= 1 << (c & 7)
+    # Clusters past the end of the volume are marked in use so nothing
+    # allocates into the rounding slack at the tail of the last byte.
+    for c in range(total_clusters, bitmap_bytes_len * 8):
+        bitmap[c >> 3] |= 1 << (c & 7)
     bitmap_bytes = bytes(bitmap)
-    bitmap_clusters = max(1, align(len(bitmap_bytes), CLUSTER) // CLUSTER)
-    bitmap_lcn = data_end
-    mark(bitmap_lcn, bitmap_clusters)
-    bitmap_bytes = bytes(bitmap)             # re-read after marking itself
-    volume_end = bitmap_lcn + bitmap_clusters
 
     # --- MFT records ---
     records = {}
+    ROOT_REF = 5 | (5 << 48)
 
-    # 0: $MFT
-    records[0] = mft_record(0, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$MFT", False),
+    def sysrec(number, name, attrs, is_dir=False):
+        return mft_record(number, 1,
+                          [standard_information(),
+                           file_name_attr(ROOT_REF, name, is_dir)] + attrs,
+                          is_dir=is_dir)
+
+    records[0] = sysrec(0, "$MFT", [
         attr_nonresident(AT_DATA, [(mft_lcn, mft_clusters)],
-                         mft_clusters * CLUSTER, mft_clusters * CLUSTER),
-    ])
+                         mft_clusters * CLUSTER, mft_clusters * CLUSTER)])
+    records[1] = sysrec(1, "$MFTMirr", [
+        attr_nonresident(AT_DATA, [(mftmirr_lcn, 1)], CLUSTER, CLUSTER)])
+    records[2] = sysrec(2, "$LogFile", [attr_resident(AT_DATA, b"")])
 
-    # 1: $MFTMirr -- the first four records, duplicated
-    records[1] = mft_record(1, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$MFTMirr", False),
-        attr_nonresident(AT_DATA, [(mftmirr_lcn, 1)], CLUSTER, CLUSTER),
-    ])
-
-    # 2: $LogFile.
-    #
-    # Allocated and zeroed, not populated. NTFS's log is an LFS
-    # transaction journal whose restart and redo record formats are not
-    # publicly specified, so what a real one contains cannot be written
-    # from documentation. The kernel journals its own metadata writes
-    # instead -- see ntfs_journal_* in ntfs_ops.c -- and this file
-    # exists so that a Windows chkdsk sees a well-formed volume rather
-    # than a missing system file.
-    records[2] = mft_record(2, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$LogFile", False),
-        attr_resident(AT_DATA, b""),
-    ])
-
-    # 3: $Volume
-    vol_name = attr_resident(0x60, utf16("Vextro"))
-    vol_info = attr_resident(0x70, struct.pack("<QBBH", 0, 3, 1, 0))
     records[3] = mft_record(3, 1, [
         standard_information(),
-        file_name_attr(5 | (5 << 48), "$Volume", False),
-        vol_name, vol_info,
+        file_name_attr(ROOT_REF, "$Volume", False),
+        attr_resident(0x60, utf16("Vextro")),
+        attr_resident(0x70, struct.pack("<QBBH", 0, 3, 1, 0)),
         attr_resident(AT_DATA, b""),
     ])
+    records[4] = sysrec(4, "$AttrDef", [attr_resident(AT_DATA, b"")])
 
-    # 4: $AttrDef
-    records[4] = mft_record(4, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$AttrDef", False),
-        attr_resident(AT_DATA, b""),
-    ])
+    # 5: the root directory, whose index lists its own children
+    def index_for(node):
+        entries = []
+        for c in sorted(node.children.values(),
+                        key=lambda n: n.name.upper()):
+            ref = c.record | (1 << 48)
+            entries.append(index_entry(ref, c.name, c.is_dir, c.size,
+                                       c.clusters * CLUSTER))
+        return index_root(entries)
 
-    # 5: the root directory
-    entries = []
-    for i, (name, src, size, flcn, fclu) in enumerate(placed):
-        ref = (MFT_RECS_RESERVED + i) | (1 << 48)
-        entries.append(index_entry(ref, name, False, size, fclu * CLUSTER))
     records[5] = mft_record(5, 5, [
         standard_information(),
-        file_name_attr(5 | (5 << 48), ".", True),
-        attr_resident(AT_INDEX_ROOT, index_root(entries), name="$I30"),
+        file_name_attr(ROOT_REF, ".", True),
+        attr_resident(AT_INDEX_ROOT, index_for(root), name="$I30"),
     ], is_dir=True, link_count=1)
 
-    # 6: $Bitmap
-    records[6] = mft_record(6, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$Bitmap", False),
+    records[6] = sysrec(6, "$Bitmap", [
         attr_nonresident(AT_DATA, [(bitmap_lcn, bitmap_clusters)],
-                         len(bitmap_bytes), bitmap_clusters * CLUSTER),
-    ])
+                         len(bitmap_bytes), bitmap_clusters * CLUSTER)])
+    records[7] = sysrec(7, "$Boot", [
+        attr_nonresident(AT_DATA, [(0, 1)], CLUSTER, CLUSTER)])
 
-    # 7: $Boot
-    records[7] = mft_record(7, 1, [
-        standard_information(),
-        file_name_attr(5 | (5 << 48), "$Boot", False),
-        attr_nonresident(AT_DATA, [(0, 1)], CLUSTER, CLUSTER),
-    ])
-
-    # 8..15: the remaining reserved records, present but empty
     for n, nm in ((8, "$BadClus"), (9, "$Secure"), (10, "$UpCase"),
                   (11, "$Extend"), (12, ""), (13, ""), (14, ""), (15, "")):
         attrs = [standard_information()]
         if nm:
-            attrs.append(file_name_attr(5 | (5 << 48), nm, nm == "$Extend"))
+            attrs.append(file_name_attr(ROOT_REF, nm, nm == "$Extend"))
         attrs.append(attr_resident(AT_DATA, b""))
         records[n] = mft_record(n, 1, attrs, is_dir=(nm == "$Extend"))
 
-    # 16..: the packed files
-    for i, (name, src, size, flcn, fclu) in enumerate(placed):
-        n = MFT_RECS_RESERVED + i
-        records[n] = mft_record(n, 1, [
-            standard_information(),
-            file_name_attr(5 | (5 << 48), name, False, size, fclu * CLUSTER),
-            attr_nonresident(AT_DATA, [(flcn, fclu)], size, fclu * CLUSTER),
-        ])
+    # --- the tree ---
+    #
+    # A parent reference is the record number and the sequence number
+    # together, and getting it wrong is invisible until something walks
+    # back up: the entry reads correctly, and the file claims to live in
+    # a directory that does not contain it.
+    parent_of = {}
+    for parent in [root] + dirs:
+        pref = ROOT_REF if parent is root else (parent.record | (1 << 48))
+        for c in parent.children.values():
+            parent_of[id(c)] = pref
+
+    for n in nodes:
+        pref = parent_of[id(n)]
+        if n.is_dir:
+            records[n.record] = mft_record(n.record, 1, [
+                standard_information(),
+                file_name_attr(pref, n.name, True),
+                attr_resident(AT_INDEX_ROOT, index_for(n), name="$I30"),
+            ], is_dir=True)
+        else:
+            records[n.record] = mft_record(n.record, 1, [
+                standard_information(),
+                file_name_attr(pref, n.name, False, n.size,
+                               n.clusters * CLUSTER),
+                attr_nonresident(AT_DATA, [(n.lcn, n.clusters)], n.size,
+                                 n.clusters * CLUSTER),
+            ])
 
     highest = max(records)
     if (highest + 1) * MFT_REC > mft_clusters * CLUSTER:
@@ -453,33 +574,41 @@ def main():
     struct.pack_into("<Q", boot, 0x28, total_sectors - 1)
     struct.pack_into("<Q", boot, 0x30, mft_lcn)
     struct.pack_into("<Q", boot, 0x38, mftmirr_lcn)
-    # A negative "clusters per record" means 2^-n bytes, which is how a
-    # 1024-byte record is expressed on a volume with 4096-byte clusters.
-    struct.pack_into("<b", boot, 0x40, -10)
+    # Clusters per MFT record. A positive value is a count of clusters,
+    # a negative one is 2^-n bytes. With 4096-byte records on 4096-byte
+    # clusters it is exactly 1, and the kernel handles both forms.
+    if MFT_REC >= CLUSTER:
+        struct.pack_into("<b", boot, 0x40, MFT_REC // CLUSTER)
+    else:
+        struct.pack_into("<b", boot, 0x40, -(MFT_REC.bit_length() - 1))
     struct.pack_into("<b", boot, 0x44, 1)
     struct.pack_into("<Q", boot, 0x48, 0x56455854524F0009)
     struct.pack_into("<H", boot, 0x1FE, 0xAA55)
 
     # --- write it ---
+    #
+    # Sparse: the length is set without writing 8 GB of zeros, and only
+    # the clusters that carry something are touched. The pagefile is
+    # allocated and never written, so 256 MB of it costs nothing on the
+    # host until the kernel pages into it.
     with open(path, "wb") as f:
         f.truncate(size_mb * 1024 * 1024)
 
-        f.seek(0)
         f.write(boot)
 
-        f.seek(mft_lcn * CLUSTER)
         for n in range(highest + 1):
             f.seek(mft_lcn * CLUSTER + n * MFT_REC)
             f.write(records.get(n, bytes(MFT_REC)))
 
-        # the mirror: the first four records
         f.seek(mftmirr_lcn * CLUSTER)
         for n in range(4):
             f.write(records[n])
 
-        for name, src, size, flcn, fclu in placed:
-            f.seek(flcn * CLUSTER)
-            with open(src, "rb") as g:
+        for n in files:
+            if n.is_pagefile:
+                continue
+            f.seek(n.lcn * CLUSTER)
+            with open(n.src, "rb") as g:
                 while True:
                     chunk = g.read(1 << 20)
                     if not chunk:
@@ -489,15 +618,19 @@ def main():
         f.seek(bitmap_lcn * CLUSTER)
         f.write(bitmap_bytes)
 
-        # the backup boot sector, which lives in the last sector
         f.seek((total_sectors - 1) * SECTOR)
         f.write(boot)
 
-    used_mb = volume_end * CLUSTER // (1024 * 1024)
-    print(f"  NTFS   {path}: {size_mb} MB volume, {total_clusters} clusters "
-          f"of {CLUSTER}")
-    print(f"         $MFT at cluster {mft_lcn}, {highest + 1} records, "
-          f"{len(placed)} files, {used_mb} MB used")
+    content = sum(n.clusters for n in files if not n.is_pagefile)
+    nfiles = len([n for n in files if not n.is_pagefile])
+    print(f"  NTFS   {path}: {size_mb} MB, {total_clusters} clusters of "
+          f"{CLUSTER}, {MFT_REC}-byte records")
+    print(f"         $MFT {mft_clusters} clusters at {mft_lcn} "
+          f"({mft_records} records, {runtime_records} spare), "
+          f"$Bitmap at {bitmap_lcn}")
+    print(f"         {nfiles} files in {len(dirs) + 1} directories, "
+          f"{content * CLUSTER // (1024 * 1024)} MB content, "
+          + (f"{pagefile_mb} MB pagefile" if pagefile_mb else "no pagefile"))
     return 0
 
 

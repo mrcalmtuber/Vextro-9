@@ -98,4 +98,13 @@ static int part_count = 0;
  * the host there always is: the image file. */
 static int blk_present(void) { return ntfs_host_img != 0; }
 
+/* The image's size in bytes, so a test can derive the volume geometry
+ * rather than writing a constant that has to be kept in step with
+ * whatever size the harness happens to format. */
+static uint64_t ntfs_host_size(void) {
+    if (!ntfs_host_img) return 0;
+    if (fseeko(ntfs_host_img, 0, SEEK_END) != 0) return 0;
+    return (uint64_t)ftello(ntfs_host_img);
+}
+
 #endif /* NTFS_HOST_SHIM_H */

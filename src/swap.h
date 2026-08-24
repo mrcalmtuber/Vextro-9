@@ -230,7 +230,11 @@ static int swap_init(void) {
     swap_ready = 0;
     swap_errstr = "";
 
-    if (fs_kind != FS_EXFAT || !exf_vol.mounted) {
+    if (fs_kind != FS_NTFS && fs_kind != FS_EXFAT) {
+        swap_errstr = "no writable volume to put a pagefile on";
+        return -1;
+    }
+    if (fs_kind == FS_EXFAT && !exf_vol.mounted) {
         swap_errstr = "no exFAT volume to put a pagefile on";
         return -1;
     }
@@ -249,6 +253,54 @@ static int swap_init(void) {
     for (uint64_t i = 0; i < pmm_highest_frame; i++) {
         swap_rmap[i].as = 0;
         swap_rmap[i].virt = 0;
+    }
+
+    /*
+     * On NTFS the pagefile is the formatter's job, not the kernel's.
+     *
+     * tools/mkntfs.py lays the volume out in order and preallocates
+     * pagefile.sys as one run, which is the only way a single extent can
+     * be *guaranteed* rather than hoped for. Creating it here instead
+     * would mean asking the cluster allocator for 65,536 contiguous
+     * clusters on a volume that has already been written to, and taking
+     * whatever fragmentation it could manage -- and a fragmented
+     * pagefile is one this pager cannot use at all, because resolving
+     * runs per page is filesystem I/O inside a fault.
+     *
+     * So the kernel's half is: find it, insist it is one whole extent,
+     * and take the LBA. Anything else turns swap off with a reason
+     * rather than half-enabling it.
+     */
+    if (fs_kind == FS_NTFS) {
+        uint64_t rec = 0, lba = 0, bytes_have = 0;
+        int is_dir = 1;
+
+        if (ntfs_lookup(SWAP_PATH, &rec, 0, &is_dir, 0) != 0 || is_dir) {
+            swap_errstr = "no pagefile.sys on the volume";
+            return -1;
+        }
+        if (ntfs_single_extent(rec, SWAP_BYTES, &lba, &bytes_have) != 0) {
+            swap_errstr = "pagefile.sys is fragmented or too small";
+            return -1;
+        }
+
+        swap_base_lba   = lba;
+        swap_slot_count = SWAP_SLOTS;
+        swap_slots_used = 0;
+        for (uint32_t i = 0; i < SWAP_SLOTS / 64; i++) swap_slot_bm[i] = 0;
+        blk_cache_drop(swap_base_lba, (uint32_t)(SWAP_BYTES / EXF_SECTOR));
+        swap_ready = 1;
+
+        serial_puts("[swap] pagefile.sys: one extent at LBA ");
+        serial_put_dec((uint32_t)swap_base_lba);
+        serial_puts(", ");
+        serial_put_dec(SWAP_MB);
+        serial_puts(" MB, ");
+        serial_put_dec(swap_slot_count);
+        serial_puts(" slots, reverse map ");
+        serial_put_dec((uint32_t)(bytes / 1024));
+        serial_puts(" KB\n");
+        return 0;
     }
 
     const uint32_t cbytes  = exf_vol.cluster_bytes;

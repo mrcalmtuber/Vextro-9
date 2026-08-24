@@ -282,8 +282,54 @@ static const void *tar_read_file(const char *filename, uint64_t *out_size) {
 #define FS_NONE   0
 #define FS_EXFAT  1
 #define FS_FAT32  2
+#define FS_NTFS   3
 
 static int fs_kind = FS_NONE;
+
+/*
+ * Splitting an absolute path into the directory holding the last
+ * component and the component itself.
+ *
+ * Every NTFS write needs both: the driver's create, delete and mkdir
+ * take a parent *record* and a name, because that is what an index
+ * insert actually operates on. exFAT's writer re-walks the path
+ * internally and hides this; doing the walk here instead means it
+ * happens once and the record is the one the insert uses.
+ *
+ * Returns 0 on success. A path with no parent -- "/" -- is refused,
+ * because there is nothing above the root to insert into.
+ */
+static int ntfs_split(const char *abs, uint64_t *out_dir, char *leaf,
+                      int leaf_max) {
+    int last = -1, n = 0;
+
+    for (int i = 0; abs[i]; i++) if (abs[i] == '/') last = i;
+    if (last < 0) return -1;
+
+    while (abs[last + 1 + n] && n < leaf_max - 1) {
+        leaf[n] = abs[last + 1 + n];
+        n++;
+    }
+    leaf[n] = '\0';
+    if (n == 0) return -1;              /* a trailing slash, or the root */
+
+    {
+        char dir[256];
+        int i = 0;
+        if (last == 0) {
+            dir[0] = '/'; dir[1] = '\0';
+        } else {
+            while (i < last && i < (int)sizeof(dir) - 1) { dir[i] = abs[i]; i++; }
+            dir[i] = '\0';
+        }
+        {
+            int is_dir = 0;
+            if (ntfs_lookup(dir, out_dir, 0, &is_dir, 0) != 0) return -1;
+            if (!is_dir) return -1;
+        }
+    }
+    return 0;
+}
 
 /* Big enough for a compressed full-colour image; larger files are read
  * through fs_read_range() a window at a time. */
@@ -338,15 +384,25 @@ static int swap_owns_path(const char *abs);
 static void fs_mount(void) {
     for (int i = 0; i < blk_count; i++) {
         if (blk_select(i) != 0) continue;
-        exfat_mount();
-        if (exf_vol.mounted) fs_kind = FS_EXFAT;
+        /* NTFS first: it is what this system formats and boots from now.
+         * exFAT and FAT32 stay behind it so that a volume made by an
+         * older build, or a USB stick from somewhere else, still
+         * mounts -- the boot volume changed, the ability to read the
+         * others did not. */
+        ntfs_mount();
+        if (ntfs_mounted()) fs_kind = FS_NTFS;
         else {
-            fat32_mount();
-            if (fat_vol.mounted) fs_kind = FS_FAT32;
+            exfat_mount();
+            if (exf_vol.mounted) fs_kind = FS_EXFAT;
+            else {
+                fat32_mount();
+                if (fat_vol.mounted) fs_kind = FS_FAT32;
+            }
         }
         if (fs_kind != FS_NONE) {
             serial_puts("[fs] mounted ");
-            serial_puts(fs_kind == FS_EXFAT ? "exFAT" : "FAT32");
+            serial_puts(fs_kind == FS_NTFS  ? "NTFS"
+                      : fs_kind == FS_EXFAT ? "exFAT" : "FAT32");
             serial_puts(" on ");
             serial_puts(blk_bus_name());
             serial_puts(" disk ");
@@ -361,6 +417,7 @@ static void fs_mount(void) {
 }
 
 static const char *fs_name(void) {
+    if (fs_kind == FS_NTFS)  return "NTFS";
     if (fs_kind == FS_EXFAT) return "exFAT";
     if (fs_kind == FS_FAT32) return "FAT32";
     return tarfs_base ? "ramdisk (read-only)" : "none";
@@ -368,13 +425,38 @@ static const char *fs_name(void) {
 
 static int fs_writable(void) { return fs_kind != FS_NONE; }
 
+/* Counted out of $Bitmap on NTFS, which is a pass over a few hundred
+ * kilobytes. Cached, because `df` and the settings panel ask on every
+ * refresh and the answer only changes when something is written. */
+static uint32_t ntfs_total_kb_cache = 0, ntfs_free_kb_cache = 0;
+static int      ntfs_space_valid = 0;
+
+static void ntfs_space_refresh(void) {
+    uint64_t total = 0, freec = 0;
+    if (ntfs_space(&total, &freec) != 0) return;
+    {
+        const uint64_t per_kb = ntfs_cluster_bytes() / 1024;
+        ntfs_total_kb_cache = (uint32_t)(total * per_kb);
+        ntfs_free_kb_cache  = (uint32_t)(freec * per_kb);
+    }
+    ntfs_space_valid = 1;
+}
+
 static uint32_t fs_total_kb(void) {
+    if (fs_kind == FS_NTFS) {
+        if (!ntfs_space_valid) ntfs_space_refresh();
+        return ntfs_total_kb_cache;
+    }
     if (fs_kind == FS_EXFAT) return exf_total_kb();
     if (fs_kind == FS_FAT32) return fat_total_kb();
     return 0;
 }
 
 static uint32_t fs_free_kb(void) {
+    if (fs_kind == FS_NTFS) {
+        if (!ntfs_space_valid) ntfs_space_refresh();
+        return ntfs_free_kb_cache;
+    }
     if (fs_kind == FS_EXFAT) return exf_free_kb();
     if (fs_kind == FS_FAT32) return fat_free_kb();
     return 0;
@@ -394,6 +476,14 @@ static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 0)) return 0;
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t sz = 0;
+        int dir = 0;
+        if (ntfs_lookup(abs, 0, 0, &dir, &sz) != 0) return 0;
+        if (size) *size = sz;
+        if (is_dir) *is_dir = dir;
+        return 1;
+    }
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
         if (!exf_lookup(abs, &e)) return 0;
@@ -422,6 +512,22 @@ const void *fs_read_file(const char *filename, uint64_t *out_size) {
     fs_abs(filename, abs, sizeof(abs));
     if (!prof_may(abs, 0)) { if (out_size) *out_size = 0; return 0; }
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t rec = 0;
+        int dir = 1;
+        int64_t got;
+        if (ntfs_lookup(abs, &rec, 0, &dir, 0) != 0 || dir) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        got = ntfs_read_file(rec, fs_filebuf, FS_FILEBUF_MAX);
+        if (got < 0) {
+            if (out_size) *out_size = 0;
+            return 0;
+        }
+        if (out_size) *out_size = (uint64_t)got;
+        return fs_filebuf;
+    }
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
         if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
@@ -465,6 +571,19 @@ static int fs_read_range(const char *path, uint64_t offset, void *buf,
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 0)) return -1;
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t rec = 0;
+        int dir = 1;
+        int64_t n;
+        if (ntfs_lookup(abs, &rec, 0, &dir, 0) != 0 || dir) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        n = ntfs_read_range(rec, offset, buf, len);
+        if (n < 0) { fs_errstr = "read failed"; return -1; }
+        *got = (uint32_t)n;
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         exf_dirent_t e;
         if (!exf_lookup(abs, &e) || (e.attr & EXF_ATTR_DIR)) {
@@ -500,6 +619,7 @@ typedef struct {
     int      valid;
     uint64_t size;
     exf_dirent_t exf;
+    uint64_t ntfs_record;     /* resolved once, for FS_NTFS */
     char     path[160];
 } fs_file_t;
 
@@ -521,6 +641,17 @@ static int fs_open(const char *path, fs_file_t *f) {
         if (!prof_may(abs, 0)) return -1;
     }
 
+    if (fs_kind == FS_NTFS) {
+        char abs[256];
+        int dir = 1;
+        fs_abs(path, abs, sizeof(abs));
+        if (ntfs_lookup(abs, &f->ntfs_record, 0, &dir, &f->size) != 0 || dir) {
+            fs_errstr = "not found";
+            return -1;
+        }
+        f->valid = 1;
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         char abs[256];
         fs_abs(path, abs, sizeof(abs));
@@ -548,6 +679,15 @@ static int fs_pread(fs_file_t *f, uint64_t off, void *buf, uint32_t len,
                     uint32_t *got) {
     *got = 0;
     if (!f->valid) { fs_errstr = "file not open"; return -1; }
+    if (f->kind == FS_NTFS) {
+        /* Straight to the record the handle resolved at open time: an
+         * archive read is thousands of small reads and re-walking the
+         * path for each would dominate the cost. */
+        const int64_t n = ntfs_read_range(f->ntfs_record, off, buf, len);
+        if (n < 0) { fs_errstr = "read failed"; return -1; }
+        *got = (uint32_t)n;
+        return 0;
+    }
     if (f->kind == FS_EXFAT) {
         if (exf_read_range(&f->exf, off, (uint8_t *)buf, len, got) != 0) {
             fs_errstr = exf_errstr;
@@ -567,6 +707,33 @@ int fs_write_file(const char *path, const void *data, uint32_t len) {
         return -1;
     }
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t dir = 0;
+        char leaf[256];
+        int rc;
+
+        if (ntfs_split(abs, &dir, leaf, sizeof(leaf)) != 0) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        /* Replace rather than update in place. NTFS's writer creates a
+         * record with its data attribute already sized, so changing a
+         * file's length means rebuilding it -- and delete-then-create is
+         * exactly what exFAT's writer does above, so the two agree about
+         * what "write this file" means. Both halves go through the
+         * journal, so a power loss between them replays to one state or
+         * the other rather than to a directory entry with no record. */
+        if (ntfs_lookup(abs, 0, 0, 0, 0) == 0)
+            ntfs_delete_file(dir, leaf);
+
+        rc = ntfs_create_file(dir, leaf, (const uint8_t *)data, len);
+        if (rc != NTFS_W_OK) {
+            fs_errstr = ntfs_w_errstr;
+            return -1;
+        }
+        ntfs_space_valid = 0;
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         if (exf_write_file(abs, (const uint8_t *)data, len) != 0) {
             fs_errstr = exf_errstr;
@@ -594,6 +761,20 @@ static int fs_delete(const char *path) {
         return -1;
     }
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t dir = 0;
+        char leaf[256];
+        if (ntfs_split(abs, &dir, leaf, sizeof(leaf)) != 0) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        if (ntfs_delete_file(dir, leaf) != NTFS_W_OK) {
+            fs_errstr = ntfs_w_errstr;
+            return -1;
+        }
+        ntfs_space_valid = 0;
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         if (exf_delete(abs) != 0) { fs_errstr = exf_errstr; return -1; }
         return 0;
@@ -611,6 +792,24 @@ int fs_mkdir(const char *path) {
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 1)) return -1;
 
+    if (fs_kind == FS_NTFS) {
+        uint64_t dir = 0;
+        char leaf[256];
+        /* Already there is success, not an error: callers do
+         * fs_mkdir("/etc") before writing into it and do not expect the
+         * second boot to fail. exFAT's writer behaves the same way. */
+        if (ntfs_lookup(abs, 0, 0, 0, 0) == 0) return 0;
+        if (ntfs_split(abs, &dir, leaf, sizeof(leaf)) != 0) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        if (ntfs_mkdir_at(dir, leaf) != NTFS_W_OK) {
+            fs_errstr = ntfs_w_errstr;
+            return -1;
+        }
+        ntfs_space_valid = 0;
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         if (exf_mkdir(abs) != 0) { fs_errstr = exf_errstr; return -1; }
         return 0;
@@ -625,11 +824,28 @@ int fs_mkdir(const char *path) {
 
 typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
 
+static void fs_ntfs_list_adapt(void *ctx, const char *name, uint64_t size,
+                               int is_dir) {
+    ((fs_list_cb)ctx)(name, (uint32_t)size, is_dir);
+}
+
 static int fs_list(const char *path, fs_list_cb cb) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 0)) return -1;
 
+    if (fs_kind == FS_NTFS) {
+        /* The driver hands back a 64-bit size and a context pointer;
+         * this layer's callback takes neither. The adapter is the whole
+         * difference, and it lives here rather than in the driver
+         * because the driver should not know what the desktop's
+         * callback signature happens to be. */
+        if (ntfs_list(abs, fs_ntfs_list_adapt, (void *)cb) != 0) {
+            fs_errstr = "no such directory";
+            return -1;
+        }
+        return 0;
+    }
     if (fs_kind == FS_EXFAT) {
         if (exf_list(abs, (exf_list_cb)cb) != 0) {
             fs_errstr = exf_errstr;

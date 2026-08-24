@@ -36,9 +36,9 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**87,071 lines of C written here**, across 153 files, built as four kernel
+**88,565 lines of C written here**, across 154 files, built as four kernel
 objects plus one for inference, over a user-space C library of its own.
-614 host checks across 14 suites on every build.
+698 host checks across 14 suites on every build.
 
 ---
 
@@ -196,8 +196,11 @@ a protected system is not that correct programs run.
 
 Demand paging to a **256 MB `pagefile.sys`**, 65,536 slots, resolved to one
 raw extent at boot so that **no filesystem code runs inside a page fault** —
-a fault that had to walk exFAT to find its own backing store would deadlock
-the first time it faulted on the filesystem's buffers.
+a fault that had to walk the MFT to find its own backing store would
+deadlock the first time it faulted on a buffer that walk was using. The
+formatter preallocates it as a single run, because that is the only way
+one can be *guaranteed* rather than hoped for, and the kernel refuses to
+enable swap at all rather than use a fragmented one.
 
 - **Clock replacement** over a reverse map from physical frame back to the
   mapping that owns it, revalidated against the page tables before anything
@@ -207,6 +210,84 @@ the first time it faulted on the filesystem's buffers.
   copy-on-write bit that shares the field.
 - **User pages only.** Kernel memory, page tables and shared frames never
   leave RAM. A page the fault handler itself might touch is not a candidate.
+
+## The filesystem, and why it is NTFS
+
+`disk.img` is NTFS, and the system boots from it. It was exFAT for as
+long as this system had a filesystem, and the switch was held back
+deliberately until the writer had somewhere safe to be wrong: a
+half-exercised filesystem writer pointed at the volume holding someone's
+account is the one bug with no recovery.
+
+`tools/mkntfs.py` formats it — there is no `mkntfs(8)` on a Mac, and the
+layout has to be one `src/fs/ntfs/ntfs_ops.c` agrees with byte for byte.
+What the driver implements is the part that actually allocates:
+
+| | |
+|---|---|
+| `$Bitmap` | first-fit cluster allocation, persisted before the caller sees the run |
+| `$MFT` | record allocation past the sixteen system files |
+| data runs | signed-delta encoding, checked against the reader's own decoder |
+| `$INDEX_ROOT` | ordered insert and remove of `$FILE_NAME` entries |
+| paths | per-component resolution from record 5, case-insensitively |
+| ranges | a window out of a file, seeking within the run list |
+| `$UsnJrnl` | change records in the documented v2 format |
+| journal | a write-ahead redo log — payload, then commit, then the write — replayed on mount |
+
+**Two layout decisions are load-bearing**, and both are the formatter's
+job rather than the kernel's:
+
+*Every file is one contiguous run.* Not for speed. Without
+`$ATTRIBUTE_LIST` — which this driver does not write — a file's entire
+run list has to fit inside its own MFT record, and a 937 MB archive
+broken into a few thousand fragments would not. Allocating sequentially
+makes every run list exactly one entry, whatever the file's size. The
+pagefile gets the same treatment for a different reason: the pager
+resolves it to one absolute LBA at boot and cannot use a fragmented one.
+
+*MFT records are 4096 bytes rather than the usual 1024.* A directory
+lives entirely in its resident `$INDEX_ROOT`, so the record size **is**
+the directory capacity: about six entries at 1024, about thirty-five at
+4096. That is the ceiling rather than a preference — the kernel reads a
+record into a 4096-byte buffer and refuses a volume claiming more.
+
+### How it was checked before anything booted from it
+
+Three gates, because "the writer returned success" is not evidence that
+a volume is correct:
+
+- **156 host checks** against scratch images — the run-list encoder
+  against the *decoder*, path resolution including the paths that must
+  *fail*, ranged reads at cluster boundaries and past end-of-file, and
+  the journal replayed against a deliberately interrupted write.
+- **`make verifydisk`** mounts the real 8 GB image with the kernel's own
+  driver, on the host, and compares every seeded file byte for byte
+  against its source — including `wiki.zim`, read in windows through the
+  same ranged path the archive reader uses. Two implementations written
+  from one specification, made to agree about what one of them produced.
+- **A reboot.** The system writes files, an account and a registry hive;
+  the machine is stopped; it comes back and every byte is still there,
+  and the login screen offers the account rather than first-run setup.
+  `make iso EXTRA=-DFS_SELFTEST` runs that check itself, in two halves
+  across two boots.
+
+macOS's own filesystem prober identifies the result as NTFS, volume name
+`Vextro`.
+
+### What is deliberately absent
+
+`$INDEX_ALLOCATION` — a directory that outgrows its record is refused
+rather than split into a B-tree. That is the one functional regression
+against exFAT, and the named next piece of work. Also `$ATTRIBUTE_LIST`,
+compression, and NTFS's own `$LogFile`, whose redo record format is not
+publicly specified: what protects writes here is this system's journal,
+not one Windows would replay. chkdsk has never been run against a volume
+this driver wrote.
+
+exFAT and FAT32 are still in the tree and still mount — a volume made by
+an older build, or a stick from another machine, is read exactly as
+before. What changed is what `make` lays down.
+
 
 ## Hardware drivers
 
@@ -405,7 +486,7 @@ the ISO, generated from a 6.8 MB `.mp4` by ffmpeg.
 | **Scheduler** | Preemptive strict-priority round-robin over 64 threads on the APIC timer at 1 kHz; per-thread FPU state through `fxsave64`/`fxrstor64`; `general-regs-only` handlers; sleep, join, block-on-channel and a frame clock |
 | **Processes** | Ring 3 with its own GDT and TSS, `SYSCALL`/`SYSRET` and a DPL-3 `int 0x80` gate, W^X on every image, absent page zero, faults that kill a thread instead of the machine |
 | **Paging** | Demand paging to a 256 MB contiguous `pagefile.sys` resolved to one raw extent at boot; clock replacement over a frame-to-mapping reverse map; swap slot recorded in bit 10 of the non-present PTE; user pages only |
-| **Filesystem** | **NTFS read *and* write** — `$MFT` record allocation, `$Bitmap` first-fit clusters, signed-delta run lists, `$INDEX_ROOT` insert/remove, `$UsnJrnl` v2 records, write-ahead redo journal. exFAT read/write with 64-bit sizes, FAT32 fallback, ustar ramdisk, GPT and MBR, 8.3 short names, ACLs and SIDs, share modes, change notification |
+| **Filesystem** | **NTFS, read and write — the boot volume** — `$MFT` record allocation, `$Bitmap` first-fit clusters, signed-delta run lists, `$INDEX_ROOT` insert and remove, path resolution, directory enumeration, ranged reads, `$UsnJrnl` v2 records and a write-ahead redo journal replayed on mount. exFAT and FAT32 still mount as secondary volumes; ustar ramdisk, GPT and MBR, 8.3 short names, ACLs and SIDs, share modes, change notification |
 | **Storage** | NVMe, AHCI/SATA, ATA PIO and USB mass storage behind one 512-byte sector view; physical-contiguity resolution and 4K-block read-modify-write |
 | **Network** | lwIP 2.2.1 — IPv4, ARP, ICMP, UDP, DHCP, DNS and a real TCP with reassembly, backoff, window scaling and delayed ACKs — behind the sockets API, eight simultaneous connections. Stateful firewall with connection tracking, NAT, NTP, Intel e1000 |
 | **Wireless** | 802.11 frame layer and a complete WPA2 supplicant: PBKDF2 PMK, the 4-way handshake, PTK/GTK derivation, RFC 3394 key wrap and CCMP — all checked against published vectors. Intel and Realtek PCIe back-ends do the probe, reset, APM sequence, DMA rings and firmware-load protocol *(see the caveat below)* |
@@ -450,7 +531,7 @@ every time.
 
 # Verification
 
-`make test` runs **614 checks across 14 suites** on the host, every build.
+`make test` runs **698 checks across 14 suites** on the host, every build.
 The bar is not "it agrees with itself" — an implementation that is merely
 self-consistent round-trips perfectly and proves nothing:
 
@@ -458,7 +539,7 @@ self-consistent round-trips perfectly and proves nothing:
 |---|---|
 | `ntcrypto`, `aes`, `krb5` | AES against FIPS-197, RFC 3961 n-fold/DK/string-to-key against the RFCs' own vectors, AESENC and the portable path made to agree |
 | `wifi` | PMK against IEEE 802.11i's passphrase vectors, key wrap against RFC 3394, CCMP against RFC 3610, the 4-way handshake against a synthetic authenticator |
-| `ntfs` | 72 checks against a scratch volume — run-list encoder against the *decoder*, every mutation followed by a fresh mount, the journal replayed against a deliberately interrupted write |
+| `ntfs` | 156 checks against scratch volumes — run-list encoder against the *decoder*, path resolution including the paths that must *fail*, ranged reads at cluster boundaries and past end-of-file, directory capacity, every mutation followed by a fresh mount, and the journal replayed against a deliberately interrupted write |
 | `av` | the automaton against the brute-force search it replaced, over 20,000 buffers, under ASan and UBSan |
 | `vmx` | EPT entry format, capability-MSR negotiation, VMCS field encodings decoded against their width/type structure |
 | `media`, `rdp` | bitstream parsing and surface geometry; RDP wire encoders against the bytes the specification prescribes |
@@ -485,7 +566,6 @@ because a repository that blurs it is not worth reading.
 | **Hardware video decode** | The H.264 bitstream parser, surface geometry and colour conversion, all host-verified. The zero-copy design is the substance: the decoder's output surface *is* the window, because the same physical pages are in both the process's page tables and the GPU's GGTT. | **No machine this is built or tested on has an Intel GPU.** QEMU models none, so `igpu_init()` reports "no Intel display controller" and everything from the VCS ring downward is unreachable. The MFX command encodings come from Intel's public documentation; they have not touched silicon, and a misplaced field would show up as an engine hang only hardware can reveal. |
 | **Intel VT-x** | The arithmetic those instructions consume: EPT entry format, control negotiation against the capability MSRs, VMCS field encodings, the long-mode guest's own page tables. 46 host checks. | `query-cpu-model-expansion max` on this QEMU reports **`vmx = False`**, so no `VMXON` or `VMLAUNCH` here has executed or can be made to. It also stops short of `VMLAUNCH` deliberately — entering a guest with no host-resume stub would be worse than not entering one. `vmx_init()` reports *"no VT-x on this processor"* and stays out of the way; the AMD path still says `ready`. |
 | **RDP** | This one *does* run — it is software over TCP and the stack is up in QEMU. `tools/rdp_probe.py` drives a real connection through all eight handshake stages from the host. | The session is **plaintext**: it negotiates `PROTOCOL_RDP` with `ENCRYPTION_METHOD_NONE`, which is legal and real clients support it, but keystrokes, the login password and the screen contents are in the clear, and there is no server authentication. `rdp_is_encrypted()` returns 0 and the terminal says so before anyone starts the service. Sustained bitmap streaming is not proven — the encoders are correct and unit-tested, but long sessions have stalled on this transport and that has not been root-caused. |
-| **NTFS** | Read and write, 72 checks against scratch images, and it is compiled into the kernel with the kernel's own flags. | **It is not the boot volume** — `disk.img` is still exFAT, and until a volume that matters has nothing to lose, that is where it stays. `$INDEX_ALLOCATION` is absent (a directory that outgrows its record is refused, not split into a B-tree), as are `$ATTRIBUTE_LIST`, compression, and NTFS's own `$LogFile` — whose redo format is not publicly specified, so what protects writes here is this system's journal and not one Windows would replay. |
 
 ## Not implemented
 
@@ -754,7 +834,7 @@ hypervisor to ask.
 make run RES=1920x1080x32   # display mode, up to the back buffer's bound
 make run NATIVE=1           # render at the panel's own resolution
 make cleandisk              # reset disk.img to factory contents
-make test                   # 614 host checks
+make test                   # 698 host checks
 make repo                   # serve the package repository on :8000
 ```
 

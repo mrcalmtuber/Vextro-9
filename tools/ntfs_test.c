@@ -118,7 +118,10 @@ static void test_mount_and_read(void) {
 
     expect(remount() == 0, "the volume mounts");
     expect_eq(ntfs.bytes_per_cluster, 4096, "cluster size is 4096");
-    expect_eq(ntfs.bytes_per_record, 1024, "MFT record size is 1024");
+    /* 4096 rather than Windows' usual 1024: a directory lives entirely
+     * in its resident $INDEX_ROOT here, so the record size *is* the
+     * directory capacity. See the note in tools/mkntfs.py. */
+    expect_eq(ntfs.bytes_per_record, 4096, "MFT record size is 4096");
 
     /* Record 5 is always the root directory, and it must be a
      * directory with an index. */
@@ -498,12 +501,330 @@ static void test_fixups(void) {
            "refuses  a record with a torn sector");
 }
 
+
+/* ===== 7. paths, listings and ranges =====
+ *
+ * Everything above names files by MFT record, which is how the write
+ * engine was checked while NTFS was a validated driver with no callers.
+ * The volume boots the system now, so the layer the desktop actually
+ * calls -- paths, directory listings, byte ranges -- gets the same
+ * treatment.
+ *
+ * These run against a second image with a directory tree in it, because
+ * a path walker checked only against a flat volume never walks.
+ */
+
+static const char *TREE_IMG = 0;
+
+static int tree_mount(void) {
+    ntfs_host_close();
+    if (ntfs_host_open(TREE_IMG) != 0) return -1;
+    ntfs.mounted = 0;
+    ntfs_bmp.loaded = 0;
+    if (!ntfs_try(0)) return -1;
+    return 0;
+}
+
+static void test_lookup(void) {
+    uint64_t rec = 0, parent = 0, size = 0;
+    int is_dir = -1;
+
+    printf("\npath resolution\n");
+
+    expect(tree_mount() == 0, "the tree volume mounts");
+
+    expect(ntfs_lookup("/", &rec, 0, &is_dir, 0) == 0, "the root resolves");
+    expect_eq(rec, NTFS_MFT_ROOT, "  to record 5");
+    expect(is_dir == 1, "  and is a directory");
+
+    expect(ntfs_lookup("/a.txt", &rec, &parent, &is_dir, &size) == 0,
+           "a file in the root resolves");
+    expect(is_dir == 0, "  and is not a directory");
+    expect_eq(parent, NTFS_MFT_ROOT, "  with the root as its parent");
+    expect_eq(size, 20, "  and the size the formatter wrote");
+
+    expect(ntfs_lookup("/docs", 0, 0, &is_dir, 0) == 0,
+           "a subdirectory resolves");
+    expect(is_dir == 1, "  as a directory");
+
+    expect(ntfs_lookup("/docs/readme.txt", &rec, &parent, &is_dir, &size) == 0,
+           "a file one level down resolves");
+    expect(is_dir == 0, "  as a file");
+    expect_eq(size, 26, "  with its own size");
+    {
+        uint64_t droot = 0;
+        ntfs_lookup("/docs", &droot, 0, 0, 0);
+        expect_eq(parent, droot, "  and /docs as its parent");
+    }
+
+    expect(ntfs_lookup("/store/pkg/big.bin", &rec, 0, &is_dir, &size) == 0,
+           "a file two levels down resolves");
+    expect_eq(size, 300000, "  with the right size");
+
+    /* The failures, which matter more than the successes: a lookup that
+     * quietly returns the root for a bad path would make every caller
+     * read the wrong file. */
+    expect(ntfs_lookup("/nope.txt", 0, 0, 0, 0) != 0,
+           "a missing file is refused");
+    expect(ntfs_lookup("/docs/nope.txt", 0, 0, 0, 0) != 0,
+           "  as is a missing file in a real directory");
+    expect(ntfs_lookup("/nodir/readme.txt", 0, 0, 0, 0) != 0,
+           "  as is a path through a missing directory");
+    expect(ntfs_lookup("/a.txt/child", 0, 0, 0, 0) != 0,
+           "  and a path *through a file* is refused, not followed");
+
+    /* Case folding, to match the exFAT driver this replaces --
+     * everything above the filesystem was written against a folding
+     * volume, and /Etc and /etc being different would break it. */
+    expect(ntfs_lookup("/A.TXT", &rec, 0, 0, 0) == 0,
+           "lookup folds case");
+    expect(ntfs_lookup("/DOCS/ReadMe.TXT", 0, 0, 0, &size) == 0,
+           "  at every component");
+    expect_eq(size, 26, "  and finds the same file");
+
+    /* Leading and repeated separators are the shapes a path arrives in
+     * when it has been joined from two halves. */
+    expect(ntfs_lookup("//docs//readme.txt", 0, 0, 0, 0) == 0,
+           "repeated separators are ignored");
+    expect(ntfs_lookup("/docs/", 0, 0, &is_dir, 0) == 0,
+           "a trailing separator is ignored");
+}
+
+/* ---- listing ---- */
+
+typedef struct {
+    char names[32][64];
+    uint64_t sizes[32];
+    int dirs[32];
+    int n;
+} list_ctx_t;
+
+static void list_cb(void *ctx, const char *name, uint64_t size, int is_dir) {
+    list_ctx_t *l = (list_ctx_t *)ctx;
+    if (l->n >= 32) return;
+    snprintf(l->names[l->n], sizeof(l->names[0]), "%s", name);
+    l->sizes[l->n] = size;
+    l->dirs[l->n]  = is_dir;
+    l->n++;
+}
+
+static int list_has(const list_ctx_t *l, const char *name, int is_dir) {
+    for (int i = 0; i < l->n; i++)
+        if (strcmp(l->names[i], name) == 0 && l->dirs[i] == is_dir) return 1;
+    return 0;
+}
+
+static void test_list(void) {
+    list_ctx_t l;
+
+    printf("\ndirectory listing\n");
+
+    expect(tree_mount() == 0, "remounted");
+
+    l.n = 0;
+    expect(ntfs_list("/", list_cb, &l) == 0, "the root lists");
+    expect(list_has(&l, "a.txt", 0), "  and contains a.txt as a file");
+    expect(list_has(&l, "docs", 1), "  and docs as a directory");
+    expect(list_has(&l, "store", 1), "  and store as a directory");
+    expect(list_has(&l, "pagefile.sys", 0), "  and the pagefile");
+
+    /* The system files are on the volume and in record 0-15, but a
+     * listing that showed $MFT would be true and useless. */
+    {
+        int sys = 0;
+        for (int i = 0; i < l.n; i++) if (l.names[i][0] == '$') sys++;
+        expect_eq(sys, 0, "  and no $-prefixed system files");
+    }
+
+    l.n = 0;
+    expect(ntfs_list("/docs", list_cb, &l) == 0, "a subdirectory lists");
+    expect_eq(l.n, 1, "  with one entry");
+    expect(list_has(&l, "readme.txt", 0), "  which is readme.txt");
+    expect_eq(l.sizes[0], 26, "  at its real size");
+
+    l.n = 0;
+    expect(ntfs_list("/store/pkg", list_cb, &l) == 0, "a nested one lists");
+    expect(list_has(&l, "big.bin", 0), "  and holds big.bin");
+
+    expect(ntfs_list("/a.txt", list_cb, &l) != 0,
+           "listing a *file* is refused");
+    expect(ntfs_list("/nodir", list_cb, &l) != 0,
+           "  as is listing something absent");
+}
+
+/* ---- ranged reads ---- */
+
+static void test_read_range(void) {
+    static uint8_t whole[300000];
+    static uint8_t part[70000];
+    uint64_t rec = 0;
+    int64_t got;
+
+    printf("\nranged reads\n");
+
+    expect(tree_mount() == 0, "remounted");
+    expect(ntfs_lookup("/store/pkg/big.bin", &rec, 0, 0, 0) == 0,
+           "the large file resolves");
+
+    got = ntfs_read_file(rec, whole, sizeof(whole));
+    expect_eq((uint64_t)got, 300000, "it reads whole");
+
+    /* A range from the start must equal the same bytes read whole --
+     * the two paths through the run list have to agree. */
+    got = ntfs_read_range(rec, 0, part, 1000);
+    expect_eq((uint64_t)got, 1000, "a range from zero reads");
+    expect(memcmp(part, whole, 1000) == 0, "  and matches the whole read");
+
+    /* Not on a cluster boundary, which is the case a run walk that only
+     * counts whole clusters gets wrong. */
+    got = ntfs_read_range(rec, 1, part, 1000);
+    expect_eq((uint64_t)got, 1000, "a range at offset 1 reads");
+    expect(memcmp(part, whole + 1, 1000) == 0, "  and matches");
+
+    got = ntfs_read_range(rec, 4095, part, 2);
+    expect_eq((uint64_t)got, 2, "a range straddling a cluster boundary reads");
+    expect(memcmp(part, whole + 4095, 2) == 0, "  and matches");
+
+    got = ntfs_read_range(rec, 4096, part, 4096);
+    expect_eq((uint64_t)got, 4096, "a whole aligned cluster reads");
+    expect(memcmp(part, whole + 4096, 4096) == 0, "  and matches");
+
+    got = ntfs_read_range(rec, 100003, part, 70000);
+    expect_eq((uint64_t)got, 70000, "a long unaligned range reads");
+    expect(memcmp(part, whole + 100003, 70000) == 0, "  and matches");
+
+    /* The ends. Reading past the end is a short read, not an error and
+     * not a buffer overrun. */
+    got = ntfs_read_range(rec, 299000, part, 5000);
+    expect_eq((uint64_t)got, 1000, "a range past the end is short");
+    expect(memcmp(part, whole + 299000, 1000) == 0, "  and matches");
+    got = ntfs_read_range(rec, 300000, part, 100);
+    expect_eq((uint64_t)got, 0, "a range starting at the end reads nothing");
+    got = ntfs_read_range(rec, 999999, part, 100);
+    expect_eq((uint64_t)got, 0, "a range well past the end reads nothing");
+
+    /* A small file is resident -- it lives inside its own MFT record --
+     * so the range path has a second implementation that also has to be
+     * right. */
+    expect(ntfs_lookup("/docs/readme.txt", &rec, 0, 0, 0) == 0,
+           "the small file resolves");
+    got = ntfs_read_file(rec, whole, sizeof(whole));
+    expect_eq((uint64_t)got, 26, "it reads whole");
+    got = ntfs_read_range(rec, 6, part, 10);
+    expect_eq((uint64_t)got, 10, "a range inside a resident file reads");
+    expect(memcmp(part, whole + 6, 10) == 0, "  and matches");
+    got = ntfs_read_range(rec, 20, part, 100);
+    expect_eq((uint64_t)got, 6, "  and is short at its end");
+}
+
+/* ---- free space, and the pagefile's single extent ---- */
+
+static void test_space_and_extent(void) {
+    uint64_t total = 0, freec = 0, rec = 0, lba = 0, bytes = 0;
+
+    printf("\nfree space and the pagefile\n");
+
+    expect(tree_mount() == 0, "remounted");
+
+    expect(ntfs_space(&total, &freec) == 0, "the volume reports its space");
+    /* Derived from the image rather than written down, so resizing the
+     * scratch volume does not turn into a failing assertion about a
+     * number that was never the point. */
+    expect_eq(total, (uint64_t)(ntfs_host_size() / ntfs.bytes_per_cluster),
+              "  total clusters match the volume");
+    expect(freec > 0 && freec < total, "  and free is between none and all");
+    /* 256 MB of pagefile is 65536 clusters, so at least that much must
+     * read as used. A bitmap counted backwards would say the opposite. */
+    expect(total - freec >= 65536,
+           "  with at least the pagefile counted as used");
+
+    expect(ntfs_lookup("/pagefile.sys", &rec, 0, 0, &bytes) == 0,
+           "the pagefile resolves");
+    expect_eq(bytes, 256ULL * 1024 * 1024, "  at 256 MB");
+
+    expect(ntfs_single_extent(rec, 256ULL * 1024 * 1024, &lba, &bytes) == 0,
+           "and is exactly one extent");
+    expect(bytes >= 256ULL * 1024 * 1024, "  covering the whole file");
+    expect(lba > 0, "  at a real LBA");
+    expect_eq(lba % 8, 0, "  cluster-aligned");
+
+    /* The refusals. A swapper handed the first run of a fragmented file
+     * would write pages over whatever followed it, so anything short of
+     * one whole run has to fail. */
+    expect(ntfs_single_extent(rec, 512ULL * 1024 * 1024, 0, 0) != 0,
+           "a request larger than the file is refused");
+    /* A resident file -- one small enough to live inside its own MFT
+     * record -- has no runs at all, and must be refused rather than
+     * read as an extent at cluster zero. The formatter always writes
+     * non-resident data, so the only way to get one is to have the
+     * kernel create it, which is also the case that matters: a pagefile
+     * small enough to go resident would otherwise resolve to garbage. */
+    {
+        uint64_t small = 0;
+        ntfs_journal_init(0, 64 * 1024 * 1024 / 512);
+        expect_eq(ntfs_create_file(NTFS_MFT_ROOT, "tiny.txt",
+                                   (const uint8_t *)"hi", 2), NTFS_W_OK,
+                  "a two-byte file is created");
+        expect(ntfs_lookup("/tiny.txt", &small, 0, 0, 0) == 0,
+               "  and resolves");
+        {
+            uint8_t rec[4096];
+            const ntfs_attr_t *d;
+            expect(ntfs_read_record(small, rec) == 0, "  its record reads");
+            d = ntfs_find_attr(rec, NTFS_ATTR_DATA);
+            expect(d && !d->non_resident, "  and its data is resident");
+        }
+        expect(ntfs_single_extent(small, 2, 0, 0) != 0,
+               "  so it is refused as an extent");
+    }
+}
+
+/* ---- how many entries a directory actually holds ---- */
+
+static void test_directory_capacity(void) {
+    uint64_t root = NTFS_MFT_ROOT;
+    int made = 0;
+
+    printf("\ndirectory capacity\n");
+
+    expect(tree_mount() == 0, "remounted");
+    ntfs_journal_init(0, 512 * 1024 * 1024 / 512);
+
+    /* Fill the root until it refuses, which is the documented ceiling:
+     * a directory lives in its resident $INDEX_ROOT and there is no
+     * $INDEX_ALLOCATION, so it holds what fits in one MFT record. The
+     * number is asserted rather than described so that a change to the
+     * record size or the entry layout shows up here. */
+    for (int i = 0; i < 200; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "fill%03d.txt", i);
+        if (ntfs_create_file(root, nm, (const uint8_t *)"x", 1) != NTFS_W_OK)
+            break;
+        made++;
+    }
+
+    printf("       (the root took %d more entries before it filled)\n", made);
+    expect(made >= 20, "a 4096-byte record holds at least twenty more names");
+    expect(made < 200, "  and does fill, rather than growing forever");
+
+    /* And it fails cleanly: the refusal is ENOSPC with a message, not a
+     * corrupt index. Everything still resolves afterwards. */
+    {
+        uint64_t rec = 0;
+        expect(ntfs_lookup("/a.txt", &rec, 0, 0, 0) == 0,
+               "  and the directory still resolves afterwards");
+        expect(ntfs_lookup("/docs/readme.txt", &rec, 0, 0, 0) == 0,
+               "  including through its subdirectories");
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: ntfs_test <image>\n");
         return 2;
     }
     IMG = argv[1];
+    TREE_IMG = (argc > 2) ? argv[2] : 0;
 
     printf("Vextro NTFS: allocation, records, indexes, journal\n");
     printf("==================================================\n");
@@ -519,6 +840,17 @@ int main(int argc, char **argv) {
     test_allocation();
     test_create_read_delete();
     test_journal();
+
+    if (TREE_IMG) {
+        test_lookup();
+        test_list();
+        test_read_range();
+        test_space_and_extent();
+        test_directory_capacity();
+    } else {
+        printf("\n(no tree image given: skipping paths, listings and "
+               "ranges)\n");
+    }
 
     ntfs_host_close();
     printf("\n%d checks, %d failures\n", checks, fails);

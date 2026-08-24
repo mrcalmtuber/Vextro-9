@@ -5,30 +5,24 @@
  * src/fs/ntfs/ntfs.h — what the rest of the kernel may call in the NTFS
  * module.
  *
- * ---- a note on what is and is not wired up ----
+ * ---- this is the boot volume ----
  *
- * Everything below is compiled into the kernel and callable. Only
- * ntfs_mount() is currently *called* from it: this system still boots
- * from exFAT, so no file operation routes through here yet, and the
- * writer's only caller today is tools/ntfs_test.c against scratch
- * images. That is a deliberate state rather than an unfinished one — a
- * half-exercised filesystem writer pointed at the volume holding the
- * user's account is the single bug with no recovery, so the switch was
- * left as its own decision.
+ * It was not always. For a long time the writer here was compiled,
+ * host-tested against scratch images, and called by nothing: the system
+ * booted from exFAT, and pointing a half-exercised filesystem writer at
+ * the volume holding someone's account is the one bug with no recovery.
  *
- * Before the split these declarations did not exist and the writer was
- * not in the kernel image at all: src/ntfswrite.h was included by
- * nothing except the host test, so roughly 1,200 lines of it compiled
- * only on the build machine. Naming the interface here is what puts it
- * in the kernel, which means it is now built with the kernel's warning
- * set and its own flags on every build rather than only when the test
- * suite runs.
+ * That changed with the surface at the bottom of this file. Everything
+ * above names files by MFT record, which is NTFS's own way of doing it
+ * and enough for a driver with no callers. A volume the desktop mounts
+ * has to answer what is at /etc/policy.cfg, what is in /store/pkg, and
+ * what the sixty-four kilobytes four hundred megabytes into wiki.zim
+ * are — so paths, listings and ranged reads are here too, and
+ * src/desktop.h dispatches to them.
  *
- * ---- error codes ----
- *
- * The write calls return NTFS_W_OK or a negative code; those constants
- * live with their explanations in ntfs_ops.c, and callers should test
- * against zero rather than against a particular failure.
+ * exFAT and FAT32 are still in the tree and still mount. The boot
+ * volume moved; the ability to read a volume made by an older build, or
+ * a stick from another machine, did not.
  */
 
 #include <stdint.h>
@@ -93,5 +87,89 @@ int ntfs_journal_init(uint64_t part_lba, uint64_t part_sectors);
  * makes a torn write recoverable. Returns the number applied.
  */
 int ntfs_journal_replay(void);
+
+/* ===== THE FILESYSTEM SURFACE =====
+ *
+ * Everything above names files by MFT record, which is NTFS's own way of
+ * doing it. Everything below speaks paths, because the volume this
+ * driver mounts is now the one the system boots from, and the desktop
+ * asks for /etc/policy.cfg rather than for record 43.
+ */
+
+/*
+ * Resolve an absolute path. Any of the four outputs may be null.
+ *
+ * `out_parent` is the record of the directory holding the last
+ * component — every write needs it, and returning it here saves the
+ * caller a second walk down the same path.
+ *
+ * Case-insensitive, matching the exFAT driver this replaces: everything
+ * above the filesystem was written against a folding volume.
+ */
+int ntfs_lookup(const char *path, uint64_t *out_record, uint64_t *out_parent,
+                int *out_is_dir, uint64_t *out_size);
+
+/* Called once per entry by ntfs_list, in the order the index holds them
+ * (which NTFS keeps sorted). Names are ASCII; a code point that does not
+ * fit a byte arrives as '?'. */
+typedef void (*ntfs_list_cb_t)(void *ctx, const char *name,
+                               uint64_t size, int is_dir);
+
+/* Enumerate a directory by path. Returns -1 if it is not a directory
+ * here. System files (`$MFT` and the rest of records 0–15) are omitted:
+ * listing them would be true and useless. */
+int ntfs_list(const char *path, ntfs_list_cb_t cb, void *ctx);
+
+/*
+ * A byte range from a file, by record.
+ *
+ * This is what makes a 937 MB encyclopedia readable on a machine that
+ * cannot hold one — the archive reader asks for a window at a time.
+ * Returns bytes read (short at end of file) or -1. Handles resident
+ * files, sparse runs, and ranges that start part-way into a cluster.
+ */
+int64_t ntfs_read_range(uint64_t record, uint64_t offset,
+                        void *buf, uint64_t len);
+
+/* Total and free clusters, counted out of $Bitmap rather than tracked —
+ * a count maintained separately from the thing it counts is one that
+ * drifts. One pass, for `df` and the settings panel. */
+int ntfs_space(uint64_t *out_total, uint64_t *out_free);
+
+uint32_t ntfs_cluster_bytes(void);
+
+/* Whether a volume is mounted, what the mount decided, and how big it
+ * is. The volume state itself stays inside the module. */
+int         ntfs_mounted(void);
+const char *ntfs_status(void);
+uint64_t    ntfs_total_clusters(void);
+
+/* Why the last write call failed. Set by every NTFS_W_* return that is
+ * not NTFS_W_OK, so the filesystem layer can report a reason rather
+ * than a number. */
+extern const char *ntfs_w_errstr;
+
+/* The write-call return codes, so callers can compare against OK
+ * rather than against zero and hope. */
+#define NTFS_W_OK            0
+#define NTFS_W_NOSPACE      -1
+#define NTFS_W_IO           -2
+#define NTFS_W_EXISTS       -3
+#define NTFS_W_NOTFOUND     -4
+#define NTFS_W_TOOBIG       -5
+#define NTFS_W_READONLY     -6
+
+/*
+ * Where a file's data physically starts, if and only if it is exactly
+ * one non-sparse run of at least `need_bytes`.
+ *
+ * For the pagefile and nothing else: src/swap.h resolves its backing
+ * store to one absolute LBA at boot so that no filesystem code runs
+ * inside a page fault. Fragmented, sparse, resident or short is refused
+ * rather than partially accepted — a swapper that quietly used the first
+ * run of a fragmented file would write pages over whatever followed it.
+ */
+int ntfs_single_extent(uint64_t record, uint64_t need_bytes,
+                       uint64_t *out_lba, uint64_t *out_bytes);
 
 #endif /* VEXTRO_FS_NTFS_H */
