@@ -541,11 +541,6 @@ done:
  * Stated plainly, because the gap between "writes NTFS" and "writes all
  * of NTFS" is where a filesystem eats data.
  *
- *   $INDEX_ALLOCATION      Directories live entirely in the resident
- *                          $INDEX_ROOT. When one fills, this reports
- *                          ENOSPC rather than splitting into a B-tree.
- *                          A directory holds roughly forty entries.
- *
  *   $ATTRIBUTE_LIST        A file whose attributes outgrow one MFT
  *                          record needs its attributes spread across
  *                          several. Not implemented; a file that would
@@ -820,11 +815,16 @@ static int ntfs_write_record(uint64_t number, uint8_t *rec) {
         ntfs_w_errstr = "record has no update sequence array";
         return NTFS_W_IO;
     }
+    /* And undone below, for the reason spelled out in ix_block_write:
+     * a written buffer is not the buffer that was written, and callers
+     * here go on using it. */
     if (ntfs_journal_write_run(ntfs_record_lba(number),
                                ntfs.bytes_per_record / 512, rec) != 0) {
+        ntfs_apply_fixups(rec, ntfs.bytes_per_record, 512);
         ntfs_w_errstr = "write failed";
         return NTFS_W_IO;
     }
+    ntfs_apply_fixups(rec, ntfs.bytes_per_record, 512);
     return NTFS_W_OK;
 }
 
@@ -1248,161 +1248,1605 @@ static int ntfs_name_cmp(const uint8_t *a_utf16, uint32_t alen,
     return (i == alen) ? -1 : 1;
 }
 
+/* The $FILE_NAME attribute value, whose layout every index entry
+ * embeds. Named rather than open-coded because four functions below
+ * index into it and a wrong offset reads a timestamp as a size. */
+#define NTFS_FN_PARENT      0x00
+#define NTFS_FN_ALLOC_SIZE  0x28
+#define NTFS_FN_REAL_SIZE   0x30
+#define NTFS_FN_FLAGS       0x38
+#define NTFS_FN_NAME_LEN    0x40
+#define NTFS_FN_NAMESPACE   0x41
+#define NTFS_FN_NAME        0x42
+
+#define NTFS_FA_DIRECTORY   0x10000000u
+
+/* An index entry, once the header is past. */
+#define NTFS_IE_REF         0x00        /* child MFT reference, 8 bytes */
+#define NTFS_IE_LEN         0x08        /* entry length,        2 bytes */
+#define NTFS_IE_FNLEN       0x0A        /* $FILE_NAME length,   2 bytes */
+#define NTFS_IE_FLAGS       0x0C        /* bit 1 = last entry           */
+#define NTFS_IE_VALUE       0x10        /* the $FILE_NAME value         */
+
 /*
- * Insert a name into a directory's resident index.
+ * The name out of an index entry, as ASCII.
  *
- * The index is a run of variable-length entries terminated by one with
- * the "last" flag; the new entry goes in collation order before the
- * first entry that sorts after it. Everything from there to the end
- * moves up, which is why this needs the whole record in memory and why
- * a directory that has outgrown its record cannot be handled by moving
- * bytes -- it needs a B-tree split, which is the gap named at the top.
+ * NTFS names are UTF-16. Everything above this driver -- the terminal,
+ * the file manager, the loader -- is byte strings, exactly as it is over
+ * exFAT, whose driver folds the same way. A code point that does not fit
+ * in a byte becomes '?' rather than being silently truncated to its low
+ * half, which would turn two different names into one.
  */
-static int ntfs_index_insert(uint8_t *dir_rec, uint64_t child_ref,
-                             const char *name, int is_dir,
-                             uint64_t real, uint64_t alloc, uint64_t now) {
+static void ntfs_name_to_ascii(const uint8_t *utf16, uint32_t chars,
+                               char *out, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < chars && n + 1 < cap; i++) {
+        const uint16_t c = (uint16_t)(utf16[i * 2] | (utf16[i * 2 + 1] << 8));
+        out[n++] = (c && c < 0x80) ? (char)c : '?';
+    }
+    out[n] = '\0';
+}
+
+typedef int (*ntfs_index_cb_t)(void *ctx, const uint8_t *entry,
+                              const char *name);
+
+/* ===========================================================
+ * $INDEX_ALLOCATION: the directory B-tree
+ * ===========================================================
+ *
+ * A directory's names live in an index, and until this existed the
+ * index was one resident $INDEX_ROOT inside the directory's own MFT
+ * record. That holds about thirty-five names in a 4096-byte record and
+ * then the directory is full -- which is a filesystem that works right
+ * up until somebody uses it.
+ *
+ * NTFS's answer is a B-tree. $INDEX_ROOT stays in the record and
+ * becomes the root node; the rest of the tree lives in $INDEX_ALLOCATION,
+ * a non-resident attribute divided into fixed-size *index blocks*, each
+ * one an "INDX" record with its own update sequence. A third attribute,
+ * $BITMAP, records which blocks are in use. All three are named "$I30",
+ * which is how a directory index is distinguished from any other index
+ * on the same file.
+ *
+ * ---- the shape of a node ----
+ *
+ * Every node is a run of variable-length entries in collation order,
+ * ending with one that carries no name and has the "last" flag. If the
+ * node has children, *every* entry including the last carries an 8-byte
+ * VCN in its final eight bytes, and that child holds the keys that sort
+ * *before* the entry. The last entry's child therefore holds everything
+ * after the final name, which is why forgetting it silently loses the
+ * rightmost subtree of every node in the tree.
+ *
+ * Entries live in both leaves and interior nodes -- this is a B-tree
+ * rather than a B+tree, and a name appears exactly once. That is what
+ * makes deletion interesting: removing a name that is acting as a
+ * separator has to put something in its place.
+ *
+ * ---- the block layout, which has one trap in it ----
+ *
+ *     0x00  "INDX"
+ *     0x04  update sequence offset (0x28) and count
+ *     0x08  $LogFile sequence number
+ *     0x10  this block's VCN
+ *     0x18  the index header: entries offset, used, allocated, flags
+ *     0x28  the update sequence array
+ *     0x40  entries
+ *
+ * The entries start after the update sequence array, not immediately
+ * after the header, and every offset in the index header is relative to
+ * the header at 0x18 rather than to the block. Writing entries at 0x28
+ * puts them underneath the fixup array, and the first write installs
+ * sequence numbers over the top of real data.
+ *
+ * ---- what is guaranteed when the power fails ----
+ *
+ * Index blocks are written through the same write-ahead journal as
+ * everything else, but a split touches several of them and the journal
+ * makes single writes atomic rather than whole operations. So the
+ * ordering is the guarantee: **a child is durable before anything
+ * points at it**. Blocks are written here; the directory's MFT record
+ * is written by the caller, afterwards, exactly as create and delete
+ * already do it. An interruption therefore leaves a consistent tree and
+ * at most a leaked index block -- never a pointer into a block that was
+ * never written.
+ */
+
+/* The index header, at 0x18 in a block and at +16 in $INDEX_ROOT. */
+#define IX_HDR_ENTRIES_OFF  0x00
+#define IX_HDR_USED         0x04
+#define IX_HDR_ALLOC        0x08
+#define IX_HDR_FLAGS        0x0C
+#define IX_HDR_SIZE         0x10
+
+#define IX_HDR_LARGE        0x01        /* this node has children */
+
+/* An entry. */
+#define IE_REF              0x00
+#define IE_LEN              0x08
+#define IE_KEYLEN           0x0A
+#define IE_FLAGS            0x0C
+#define IE_KEY              0x10
+
+#define IE_HAS_CHILD        0x01
+#define IE_LAST             0x02
+
+/* An INDX block. */
+#define IXB_HDR             0x18        /* where the index header sits */
+#define IXB_USA             0x28        /* the update sequence array   */
+
+/* How deep a directory may get. Four levels of a tree whose nodes hold
+ * thirty-odd entries is on the order of a million names; eight is far
+ * past anything this system will see, and the limit exists so that a
+ * corrupt volume with a cycle in it stops rather than descending
+ * forever. */
+#define IX_MAX_DEPTH        8
+
+/*
+ * The largest an entry can be: the header, a 255-character name, and a
+ * downlink. A node is split on the way down whenever it has less than
+ * this free, which is what makes the descent one-way -- the level below
+ * can never promote something the level above cannot hold.
+ */
+#define IX_MAX_ENTRY  ntfs_align8(IE_KEY + 0x42 + 255 * 2 + 8)
+
+/*
+ * The buffers a descent needs: one block per level, and two more for
+ * the halves of a split.
+ *
+ * These are named after their owner deliberately. ntfs_rec belongs to
+ * whoever is reading a file record, ntfs_w_rec to the write path,
+ * ntfs_dirrec to a path walk -- and an index descent runs *inside* an
+ * operation that is already holding one of them. Sharing any of them is
+ * the aliasing bug that costs a directory.
+ */
+static uint8_t  ntfs_ix_path[IX_MAX_DEPTH][4096];   /* the descent      */
+static uint64_t ntfs_ix_path_vcn[IX_MAX_DEPTH];
+static uint32_t ntfs_ix_path_off[IX_MAX_DEPTH];     /* entry followed   */
+static uint8_t  ntfs_ix_succ[IX_MAX_DEPTH][4096];   /* successor hunt   */
+static uint8_t  ntfs_ix_walk[IX_MAX_DEPTH][4096];   /* enumeration      */
+static uint8_t  ntfs_ix_split[4096];                /* the new right half */
+static uint8_t  ntfs_ix_scratch[4096];              /* rebuilding a node  */
+
+/*
+ * Two counters, because the paths they measure cannot be reached on
+ * purpose from outside and a test that assumed they ran would be
+ * testing nothing.
+ *
+ * ntfs_ix_splits counts nodes split -- the tree growing sideways.
+ * ntfs_ix_promote_grew counts the case that only a delete can produce:
+ * a separator replaced by its successor, where the successor's name is
+ * *longer* than the one it stands in for, so removing an entry needed
+ * more room than it freed.
+ */
+static uint32_t ntfs_ix_splits = 0;
+static uint32_t ntfs_ix_promote_grew = 0;
+
+/* ---- reading the shape ---- */
+
+static uint32_t ix_used(const uint8_t *hdr) {
+    return ntfs_get32(hdr + IX_HDR_USED);
+}
+static uint32_t ix_flags(const uint8_t *hdr) {
+    return ntfs_get32(hdr + IX_HDR_FLAGS);
+}
+static uint8_t *ix_first(uint8_t *hdr) {
+    return hdr + ntfs_get32(hdr + IX_HDR_ENTRIES_OFF);
+}
+static uint8_t *ix_end(uint8_t *hdr) {
+    return hdr + ix_used(hdr);
+}
+static uint16_t ie_len(const uint8_t *e)    { return (uint16_t)(e[IE_LEN] |
+                                                     (e[IE_LEN + 1] << 8)); }
+static uint16_t ie_keylen(const uint8_t *e) { return (uint16_t)(e[IE_KEYLEN] |
+                                                  (e[IE_KEYLEN + 1] << 8)); }
+static uint32_t ie_flags(const uint8_t *e)  { return ntfs_get32(e + IE_FLAGS); }
+
+/* The child pointer is the last eight bytes of the entry, wherever the
+ * key happens to end -- not a fixed offset. */
+static uint64_t ie_vcn(const uint8_t *e) {
+    return ntfs_get64(e + ie_len(e) - 8);
+}
+static void ie_set_vcn(uint8_t *e, uint64_t vcn) {
+    ntfs_put64(e + ie_len(e) - 8, vcn);
+}
+
+/* The index block size, out of $INDEX_ROOT's own header. */
+static uint32_t ix_block_size(const uint8_t *ir_body) {
+    const uint32_t n = ntfs_get32(ir_body + 0x08);
+    return n ? n : ntfs.bytes_per_cluster;
+}
+
+/* Where entries begin in a fresh block: past the header and past the
+ * update sequence array, rounded up to eight. */
+static uint32_t ix_block_entries_off(uint32_t block_size) {
+    const uint32_t usa = block_size / 512 + 1;
+    return ntfs_align8(IXB_USA + usa * 2) - IXB_HDR;
+}
+
+/* $INDEX_ROOT's body, and the node header inside it. */
+static uint8_t *ix_root_body(uint8_t *dir_rec) {
+    ntfs_attr_t *ir = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
+                                                    NTFS_ATTR_INDEX_ROOT);
+    if (!ir || ir->non_resident) return 0;
+    return (uint8_t *)ir + ir->u.res.value_offset;
+}
+static uint8_t *ix_root_hdr(uint8_t *dir_rec) {
+    uint8_t *b = ix_root_body(dir_rec);
+    return b ? b + 16 : 0;
+}
+
+/*
+ * Resize $INDEX_ROOT by `delta` bytes, moving every attribute after it
+ * and fixing the record's used size.
+ *
+ * The root is resident, so it grows and shrinks inside the MFT record,
+ * and anything following it -- $INDEX_ALLOCATION and $BITMAP, once they
+ * exist -- has to move with it.
+ */
+static int ix_root_resize(uint8_t *dir_rec, int32_t delta) {
     ntfs_record_t *h = (ntfs_record_t *)dir_rec;
     ntfs_attr_t *ir = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
                                                     NTFS_ATTR_INDEX_ROOT);
-    uint8_t *root, *node, *p, *end;
-    uint8_t entry[16 + 0x42 + 255 * 2];
-    uint8_t fnval[0x42 + 255 * 2];
-    uint32_t fnlen, elen;
-    uint32_t grow;
+    uint8_t *after;
+    uint32_t tail;
 
-    if (!ir || ir->non_resident) {
-        ntfs_w_errstr = "directory index is not resident";
-        return NTFS_W_IO;
-    }
-
-    root = (uint8_t *)ir + ir->u.res.value_offset;
-    node = root + 16;                   /* past the index root header   */
-
-    fnlen = ntfs_build_filename_value(fnval, ((uint64_t)h->sequence << 48) |
-                                      (uint64_t)(uintptr_t)0, name, is_dir,
-                                      real, alloc, now);
-    /* the parent reference is filled by the caller's record number */
-    elen = ntfs_align8(16 + fnlen);
-
-    for (uint32_t i = 0; i < elen; i++) entry[i] = 0;
-    ntfs_put64(entry + 0x00, child_ref);
-    ntfs_put16(entry + 0x08, (uint16_t)elen);
-    ntfs_put16(entry + 0x0A, (uint16_t)fnlen);
-    ntfs_put32(entry + 0x0C, 0);
-    for (uint32_t i = 0; i < fnlen; i++) entry[16 + i] = fnval[i];
-
-    /* Does it fit? The record's used size plus the entry must stay
-     * inside the record. */
-    grow = elen;
-    if (h->used_size + grow > ntfs.bytes_per_record) {
-        ntfs_w_errstr = "directory full (index would need a B-tree node)";
+    if (!ir) return NTFS_W_IO;
+    if (delta > 0 &&
+        h->used_size + (uint32_t)delta > ntfs.bytes_per_record) {
+        ntfs_w_errstr = "no room in the directory record";
         return NTFS_W_NOSPACE;
     }
 
-    /* Find the insertion point. */
-    p = node + (uint32_t)(node[0] | (node[1] << 8) | (node[2] << 16) |
-                          ((uint32_t)node[3] << 24));
-    end = node + (uint32_t)(node[4] | (node[5] << 8) | (node[6] << 16) |
-                            ((uint32_t)node[7] << 24));
+    after = (uint8_t *)ir + ir->length;
+    tail  = (uint32_t)(dir_rec + h->used_size - after);
 
-    while (p < end) {
-        uint16_t this_len = (uint16_t)(p[8] | (p[9] << 8));
-        uint32_t flags = (uint32_t)(p[12] | (p[13] << 8) |
-                                    (p[14] << 16) | ((uint32_t)p[15] << 24));
-        uint16_t nlen = (uint16_t)(p[10] | (p[11] << 8));
-
-        if (this_len < 16) break;
-        if (flags & 0x02) break;                    /* the terminator   */
-
-        if (nlen >= 0x42) {
-            uint8_t namelen = p[16 + 0x40];
-            if (ntfs_name_cmp(p + 16 + 0x42, namelen, name) == 0) {
-                ntfs_w_errstr = "a file of that name already exists";
-                return NTFS_W_EXISTS;
-            }
-            if (ntfs_name_cmp(p + 16 + 0x42, namelen, name) > 0) break;
-        }
-        p += this_len;
-    }
-
-    /* Shift everything from the insertion point to the end of the
-     * record up, then drop the entry in. */
-    {
-        uint32_t tail = (uint32_t)(dir_rec + h->used_size - p);
+    if (delta > 0)
         for (uint32_t i = 0; i < tail; i++)
-            dir_rec[h->used_size + grow - 1 - i] = p[tail - 1 - i];
-        for (uint32_t i = 0; i < elen; i++) p[i] = entry[i];
+            after[(uint32_t)delta + tail - 1 - i] = after[tail - 1 - i];
+    else if (delta < 0)
+        for (uint32_t i = 0; i < tail; i++)
+            after[(int32_t)i + delta] = after[i];
+
+    ir->length              = (uint32_t)((int32_t)ir->length + delta);
+    ir->u.res.value_length  = (uint32_t)((int32_t)ir->u.res.value_length + delta);
+    h->used_size            = (uint32_t)((int32_t)h->used_size + delta);
+    return NTFS_W_OK;
+}
+
+/* ---- $INDEX_ALLOCATION: mapping a VCN to the disk ---- */
+
+/*
+ * Walk the run list of an attribute and turn a virtual cluster number
+ * into a logical one. Returns 0 when the VCN is not mapped, which is
+ * how "this block has never been allocated" is told from a real one.
+ */
+static int ix_vcn_to_lcn(const ntfs_attr_t *a, uint64_t vcn, uint64_t *out) {
+    const uint8_t *p = (const uint8_t *)a + a->u.nonres.run_offset;
+    const uint8_t *end = (const uint8_t *)a + a->length;
+    int64_t prev = 0;
+    uint64_t at = 0;
+    ntfs_run_t run;
+
+    while (ntfs_next_run(&p, end, &prev, &run)) {
+        if (vcn < at + run.length) {
+            if (run.sparse) return 0;
+            *out = run.lcn + (vcn - at);
+            return 1;
+        }
+        at += run.length;
+    }
+    return 0;
+}
+
+/* How many clusters $INDEX_ALLOCATION currently covers. */
+static uint64_t ix_alloc_clusters(const ntfs_attr_t *a) {
+    const uint8_t *p = (const uint8_t *)a + a->u.nonres.run_offset;
+    const uint8_t *end = (const uint8_t *)a + a->length;
+    int64_t prev = 0;
+    uint64_t n = 0;
+    ntfs_run_t run;
+    while (ntfs_next_run(&p, end, &prev, &run)) n += run.length;
+    return n;
+}
+
+/* Read the run list back out into an array, so a chunk can be appended
+ * and the whole thing re-encoded. */
+static int ix_read_runs(const ntfs_attr_t *a, ntfs_run_t *runs, int max,
+                        int *out_n) {
+    const uint8_t *p = (const uint8_t *)a + a->u.nonres.run_offset;
+    const uint8_t *end = (const uint8_t *)a + a->length;
+    int64_t prev = 0;
+    int n = 0;
+    ntfs_run_t run;
+
+    while (ntfs_next_run(&p, end, &prev, &run)) {
+        if (n >= max) return -1;
+        runs[n++] = run;
+    }
+    *out_n = n;
+    return 0;
+}
+
+/*
+ * Read one index block by VCN, undo its fixups, and check it is one.
+ */
+static int ix_block_read(uint8_t *dir_rec, uint64_t vcn, uint8_t *out) {
+    const ntfs_attr_t *ia = ntfs_find_attr(dir_rec, NTFS_ATTR_INDEX_ALLOC);
+    const uint8_t *body = ix_root_body(dir_rec);
+    uint32_t bsize, per;
+    uint64_t lcn = 0;
+
+    if (!ia || !ia->non_resident || !body) return -1;
+    bsize = ix_block_size(body);
+    per   = bsize / ntfs.bytes_per_cluster;
+    if (per == 0) per = 1;
+
+    if (!ix_vcn_to_lcn(ia, vcn * per, &lcn)) return -1;
+    if (ntfs_read_clusters(lcn, per, out) != 0) return -1;
+    if (out[0] != 'I' || out[1] != 'N' || out[2] != 'D' || out[3] != 'X')
+        return -1;
+    if (ntfs_apply_fixups(out, bsize, 512) != 0) return -1;
+    return 0;
+}
+
+/*
+ * Write one index block. Journaled, and this is the write that has to
+ * land before anything points at the block.
+ */
+static int ix_block_write(uint8_t *dir_rec, uint64_t vcn, uint8_t *buf) {
+    const ntfs_attr_t *ia = ntfs_find_attr(dir_rec, NTFS_ATTR_INDEX_ALLOC);
+    const uint8_t *body = ix_root_body(dir_rec);
+    uint32_t bsize, per;
+    uint64_t lcn = 0;
+
+    if (!ia || !ia->non_resident || !body) return NTFS_W_IO;
+    bsize = ix_block_size(body);
+    per   = bsize / ntfs.bytes_per_cluster;
+    if (per == 0) per = 1;
+
+    if (!ix_vcn_to_lcn(ia, vcn * per, &lcn)) return NTFS_W_IO;
+    ntfs_put64(buf + 0x10, vcn);
+    if (ntfs_install_fixups(buf, bsize, 512) != 0) return NTFS_W_IO;
+    if (ntfs_journal_write_run(ntfs.part_lba +
+                               lcn * ntfs.sectors_per_cluster,
+                               bsize / 512, buf) != 0) {
+        ntfs_w_errstr = "index block write failed";
+        return NTFS_W_IO;
     }
 
-    /* Every enclosing length grows by the same amount. */
-    h->used_size += grow;
-    ir->length += grow;
-    ir->u.res.value_length += grow;
-    ntfs_put32(node + 0, (uint32_t)(node[0] | (node[1] << 8) |
-                                    (node[2] << 16) |
-                                    ((uint32_t)node[3] << 24)));
+    /*
+     * Put the buffer back the way the caller had it.
+     *
+     * Installing the update sequence *replaces* the last two bytes of
+     * every sector with the sequence number and stows the real values
+     * in the array at the top. That is what makes a torn write
+     * detectable on disk -- and it means the in-memory block is no
+     * longer the block once it has been written.
+     *
+     * A descent keeps using the node it just wrote: it splits a child,
+     * writes the parent, then seeks in that same parent again to decide
+     * which half to enter. Without this, that second seek reads two
+     * bytes of sequence number in the middle of whatever entry happened
+     * to straddle offset 510 -- so a name compared correctly before the
+     * write and incorrectly after it, and the key went into the wrong
+     * subtree. Undoing the fixups restores the bytes exactly.
+     */
+    ntfs_apply_fixups(buf, bsize, 512);
+    return NTFS_W_OK;
+}
+
+/* Format an empty block in `buf`: a node with just its end entry. */
+static void ix_block_init(uint8_t *buf, uint32_t bsize, uint64_t vcn,
+                          int large) {
+    const uint32_t eoff = ix_block_entries_off(bsize);
+    uint8_t *hdr = buf + IXB_HDR;
+    uint8_t *e;
+
+    for (uint32_t i = 0; i < bsize; i++) buf[i] = 0;
+    buf[0] = 'I'; buf[1] = 'N'; buf[2] = 'D'; buf[3] = 'X';
+    ntfs_put16(buf + 0x04, IXB_USA);
+    ntfs_put16(buf + 0x06, (uint16_t)(bsize / 512 + 1));
+    ntfs_put64(buf + 0x10, vcn);
+
+    ntfs_put32(hdr + IX_HDR_ENTRIES_OFF, eoff);
+    ntfs_put32(hdr + IX_HDR_ALLOC, bsize - IXB_HDR);
+    ntfs_put32(hdr + IX_HDR_FLAGS, large ? IX_HDR_LARGE : 0);
+
+    e = hdr + eoff;
+    ntfs_put64(e + IE_REF, 0);
+    ntfs_put16(e + IE_LEN, (uint16_t)(large ? 0x18 : 0x10));
+    ntfs_put16(e + IE_KEYLEN, 0);
+    ntfs_put32(e + IE_FLAGS, IE_LAST | (large ? IE_HAS_CHILD : 0));
+    if (large) ntfs_put64(e + 0x10, 0);
+    ntfs_put32(hdr + IX_HDR_USED, eoff + (large ? 0x18u : 0x10u));
+}
+
+/* ---- $BITMAP: which index blocks exist ---- */
+
+static uint8_t *ix_bitmap_value(uint8_t *dir_rec, uint32_t *out_len) {
+    ntfs_attr_t *b = (ntfs_attr_t *)ntfs_find_attr(dir_rec, NTFS_ATTR_BITMAP);
+    if (!b || b->non_resident) return 0;
+    if (out_len) *out_len = b->u.res.value_length;
+    return (uint8_t *)b + b->u.res.value_offset;
+}
+
+/*
+ * Find a free index block, allocating more space if every bit is set.
+ *
+ * Clusters are taken in chunks rather than one at a time, and that is
+ * not about speed either: the run list lives inside the directory's own
+ * MFT record, and without $ATTRIBUTE_LIST there is nowhere else for it
+ * to go. One cluster per block would add a run per block until the
+ * record filled with run list instead of names.
+ */
+#define IX_GROW_CLUSTERS 8
+
+static int ix_alloc_block(uint8_t *dir_rec, uint64_t *out_vcn) {
+    uint32_t blen = 0;
+    uint8_t *bits = ix_bitmap_value(dir_rec, &blen);
+    ntfs_attr_t *ia;
+    const uint8_t *body = ix_root_body(dir_rec);
+    uint32_t bsize, per;
+    uint64_t have, want;
+
+    if (!bits || !body) return NTFS_W_IO;
+    bsize = ix_block_size(body);
+    per   = bsize / ntfs.bytes_per_cluster;
+    if (per == 0) per = 1;
+
+    /* A cleared bit is a block that already has clusters behind it. */
+    for (uint32_t i = 0; i < blen * 8; i++) {
+        if (!(bits[i >> 3] & (1u << (i & 7)))) {
+            ia = (ntfs_attr_t *)ntfs_find_attr(dir_rec, NTFS_ATTR_INDEX_ALLOC);
+            if (!ia) return NTFS_W_IO;
+            if ((uint64_t)(i + 1) * per <= ix_alloc_clusters(ia)) {
+                bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+                *out_vcn = i;
+                return NTFS_W_OK;
+            }
+            break;                      /* past what is mapped: extend */
+        }
+    }
+
+    /* Extend $INDEX_ALLOCATION by a chunk. */
+    ia = (ntfs_attr_t *)ntfs_find_attr(dir_rec, NTFS_ATTR_INDEX_ALLOC);
+    if (!ia) return NTFS_W_IO;
+    have = ix_alloc_clusters(ia);
+    want = have + IX_GROW_CLUSTERS;
+
     {
-        uint32_t used = (uint32_t)(node[4] | (node[5] << 8) |
-                                   (node[6] << 16) |
-                                   ((uint32_t)node[7] << 24)) + grow;
-        uint32_t allocated = (uint32_t)(node[8] | (node[9] << 8) |
-                                        (node[10] << 16) |
-                                        ((uint32_t)node[11] << 24)) + grow;
-        ntfs_put32(node + 4, used);
-        ntfs_put32(node + 8, allocated);
+        ntfs_run_t runs[16];
+        int n = 0, rc;
+        uint64_t lcn = 0;
+        uint8_t enc[256];
+        uint32_t enclen, oldlen, newlen;
+        int32_t delta;
+
+        if (ix_read_runs(ia, runs, 15, &n) != 0) {
+            ntfs_w_errstr = "index run list too fragmented";
+            return NTFS_W_NOSPACE;
+        }
+        rc = ntfs_clusters_alloc(IX_GROW_CLUSTERS, &lcn);
+        if (rc != NTFS_W_OK) return rc;
+
+        /* Coalesce onto the previous run when the allocator handed back
+         * the clusters immediately after it, which keeps the run list
+         * one entry long on a volume with room. */
+        if (n > 0 && runs[n - 1].lcn + runs[n - 1].length == lcn)
+            runs[n - 1].length += IX_GROW_CLUSTERS;
+        else {
+            runs[n].lcn = lcn;
+            runs[n].length = IX_GROW_CLUSTERS;
+            runs[n].sparse = 0;
+            n++;
+        }
+
+        enclen = ntfs_encode_runs(runs, n, enc, sizeof(enc));
+        if (enclen == 0) {
+            ntfs_clusters_free(lcn, IX_GROW_CLUSTERS);
+            ntfs_w_errstr = "index run list does not fit";
+            return NTFS_W_NOSPACE;
+        }
+
+        oldlen = ia->length;
+        newlen = ntfs_align8(ia->u.nonres.run_offset + enclen);
+        delta  = (int32_t)newlen - (int32_t)oldlen;
+
+        {
+            ntfs_record_t *h = (ntfs_record_t *)dir_rec;
+            uint8_t *after = (uint8_t *)ia + oldlen;
+            uint32_t tail = (uint32_t)(dir_rec + h->used_size - after);
+
+            if (delta > 0 &&
+                h->used_size + (uint32_t)delta > ntfs.bytes_per_record) {
+                ntfs_clusters_free(lcn, IX_GROW_CLUSTERS);
+                ntfs_w_errstr = "no room to grow the index run list";
+                return NTFS_W_NOSPACE;
+            }
+            if (delta > 0)
+                for (uint32_t i = 0; i < tail; i++)
+                    after[(uint32_t)delta + tail - 1 - i] = after[tail - 1 - i];
+            else if (delta < 0)
+                for (uint32_t i = 0; i < tail; i++)
+                    after[(int32_t)i + delta] = after[i];
+            h->used_size = (uint32_t)((int32_t)h->used_size + delta);
+        }
+
+        for (uint32_t i = 0; i < enclen; i++)
+            ((uint8_t *)ia)[ia->u.nonres.run_offset + i] = enc[i];
+        ia->length = newlen;
+        ia->u.nonres.last_vcn   = want - 1;
+        ia->u.nonres.alloc_size = want * ntfs.bytes_per_cluster;
+        ia->u.nonres.real_size  = want * ntfs.bytes_per_cluster;
+        ia->u.nonres.init_size  = want * ntfs.bytes_per_cluster;
+    }
+
+    /* The bitmap may itself need another byte now. */
+    bits = ix_bitmap_value(dir_rec, &blen);
+    {
+        const uint64_t nblocks = want / per;
+        if (nblocks > (uint64_t)blen * 8) {
+            ntfs_attr_t *b = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
+                                                           NTFS_ATTR_BITMAP);
+            ntfs_record_t *h = (ntfs_record_t *)dir_rec;
+            uint8_t *after = (uint8_t *)b + b->length;
+            uint32_t tail = (uint32_t)(dir_rec + h->used_size - after);
+
+            if (h->used_size + 8 > ntfs.bytes_per_record) {
+                ntfs_w_errstr = "no room to grow the index bitmap";
+                return NTFS_W_NOSPACE;
+            }
+            for (uint32_t i = 0; i < tail; i++)
+                after[8 + tail - 1 - i] = after[tail - 1 - i];
+            for (uint32_t i = 0; i < 8; i++)
+                ((uint8_t *)b)[b->u.res.value_offset + blen + i] = 0;
+            b->length += 8;
+            b->u.res.value_length += 8;
+            h->used_size += 8;
+            bits = ix_bitmap_value(dir_rec, &blen);
+        }
+    }
+
+    for (uint32_t i = 0; i < blen * 8; i++) {
+        if (!(bits[i >> 3] & (1u << (i & 7)))) {
+            bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+            *out_vcn = i;
+            return NTFS_W_OK;
+        }
+    }
+    ntfs_w_errstr = "index bitmap is full";
+    return NTFS_W_NOSPACE;
+}
+
+static void ix_free_block(uint8_t *dir_rec, uint64_t vcn) {
+    uint32_t blen = 0;
+    uint8_t *bits = ix_bitmap_value(dir_rec, &blen);
+    if (bits && vcn < (uint64_t)blen * 8)
+        bits[vcn >> 3] &= (uint8_t)~(1u << (vcn & 7));
+}
+
+/*
+ * Add $INDEX_ALLOCATION and $BITMAP to a directory that has neither.
+ *
+ * They go after $INDEX_ROOT because attributes are ordered by type and
+ * 0x90 < 0xA0 < 0xB0, and $INDEX_ROOT is the last attribute a directory
+ * record has -- so this appends rather than inserting, and nothing
+ * before it moves.
+ */
+static int ix_add_alloc_attrs(uint8_t *dir_rec) {
+    ntfs_record_t *h = (ntfs_record_t *)dir_rec;
+    ntfs_attr_t *ir = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
+                                                    NTFS_ATTR_INDEX_ROOT);
+    uint8_t *at;
+    uint64_t lcn = 0;
+    int rc;
+    uint8_t enc[64];
+    uint32_t enclen;
+    ntfs_run_t run;
+    uint32_t ia_len, bm_len;
+
+    if (!ir) return NTFS_W_IO;
+    if (ntfs_find_attr(dir_rec, NTFS_ATTR_INDEX_ALLOC)) return NTFS_W_OK;
+
+    rc = ntfs_clusters_alloc(IX_GROW_CLUSTERS, &lcn);
+    if (rc != NTFS_W_OK) return rc;
+
+    run.lcn = lcn; run.length = IX_GROW_CLUSTERS; run.sparse = 0;
+    enclen = ntfs_encode_runs(&run, 1, enc, sizeof(enc));
+    if (enclen == 0) {
+        ntfs_clusters_free(lcn, IX_GROW_CLUSTERS);
+        return NTFS_W_NOSPACE;
+    }
+
+    /* $INDEX_ALLOCATION: non-resident, named "$I30", run offset past the
+     * 64-byte non-resident header and the eight bytes of name. */
+    ia_len = ntfs_align8(0x40 + 8 + enclen);
+    bm_len = ntfs_align8(0x18 + 8 + 8);
+    if (h->used_size + ia_len + bm_len > ntfs.bytes_per_record) {
+        ntfs_clusters_free(lcn, IX_GROW_CLUSTERS);
+        ntfs_w_errstr = "no room for an index allocation attribute";
+        return NTFS_W_NOSPACE;
+    }
+
+    at = dir_rec + h->used_size - 8;     /* over the END marker */
+
+    for (uint32_t i = 0; i < ia_len; i++) at[i] = 0;
+    ntfs_put32(at + 0x00, NTFS_ATTR_INDEX_ALLOC);
+    ntfs_put32(at + 0x04, ia_len);
+    at[0x08] = 1;                        /* non-resident */
+    at[0x09] = 4;                        /* name length  */
+    ntfs_put16(at + 0x0A, 0x40);         /* name offset  */
+    ntfs_put16(at + 0x0E, 0);            /* instance     */
+    ntfs_put64(at + 0x10, 0);            /* first VCN    */
+    ntfs_put64(at + 0x18, IX_GROW_CLUSTERS - 1);          /* last VCN */
+    ntfs_put16(at + 0x20, (uint16_t)(0x40 + 8));          /* run off  */
+    ntfs_put64(at + 0x28, (uint64_t)IX_GROW_CLUSTERS * ntfs.bytes_per_cluster);
+    ntfs_put64(at + 0x30, (uint64_t)IX_GROW_CLUSTERS * ntfs.bytes_per_cluster);
+    ntfs_put64(at + 0x38, (uint64_t)IX_GROW_CLUSTERS * ntfs.bytes_per_cluster);
+    {
+        const char *nm = "$I30";
+        for (int i = 0; i < 4; i++) {
+            at[0x40 + i * 2] = (uint8_t)nm[i];
+            at[0x40 + i * 2 + 1] = 0;
+        }
+    }
+    for (uint32_t i = 0; i < enclen; i++) at[0x40 + 8 + i] = enc[i];
+    at += ia_len;
+
+    /* $BITMAP: resident, named "$I30", eight bytes of bits. */
+    for (uint32_t i = 0; i < bm_len; i++) at[i] = 0;
+    ntfs_put32(at + 0x00, NTFS_ATTR_BITMAP);
+    ntfs_put32(at + 0x04, bm_len);
+    at[0x08] = 0;
+    at[0x09] = 4;
+    ntfs_put16(at + 0x0A, 0x18);
+    ntfs_put32(at + 0x10, 8);            /* value length */
+    ntfs_put16(at + 0x14, (uint16_t)(0x18 + 8));          /* value off */
+    {
+        const char *nm = "$I30";
+        for (int i = 0; i < 4; i++) {
+            at[0x18 + i * 2] = (uint8_t)nm[i];
+            at[0x18 + i * 2 + 1] = 0;
+        }
+    }
+    at += bm_len;
+
+    ntfs_put32(at + 0, NTFS_ATTR_END);
+    ntfs_put32(at + 4, 0);
+    h->used_size += ia_len + bm_len;
+    return NTFS_W_OK;
+}
+
+/* ---- entries ---- */
+
+/*
+ * Build a directory entry for `name`. `child` is the MFT reference the
+ * name resolves to; `vcn_child` is a subtree pointer, or IX_NO_CHILD
+ * for a leaf entry.
+ */
+#define IX_NO_CHILD 0xFFFFFFFFFFFFFFFFULL
+
+static uint32_t ix_make_entry(uint8_t *out, uint64_t child_ref,
+                              const char *name, int is_dir, uint64_t real,
+                              uint64_t alloc, uint64_t now, uint64_t vcn_child) {
+    uint8_t fnval[0x42 + 255 * 2];
+    const uint32_t fnlen = ntfs_build_filename_value(fnval, 0, name, is_dir,
+                                                     real, alloc, now);
+    const int child = (vcn_child != IX_NO_CHILD);
+    const uint32_t elen = ntfs_align8(IE_KEY + fnlen + (child ? 8 : 0));
+
+    for (uint32_t i = 0; i < elen; i++) out[i] = 0;
+    ntfs_put64(out + IE_REF, child_ref);
+    ntfs_put16(out + IE_LEN, (uint16_t)elen);
+    ntfs_put16(out + IE_KEYLEN, (uint16_t)fnlen);
+    ntfs_put32(out + IE_FLAGS, child ? IE_HAS_CHILD : 0);
+    for (uint32_t i = 0; i < fnlen; i++) out[IE_KEY + i] = fnval[i];
+    if (child) ntfs_put64(out + elen - 8, vcn_child);
+    return elen;
+}
+
+/* Re-cut an existing entry so it carries a child pointer (or does not),
+ * which is what promoting a leaf entry into an interior node needs. */
+static uint32_t ix_recut_entry(uint8_t *out, const uint8_t *src,
+                               uint64_t vcn_child) {
+    const uint32_t keylen = ie_keylen(src);
+    const int child = (vcn_child != IX_NO_CHILD);
+    const uint32_t elen = ntfs_align8(IE_KEY + keylen + (child ? 8 : 0));
+
+    for (uint32_t i = 0; i < elen; i++) out[i] = 0;
+    for (uint32_t i = 0; i < IE_KEY + keylen; i++) out[i] = src[i];
+    ntfs_put16(out + IE_LEN, (uint16_t)elen);
+    ntfs_put32(out + IE_FLAGS,
+               (ie_flags(src) & ~(uint32_t)IE_HAS_CHILD) |
+               (child ? IE_HAS_CHILD : 0));
+    if (child) ntfs_put64(out + elen - 8, vcn_child);
+    return elen;
+}
+
+/* The name in an entry, compared against a C string. Returns <0, 0, >0,
+ * or 2 for the end entry, which sorts after everything. */
+static int ix_cmp(const uint8_t *e, const char *name) {
+    if (ie_flags(e) & IE_LAST) return 2;
+    if (ie_keylen(e) < NTFS_FN_NAME) return 2;
+    return ntfs_name_cmp(e + IE_KEY + NTFS_FN_NAME,
+                         e[IE_KEY + NTFS_FN_NAME_LEN], name);
+}
+
+/* Where in this node `name` belongs: the first entry that sorts at or
+ * after it, which is also the entry whose child subtree would hold it. */
+static uint8_t *ix_seek(uint8_t *hdr, const char *name, int *out_exact) {
+    uint8_t *p = ix_first(hdr);
+    uint8_t *end = ix_end(hdr);
+
+    if (out_exact) *out_exact = 0;
+    while (p < end) {
+        const uint16_t l = ie_len(p);
+        int c;
+        if (l < IE_KEY) break;
+        c = ix_cmp(p, name);
+        if (c == 0) { if (out_exact) *out_exact = 1; return p; }
+        if (c > 0) return p;            /* includes the end entry */
+        p += l;
+    }
+    return p;
+}
+
+/* ---- growing the tree ---- */
+
+/*
+ * Turn a small directory into a large one.
+ *
+ * Everything the root holds moves into block 0, and the root is left
+ * with a single end entry pointing at it. That entry is the one it is
+ * easiest to get wrong: it has no name, carries flags 0x03 rather than
+ * 0x02, and its eight trailing bytes are the only route to every name
+ * in the directory.
+ */
+static int ix_make_large(uint8_t *dir_rec) {
+    uint8_t *body = ix_root_body(dir_rec);
+    uint8_t *hdr;
+    uint32_t bsize, eoff, used, copy, root_eoff;
+    uint64_t vcn = 0;
+    int rc;
+
+    if (!body) return NTFS_W_IO;
+    bsize = ix_block_size(body);
+    hdr   = body + 16;
+
+    /*
+     * The order here is forced, and getting it wrong is why the first
+     * attempt could not convert a *full* directory -- which is the only
+     * kind that ever needs converting.
+     *
+     * $INDEX_ALLOCATION and $BITMAP have to be added to the record, and
+     * they need about a hundred and twenty bytes. At the moment this is
+     * called there are none: the root is full, which is what triggered
+     * it. So the entries come out *first*, into a buffer; then the root
+     * shrinks to a single downlink, freeing most of the record; then
+     * the attributes are added into the room that made; and only then
+     * is a block allocated and written.
+     */
+    eoff  = ix_block_entries_off(bsize);
+    used  = ix_used(hdr);
+    root_eoff = ntfs_get32(hdr + IX_HDR_ENTRIES_OFF);
+    copy  = used - root_eoff;
+    if (eoff + copy > bsize - IXB_HDR) {
+        ntfs_w_errstr = "index block too small for the root's entries";
+        return NTFS_W_NOSPACE;
+    }
+
+    ix_block_init(ntfs_ix_split, bsize, 0, 0);
+    for (uint32_t i = 0; i < copy; i++)
+        ntfs_ix_split[IXB_HDR + eoff + i] = ix_first(hdr)[i];
+    ntfs_put32(ntfs_ix_split + IXB_HDR + IX_HDR_USED, eoff + copy);
+
+    /* The root, reduced to one end entry with a downlink. The child it
+     * names is filled in below, once there is a block to name. */
+    {
+        const int32_t delta = (int32_t)(root_eoff + 0x18) - (int32_t)used;
+        uint8_t *e;
+
+        rc = ix_root_resize(dir_rec, delta);
+        if (rc != NTFS_W_OK) return rc;
+
+        hdr = ix_root_hdr(dir_rec);
+        e = ix_first(hdr);
+        for (uint32_t i = 0; i < 0x18; i++) e[i] = 0;
+        ntfs_put16(e + IE_LEN, 0x18);
+        ntfs_put32(e + IE_FLAGS, IE_LAST | IE_HAS_CHILD);
+        ntfs_put32(hdr + IX_HDR_USED, root_eoff + 0x18);
+        ntfs_put32(hdr + IX_HDR_ALLOC, root_eoff + 0x18);
+        ntfs_put32(hdr + IX_HDR_FLAGS, IX_HDR_LARGE);
+    }
+
+    /* Now there is room for them. */
+    rc = ix_add_alloc_attrs(dir_rec);
+    if (rc != NTFS_W_OK) return rc;
+
+    rc = ix_alloc_block(dir_rec, &vcn);
+    if (rc != NTFS_W_OK) return rc;
+
+    /* The block is written before the record naming it ever reaches the
+     * disk -- the caller writes the record last -- so an interruption
+     * leaves a leaked block rather than a directory pointing into one
+     * that was never written. */
+    rc = ix_block_write(dir_rec, vcn, ntfs_ix_split);
+    if (rc != NTFS_W_OK) { ix_free_block(dir_rec, vcn); return rc; }
+
+    hdr = ix_root_hdr(dir_rec);
+    ntfs_put64(ix_first(hdr) + 0x10, vcn);
+    return NTFS_W_OK;
+}
+
+/*
+ * Split a node.
+ *
+ * `hdr` is the node, full. Its lower half stays where it is; the median
+ * entry is copied to `median` and the upper half is built in `right`.
+ * The median's own child becomes the left node's rightmost downlink,
+ * and the original end entry's child becomes the right node's, which is
+ * the part that keeps every subtree reachable.
+ *
+ * Written over "a node" rather than over "a leaf" on purpose: a delete
+ * that promotes a longer key into an interior slot can overflow one,
+ * and that path needs exactly this.
+ */
+static int ix_split_node(uint8_t *hdr, uint8_t *right_block, uint32_t bsize,
+                         uint64_t right_vcn, uint8_t *median,
+                         uint32_t *median_len) {
+    const uint32_t eoff = ntfs_get32(hdr + IX_HDR_ENTRIES_OFF);
+    const int large = (ix_flags(hdr) & IX_HDR_LARGE) != 0;
+    uint8_t *first = ix_first(hdr);
+    uint8_t *end = ix_end(hdr);
+    uint8_t *p, *mid = 0;
+    uint32_t total = 0, half, acc = 0;
+    uint32_t reoff;
+
+    /* The median is the entry that puts about half the bytes on each
+     * side. Counting bytes rather than entries matters because names
+     * here are not the same length. */
+    for (p = first; p < end && !(ie_flags(p) & IE_LAST); p += ie_len(p))
+        total += ie_len(p);
+    if (total == 0) return NTFS_W_NOSPACE;
+    half = total / 2;
+    for (p = first; p < end && !(ie_flags(p) & IE_LAST); p += ie_len(p)) {
+        if (acc + ie_len(p) > half) { mid = p; break; }
+        acc += ie_len(p);
+    }
+    if (!mid) mid = first;
+    if (mid == first && ie_flags(mid) & IE_LAST) return NTFS_W_NOSPACE;
+
+    /* The median, re-cut without a child: the caller decides what it
+     * points at once the halves have VCNs. */
+    *median_len = ix_recut_entry(median, mid, IX_NO_CHILD);
+
+    /* The right half: everything after the median, plus the original
+     * end entry unchanged -- it already points at the rightmost
+     * subtree. */
+    ix_block_init(right_block, bsize, right_vcn, large);
+    reoff = ix_block_entries_off(bsize);
+    {
+        uint8_t *src = mid + ie_len(mid);
+        const uint32_t n = (uint32_t)(end - src);
+        if (reoff + n > bsize - IXB_HDR) return NTFS_W_NOSPACE;
+        for (uint32_t i = 0; i < n; i++)
+            right_block[IXB_HDR + reoff + i] = src[i];
+        ntfs_put32(right_block + IXB_HDR + IX_HDR_USED, reoff + n);
+    }
+
+    /* The left half keeps everything before the median and ends with a
+     * new end entry whose downlink is the median's old child. */
+    {
+        const uint64_t mid_child = large ? ie_vcn(mid) : 0;
+        uint32_t left_len = (uint32_t)(mid - first);
+        uint8_t *e = first + left_len;
+        const uint32_t elen = large ? 0x18u : 0x10u;
+
+        for (uint32_t i = 0; i < elen; i++) e[i] = 0;
+        ntfs_put16(e + IE_LEN, (uint16_t)elen);
+        ntfs_put32(e + IE_FLAGS, IE_LAST | (large ? IE_HAS_CHILD : 0));
+        if (large) ntfs_put64(e + 0x10, mid_child);
+        ntfs_put32(hdr + IX_HDR_USED, eoff + left_len + elen);
     }
     return NTFS_W_OK;
 }
 
-/* Remove a name from a directory index. The inverse shift. */
-static int ntfs_index_remove(uint8_t *dir_rec, const char *name) {
-    ntfs_record_t *h = (ntfs_record_t *)dir_rec;
-    ntfs_attr_t *ir = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
-                                                    NTFS_ATTR_INDEX_ROOT);
-    uint8_t *root, *node, *p, *end;
+/* Room left in a node, in bytes. */
+static uint32_t ix_room(const uint8_t *hdr) {
+    const uint32_t used = ix_used(hdr);
+    const uint32_t cap  = ntfs_get32(hdr + IX_HDR_ALLOC);
+    return used < cap ? cap - used : 0;
+}
 
-    if (!ir || ir->non_resident) return NTFS_W_IO;
+/* Put an entry into a node at `slot`, which ix_seek found. The node
+ * must have room; the caller checks. */
+static void ix_put_at(uint8_t *hdr, uint8_t *slot, const uint8_t *entry,
+                      uint32_t elen) {
+    uint8_t *end = ix_end(hdr);
+    const uint32_t tail = (uint32_t)(end - slot);
 
-    root = (uint8_t *)ir + ir->u.res.value_offset;
-    node = root + 16;
-    p = node + (uint32_t)(node[0] | (node[1] << 8) | (node[2] << 16) |
-                          ((uint32_t)node[3] << 24));
-    end = node + (uint32_t)(node[4] | (node[5] << 8) | (node[6] << 16) |
-                            ((uint32_t)node[7] << 24));
+    for (uint32_t i = 0; i < tail; i++)
+        slot[elen + tail - 1 - i] = slot[tail - 1 - i];
+    for (uint32_t i = 0; i < elen; i++) slot[i] = entry[i];
+    ntfs_put32(hdr + IX_HDR_USED, ix_used(hdr) + elen);
+}
+
+/* Take an entry out of a node. */
+static void ix_take_at(uint8_t *hdr, uint8_t *slot) {
+    const uint32_t elen = ie_len(slot);
+    uint8_t *end = ix_end(hdr);
+    const uint32_t tail = (uint32_t)(end - (slot + elen));
+
+    for (uint32_t i = 0; i < tail; i++) slot[i] = slot[elen + i];
+    ntfs_put32(hdr + IX_HDR_USED, ix_used(hdr) - elen);
+}
+
+/*
+ * Insert into the root, growing the resident attribute to suit.
+ *
+ * The root is the one node whose capacity is not its own: it lives in
+ * the MFT record, so "does it fit" is a question about the record. The
+ * resize has to happen before the slot is found, because moving the
+ * attribute invalidates every pointer into it -- which is why the name
+ * is passed in rather than a position.
+ */
+static int ix_root_put(uint8_t *dir_rec, const char *name,
+                       const uint8_t *entry, uint32_t elen) {
+    uint8_t *hdr;
+    uint8_t *slot;
+    uint32_t slot_off;
+    int rc;
+
+    hdr = ix_root_hdr(dir_rec);
+    if (!hdr) return NTFS_W_IO;
+
+    /* Where it goes, as an offset from the header rather than a
+     * pointer, so it survives the move. */
+    slot = ix_seek(hdr, name, 0);
+    slot_off = (uint32_t)(slot - hdr);
+
+    rc = ix_root_resize(dir_rec, (int32_t)elen);
+    if (rc != NTFS_W_OK) return rc;
+
+    hdr = ix_root_hdr(dir_rec);
+    ntfs_put32(hdr + IX_HDR_ALLOC, ntfs_get32(hdr + IX_HDR_ALLOC) + elen);
+    ix_put_at(hdr, hdr + slot_off, entry, elen);
+    return NTFS_W_OK;
+}
+
+/* And out of it. */
+static int ix_root_take(uint8_t *dir_rec, uint8_t *slot) {
+    uint8_t *hdr = ix_root_hdr(dir_rec);
+    const uint32_t elen = ie_len(slot);
+
+    if (!hdr) return NTFS_W_IO;
+    ix_take_at(hdr, slot);
+    ntfs_put32(hdr + IX_HDR_ALLOC, ntfs_get32(hdr + IX_HDR_ALLOC) - elen);
+    return ix_root_resize(dir_rec, -(int32_t)elen);
+}
+
+/*
+ * Split the root, which is the only way the tree gets deeper.
+ *
+ * Both halves become blocks and the root is left holding one real entry
+ * and one end entry: the median, pointing at the left block, and the
+ * terminator pointing at the right. Every other split keeps its left
+ * half where it was; this one cannot, because the root is not a block.
+ */
+static int ix_split_root(uint8_t *dir_rec) {
+    uint8_t *body = ix_root_body(dir_rec);
+    uint8_t *hdr;
+    uint32_t bsize, eoff, copy;
+    uint64_t left_vcn = 0, right_vcn = 0;
+    uint8_t median[16 + 0x42 + 255 * 2 + 8];
+    uint32_t mlen = 0;
+    int rc;
+
+    if (!body) return NTFS_W_IO;
+    bsize = ix_block_size(body);
+    hdr = body + 16;
+
+    rc = ix_alloc_block(dir_rec, &left_vcn);
+    if (rc != NTFS_W_OK) return rc;
+    rc = ix_alloc_block(dir_rec, &right_vcn);
+    if (rc != NTFS_W_OK) return rc;
+
+    body = ix_root_body(dir_rec);
+    hdr  = body + 16;
+
+    /* Copy the root into a block-shaped buffer, then split that. */
+    ix_block_init(ntfs_ix_scratch, bsize, left_vcn,
+                  (ix_flags(hdr) & IX_HDR_LARGE) != 0);
+    eoff = ix_block_entries_off(bsize);
+    copy = ix_used(hdr) - ntfs_get32(hdr + IX_HDR_ENTRIES_OFF);
+    if (eoff + copy > bsize - IXB_HDR) return NTFS_W_NOSPACE;
+    for (uint32_t i = 0; i < copy; i++)
+        ntfs_ix_scratch[IXB_HDR + eoff + i] = ix_first(hdr)[i];
+    ntfs_put32(ntfs_ix_scratch + IXB_HDR + IX_HDR_USED, eoff + copy);
+
+    rc = ix_split_node(ntfs_ix_scratch + IXB_HDR, ntfs_ix_split, bsize,
+                       right_vcn, median, &mlen);
+    if (rc != NTFS_W_OK) return rc;
+
+    /* Both children durable before the root names either of them. */
+    rc = ix_block_write(dir_rec, left_vcn, ntfs_ix_scratch);
+    if (rc != NTFS_W_OK) return rc;
+    rc = ix_block_write(dir_rec, right_vcn, ntfs_ix_split);
+    if (rc != NTFS_W_OK) return rc;
+
+    /* The new root: median -> left, terminator -> right. */
+    {
+        uint8_t promoted[16 + 0x42 + 255 * 2 + 8];
+        const uint32_t plen = ix_recut_entry(promoted, median, left_vcn);
+        const uint32_t root_eoff = ntfs_get32(ix_root_hdr(dir_rec) +
+                                              IX_HDR_ENTRIES_OFF);
+        const int32_t want = (int32_t)(root_eoff + plen + 0x18);
+        uint8_t *e;
+
+        rc = ix_root_resize(dir_rec,
+                            want - (int32_t)ix_used(ix_root_hdr(dir_rec)));
+        if (rc != NTFS_W_OK) return rc;
+
+        hdr = ix_root_hdr(dir_rec);
+        e = ix_first(hdr);
+        for (uint32_t i = 0; i < plen; i++) e[i] = promoted[i];
+        e += plen;
+        for (uint32_t i = 0; i < 0x18; i++) e[i] = 0;
+        ntfs_put16(e + IE_LEN, 0x18);
+        ntfs_put32(e + IE_FLAGS, IE_LAST | IE_HAS_CHILD);
+        ntfs_put64(e + 0x10, right_vcn);
+
+        ntfs_put32(hdr + IX_HDR_USED, (uint32_t)want);
+        ntfs_put32(hdr + IX_HDR_ALLOC, (uint32_t)want);
+        ntfs_put32(hdr + IX_HDR_FLAGS, IX_HDR_LARGE);
+    }
+    return NTFS_W_OK;
+}
+
+/* ---- walking the whole tree ---- */
+
+/*
+ * In-order traversal, root and blocks together.
+ *
+ * Everything above the index -- lookup, listing, the fs dispatch --
+ * calls through here and does not know whether a directory has one node
+ * or a thousand. That is the whole point of the abstraction: adding
+ * $INDEX_ALLOCATION changed no caller.
+ *
+ * Recursive over a bounded depth rather than iterative, because the
+ * recursion is at most IX_MAX_DEPTH frames and an explicit stack of
+ * the same size is the same memory with more places to be wrong. Each
+ * level reads into its own buffer.
+ */
+static int ix_walk_node(uint8_t *dir_rec, uint8_t *hdr, int depth,
+                        ntfs_index_cb_t cb, void *ctx) {
+    uint8_t *p = ix_first(hdr);
+    uint8_t *end = ix_end(hdr);
+    char name[256];
+
+    if (depth >= IX_MAX_DEPTH) return 0;
 
     while (p < end) {
-        uint16_t this_len = (uint16_t)(p[8] | (p[9] << 8));
-        uint32_t flags = (uint32_t)(p[12] | (p[13] << 8) |
-                                    (p[14] << 16) | ((uint32_t)p[15] << 24));
-        uint16_t nlen = (uint16_t)(p[10] | (p[11] << 8));
+        const uint16_t l = ie_len(p);
+        const uint32_t f = ie_flags(p);
+        if (l < IE_KEY) break;
 
-        if (this_len < 16 || (flags & 0x02)) break;
-
-        if (nlen >= 0x42 &&
-            ntfs_name_cmp(p + 16 + 0x42, p[16 + 0x40], name) == 0) {
-            uint32_t tail = (uint32_t)(dir_rec + h->used_size - (p + this_len));
-            for (uint32_t i = 0; i < tail; i++) p[i] = p[this_len + i];
-
-            h->used_size -= this_len;
-            ir->length -= this_len;
-            ir->u.res.value_length -= this_len;
-            {
-                uint32_t used = (uint32_t)(node[4] | (node[5] << 8) |
-                                           (node[6] << 16) |
-                                           ((uint32_t)node[7] << 24)) - this_len;
-                uint32_t allocated = (uint32_t)(node[8] | (node[9] << 8) |
-                                                (node[10] << 16) |
-                                                ((uint32_t)node[11] << 24)) - this_len;
-                ntfs_put32(node + 4, used);
-                ntfs_put32(node + 8, allocated);
+        /* The subtree that sorts before this entry comes first --
+         * including for the end entry, which is how everything after
+         * the last name is reached. */
+        if (f & IE_HAS_CHILD) {
+            uint8_t *cbuf = ntfs_ix_walk[depth];
+            if (ix_block_read(dir_rec, ie_vcn(p), cbuf) == 0) {
+                const int r = ix_walk_node(dir_rec, cbuf + IXB_HDR, depth + 1,
+                                           cb, ctx);
+                if (r) return r;
             }
-            return NTFS_W_OK;
         }
-        p += this_len;
+        if (f & IE_LAST) break;
+
+        if (ie_keylen(p) >= NTFS_FN_NAME) {
+            const uint8_t *fn = p + IE_KEY;
+            const uint32_t chars = fn[NTFS_FN_NAME_LEN];
+            if (IE_KEY + NTFS_FN_NAME + chars * 2 <= l &&
+                fn[NTFS_FN_NAMESPACE] != 2) {
+                int r;
+                ntfs_name_to_ascii(fn + NTFS_FN_NAME, chars, name,
+                                   sizeof(name));
+                r = cb(ctx, p, name);
+                if (r) return r;
+            }
+        }
+        p += l;
+    }
+    return 0;
+}
+
+/* ---- deletion ---- */
+
+/*
+ * Replace a separator with its in-order successor.
+ *
+ * `slot` names an interior entry: the tree below it is divided *by* it,
+ * so removing it outright would orphan one side. The entry that can
+ * stand in its place is the next name in order, which is the leftmost
+ * name in the subtree immediately to its right.
+ *
+ * Two things make this safe without any further splitting:
+ *
+ *   - the successor always comes out of a *leaf*, and taking an entry
+ *     out of a leaf only makes it smaller, so nothing below can split
+ *     and nothing above can move while this runs
+ *   - the successor is re-cut with the departing entry's downlink, and
+ *     may be a longer name than the one it replaces -- but the descent
+ *     that got here split every node it entered until it had room for a
+ *     maximum-size entry, so the growth always fits
+ */
+/*
+ * Take the smallest key out of the subtree at `vcn`.
+ *
+ * Usually that is the first entry of the leftmost leaf. But nothing
+ * here merges nodes, so a subtree can be emptied out by deletions and
+ * still exist -- and then the smallest key is the first entry of an
+ * *interior* node whose leftmost child holds nothing.
+ *
+ * Removing an interior entry is normally the hard case, and it is safe
+ * here for a specific reason: the only interior entry this ever takes
+ * is the first one, and it is only taken after its own child subtree
+ * has been found empty. Keys below it were in that empty subtree, so
+ * the entry after it already covers everything it was separating.
+ * The empty blocks become unreachable and are returned when the
+ * directory is deleted.
+ *
+ * Returns 0 and fills `out` if the subtree had any key at all.
+ */
+static int ix_take_leftmost(uint8_t *dir_rec, uint64_t vcn, int d,
+                            uint8_t *out, uint32_t *out_len) {
+    uint8_t *buf, *shdr, *first;
+
+    if (d >= IX_MAX_DEPTH) return -1;
+    buf = ntfs_ix_succ[d];
+    if (ix_block_read(dir_rec, vcn, buf) != 0) return -1;
+    shdr = buf + IXB_HDR;
+    first = ix_first(shdr);
+
+    if (ix_flags(shdr) & IX_HDR_LARGE) {
+        if (ix_take_leftmost(dir_rec, ie_vcn(first), d + 1, out, out_len) == 0)
+            return 0;
+        /* The leftmost child held nothing, so this node's own first
+         * entry is the smallest key -- if it has one. */
+        buf = ntfs_ix_succ[d];
+        shdr = buf + IXB_HDR;
+        first = ix_first(shdr);
     }
 
-    ntfs_w_errstr = "no such entry in the directory";
-    return NTFS_W_NOTFOUND;
+    if (ie_flags(first) & IE_LAST) return -1;   /* the subtree is empty */
+
+    *out_len = ie_len(first);
+    for (uint32_t i = 0; i < *out_len; i++) out[i] = first[i];
+    ix_take_at(shdr, first);
+    return ix_block_write(dir_rec, vcn, buf) == NTFS_W_OK ? 0 : -1;
+}
+
+/*
+ * Replace a separator with its in-order successor.
+ *
+ * `slot` names an interior entry: the tree below it is divided *by* it,
+ * so removing it outright would orphan one side. The entry that can
+ * stand in its place is the next name in order, which is the smallest
+ * key in the subtree immediately to its right.
+ *
+ * Two things make this safe without further splitting:
+ *
+ *   - taking the smallest key only ever *shrinks* the node it comes
+ *     from, so nothing below can split and nothing above can move
+ *   - the successor is re-cut with the departing entry's downlink, and
+ *     may be a longer name than the one it replaces -- but the descent
+ *     that got here split every node it entered until it had room for a
+ *     maximum-size entry, so the growth always fits
+ *
+ * If the right subtree turns out to be empty, there is no successor and
+ * the separator is simply dropped: the entry after it inherits the left
+ * child, which is exactly what it should cover once the right side
+ * holds nothing.
+ */
+static int ix_replace_separator(uint8_t *dir_rec, uint8_t *hdr,
+                                uint32_t slot_off, int depth, uint32_t bsize) {
+    uint8_t *slot = hdr + slot_off;
+    const uint64_t dchild = ie_vcn(slot);
+    const uint32_t dlen = ie_len(slot);
+    uint8_t *next = slot + dlen;
+    uint64_t vcn;
+    uint8_t succ[16 + 0x42 + 255 * 2 + 8];
+    uint8_t recut[16 + 0x42 + 255 * 2 + 8];
+    uint32_t slen = 0, rlen;
+    int rc;
+
+    (void)bsize;
+    if (!(ie_flags(next) & IE_HAS_CHILD)) {
+        ntfs_w_errstr = "interior entry with no successor subtree";
+        return NTFS_W_IO;
+    }
+    vcn = ie_vcn(next);
+
+    if (ix_take_leftmost(dir_rec, vcn, 0, succ, &slen) != 0) {
+        /* Nothing to the right: drop the separator instead. */
+        if (depth == 0) {
+            uint8_t *rh = ix_root_hdr(dir_rec);
+            uint8_t *sl = rh + slot_off;
+            ie_set_vcn(sl + ie_len(sl), dchild);
+            return ix_root_take(dir_rec, sl);
+        }
+        ie_set_vcn(slot + dlen, dchild);
+        ix_take_at(hdr, slot);
+        return ix_block_write(dir_rec, ntfs_ix_path_vcn[depth - 1],
+                              ntfs_ix_path[depth - 1]);
+    }
+
+    /* The successor, wearing the departing entry's downlink. */
+    rlen = ix_recut_entry(recut, succ, dchild);
+    if (rlen > dlen) ntfs_ix_promote_grew++;
+
+    if (depth == 0) {
+        /* The root is resident, so a length change is a resize. */
+        uint8_t *rh = ix_root_hdr(dir_rec);
+        rc = ix_root_take(dir_rec, rh + slot_off);
+        if (rc != NTFS_W_OK) return rc;
+        {
+            char nm[256];
+            ntfs_name_to_ascii(recut + IE_KEY + NTFS_FN_NAME,
+                               recut[IE_KEY + NTFS_FN_NAME_LEN],
+                               nm, sizeof(nm));
+            return ix_root_put(dir_rec, nm, recut, rlen);
+        }
+    }
+
+    if (ix_room(hdr) + dlen < rlen) {
+        ntfs_w_errstr = "no room to promote the successor";
+        return NTFS_W_NOSPACE;
+    }
+    ix_take_at(hdr, slot);
+    ix_put_at(hdr, slot, recut, rlen);
+    return ix_block_write(dir_rec, ntfs_ix_path_vcn[depth - 1],
+                          ntfs_ix_path[depth - 1]);
+}
+
+/*
+ * Split whatever `slot`'s child is if it could not take a maximum-size
+ * entry, promoting the median into the parent. Returns 1 if it split
+ * (the caller re-decides which way to go), 0 if not, -1 on failure.
+ *
+ * Shared by both descents: an insert needs the room for the entry it is
+ * carrying, and a delete needs it because a separator can be replaced
+ * by a longer name than it held.
+ */
+static int ix_split_child_if_full(uint8_t *dir_rec, int depth, uint8_t **hdrp,
+                                  uint32_t slot_off, uint8_t *cbuf,
+                                  uint64_t child, uint32_t bsize, int *rcout) {
+    uint8_t *chdr = cbuf + IXB_HDR;
+    uint8_t *hdr, *slot;
+    uint64_t new_vcn = 0;
+    uint8_t median[16 + 0x42 + 255 * 2 + 8];
+    uint8_t promoted[16 + 0x42 + 255 * 2 + 8];
+    uint32_t mlen = 0, plen;
+    char mname[256];
+    int rc;
+
+    *rcout = NTFS_W_OK;
+    if (ix_room(chdr) >= IX_MAX_ENTRY) return 0;
+
+    rc = ix_alloc_block(dir_rec, &new_vcn);
+    if (rc != NTFS_W_OK) { *rcout = rc; return -1; }
+
+    /* Growing the bitmap can move the record's attributes, so the
+     * parent is located again rather than remembered. */
+    hdr  = (depth == 0) ? ix_root_hdr(dir_rec)
+                        : ntfs_ix_path[depth - 1] + IXB_HDR;
+    slot = hdr + slot_off;
+
+    rc = ix_split_node(chdr, ntfs_ix_split, bsize, new_vcn, median, &mlen);
+    if (rc != NTFS_W_OK) {
+        ix_free_block(dir_rec, new_vcn);
+        *rcout = rc;
+        return -1;
+    }
+
+    /* Both halves durable before the parent names either of them. */
+    rc = ix_block_write(dir_rec, child, cbuf);
+    if (rc != NTFS_W_OK) { *rcout = rc; return -1; }
+    rc = ix_block_write(dir_rec, new_vcn, ntfs_ix_split);
+    if (rc != NTFS_W_OK) { *rcout = rc; return -1; }
+
+    plen = ix_recut_entry(promoted, median, child);
+    ntfs_name_to_ascii(promoted + IE_KEY + NTFS_FN_NAME,
+                       promoted[IE_KEY + NTFS_FN_NAME_LEN], mname,
+                       sizeof(mname));
+
+    if (depth == 0) {
+        rc = ix_root_put(dir_rec, mname, promoted, plen);
+        if (rc != NTFS_W_OK) { *rcout = rc; return -1; }
+        hdr  = ix_root_hdr(dir_rec);
+        slot = ix_seek(hdr, mname, 0);
+        ie_set_vcn(slot + ie_len(slot), new_vcn);
+    } else {
+        if (ix_room(hdr) < plen) {
+            ntfs_w_errstr = "index parent full after a split";
+            *rcout = NTFS_W_NOSPACE;
+            return -1;
+        }
+        ix_put_at(hdr, slot, promoted, plen);
+        ie_set_vcn(slot + plen, new_vcn);
+        rc = ix_block_write(dir_rec, ntfs_ix_path_vcn[depth - 1],
+                            ntfs_ix_path[depth - 1]);
+        if (rc != NTFS_W_OK) { *rcout = rc; return -1; }
+    }
+
+    *hdrp = hdr;
+    ntfs_ix_splits++;
+    return 1;
+}
+
+/*
+ * Insert, splitting on the way down.
+ *
+ * The textbook alternative is to descend, insert at the leaf, and carry
+ * an overflow back up -- which needs the whole path held in memory, a
+ * median propagated level by level, and a special case when the root
+ * itself overflows. Splitting *pre-emptively* instead -- any node that
+ * could not accept a maximum-size entry is split before it is entered
+ * -- means the leaf insert can never fail, so nothing has to come back
+ * up. Every node on the path is guaranteed to have room for whatever
+ * the level below promotes into it.
+ *
+ * The cost is that a node splits while up to six hundred bytes of it
+ * are still free. On a 4096-byte block that is fifteen per cent of the
+ * space, and it buys away the entire class of bugs that lives in
+ * unwinding a failed insert halfway up a tree.
+ */
+static int ntfs_index_insert(uint8_t *dir_rec, uint64_t child_ref,
+                             const char *name, int is_dir,
+                             uint64_t real, uint64_t alloc, uint64_t now) {
+    uint8_t entry[16 + 0x42 + 255 * 2 + 8];
+    uint32_t elen;
+    uint8_t *hdr;
+    uint32_t bsize;
+    int depth = 0;
+    int rc;
+
+    hdr = ix_root_hdr(dir_rec);
+    if (!hdr) {
+        ntfs_w_errstr = "directory index is not resident";
+        return NTFS_W_IO;
+    }
+    bsize = ix_block_size(ix_root_body(dir_rec));
+
+    elen = ix_make_entry(entry, child_ref, name, is_dir, real, alloc, now,
+                         IX_NO_CHILD);
+
+    /* ---- the small case: everything is in the record ---- */
+    if (!(ix_flags(hdr) & IX_HDR_LARGE)) {
+        int exact = 0;
+        ix_seek(hdr, name, &exact);
+        if (exact) {
+            ntfs_w_errstr = "a file of that name already exists";
+            return NTFS_W_EXISTS;
+        }
+        if (((ntfs_record_t *)dir_rec)->used_size + elen <=
+            ntfs.bytes_per_record)
+            return ix_root_put(dir_rec, name, entry, elen);
+
+        /* Out of room in the record: this is where a directory stops
+         * being a list and becomes a tree. */
+        rc = ix_make_large(dir_rec);
+        if (rc != NTFS_W_OK) return rc;
+        hdr = ix_root_hdr(dir_rec);
+    }
+
+    /* ---- the root, split first if it could not take a promotion ---- */
+    if (((ntfs_record_t *)dir_rec)->used_size + IX_MAX_ENTRY >
+        ntfs.bytes_per_record) {
+        rc = ix_split_root(dir_rec);
+        if (rc != NTFS_W_OK) return rc;
+    }
+    hdr = ix_root_hdr(dir_rec);
+
+    /* ---- descend ---- */
+    for (;;) {
+        int exact = 0;
+        uint8_t *slot = ix_seek(hdr, name, &exact);
+        uint32_t slot_off = (uint32_t)(slot - hdr);
+        uint64_t child;
+        uint8_t *cbuf, *chdr;
+
+        if (exact) {
+            ntfs_w_errstr = "a file of that name already exists";
+            return NTFS_W_EXISTS;
+        }
+
+        /* A leaf: the insert lands here, and cannot fail. */
+        if (!(ix_flags(hdr) & IX_HDR_LARGE)) {
+            if (depth == 0) return ix_root_put(dir_rec, name, entry, elen);
+            if (ix_room(hdr) < elen) {
+                ntfs_w_errstr = "index leaf full after a pre-emptive split";
+                return NTFS_W_NOSPACE;
+            }
+            ix_put_at(hdr, slot, entry, elen);
+            return ix_block_write(dir_rec, ntfs_ix_path_vcn[depth - 1],
+                                  ntfs_ix_path[depth - 1]);
+        }
+
+        if (depth >= IX_MAX_DEPTH) {
+            ntfs_w_errstr = "directory index deeper than the limit";
+            return NTFS_W_NOSPACE;
+        }
+
+        child = ie_vcn(slot);
+        cbuf  = ntfs_ix_path[depth];
+        chdr  = cbuf + IXB_HDR;
+        if (ix_block_read(dir_rec, child, cbuf) != 0) {
+            ntfs_w_errstr = "index block will not read";
+            return NTFS_W_IO;
+        }
+        ntfs_ix_path_vcn[depth] = child;
+        ntfs_ix_path_off[depth] = (uint32_t)(slot - hdr);
+
+        /* Split the child before entering it, if it could not take a
+         * maximum-size entry. The parent is known to have room for the
+         * median, because the same test was applied to it on the way
+         * past -- which is what makes the descent one-way. */
+        {
+            int r = ix_split_child_if_full(dir_rec, depth, &hdr, slot_off,
+                                           cbuf, child, bsize, &rc);
+            if (r < 0) return rc;
+            if (r == 1) continue;       /* re-decide which half to enter */
+        }
+
+        hdr = chdr;
+        depth++;
+    }
+}
+
+/*
+ * Remove a name.
+ *
+ * Nodes are left under-full rather than merged. That is legal NTFS --
+ * a shrinking directory stays correct and stays readable by anything
+ * else -- and what it costs is that index blocks are not handed back
+ * until the directory itself is removed.
+ */
+static int ntfs_index_remove(uint8_t *dir_rec, const char *name) {
+    uint8_t *hdr = ix_root_hdr(dir_rec);
+    uint32_t bsize;
+    int depth = 0;
+    int rc;
+
+    if (!hdr) return NTFS_W_IO;
+    bsize = ix_block_size(ix_root_body(dir_rec));
+
+    /* The root is split up front for the same reason every other node
+     * is split on the way past: a separator here may be replaced by a
+     * longer name, and the record has to be able to take it. */
+    if ((ix_flags(hdr) & IX_HDR_LARGE) &&
+        ((ntfs_record_t *)dir_rec)->used_size + IX_MAX_ENTRY >
+        ntfs.bytes_per_record) {
+        rc = ix_split_root(dir_rec);
+        if (rc != NTFS_W_OK) return rc;
+        hdr = ix_root_hdr(dir_rec);
+    }
+
+    for (;;) {
+        int exact = 0;
+        uint8_t *slot = ix_seek(hdr, name, &exact);
+        uint32_t slot_off = (uint32_t)(slot - hdr);
+        uint64_t child;
+        uint8_t *cbuf;
+
+        if (exact) {
+            if (!(ie_flags(slot) & IE_HAS_CHILD)) {
+                if (depth == 0) return ix_root_take(dir_rec, slot);
+                ix_take_at(hdr, slot);
+                return ix_block_write(dir_rec, ntfs_ix_path_vcn[depth - 1],
+                                      ntfs_ix_path[depth - 1]);
+            }
+            return ix_replace_separator(dir_rec, hdr, slot_off, depth, bsize);
+        }
+
+        if (!(ix_flags(hdr) & IX_HDR_LARGE)) {
+            ntfs_w_errstr = "no such entry in the directory";
+            return NTFS_W_NOTFOUND;
+        }
+        if (depth >= IX_MAX_DEPTH) {
+            ntfs_w_errstr = "directory index deeper than the limit";
+            return NTFS_W_IO;
+        }
+
+        child = ie_vcn(slot);
+        cbuf  = ntfs_ix_path[depth];
+        if (ix_block_read(dir_rec, child, cbuf) != 0) {
+            ntfs_w_errstr = "index block will not read";
+            return NTFS_W_IO;
+        }
+        ntfs_ix_path_vcn[depth] = child;
+        ntfs_ix_path_off[depth] = slot_off;
+
+        {
+            int r = ix_split_child_if_full(dir_rec, depth, &hdr, slot_off,
+                                           cbuf, child, bsize, &rc);
+            if (r < 0) return rc;
+            if (r == 1) continue;
+        }
+
+        hdr = cbuf + IXB_HDR;
+        depth++;
+    }
+}
+
+/*
+ * Free every index block a directory owns.
+ *
+ * Called when the directory itself is removed. Without it the clusters
+ * behind $INDEX_ALLOCATION are simply lost -- the record goes, and
+ * nothing is left holding the runs that would say what to give back.
+ */
+static int ix_release(uint8_t *dir_rec) {
+    ntfs_attr_t *ia = (ntfs_attr_t *)ntfs_find_attr(dir_rec,
+                                                    NTFS_ATTR_INDEX_ALLOC);
+    const uint8_t *p, *end;
+    int64_t prev = 0;
+    ntfs_run_t run;
+
+    if (!ia || !ia->non_resident) return NTFS_W_OK;
+    p   = (const uint8_t *)ia + ia->u.nonres.run_offset;
+    end = (const uint8_t *)ia + ia->length;
+    while (ntfs_next_run(&p, end, &prev, &run))
+        if (!run.sparse) ntfs_clusters_free(run.lcn, run.length);
+    return NTFS_W_OK;
+}
+
+/*
+ * The MFT reference a name resolves to, found by descending rather than
+ * by scanning the root.
+ *
+ * ntfs_delete_file used to walk $INDEX_ROOT's entries directly to
+ * learn which record it was about to release. That was correct while a
+ * directory *was* its root; on a tree it finds nothing for any name
+ * that lives in a block, and a delete that cannot find the record it is
+ * removing would unlink the name and leave the file behind.
+ */
+static int ix_find_ref(uint8_t *dir_rec, const char *name, uint64_t *out_ref) {
+    uint8_t *hdr = ix_root_hdr(dir_rec);
+    int depth = 0;
+
+    if (!hdr) return -1;
+    for (;;) {
+        int exact = 0;
+        uint8_t *slot = ix_seek(hdr, name, &exact);
+
+        if (exact) {
+            *out_ref = ntfs_get64(slot + IE_REF) & 0x0000FFFFFFFFFFFFULL;
+            return 0;
+        }
+        if (!(ix_flags(hdr) & IX_HDR_LARGE)) return -1;
+        if (depth >= IX_MAX_DEPTH) return -1;
+        if (ix_block_read(dir_rec, ie_vcn(slot), ntfs_ix_walk[depth]) != 0)
+            return -1;
+        hdr = ntfs_ix_walk[depth] + IXB_HDR;
+        depth++;
+    }
+}
+
+/*
+ * Walk a directory's index, however big it is.
+ *
+ * This is the seam the rest of the driver sits on: lookup and listing
+ * call it and neither knows whether the directory is one resident node
+ * or a tree several levels deep. Adding $INDEX_ALLOCATION changed the
+ * implementation underneath and no caller above.
+ */
+static int ntfs_index_walk(const uint8_t *rec, ntfs_index_cb_t cb, void *ctx) {
+    uint8_t *hdr = ix_root_hdr((uint8_t *)rec);
+    if (!hdr) return 0;
+    return ix_walk_node((uint8_t *)rec, hdr, 0, cb, ctx);
 }
 
 /* ===========================================================
@@ -1646,33 +3090,10 @@ int ntfs_delete_file(uint64_t dir_record, const char *name) {
 
     if (ntfs_read_record(dir_record, ntfs_w_dir) != 0) return NTFS_W_IO;
 
-    /* Find the record number before the entry is removed. */
-    {
-        ntfs_attr_t *ir = (ntfs_attr_t *)ntfs_find_attr(ntfs_w_dir,
-                                                        NTFS_ATTR_INDEX_ROOT);
-        uint8_t *node, *p, *end;
-        if (!ir || ir->non_resident) return NTFS_W_IO;
-        node = (uint8_t *)ir + ir->u.res.value_offset + 16;
-        p = node + (uint32_t)(node[0] | (node[1] << 8) | (node[2] << 16) |
-                              ((uint32_t)node[3] << 24));
-        end = node + (uint32_t)(node[4] | (node[5] << 8) | (node[6] << 16) |
-                                ((uint32_t)node[7] << 24));
-        while (p < end) {
-            uint16_t elen = (uint16_t)(p[8] | (p[9] << 8));
-            uint32_t flags = (uint32_t)(p[12] | (p[13] << 8) | (p[14] << 16) |
-                                        ((uint32_t)p[15] << 24));
-            if (elen < 16 || (flags & 0x02)) break;
-            if (ntfs_name_cmp(p + 16 + 0x42, p[16 + 0x40], name) == 0) {
-                number = (uint64_t)(p[0] | ((uint64_t)p[1] << 8) |
-                                    ((uint64_t)p[2] << 16) |
-                                    ((uint64_t)p[3] << 24) |
-                                    ((uint64_t)p[4] << 32) |
-                                    ((uint64_t)p[5] << 40));
-                break;
-            }
-            p += elen;
-        }
-    }
+    /* Find the record number before the entry is removed -- by
+     * descending, because the name may be several levels down. */
+    if (ix_find_ref(ntfs_w_dir, name, &number) != 0) number = 0;
+
     if (!number) { ntfs_w_errstr = "no such file"; return NTFS_W_NOTFOUND; }
 
     rc = ntfs_index_remove(ntfs_w_dir, name);
@@ -1683,6 +3104,12 @@ int ntfs_delete_file(uint64_t dir_record, const char *name) {
     /* Now release what it owned. */
     if (ntfs_read_record(number, ntfs_w_rec) == 0) {
         const ntfs_attr_t *a = ntfs_find_attr(ntfs_w_rec, NTFS_ATTR_DATA);
+
+        /* A directory's index blocks are its own clusters and nothing
+         * else refers to them. Without this the record goes and the
+         * runs that said what to give back go with it. */
+        if (((ntfs_record_t *)ntfs_w_rec)->flags & 2) ix_release(ntfs_w_rec);
+
         if (a && a->non_resident) {
             const uint8_t *p = (const uint8_t *)a + a->u.nonres.run_offset;
             const uint8_t *end = (const uint8_t *)a + a->length;
@@ -1846,108 +3273,6 @@ int ntfs_mkdir_at(uint64_t dir_record, const char *name) {
  */
 
 static uint8_t ntfs_dirrec[4096];       /* directory records, during a walk */
-
-/* The $FILE_NAME attribute value, whose layout every index entry
- * embeds. Named rather than open-coded because four functions below
- * index into it and a wrong offset reads a timestamp as a size. */
-#define NTFS_FN_PARENT      0x00
-#define NTFS_FN_ALLOC_SIZE  0x28
-#define NTFS_FN_REAL_SIZE   0x30
-#define NTFS_FN_FLAGS       0x38
-#define NTFS_FN_NAME_LEN    0x40
-#define NTFS_FN_NAMESPACE   0x41
-#define NTFS_FN_NAME        0x42
-
-#define NTFS_FA_DIRECTORY   0x10000000u
-
-/* An index entry, once the header is past. */
-#define NTFS_IE_REF         0x00        /* child MFT reference, 8 bytes */
-#define NTFS_IE_LEN         0x08        /* entry length,        2 bytes */
-#define NTFS_IE_FNLEN       0x0A        /* $FILE_NAME length,   2 bytes */
-#define NTFS_IE_FLAGS       0x0C        /* bit 1 = last entry           */
-#define NTFS_IE_VALUE       0x10        /* the $FILE_NAME value         */
-
-/*
- * The name out of an index entry, as ASCII.
- *
- * NTFS names are UTF-16. Everything above this driver -- the terminal,
- * the file manager, the loader -- is byte strings, exactly as it is over
- * exFAT, whose driver folds the same way. A code point that does not fit
- * in a byte becomes '?' rather than being silently truncated to its low
- * half, which would turn two different names into one.
- */
-static void ntfs_name_to_ascii(const uint8_t *utf16, uint32_t chars,
-                               char *out, uint32_t cap) {
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < chars && n + 1 < cap; i++) {
-        const uint16_t c = (uint16_t)(utf16[i * 2] | (utf16[i * 2 + 1] << 8));
-        out[n++] = (c && c < 0x80) ? (char)c : '?';
-    }
-    out[n] = '\0';
-}
-
-/*
- * Walk one directory's resident $INDEX_ROOT.
- *
- * Returns 0 and stops early if `cb` returns non-zero; the callback's
- * return is passed back so a search can say "found". The record must
- * already be in `rec` with its fixups applied.
- *
- * Entries with the 0x02 flag are the end marker rather than a file, and
- * the DOS-namespace duplicates (namespace 2) are skipped so an 8.3 alias
- * does not appear beside the long name it stands for.
- */
-typedef int (*ntfs_index_cb_t)(void *ctx, const uint8_t *entry,
-                              const char *name);
-
-static int ntfs_index_walk(const uint8_t *rec, ntfs_index_cb_t cb, void *ctx) {
-    const ntfs_attr_t *ir = ntfs_find_attr(rec, NTFS_ATTR_INDEX_ROOT);
-    const uint8_t *root, *node, *p, *end;
-    char name[256];
-
-    if (!ir || ir->non_resident) return 0;
-
-    root = (const uint8_t *)ir + ir->u.res.value_offset;
-    node = root + 16;
-    p = node + (uint32_t)(node[0] | (node[1] << 8) | (node[2] << 16) |
-                          ((uint32_t)node[3] << 24));
-    end = node + (uint32_t)(node[4] | (node[5] << 8) | (node[6] << 16) |
-                            ((uint32_t)node[7] << 24));
-
-    while (p + NTFS_IE_VALUE <= end) {
-        const uint16_t elen  = (uint16_t)(p[NTFS_IE_LEN] |
-                                          (p[NTFS_IE_LEN + 1] << 8));
-        const uint16_t fnlen = (uint16_t)(p[NTFS_IE_FNLEN] |
-                                          (p[NTFS_IE_FNLEN + 1] << 8));
-        const uint32_t flags = (uint32_t)(p[NTFS_IE_FLAGS] |
-                                          (p[NTFS_IE_FLAGS + 1] << 8) |
-                                          (p[NTFS_IE_FLAGS + 2] << 16) |
-                                    ((uint32_t)p[NTFS_IE_FLAGS + 3] << 24));
-
-        if (elen < NTFS_IE_VALUE || p + elen > end) break;
-        if (flags & 0x02) break;                       /* the end marker */
-
-        if (fnlen >= NTFS_FN_NAME) {
-            const uint8_t *fn = p + NTFS_IE_VALUE;
-            const uint32_t chars = fn[NTFS_FN_NAME_LEN];
-
-            /* Bounds: the name has to be inside the entry it claims to
-             * be in. A record with a length that says otherwise is
-             * corrupt, and reading past it is how a corrupt volume
-             * becomes a fault rather than an error message. */
-            if (NTFS_IE_VALUE + NTFS_FN_NAME + chars * 2 <= elen &&
-                fn[NTFS_FN_NAMESPACE] != 2) {          /* skip 8.3 aliases */
-                int r;
-                ntfs_name_to_ascii(fn + NTFS_FN_NAME, chars,
-                                   name, sizeof(name));
-                r = cb(ctx, p, name);
-                if (r) return r;
-            }
-        }
-        p += elen;
-    }
-    return 0;
-}
 
 /* ---- finding one name in one directory ---- */
 

@@ -1313,6 +1313,30 @@ void kmain(void) {
                 bad = 1;
             }
 
+            /* And the large directory: three hundred names is nine
+             * times what one MFT record holds, so every one of them
+             * came back through $INDEX_ALLOCATION. */
+            {
+                int found = 0;
+                for (int i = 0; i < 300; i++) {
+                    char p[64];
+                    uint64_t sz2 = 0;
+                    int d2 = 0;
+                    str_copy(p, "/fstest/many/", sizeof(p));
+                    {
+                        char nb[12];
+                        uint_to_str((uint32_t)i, nb);
+                        str_append(p, nb, sizeof(p));
+                        str_append(p, "-entry.txt", sizeof(p));
+                    }
+                    if (fs_stat(p, &sz2, &d2)) found++;
+                }
+                serial_puts("[fstest] large directory: ");
+                serial_put_dec((uint32_t)found);
+                serial_puts(" of 300 names survived\n");
+                if (found != 300) bad = 1;
+            }
+
             serial_puts(bad ? "[fstest] FAILED across the reboot\n"
                             : "[fstest] every byte survived the reboot\n");
         } else {
@@ -1355,6 +1379,29 @@ void kmain(void) {
                 serial_putc('\n');
             } else {
                 serial_puts("[fstest] overwrote an existing file\n");
+            }
+
+            /* A directory far larger than one MFT record can hold.
+             * Before $INDEX_ALLOCATION this stopped at about
+             * thirty-five names with ENOSPC; it is the kernel-side
+             * proof that the B-tree grows on real hardware paths and
+             * not only in the host suite. */
+            {
+                int n = 0;
+                fs_mkdir("/fstest/many");
+                for (int i = 0; i < 300; i++) {
+                    char p[64], nb[12];
+                    str_copy(p, "/fstest/many/", sizeof(p));
+                    uint_to_str((uint32_t)i, nb);
+                    str_append(p, nb, sizeof(p));
+                    str_append(p, "-entry.txt", sizeof(p));
+                    if (fs_write_file(p, "n", 1) == 0) n++;
+                    else { serial_puts("[fstest] large dir stopped: ");
+                           serial_puts(fs_errstr); serial_putc('\n'); break; }
+                }
+                serial_puts("[fstest] large directory: wrote ");
+                serial_put_dec((uint32_t)n);
+                serial_puts(" names\n");
             }
 
             serial_puts("[fstest] reboot to check it survived\n");

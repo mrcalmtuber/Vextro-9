@@ -40,17 +40,17 @@ SPC = 8                       # sectors per cluster -> 4 KB clusters
 CLUSTER = SECTOR * SPC
 # 4096-byte MFT records rather than the 1024 Windows uses by default.
 #
-# A directory here lives entirely in its resident $INDEX_ROOT -- the
-# driver does not build $INDEX_ALLOCATION, so a directory holds as many
-# entries as fit in one record and then reports ENOSPC. At 1024 bytes
-# that is about six entries, which is not a filesystem. At 4096 it is
-# about thirty, which is enough for the volume this seeds and for what a
-# session adds to it.
+# This used to be the directory ceiling: a directory lived entirely in
+# its resident $INDEX_ROOT, so the record size *was* how many names it
+# could hold. The driver builds $INDEX_ALLOCATION now and directories
+# grow into a B-tree, so what the record size sets is the fan-out of the
+# root node -- about thirty children before the root itself splits --
+# and how much of a small directory stays in the record instead of
+# costing a cluster.
 #
-# 4096 is the ceiling, not a preference: the kernel reads a record into
-# a 4096-byte static buffer and ntfs_try() refuses a volume claiming
-# more. Raising it further means raising that buffer, and beyond 4096
-# the format stops being one other implementations expect.
+# 4096 is the ceiling rather than a preference: the kernel reads a
+# record into a 4096-byte static buffer and ntfs_try() refuses a volume
+# claiming more.
 MFT_REC = 4096                # bytes per MFT record
 MFT_RECS_RESERVED = 16        # the system files occupy 0..15
 
@@ -431,12 +431,19 @@ def main():
 
     # Headroom, scaled to the volume.
     #
-    # A record is one cluster here, so headroom is a direct cost in
-    # space: 2048 spare records is 8 MB, which is nothing on the 8 GB
-    # boot volume and half of a 16 MB scratch image. Sizing it against
-    # the volume keeps both sensible -- the test images stay mostly
-    # free space, and the real one can take a couple of thousand files.
-    runtime_records = min(2048, max(32, total_clusters // 64))
+    # The MFT does not grow. ntfs_mft_alloc searches up to $MFT's own
+    # allocated size and stops, so the number of spare records set here
+    # is the number of files that can ever be created on the volume --
+    # a ceiling every bit as real as the directory one $INDEX_ALLOCATION
+    # just removed, and a much less obvious one, because it presents as
+    # "the disk is full" on a volume with gigabytes free.
+    #
+    # A record is one cluster, so this is a direct cost in space: one
+    # sixty-fourth of the volume, which is 128 MB of an 8 GB disk for
+    # 32,768 files. That is 1.6% for a limit nobody reaches by accident.
+    # Small scratch images scale down the same way and stay mostly free
+    # space.
+    runtime_records = min(32768, max(64, total_clusters // 64))
     mft_records = next_record + runtime_records
     mft_clusters = max(1, align(mft_records * MFT_REC, CLUSTER) // CLUSTER)
 

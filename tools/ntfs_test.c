@@ -788,33 +788,295 @@ static void test_directory_capacity(void) {
     printf("\ndirectory capacity\n");
 
     expect(tree_mount() == 0, "remounted");
-    ntfs_journal_init(0, 512 * 1024 * 1024 / 512);
+    ntfs_journal_init(0, 2048ULL * 1024 * 1024 / 512);
 
-    /* Fill the root until it refuses, which is the documented ceiling:
-     * a directory lives in its resident $INDEX_ROOT and there is no
-     * $INDEX_ALLOCATION, so it holds what fits in one MFT record. The
-     * number is asserted rather than described so that a change to the
-     * record size or the entry layout shows up here. */
-    for (int i = 0; i < 200; i++) {
+    /*
+     * This test used to assert the opposite.
+     *
+     * A directory lived entirely in its resident $INDEX_ROOT, so it
+     * held about thirty-five names and then returned ENOSPC, and the
+     * check here was that it *did* fill -- that the refusal was clean
+     * rather than a corrupt index. With $INDEX_ALLOCATION the ceiling
+     * is gone, so the same loop now measures the opposite property:
+     * that the root grows into a tree instead of refusing.
+     */
+    for (int i = 0; i < 500; i++) {
         char nm[32];
         snprintf(nm, sizeof(nm), "fill%03d.txt", i);
-        if (ntfs_create_file(root, nm, (const uint8_t *)"x", 1) != NTFS_W_OK)
+        if (ntfs_create_file(root, nm, (const uint8_t *)"x", 1) != NTFS_W_OK) {
+            printf("       stopped at %d: %s\n", i, ntfs_w_errstr);
             break;
+        }
         made++;
     }
+    expect_eq(made, 500, "five hundred names go into one directory");
 
-    printf("       (the root took %d more entries before it filled)\n", made);
-    expect(made >= 20, "a 4096-byte record holds at least twenty more names");
-    expect(made < 200, "  and does fill, rather than growing forever");
+    /* And the root really did become a tree rather than growing the
+     * record, which is the only way that many could fit. */
+    {
+        uint8_t *hdr;
+        expect(ntfs_read_record(root, ntfs_dirrec) == 0, "the root record reads");
+        hdr = ix_root_hdr(ntfs_dirrec);
+        expect(hdr && (ix_flags(hdr) & IX_HDR_LARGE),
+               "  and its index has children");
+    }
 
-    /* And it fails cleanly: the refusal is ENOSPC with a message, not a
-     * corrupt index. Everything still resolves afterwards. */
     {
         uint64_t rec = 0;
         expect(ntfs_lookup("/a.txt", &rec, 0, 0, 0) == 0,
-               "  and the directory still resolves afterwards");
+               "  the original entries still resolve");
         expect(ntfs_lookup("/docs/readme.txt", &rec, 0, 0, 0) == 0,
-               "  including through its subdirectories");
+               "  including through subdirectories");
+        expect(ntfs_lookup("/fill499.txt", &rec, 0, 0, 0) == 0,
+               "  and so does the five hundredth new one");
+    }
+}
+
+/* ===== 8. the directory B-tree =====
+ *
+ * A directory used to be its own MFT record: about thirty-five names,
+ * and then ENOSPC. $INDEX_ALLOCATION makes it a tree, and a B-tree is
+ * the kind of structure that works perfectly on the cases you thought
+ * of and loses a subtree on the ones you did not -- so these checks are
+ * mostly about the shapes that only appear at scale.
+ *
+ * Names are deliberately of *varying* length. Fixed-width names make
+ * every entry the same size, which means the median of a split always
+ * lands in the same place and a whole class of length-dependent bugs --
+ * an entry that grows when it gains a downlink, a successor longer than
+ * the separator it replaces -- can never happen.
+ */
+
+/* A name whose length varies with i, from 8 to about 60 characters, and
+ * whose sort order is deliberately not its creation order. */
+static void btree_name(int i, char *out, size_t cap) {
+    const int pad = 8 + (i * 7) % 52;
+    int n;
+    /* The leading digits are reversed so that insertion order and
+     * collation order disagree: a tree that only ever appends is not a
+     * tree that has been tested. */
+    n = snprintf(out, cap, "%04d-", ((i * 2654435761u) >> 8) % 10000);
+    for (int k = 0; k < pad && n + 1 < (int)cap; k++) out[n++] = 'a' + (k % 26);
+    n += snprintf(out + n, cap - n, "-%d.txt", i);
+    (void)n;
+}
+
+typedef struct {
+    int      n;
+    int      out_of_order;
+    char     prev[300];
+    int      have_prev;
+    uint64_t total_size;
+} bt_ctx_t;
+
+static void bt_count(void *ctx, const char *name, uint64_t size, int is_dir) {
+    bt_ctx_t *c = (bt_ctx_t *)ctx;
+    (void)is_dir;
+    /* Strictly ascending under the driver's own comparator: an index
+     * that enumerates out of order is one a binary search cannot use,
+     * and it is exactly what a mis-split produces. */
+    if (c->have_prev) {
+        uint8_t u[600];
+        int len = 0;
+        while (c->prev[len]) { u[len * 2] = (uint8_t)c->prev[len];
+                               u[len * 2 + 1] = 0; len++; }
+        if (ntfs_name_cmp(u, (uint32_t)len, name) >= 0) c->out_of_order++;
+    }
+    snprintf(c->prev, sizeof(c->prev), "%s", name);
+    c->have_prev = 1;
+    c->total_size += size;
+    c->n++;
+}
+
+#define BT_COUNT 2000
+
+static void test_btree(void) {
+    static char nm[300];
+    bt_ctx_t c;
+    int made = 0;
+    uint64_t rec = 0;
+    int rc;
+
+    printf("\nthe directory B-tree\n");
+
+    expect(tree_mount() == 0, "remounted");
+    ntfs_journal_init(0, 2048ULL * 1024 * 1024 / 512);
+
+    expect_eq(ntfs_mkdir_at(NTFS_MFT_ROOT, "big"), NTFS_W_OK,
+              "a directory is created");
+    expect(ntfs_lookup("/big", &rec, 0, 0, 0) == 0, "  and resolves");
+
+    /* --- fill it well past what one record can hold --- */
+    for (int i = 0; i < BT_COUNT; i++) {
+        btree_name(i, nm, sizeof(nm));
+        rc = ntfs_create_file(rec, nm, (const uint8_t *)"x", 1);
+        if (rc != NTFS_W_OK) {
+            printf("       stopped at %d: %s\n", i, ntfs_w_errstr);
+            break;
+        }
+        made++;
+    }
+    expect_eq(made, BT_COUNT, "two thousand names go in");
+    printf("       (%u node splits along the way)\n", ntfs_ix_splits);
+    expect(ntfs_ix_splits > 0, "  and the tree had to split to hold them");
+
+    /* --- the tree is actually a tree --- */
+    {
+        uint8_t *hdr;
+        expect(ntfs_read_record(rec, ntfs_dirrec) == 0, "the record reads");
+        hdr = ix_root_hdr(ntfs_dirrec);
+        expect(hdr && (ix_flags(hdr) & IX_HDR_LARGE),
+               "  and its root has children");
+        expect(ntfs_find_attr(ntfs_dirrec, NTFS_ATTR_INDEX_ALLOC) != 0,
+               "  with an $INDEX_ALLOCATION");
+        expect(ntfs_find_attr(ntfs_dirrec, NTFS_ATTR_BITMAP) != 0,
+               "  and a $BITMAP");
+    }
+
+    /* --- everything is there, once, in order --- */
+    expect(tree_mount() == 0, "remounted after filling");
+    c.n = 0; c.out_of_order = 0; c.have_prev = 0; c.total_size = 0;
+    expect(ntfs_list("/big", bt_count, &c) == 0, "the directory lists");
+    expect_eq(c.n, BT_COUNT, "  and every name comes back");
+    expect_eq(c.out_of_order, 0, "  in strictly ascending order");
+    expect_eq(c.total_size, BT_COUNT, "  each one byte long");
+
+    /* --- and each one resolves by path --- */
+    {
+        int bad = 0;
+        for (int i = 0; i < BT_COUNT; i += 7) {
+            char path[400];
+            uint64_t r = 0;
+            btree_name(i, nm, sizeof(nm));
+            snprintf(path, sizeof(path), "/big/%s", nm);
+            if (ntfs_lookup(path, &r, 0, 0, 0) != 0) bad++;
+        }
+        expect_eq(bad, 0, "every name sampled resolves through the tree");
+    }
+    {
+        char path[400];
+        snprintf(path, sizeof(path), "/big/%s", "definitely-not-here.txt");
+        expect(ntfs_lookup(path, 0, 0, 0, 0) != 0,
+               "  and a name that was never added does not");
+    }
+
+    /* --- a duplicate is still refused, several levels down --- */
+    btree_name(BT_COUNT / 2, nm, sizeof(nm));
+    expect_eq(ntfs_create_file(rec, nm, (const uint8_t *)"x", 1),
+              NTFS_W_EXISTS, "a duplicate deep in the tree is refused");
+}
+
+/*
+ * Deleting separators.
+ *
+ * A name sitting in an interior node divides the tree below it, so
+ * removing it has to promote its in-order successor into the gap -- and
+ * that successor arrives from a leaf, gains a downlink, and may be a
+ * longer name than the one it replaces. It is the only operation in the
+ * driver where removing something needs *more* room than it frees.
+ *
+ * Reaching it by accident is unlikely, so this finds the separators
+ * deliberately: walk the tree, collect the names whose entries carry a
+ * child pointer, and delete exactly those.
+ */
+typedef struct { char names[64][300]; int n; } sep_ctx_t;
+
+static int sep_collect(void *ctx, const uint8_t *entry, const char *name) {
+    sep_ctx_t *s = (sep_ctx_t *)ctx;
+    if ((ie_flags(entry) & IE_HAS_CHILD) && s->n < 64)
+        snprintf(s->names[s->n++], sizeof(s->names[0]), "%s", name);
+    return 0;
+}
+
+static void test_btree_delete(void) {
+    static char nm[300];
+    sep_ctx_t sep;
+    bt_ctx_t c;
+    uint64_t rec = 0;
+    int removed = 0;
+    const uint32_t grew_before = ntfs_ix_promote_grew;
+
+    printf("\nremoving names, including the ones holding the tree apart\n");
+
+    expect(tree_mount() == 0, "remounted");
+    ntfs_journal_init(0, 2048ULL * 1024 * 1024 / 512);
+    expect(ntfs_lookup("/big", &rec, 0, 0, 0) == 0, "the directory resolves");
+
+    /* Every separator currently in the tree. */
+    sep.n = 0;
+    expect(ntfs_read_record(rec, ntfs_dirrec) == 0, "its record reads");
+    {
+        uint8_t *h = ix_root_hdr(ntfs_dirrec);
+        expect(h != 0, "  and has a resident index root");
+        if (h) ix_walk_node(ntfs_dirrec, h, 0, sep_collect, &sep);
+    }
+    printf("       (%d separators found)\n", sep.n);
+    expect(sep.n > 0, "the tree has interior entries to remove");
+
+    for (int i = 0; i < sep.n; i++)
+        if (ntfs_delete_file(rec, sep.names[i]) == NTFS_W_OK) removed++;
+    expect_eq(removed, sep.n, "every separator is removed");
+    printf("       (%u of them promoted a longer name than they held)\n",
+           ntfs_ix_promote_grew - grew_before);
+    expect(ntfs_ix_promote_grew > grew_before,
+           "  and at least one successor was longer than the separator");
+
+    /* The tree still holds everything else, still in order. */
+    expect(tree_mount() == 0, "remounted after the deletions");
+    c.n = 0; c.out_of_order = 0; c.have_prev = 0; c.total_size = 0;
+    expect(ntfs_list("/big", bt_count, &c) == 0, "it still lists");
+    expect_eq(c.n, BT_COUNT - removed, "  with exactly the rest present");
+    expect_eq(c.out_of_order, 0, "  still in ascending order");
+
+    /* The removed names are gone, and the survivors are not. */
+    {
+        int ghost = 0, lost = 0;
+        char path[400];
+        for (int i = 0; i < sep.n; i++) {
+            snprintf(path, sizeof(path), "/big/%s", sep.names[i]);
+            if (ntfs_lookup(path, 0, 0, 0, 0) == 0) ghost++;
+        }
+        expect_eq(ghost, 0, "no removed name still resolves");
+
+        for (int i = 0; i < BT_COUNT; i += 13) {
+            int was_removed = 0;
+            btree_name(i, nm, sizeof(nm));
+            for (int k = 0; k < sep.n; k++)
+                if (strcmp(sep.names[k], nm) == 0) { was_removed = 1; break; }
+            if (was_removed) continue;
+            snprintf(path, sizeof(path), "/big/%s", nm);
+            if (ntfs_lookup(path, 0, 0, 0, 0) != 0) lost++;
+        }
+        expect_eq(lost, 0, "  and every survivor sampled still does");
+    }
+
+    /* Deleting the rest empties it completely rather than leaving
+     * fragments behind -- the case where an under-full tree has to keep
+     * working all the way down to nothing. */
+    {
+        int gone = 0;
+        for (int i = 0; i < BT_COUNT; i++) {
+            btree_name(i, nm, sizeof(nm));
+            if (ntfs_delete_file(rec, nm) == NTFS_W_OK) gone++;
+        }
+        expect_eq(gone + removed, BT_COUNT, "the remaining names all delete");
+
+        expect(tree_mount() == 0, "remounted after emptying it");
+        c.n = 0; c.out_of_order = 0; c.have_prev = 0; c.total_size = 0;
+        expect(ntfs_list("/big", bt_count, &c) == 0, "the directory lists");
+        expect_eq(c.n, 0, "  and is empty");
+    }
+
+    /* And it can be filled again, which catches a tree left in a state
+     * that reads as empty but cannot be written. */
+    {
+        int again = 0;
+        for (int i = 0; i < 200; i++) {
+            btree_name(i, nm, sizeof(nm));
+            if (ntfs_create_file(rec, nm, (const uint8_t *)"y", 1) == NTFS_W_OK)
+                again++;
+        }
+        expect_eq(again, 200, "two hundred names go back in afterwards");
     }
 }
 
@@ -847,6 +1109,8 @@ int main(int argc, char **argv) {
         test_read_range();
         test_space_and_extent();
         test_directory_capacity();
+        test_btree();
+        test_btree_delete();
     } else {
         printf("\n(no tree image given: skipping paths, listings and "
                "ranges)\n");

@@ -69,9 +69,9 @@ int ntfs_create_file(uint64_t dir_record, const char *name,
  * clusters and its MFT record. */
 int ntfs_delete_file(uint64_t dir_record, const char *name);
 
-/* Create a subdirectory `name` under `dir_record`. The new directory
- * holds its entries in a resident $INDEX_ROOT, which is roughly forty
- * of them before it reports ENOSPC. */
+/* Create a subdirectory `name` under `dir_record`. It starts with a
+ * resident $INDEX_ROOT and grows an $INDEX_ALLOCATION B-tree when that
+ * fills, so there is no practical limit on how many names it holds. */
 int ntfs_mkdir_at(uint64_t dir_record, const char *name);
 
 /* ---- the journal ---- */

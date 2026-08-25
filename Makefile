@@ -221,6 +221,8 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	         build/scratch/b.txt:docs/readme.txt \
 	         build/scratch/big.bin:store/pkg/big.bin > /dev/null
 	@./build/ntfs_test build/scratch/ntfs.img build/scratch/tree.img
+	@python3 tools/ntfsdir.py build/scratch/tree.img /big > /dev/null && \
+	 echo "  ok   an independent reader agrees about the B-tree"
 	@./build/vmx_test
 	@./build/av_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
@@ -416,6 +418,8 @@ build/ntfs_verify: tools/ntfs_verify.c src/fs/ntfs/ntfs_ops.c \
 	           -Isrc -Iinclude -o $@ $<
 
 verifydisk: build/ntfs_verify disk.img
+	@python3 tools/ntfsdir.py disk.img / > /dev/null && \
+	 echo "  ok   tools/ntfsdir.py reads the volume independently"
 	@./build/ntfs_verify disk.img \
 	    /about.txt=apps/about.txt \
 	    /notes.txt=apps/notes.txt \

@@ -36,9 +36,9 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**88,565 lines of C written here**, across 154 files, built as four kernel
+**90,201 lines of C written here**, across 154 files, built as four kernel
 objects plus one for inference, over a user-space C library of its own.
-698 host checks across 14 suites on every build.
+735 host checks across 14 suites on every build.
 
 ---
 
@@ -245,21 +245,68 @@ makes every run list exactly one entry, whatever the file's size. The
 pagefile gets the same treatment for a different reason: the pager
 resolves it to one absolute LBA at boot and cannot use a fragmented one.
 
-*MFT records are 4096 bytes rather than the usual 1024.* A directory
-lives entirely in its resident `$INDEX_ROOT`, so the record size **is**
-the directory capacity: about six entries at 1024, about thirty-five at
-4096. That is the ceiling rather than a preference — the kernel reads a
-record into a 4096-byte buffer and refuses a volume claiming more.
+*MFT records are 4096 bytes rather than the usual 1024.* That used to be
+the directory ceiling; it now sets the fan-out of a directory's root
+node — about thirty children before the root itself splits — and how
+much of a small directory stays in the record instead of costing a
+cluster. 4096 is the ceiling rather than a preference: the kernel reads
+a record into a 4096-byte buffer and refuses a volume claiming more.
+
+### Directories are B-trees
+
+A directory starts as a resident `$INDEX_ROOT` inside its own MFT
+record, which holds about thirty-five names. When that fills, the whole
+index moves into `$INDEX_ALLOCATION` — a non-resident attribute divided
+into 4096-byte `INDX` blocks, each with its own update sequence, tracked
+by an `$I30` `$BITMAP` — and the root becomes the top of a B-tree.
+
+Nodes are split **on the way down**. The textbook alternative descends,
+inserts at the leaf, and carries an overflow back up, which needs the
+whole path in memory and a special case when the root overflows.
+Splitting any node that could not accept a maximum-size entry *before*
+entering it means the leaf insert can never fail, so nothing has to come
+back up. It costs a node splitting while six hundred bytes of it are
+still free; it buys away the entire class of bugs that lives in
+unwinding a half-finished insert.
+
+Deletion is the harder half. A name in an interior node is a
+*separator* — the tree below is divided by it — so it cannot simply be
+removed; its in-order successor has to take its place. That successor
+arrives from a leaf, gains a downlink, and **may be longer than the name
+it replaces**, which makes deleting an entry the one operation here that
+needs more room than it frees. The same pre-emptive splitting covers it.
+Nodes are left under-full rather than merged, which is legal NTFS; the
+blocks come back when the directory is deleted.
+
+Two ordering rules keep an interrupted operation recoverable: a child
+block is always durable before anything points at it, and the directory
+record — written by the caller, last — is what makes any of it
+reachable. A power failure mid-split leaks an index block. It never
+leaves a pointer into one that was never written.
+
+> One bug found here is worth recording, because it was invisible in
+> every structural check. Installing an update sequence *replaces* the
+> last two bytes of each 512-byte sector with the sequence number — so a
+> block that has just been written is no longer the block in memory. A
+> descent writes a parent after splitting a child and then seeks in that
+> same parent again to pick a half; the seek was reading two bytes of
+> sequence number in the middle of whichever name straddled offset 510.
+> One key in two thousand went into the wrong subtree. Every node passed
+> a structural walk, every entry length was sane, and the only symptom
+> was a single inversion in an enumeration.
+
 
 ### How it was checked before anything booted from it
 
 Three gates, because "the writer returned success" is not evidence that
 a volume is correct:
 
-- **156 host checks** against scratch images — the run-list encoder
+- **193 host checks** against scratch images — the run-list encoder
   against the *decoder*, path resolution including the paths that must
-  *fail*, ranged reads at cluster boundaries and past end-of-file, and
-  the journal replayed against a deliberately interrupted write.
+  *fail*, ranged reads at cluster boundaries and past end-of-file, the
+  journal replayed against a deliberately interrupted write, and a
+  two-thousand-name directory built to depth three, enumerated in
+  strictly ascending order, then emptied one separator at a time.
 - **`make verifydisk`** mounts the real 8 GB image with the kernel's own
   driver, on the host, and compares every seeded file byte for byte
   against its source — including `wiki.zim`, read in windows through the
@@ -271,14 +318,20 @@ a volume is correct:
   `make iso EXTRA=-DFS_SELFTEST` runs that check itself, in two halves
   across two boots.
 
+- **A third implementation.** `tools/ntfsdir.py` walks a directory from
+  the on-disk structures alone, in Python, sharing no code with either
+  the formatter or the driver — because two implementations written
+  together from one reading of a specification can agree perfectly and
+  both be wrong. It lists the same three hundred names the kernel wrote,
+  in the same order.
+
 macOS's own filesystem prober identifies the result as NTFS, volume name
 `Vextro`.
 
 ### What is deliberately absent
 
-`$INDEX_ALLOCATION` — a directory that outgrows its record is refused
-rather than split into a B-tree. That is the one functional regression
-against exFAT, and the named next piece of work. Also `$ATTRIBUTE_LIST`,
+`$ATTRIBUTE_LIST` — a file whose attributes outgrow one MFT record is
+refused rather than spread across several. Also
 compression, and NTFS's own `$LogFile`, whose redo record format is not
 publicly specified: what protects writes here is this system's journal,
 not one Windows would replay. chkdsk has never been run against a volume
@@ -531,7 +584,7 @@ every time.
 
 # Verification
 
-`make test` runs **698 checks across 14 suites** on the host, every build.
+`make test` runs **735 checks across 14 suites** on the host, every build.
 The bar is not "it agrees with itself" — an implementation that is merely
 self-consistent round-trips perfectly and proves nothing:
 
@@ -539,7 +592,7 @@ self-consistent round-trips perfectly and proves nothing:
 |---|---|
 | `ntcrypto`, `aes`, `krb5` | AES against FIPS-197, RFC 3961 n-fold/DK/string-to-key against the RFCs' own vectors, AESENC and the portable path made to agree |
 | `wifi` | PMK against IEEE 802.11i's passphrase vectors, key wrap against RFC 3394, CCMP against RFC 3610, the 4-way handshake against a synthetic authenticator |
-| `ntfs` | 156 checks against scratch volumes — run-list encoder against the *decoder*, path resolution including the paths that must *fail*, ranged reads at cluster boundaries and past end-of-file, directory capacity, every mutation followed by a fresh mount, and the journal replayed against a deliberately interrupted write |
+| `ntfs` | 193 checks against scratch volumes — run-list encoder against the *decoder*, path resolution including the paths that must *fail*, ranged reads at cluster boundaries and past end-of-file, a 2,000-name B-tree at depth three, separator deletion, every mutation followed by a fresh mount, and the journal replayed against a deliberately interrupted write |
 | `av` | the automaton against the brute-force search it replaced, over 20,000 buffers, under ASan and UBSan |
 | `vmx` | EPT entry format, capability-MSR negotiation, VMCS field encodings decoded against their width/type structure |
 | `media`, `rdp` | bitstream parsing and surface geometry; RDP wire encoders against the bytes the specification prescribes |
@@ -834,7 +887,7 @@ hypervisor to ask.
 make run RES=1920x1080x32   # display mode, up to the back buffer's bound
 make run NATIVE=1           # render at the panel's own resolution
 make cleandisk              # reset disk.img to factory contents
-make test                   # 698 host checks
+make test                   # 735 host checks
 make repo                   # serve the package repository on :8000
 ```
 
