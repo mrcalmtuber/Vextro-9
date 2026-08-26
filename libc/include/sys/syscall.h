@@ -63,6 +63,15 @@
 #define SYS_GFX_RECT        22
 #define SYS_FORK            23
 #define SYS_MEMINFO         24
+#define SYS_RANDOM          25
+#define SYS_FUTEX           26
+#define SYS_FS_WRITE        27
+#define SYS_REG_SET         28
+#define SYS_BLK_WRITE       29
+
+/* futex operations. See <vxmutex.h> for what to build on them. */
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
 
 static inline long __syscall0(long n) {
     long r;

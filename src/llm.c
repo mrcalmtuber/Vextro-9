@@ -1552,8 +1552,55 @@ static float dot_row(const wt_t *w, uint32_t row, const float *x) {
     return s;
 }
 
-/* out[j] = dot(row j, x) for every output row */
+/*
+ * out[j] = dot(row j, x) for every output row.
+ *
+ * The whole of the arithmetic in this file, by time. Rows are
+ * independent -- each reads the same activation vector and the weights
+ * of one row, and writes one float that no other row touches -- so the
+ * loop below is the same computation whether it runs on one processor or
+ * on four, and that is what makes it the thing to hand to the others.
+ *
+ * The threshold is not a guess about scheduling overhead so much as
+ * about *shape*. The small projections in an attention block are a few
+ * hundred rows of a few hundred elements; splitting one of those across
+ * processors costs an interrupt, four atomic claims and a wait, to save
+ * a few microseconds of dot products. The feed-forward matrices are
+ * thousands of rows of thousands of elements and are where nearly all
+ * the time is. 256 puts the boundary between them.
+ *
+ * Rows per chunk has a floor for the same reason at a smaller scale: a
+ * chunk of one row is an atomic increment per row, contended by every
+ * processor, for work that is a few thousand multiply-adds.
+ */
+#define MATMUL_PAR_MIN   256u
+#define MATMUL_PAR_CHUNK 16u
+
+static llm_par_fn llm_par = 0;
+static uint64_t   llm_par_calls = 0;
+
+void llm_set_parallel(llm_par_fn run) { llm_par = run; }
+uint64_t llm_parallel_calls(void)     { return llm_par_calls; }
+
+typedef struct {
+    float       *out;
+    const float *x;
+    const wt_t  *w;
+} matmul_job_t;
+
+static void matmul_rows(void *ctx, uint32_t first, uint32_t last) {
+    const matmul_job_t *j = (const matmul_job_t *)ctx;
+    for (uint32_t r = first; r < last; r++)
+        j->out[r] = dot_row(j->w, r, j->x);
+}
+
 static void matmul(float *out, const float *x, const wt_t *w) {
+    if (llm_par && w->ne1 >= MATMUL_PAR_MIN) {
+        matmul_job_t job = { out, x, w };
+        llm_par_calls++;
+        llm_par(matmul_rows, &job, w->ne1, MATMUL_PAR_CHUNK);
+        return;
+    }
     for (uint32_t j = 0; j < w->ne1; j++)
         out[j] = dot_row(w, j, x);
 }

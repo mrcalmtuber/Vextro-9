@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="ring 3" src="https://img.shields.io/badge/userland-ring%203-d4af37?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-87k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/kernel-94k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
 </p>
@@ -36,7 +36,7 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**90,201 lines of C written here**, across 154 files, built as four kernel
+**93,950 lines of C written here**, across 157 files, built as four kernel
 objects plus one for inference, over a user-space C library of its own.
 735 host checks across 14 suites on every build.
 

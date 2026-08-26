@@ -43,6 +43,33 @@ void        llm_arena_init(void *base, uint64_t size);
 uint64_t    llm_arena_total(void);
 uint64_t    llm_arena_used(void);
 
+/* ---- the other processors ----
+ *
+ * A transformer's time goes almost entirely into one operation: for each
+ * of several thousand output rows, the dot product of that row of a
+ * quantised weight matrix with one activation vector. Every row is
+ * independent of every other. They read weights that nothing writes and
+ * each writes one element of an output array, so there is no ordering
+ * between them, nothing to lock, and nothing to allocate.
+ *
+ * That is the only shape of work an application processor in this kernel
+ * may be given — it holds no locks, owns no address space and cannot
+ * take a system call — and it is a coincidence worth taking: the single
+ * most expensive thing this machine does is also the one thing that is
+ * unconditionally safe to hand out.
+ *
+ * The runner is injected rather than called directly because this
+ * translation unit is compiled apart from the rest of the kernel and
+ * cannot see src/smp.h. Null, and on a machine with one processor it
+ * stays null, means "do it here" -- the same loop, one participant.
+ */
+typedef void (*llm_row_fn)(void *ctx, uint32_t first, uint32_t last);
+typedef void (*llm_par_fn)(llm_row_fn fn, void *ctx, uint32_t rows,
+                           uint32_t min_chunk);
+
+void        llm_set_parallel(llm_par_fn run);
+uint64_t    llm_parallel_calls(void);
+
 /* ---- model ---- */
 #define LLM_NAME_MAX 64
 

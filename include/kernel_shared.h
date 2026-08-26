@@ -272,6 +272,75 @@ static inline void irq_restore(uint64_t flags) {
     if (flags & 0x200ULL) __asm__ volatile("sti" ::: "memory");
 }
 
+/* ---- 7a2. the spinlock ----
+ *
+ * Moved here from src/pmm.h, unchanged, for the reason the comment there
+ * always anticipated: it was written the way it is so that bringing up a
+ * second processor would not mean revisiting every caller. That day has
+ * arrived, and the callers are now in more than one translation unit —
+ * the scheduler's per-core queues take these, and scheduler.o cannot see
+ * src/pmm.h.
+ *
+ * The exchange was already atomic and already correct under real
+ * contention; what changes with an AP awake is only that the spin can
+ * now genuinely spin. Saving and clearing IF around the critical section
+ * is what makes a lock safe to take from a thread and from the interrupt
+ * that preempts it, and that is unchanged too.
+ *
+ * The bounded spin stays as it was: after a hold time far beyond any
+ * legitimate one the lock is taken anyway and the event reported, which
+ * converts a silent freeze into a live machine and a message naming the
+ * lock. spin_report_timeout keeps its counter in src/pmm.h — it is
+ * diagnostic state and belongs to one object, so what crosses the seam
+ * is the call and not the variable.
+ */
+typedef struct {
+    volatile uint32_t locked;
+    const char       *name;      /* for the report when it never comes free */
+} spinlock_t;
+
+#define SPIN_TIMEOUT 40000000u
+
+void spin_report_timeout(spinlock_t *l);
+
+static inline uint64_t spin_lock_irq(spinlock_t *l) {
+    uint64_t flags = irq_save();
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE)) {
+        if (++spins >= SPIN_TIMEOUT) {
+            spin_report_timeout(l);
+            __atomic_store_n(&l->locked, 1u, __ATOMIC_RELEASE);
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+    return flags;
+}
+
+static inline void spin_unlock_irq(spinlock_t *l, uint64_t flags) {
+    __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);
+    irq_restore(flags);
+}
+
+/* The same lock without touching the interrupt flag, for the one place
+ * that needs it: an application processor's idle loop, which must keep
+ * interrupts exactly as it found them across a queue pop. */
+static inline void spin_lock(spinlock_t *l) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE)) {
+        if (++spins >= SPIN_TIMEOUT) {
+            spin_report_timeout(l);
+            __atomic_store_n(&l->locked, 1u, __ATOMIC_RELEASE);
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+
+static inline void spin_unlock(spinlock_t *l) {
+    __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);
+}
+
 /* ---- 7b. segment selectors and the task-state segment ----
  *
  * Moved from src/gdt.h. Long mode kept the TSS for one field: RSP0, the
@@ -348,6 +417,31 @@ static inline void lapic_eoi(void) {
  */
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
+/*
+ * The window surface a process draws into, and the token it draws with.
+ *
+ * Both are per-process rather than per-thread, which is why they are
+ * here and not in thread_t: a fork shares the parent's pixels and
+ * inherits the parent's privileges, and both of those follow the address
+ * space. src/desktop.h owns the definition of struct app_surface and is
+ * the only thing that ever dereferences the pointer; scheduler.o carries
+ * it across a fork and a reap without needing to know what it is, which
+ * is exactly what an incomplete type is for.
+ */
+struct app_surface;
+
+/* ---- the token ----
+ *
+ * UAC_TOKEN_RESTRICTED is what every process gets, including one started
+ * by an administrator. The elevated form is granted for the life of one
+ * process by an explicit answer at the keyboard and never inherited: a
+ * child of an elevated process starts restricted like anything else,
+ * because an elevation is an answer about one program and not a property
+ * a program can pass on.
+ */
+#define UAC_TOKEN_RESTRICTED 0
+#define UAC_TOKEN_ELEVATED   1
+
 typedef struct {
     uint64_t  pml4_phys;
     uint64_t *pml4;          /* through the HHDM */
@@ -356,6 +450,16 @@ typedef struct {
     uint64_t  canvas_va;     /* where the window's pixels landed this run */
     uint64_t  tramp_va;      /* and the trampoline page - both randomised */
     int       live;
+
+    struct app_surface *surface;  /* private pixels, or null for the
+                                   * shared fallback canvas             */
+
+    /* ---- the security token ---- */
+    uint32_t  sid;           /* which account owns this process         */
+    uint8_t   sid_admin;     /* that account holds the administrator
+                              * flag -- which is permission to be
+                              * *asked*, never permission itself        */
+    uint8_t   token;         /* UAC_TOKEN_*, this run only              */
 } addr_space_t;
 
 /* Whose address space CR3 currently holds, or null for the kernel's

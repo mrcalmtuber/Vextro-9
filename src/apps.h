@@ -1003,6 +1003,83 @@ static void sysmon_draw(uint32_t *buf, uint32_t w, uint32_t h,
                igpu.active ? igpu.name : "CPU renderer",
                igpu.active ? C_GREEN : C_TEXT);
 
+    /*
+     * The compositor, which is worth a line of its own now that there is
+     * something to say about it. How many applications hold a private
+     * window surface, and whether the blitter is carrying any of the
+     * frame -- "0 batches" against a live engine means every rectangle
+     * this frame overlapped the last, which is a real answer and not a
+     * fault.
+     */
+    /*
+     * The processors, and what they are actually carrying.
+     *
+     * Core count alone would say nothing new -- the boot log has printed
+     * it since the ACPI tables were first read. What is worth a line is
+     * how much work the auxiliary cores have taken off this one, which
+     * is the chunk counter each of them keeps.
+     */
+    y += 22;
+    {
+        char v[64];
+        uint_to_str((uint32_t)smp_online, nb);
+        str_copy(v, nb, sizeof(v));
+        str_append(v, " core", sizeof(v));
+        if (smp_online != 1) str_append(v, "s", sizeof(v));
+        if (smp_worker_count()) {
+            uint64_t done = 0;
+            for (int i = 1; i < smp_cpu_count; i++) done += smp_cpu[i].chunks;
+            str_append(v, ", ", sizeof(v));
+            uint_to_str((uint32_t)done, nb);
+            str_append(v, nb, sizeof(v));
+            str_append(v, " blocks offloaded", sizeof(v));
+        } else {
+            str_append(v, ", no worker pool", sizeof(v));
+        }
+        sysmon_row(buf, w, h, cx + 16, y, "cpu", v,
+                   smp_worker_count() ? C_GREEN : C_TEXT);
+    }
+
+    /* The balancer's own view: how many threads call each processor
+     * home. Core zero always carries the interface, which is why its
+     * queue is never the shortest and never should be. */
+    y += 22;
+    {
+        char v[64] = "";
+        for (int c = 0; c < sched_cpu_count() && c < 8; c++) {
+            if (c) str_append(v, " / ", sizeof(v));
+            uint_to_str((uint32_t)sched_queue_depth(c), nb);
+            str_append(v, nb, sizeof(v));
+        }
+        str_append(v, sched_cpu_count() > 1 ? " threads per queue"
+                                            : " threads, one queue",
+                   sizeof(v));
+        sysmon_row(buf, w, h, cx + 16, y, "queues", v, C_TEXT);
+    }
+
+    y += 22;
+    {
+        char v[64];
+        uint_to_str((uint32_t)app_surf_live(), nb);
+        str_copy(v, nb, sizeof(v));
+        str_append(v, " of ", sizeof(v));
+        uint_to_str((uint32_t)APP_SURF_MAX, nb);
+        str_append(v, nb, sizeof(v));
+        str_append(v, " surfaces, ", sizeof(v));
+        if (igpu_comp_active()) {
+            uint_to_str(aero_gpu_ops, nb);
+            str_append(v, nb, sizeof(v));
+            str_append(v, " blits in ", sizeof(v));
+            uint_to_str(aero_gpu_batches, nb);
+            str_append(v, nb, sizeof(v));
+            str_append(v, " batches", sizeof(v));
+        } else {
+            str_append(v, "CPU blending", sizeof(v));
+        }
+        sysmon_row(buf, w, h, cx + 16, y, "compositor", v,
+                   igpu_comp_active() ? C_GREEN : C_TEXT);
+    }
+
     /* activity pulse bar */
     {
         int32_t bx = cx + 16;

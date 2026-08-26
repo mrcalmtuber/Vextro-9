@@ -49,6 +49,45 @@
 #define APIC_LVT_MASKED   0x10000
 #define APIC_TIMER_PERIODIC 0x20000
 
+/* ===== THE INTERRUPT COMMAND REGISTER =====
+ *
+ * The one part of the local APIC that talks about a processor other than
+ * the one writing it. An IPI is composed in two halves: the high word
+ * says who it is for, the low word says what it is, and writing the low
+ * word is what sends it — so the high word must be written first, every
+ * time, or the message goes to whoever the previous write named.
+ *
+ * Three delivery modes are used here and nothing else is:
+ *
+ *   INIT    puts a processor into its reset state and leaves it there,
+ *           waiting. It is not a message the target runs any code for.
+ *   STARTUP carries an 8-bit vector which the target takes as the top
+ *           twelve bits of a physical address: it begins executing in
+ *           real mode at vector << 12, with CS set accordingly. That is
+ *           why the trampoline has to live in the first megabyte and on
+ *           a page boundary — the encoding cannot express anything else.
+ *   FIXED   an ordinary vector, used to wake a worker that has parked
+ *           itself in HLT.
+ *
+ * Bit 12 is delivery status and reads as set while a message is still in
+ * flight. Sending a second IPI before it clears is not queued; it
+ * replaces what was there.
+ */
+#define APIC_REG_ICR_LO   0x300
+#define APIC_REG_ICR_HI   0x310
+
+#define APIC_ICR_FIXED    0x00000000u
+#define APIC_ICR_INIT     0x00000500u
+#define APIC_ICR_STARTUP  0x00000600u
+#define APIC_ICR_ASSERT   0x00004000u
+#define APIC_ICR_LEVEL    0x00008000u   /* trigger mode: level           */
+#define APIC_ICR_PENDING  0x00001000u   /* delivery status: still in flight */
+
+/* The vector an idle application processor is woken on. Above the
+ * scheduler's timer and below the spurious vector, in the range the
+ * IDT's default stubs already cover. */
+#define APIC_VEC_WAKE     0x41
+
 /* APIC_VEC_SPURIOUS and APIC_VEC_TIMER moved to
  * include/kernel_shared.h, with lapic_eoi — the scheduler installs both
  * vectors and acknowledges from inside the timer stub. */
@@ -161,6 +200,83 @@ static void lapic_init(uint32_t hz) {
 
 static void lapic_stop(void) {
     if (!lapic_present) return;
+    lapic_write(APIC_REG_LVT_TMR, APIC_LVT_MASKED);
+    lapic_write(APIC_REG_TMR_INIT, 0);
+}
+
+/* ===== WHO AM I, AND SENDING TO SOMEBODY ELSE =====
+ *
+ * Every processor sees its own local APIC at the same physical address,
+ * so lapic_read here answers about whichever processor is executing it.
+ * That is the whole mechanism by which a woken core discovers which core
+ * it is, and it is why the ID is read rather than passed in.
+ */
+static uint32_t lapic_id(void) {
+    if (!lapic_present) return 0;
+    return lapic_read(APIC_REG_ID) >> 24;
+}
+
+/* Wait for the last message to leave. Bounded, because a local APIC that
+ * never clears delivery status is a machine that would otherwise hang
+ * here with nothing said. */
+static int lapic_ipi_wait(void) {
+    for (int i = 0; i < 1000000; i++) {
+        if (!(lapic_read(APIC_REG_ICR_LO) & APIC_ICR_PENDING)) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+
+/*
+ * Compose and send. High word first — see the note on the ICR above; the
+ * low word is the trigger and must be the last thing written.
+ */
+static int lapic_ipi(uint32_t apic_id, uint32_t low) {
+    if (!lapic_present) return -1;
+    if (lapic_ipi_wait() != 0) return -1;
+    lapic_write(APIC_REG_ICR_HI, apic_id << 24);
+    lapic_write(APIC_REG_ICR_LO, low);
+    return lapic_ipi_wait();
+}
+
+static int lapic_send_init(uint32_t apic_id) {
+    return lapic_ipi(apic_id, APIC_ICR_INIT | APIC_ICR_ASSERT |
+                              APIC_ICR_LEVEL);
+}
+
+/* The vector is the page number of the trampoline: the target begins
+ * executing at vector << 12 in real mode. */
+static int lapic_send_startup(uint32_t apic_id, uint8_t vector) {
+    return lapic_ipi(apic_id, APIC_ICR_STARTUP | APIC_ICR_ASSERT | vector);
+}
+
+static int lapic_send_wake(uint32_t apic_id) {
+    return lapic_ipi(apic_id, APIC_ICR_FIXED | APIC_ICR_ASSERT |
+                              APIC_VEC_WAKE);
+}
+
+/*
+ * Bring up the local APIC of the processor that is executing this.
+ *
+ * Everything lapic_init does *once for the machine* — finding the
+ * registers, mapping them, measuring the bus clock — has already been
+ * done by the time an application processor runs. What has not been done
+ * for that processor is the part that is per-processor state: the task
+ * priority, which silently drops every vector below it if it is left at
+ * whatever reset put there, and the spurious-interrupt register, whose
+ * enable bit is what makes the APIC deliver anything at all.
+ *
+ * Deliberately absent: the timer. One processor drives the scheduler's
+ * clock and it is the boot processor; a second timer ticking into the
+ * same handler would double the tick rate and halve every sleep in the
+ * system.
+ */
+static void lapic_init_ap(void) {
+    if (!lapic_present) return;
+    uint64_t base_msr = rdmsr(MSR_APIC_BASE);
+    wrmsr(MSR_APIC_BASE, base_msr | APIC_BASE_ENABLE);
+    lapic_write(APIC_REG_TPR, 0);
+    lapic_write(APIC_REG_SVR, APIC_SVR_ENABLE | APIC_VEC_SPURIOUS);
     lapic_write(APIC_REG_LVT_TMR, APIC_LVT_MASKED);
     lapic_write(APIC_REG_TMR_INIT, 0);
 }

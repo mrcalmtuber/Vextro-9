@@ -12,6 +12,12 @@
 #include "syscall.h"
 #include "apic.h"
 #include "sched/sched.h"
+/* The other processors. Below apic.h because starting one is a sequence
+ * of inter-processor interrupts, and below acpi.h because the list of
+ * them comes from the MADT. It owns static state -- the per-processor
+ * blocks and the job queue -- so it appears in this translation unit and
+ * nowhere else; see the invariant in include/kernel_shared.h. */
+#include "smp.h"
 #include "trap.h"
 #include "mouse.h"
 #include "keyboard.h"
@@ -472,6 +478,21 @@ static void frame_report(void) {
  * there is no swap file to evict to — but the measurement is real and
  * `free` reports it.
  */
+/*
+ * The inference unit's way onto the other processors.
+ *
+ * src/llm.c is compiled as its own translation unit and cannot see
+ * src/smp.h -- it is built at -O3 with its own flags and includes only
+ * llm.h. So the runner is handed to it as a function pointer from here,
+ * which is the same seam the model file reader already crosses, and the
+ * two signatures are deliberately identical so that this is a cast-free
+ * one-line forward rather than a shim with an opinion.
+ */
+static void llm_parallel_rows(llm_row_fn fn, void *ctx, uint32_t rows,
+                              uint32_t min_chunk) {
+    smp_parallel_for((smp_work_fn)fn, ctx, rows, min_chunk);
+}
+
 static void reclaim_thread(void) {
     for (;;) {
         sched_sleep_ms(1000);
@@ -1083,6 +1104,43 @@ void kmain(void) {
     sched_start();
     sched_spawn_kernel(reclaim_thread, "reclaim", PRIO_IDLE + 1);
 
+    /*
+     * ---- and the rest of the machine ----
+     *
+     * After the local APIC, because starting a processor is a sequence
+     * of messages sent through it; after the heap and the page tables,
+     * because each one needs a kernel stack and an identity mapping;
+     * after tsc_calibrate, because the startup sequence has to wait ten
+     * milliseconds and there is no scheduler clock it may use to do so.
+     *
+     * What comes up is a pool of kernel workers, not a symmetric
+     * scheduler. src/smp.h sets out at length which single-processor
+     * assumptions in this kernel would break under the second kind and
+     * why the first is the honest boundary today.
+     */
+    smp_init(memmap_request.response);
+
+    /* A job with a known answer, read back element by element, before
+     * anything real is handed to the pool. See the note above
+     * smp_selftest for the three distinct failures it separates. */
+    smp_selftest();
+
+    /*
+     * Tell the scheduler how wide the machine turned out to be.
+     *
+     * It defaults to one and everything in it is correct at one, so this
+     * is the only thing that has to happen for the balancer to start
+     * spreading threads across queues. It comes after smp_init because
+     * the answer is how many processors *answered*, not how many the
+     * firmware listed.
+     */
+    sched_set_cpu_count(smp_online);
+
+    /* And the inference path, which is what the extra processors are
+     * for. Nothing else in this kernel has work shaped the right way;
+     * see the note above llm_set_parallel. */
+    llm_set_parallel(smp_online > 1 ? llm_parallel_rows : 0);
+
     /* Initialize Intel e1000 NIC via PCI discovery */
     if (hhdm_request.response != NULL) {
         e1000_init(hhdm_request.response->offset);
@@ -1168,6 +1226,19 @@ void kmain(void) {
         if (fb_phys)
             igpu_init(fb_phys, w, h, pitch_px);
     }
+
+    /*
+     * The compositor's own view of the GPU, and the pool of offscreen
+     * surfaces it composites from.
+     *
+     * The surfaces are initialised unconditionally, because they are
+     * what every ring-3 program draws into whether or not there is any
+     * hardware to accelerate the drawing. The GGTT window is only
+     * programmed if the blitter came up and passed its self-test, and
+     * everything downstream of it tests for that.
+     */
+    app_surf_init();
+    aero_gpu_init(backbuf, w, h);
 
     /*
      * AMD-V. This has to run after the HHDM offset is known, because
@@ -1638,6 +1709,16 @@ void kmain(void) {
     serial_puts("[vextro] app selftest: running /hello\n");
     execute_bin_blocking("/hello", 0);
     serial_puts("[vextro] app selftest: done\n");
+
+    /*
+     * And the futex, which needs two processes and shared memory to say
+     * anything at all -- so it forks, and both halves hammer one counter
+     * through one lock. A harness that only ever ran a single-threaded
+     * program could not have tested this.
+     */
+    serial_puts("[vextro] futex selftest: running /mutextest\n");
+    execute_bin_blocking("/mutextest", 0);
+    serial_puts("[vextro] futex selftest: done\n");
 #endif
 
 #ifdef PE_SELFTEST
@@ -2506,7 +2587,38 @@ void kmain(void) {
         if (auto_login && !desktop_mode) {
             auto_login = 0;
             desktop_mode = 1;
-            serial_puts("[vextro] AUTO_LOGIN: skipped the login screen\n");
+            /*
+             * Skipping the login screen is not the same as signing in,
+             * and until now this did only the first.
+             *
+             * It set desktop_mode and stopped, which left user_current
+             * at -1 -- nobody signed in. That was invisible while
+             * nothing consulted the account: the desktop drew, the
+             * screenshot came out, and the only thing missing was a name
+             * in the corner. It stopped being invisible when a program's
+             * privileges started depending on whose session it was,
+             * because a session belonging to nobody can never be
+             * elevated and every prompt would be refused before it was
+             * asked.
+             *
+             * So the harness signs in properly: an existing account if
+             * the volume has one, and an administrator called `auto` if
+             * it does not. The password is fixed and it does not matter
+             * -- this whole branch is compiled out of anything anybody
+             * could boot, which is the only thing that makes writing one
+             * here acceptable at all.
+             */
+            if (user_current < 0) {
+                if (user_count == 0)
+                    user_add("auto", "auto", 1);
+                if (user_count > 0) {
+                    user_current = 0;
+                    session_begin(user_name_of(user_current));
+                }
+            }
+            serial_puts("[vextro] AUTO_LOGIN: signed in as ");
+            serial_puts(user_name_of(user_current));
+            serial_puts(user_is_admin(user_current) ? " (admin)\n" : "\n");
             for (uint32_t i = 0; i < w * h; i++) backbuf[i] = COLOR_BLACK;
 #ifdef AI_ACCEPT
             /* AUTO_LOGIN skips the dialog, so the answer has to be given
@@ -2637,6 +2749,30 @@ void kmain(void) {
                 auto_ask_pending = 0;
                 serial_puts("[autoask] asking\n");
                 wiki_ask(AUTO_ASK);
+            }
+#endif
+#ifdef UAC_SELFTEST
+            /*
+             * The elevation gateway, from a session that could actually
+             * be granted one.
+             *
+             * It has to run *here* rather than beside the other boot
+             * self-tests, and the reason is the whole design: a
+             * restricted program is refused outright unless an
+             * administrator is signed in, and nobody is signed in when
+             * the boot self-tests run. So this waits for the desktop,
+             * launches once, and the launch is not blocking -- the
+             * compositor has to keep drawing to put the question on the
+             * screen, and a compositor waiting for the answer would be a
+             * compositor that never drew the prompt.
+             */
+            {
+                static int uac_test_done = 0;
+                if (!uac_test_done && desktop_tick > 120) {
+                    uac_test_done = 1;
+                    serial_puts("[vextro] uac selftest: running /mutextest\n");
+                    execute_bin("/mutextest");
+                }
             }
 #endif
             uint64_t t0 = cycle_now();

@@ -74,6 +74,44 @@
 #define SYS_RANDOM          25
 
 /*
+ * A fast user-space mutex. See the service routine in src/desktop.h for
+ * what the two operations mean and why the channel is a physical
+ * address rather than the pointer the caller passed.
+ *
+ * The two operations, and the length of one park. These are the kernel's
+ * copy; libc/include/sys/syscall.h carries the same three numbers on the
+ * other side of the boundary, because a header shared across a privilege
+ * boundary is a header a program could change.
+ */
+#define SYS_FUTEX           26
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+
+/* How long a waiter sleeps before returning to its own retry loop. Long
+ * enough that a contended lock costs one system call and not a stream of
+ * them; short enough that a wake which was somehow missed costs a fifth
+ * of a second rather than a hung program. */
+#define FUTEX_PARK_MS       200
+
+/*
+ * ---- the three privileged doors ----
+ *
+ * Everything above this line is a program acting on itself: its own
+ * pixels, its own memory, its own scheduling. These three act on the
+ * machine, and they are the first calls in this system that do.
+ *
+ * They are the three ways a program can make a permanent change:
+ * rewriting a file rewrites NTFS metadata, rewriting the registry
+ * rewrites the configuration hive, and writing a block goes past both
+ * straight to the disk. Each one goes through uac_guard first, which is
+ * what makes "may this program do that" a question with an answer
+ * rather than an assumption.
+ */
+#define SYS_FS_WRITE        27
+#define SYS_REG_SET         28
+#define SYS_BLK_WRITE       29
+
+/*
  * Every register a user thread had, in the order the entry stubs push
  * them, is syscall_frame_t in include/kernel_shared.h. It moved there
  * because sched_fork_thread copies a parent's registers out of it and

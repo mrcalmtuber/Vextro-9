@@ -46,19 +46,21 @@
  * it is written this way so that bringing up an AP later does not
  * require revisiting every caller.
  */
-typedef struct {
-    volatile uint32_t locked;
-    const char       *name;      /* for the report when it never comes free */
-} spinlock_t;
-
 /*
  * A lock that gives up.
  *
- * A plain spinlock has exactly one failure mode and it is the worst one:
- * if the holder never releases -- because it faulted, or because two
- * locks were taken in opposite orders on two processors -- every other
- * processor spins forever and the machine is dead with nothing on the
- * wire. There is no way to tell that apart from a hang.
+ * spinlock_t itself, SPIN_TIMEOUT and the four lock operations moved to
+ * include/kernel_shared.h when the scheduler grew per-core queues: they
+ * are pure inline assembly over caller-supplied state, and scheduler.o
+ * cannot see this file. What stays here is the diagnostic half, because
+ * it is state and state belongs to exactly one object.
+ *
+ * The design is unchanged and worth restating. A plain spinlock has one
+ * failure mode and it is the worst one: if the holder never releases --
+ * because it faulted, or because two locks were taken in opposite orders
+ * on two processors -- every other processor spins forever and the
+ * machine is dead with nothing on the wire. There is no way to tell that
+ * apart from a hang.
  *
  * So the spin is bounded. After a number of attempts far beyond any
  * legitimate hold time, the lock is *taken anyway* and the event is
@@ -68,32 +70,10 @@ typedef struct {
  * lock, which is the difference between a bug that can be found and one
  * that cannot.
  */
-#define SPIN_TIMEOUT 40000000u
-
 static uint64_t spin_timeouts = 0;
 
 /* irq_save and irq_restore moved to include/kernel_shared.h — the
  * scheduler brackets its critical sections with them. */
-
-static void spin_report_timeout(spinlock_t *l);
-
-static inline uint64_t spin_lock_irq(spinlock_t *l) {
-    uint64_t flags = irq_save();
-    uint32_t spins = 0;
-    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE)) {
-        if (++spins >= SPIN_TIMEOUT) {
-            spin_report_timeout(l);
-            __atomic_store_n(&l->locked, 1u, __ATOMIC_RELEASE);
-            break;
-        }
-        __asm__ volatile("pause" ::: "memory");
-    }
-    return flags;
-}
-static inline void spin_unlock_irq(spinlock_t *l, uint64_t flags) {
-    __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);
-    irq_restore(flags);
-}
 
 /* ---- state ---- */
 
@@ -107,7 +87,9 @@ static uint64_t   pmm_next_hint    = 0;   /* where the last search stopped  */
 static spinlock_t pmm_lock = { 0, "pmm" };
 static int        pmm_ready = 0;
 
-static void spin_report_timeout(spinlock_t *l) {
+/* Not static: the inline lock operations in include/kernel_shared.h call
+ * it, and they are compiled into every object that takes a lock. */
+void spin_report_timeout(spinlock_t *l) {
     spin_timeouts++;
     serial_puts("[lock] timed out waiting for ");
     serial_puts(l->name ? l->name : "an unnamed lock");

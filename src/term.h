@@ -1306,8 +1306,31 @@ static void cmd_policy(int argc, char **argv) {
         term_print(allowlist_on ? "on" : "off");
         term_print("\n  scanner    ");
         term_print(scanner_on ? "on" : "off");
-        term_print("\n\nNone of this isolates a running program; it decides\n"
-                   "whether one starts. See 'help policy'.\n");
+
+        /*
+         * What the prompts have actually decided.
+         *
+         * The sentence that used to close this panel said that none of
+         * it isolated a running program and that all of it only decided
+         * whether one started. That was exactly true for as long as
+         * there were no system calls a program could use to change the
+         * machine. There are three now -- writing a file, writing the
+         * registry, writing a block -- and every one of them goes
+         * through the gateway, so the honest summary is different and
+         * the numbers below are the evidence for it.
+         */
+        {
+            char nb[12];
+            term_print("\n\nElevation requests: ");
+            uint_to_str(uac_grants, nb);   term_print(nb);
+            term_print(" allowed, ");
+            uint_to_str(uac_denials, nb);  term_print(nb);
+            term_print(" refused\n");
+        }
+        term_print("\nEvery program starts with a restricted token, whoever\n"
+                   "launched it. The allow list and the scanner decide\n"
+                   "whether one starts; the prompts decide what it may do\n"
+                   "to this machine afterwards. See 'help policy'.\n");
         return;
     }
     int ok; sec_require_admin(&ok); if (!ok) return;
@@ -1799,6 +1822,28 @@ static void term_exec(char *cmdline) {
                 term_print(igpu.fb_blittable ?
                            "blitter can write the framebuffer\n" :
                            "offscreen surfaces only\n");
+
+                /*
+                 * The compositor's own use of the engine, which is a
+                 * different question from whether the engine works.
+                 * A batch is refused rather than truncated when it
+                 * overflows or the power well will not wake, and a
+                 * refusal is silent to the eye -- the frame simply comes
+                 * out on the processor instead -- so it is counted and
+                 * reported here rather than left to be inferred from a
+                 * frame rate.
+                 */
+                term_print("  compose   ");
+                if (igpu_comp_active()) {
+                    uint_to_str(igpu_comp.frames, nb);
+                    term_print(nb);
+                    term_print(" batches submitted, ");
+                    uint_to_str(igpu_comp.refused, nb);
+                    term_print(nb);
+                    term_print(" refused\n");
+                } else {
+                    term_print("back buffer not mapped; CPU compositing\n");
+                }
                 term_print_c("  try 'gpu test' to blit to the screen\n", 3);
             } else {
                 term_print("  renderer  CPU (portable framebuffer path)\n");

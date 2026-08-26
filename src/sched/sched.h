@@ -24,6 +24,12 @@
 #define SCHED_NAME_LEN    24
 #define SCHED_KSTACK      (32 * 1024)
 
+/* One ready queue per processor. The bound matches SMP_MAX_CPUS in
+ * src/smp.h, which is where processors are actually started; the two are
+ * separate constants because this file must compile for the host test
+ * suite, where there is no smp.h and no APIC. */
+#define SCHED_MAX_CPUS    16
+
 /* Higher runs first. The compositor sits above applications so that a
  * program in a tight loop can never cost the interface its frame. */
 #define PRIO_IDLE    0
@@ -70,6 +76,21 @@ typedef struct thread {
      * sched_block_on. */
     void          *wait_chan;
     int            exit_code;
+    /*
+     * Which processor's ready queue this thread belongs to.
+     *
+     * Chosen once, when the thread is created, by whichever queue is
+     * shortest -- except for the interface, which is pinned to processor
+     * zero because that is the one the frame clock interrupts and the
+     * one the compositor's shared state lives on.
+     *
+     * A home is a preference and not a confinement: sched_pick looks
+     * through its own queue first and then through every other one, so a
+     * thread whose home processor is not dispatching still runs. That
+     * fallback is what makes it safe to assign homes today, when exactly
+     * one processor dispatches threads at all.
+     */
+    uint32_t       cpu;
     char           name[SCHED_NAME_LEN];
     /* 512 bytes, sixteen-aligned, exactly as FXSAVE64 wants them. The
      * attribute is on the member rather than the struct because the
@@ -153,6 +174,17 @@ void      sched_reap(void);
  * a function pointer keeps the dependency pointing the right way. */
 extern void (*sched_reap_hook)(thread_t *t);
 int       sched_thread_count(void);
+
+/* ===== THE PER-CORE READY QUEUES =====
+ *
+ * How many processors the balancer may spread work across. Set once by
+ * the composition root after the application processors have answered;
+ * one until then, which is what makes every decision below correct on a
+ * machine that never starts a second one.
+ */
+void sched_set_cpu_count(int n);
+int  sched_cpu_count(void);
+int  sched_queue_depth(int cpu);
 
 /* ===== SLEEPING AND WAKING =====
  *

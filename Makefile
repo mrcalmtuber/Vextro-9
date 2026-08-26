@@ -596,7 +596,7 @@ build/ca-bundle.crt:
 # at boot and cannot use a fragmented one; and it allocates every file
 # sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
 # archive's run list would not fit in its own MFT record.
-disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
+disk.img: $(ASSET_LIST) | build/hello build/faulter build/mutextest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -604,6 +604,7 @@ disk.img: $(ASSET_LIST) | build/hello build/faulter $(WINAPPS) $(STORE_BINS) $(P
 	done; \
 	cmd="python3 tools/mkntfs.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello build/faulter \
+		build/mutextest \
 		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \
 		build/ca-bundle.crt:etc/ca-bundle.crt \
@@ -706,6 +707,21 @@ winapps: $(WINAPPS)
 # A program that writes through a null pointer, so that the containment
 # can be tested rather than assumed. Runs under `make iso
 # EXTRA=-DFAULT_SELFTEST`; otherwise it just sits on the volume.
+# --- User app: mutextest ---
+#
+# The futex, exercised from ring 3 across a fork. Built like hello --
+# same linker script, same C library -- because it is an ordinary
+# application and the point is that a mutex is now something an ordinary
+# application can have.
+build/mutextest.o: apps/mutextest.c apps/vextro.h libc/include/vxmutex.h \
+                   libc/include/sys/syscall.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/mutextest: build/mutextest.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/mutextest.o $(LIBC) -o $@
+
 build/faulter.o: apps/faulter.c apps/vextro.h
 	@mkdir -p build
 	$(CC) $(APP_CFLAGS) -c $< -o $@
@@ -743,10 +759,11 @@ build/pics/%.sci: apps/pics/%.png tools/mkimg.py
 # --- Ramdisk: tar archive of apps/ text files + compiled binaries ---
 # The store payloads ride along here too, so the storefront still has
 # something to install on an ISO-only boot with no disk attached.
-build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter $(WINAPPS) $(STORE_BINS)
+build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter \
+                  build/mutextest $(WINAPPS) $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
-	cp build/hello build/faulter build/initrd_staging/
+	cp build/hello build/faulter build/mutextest build/initrd_staging/
 	$(foreach w,$(WINAPPS),cp $(w) build/initrd_staging/;)
 	$(foreach a,$(STORE_APPS),cp build/store/$(a).vx build/initrd_staging/store/pkg/$(a).vx;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .

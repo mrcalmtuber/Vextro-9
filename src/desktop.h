@@ -1054,12 +1054,162 @@ static void reg_load(void) {
 #define APP_CANVAS_W 598
 #define APP_CANVAS_H 402
 
-/* Page-aligned because it is mapped into every application's address
- * space, and a mapping is made of whole pages. */
+/*
+ * ===== 4a. OFFSCREEN WINDOW SURFACES =====
+ *
+ * Every application used to draw into `app_canvas` — one array, mapped
+ * into every process at the same virtual address, and therefore *the
+ * same physical pixels in all of them*. Two programs running at once
+ * fought over the frame: whichever ran last in a slice owned the window,
+ * and what the compositor put on screen was an interleaving of both.
+ *
+ * That is also an isolation hole with nothing to do with graphics. A
+ * shared writable mapping between two ring-3 processes is a channel
+ * between them, and it existed for no better reason than that there had
+ * only ever been one application at a time to worry about.
+ *
+ * So a process now renders exclusively into a surface of its own, and
+ * the compositor is what puts surfaces on the screen. The mapping is
+ * still at `canvas_va` and SYS_CANVAS still answers the same three
+ * values, so no binary already on somebody's disk notices the change —
+ * what changed is which physical pages that address resolves to.
+ *
+ * ---- why the surfaces are static and counted ----
+ *
+ * They are page-aligned because a mapping is made of whole pages, and
+ * they are a fixed pool rather than heap allocations for two reasons
+ * that both matter. kmalloc's large path hands back a pointer 64 bytes
+ * into a page, so a mapped canvas would land 64 bytes off the start of
+ * the user's page and every pixel would be shifted; and a surface that
+ * never moves can be given a GGTT mapping once at boot rather than one
+ * per spawn, which the blitter needs and which the GPU's bump allocator
+ * could not take back.
+ *
+ * Six of them, and the seventh concurrent application falls back to the
+ * shared canvas with a line on the wire saying so. That is a real limit
+ * and it is stated rather than hidden: five and a half megabytes of
+ * pixels is already the third largest static allocation in this kernel,
+ * behind the wallpaper and the back buffer.
+ */
+#define APP_SURF_MAX   6
+#define APP_SURF_PX    (APP_CANVAS_W * APP_CANVAS_H)
+#define APP_SURF_BYTES (((APP_SURF_PX * 4u) + 4095u) & ~4095u)
+#define APP_SURF_WORDS (APP_SURF_BYTES / 4u)
+
+/* The trailing words of each row are padding to the page boundary and
+ * are never drawn; they exist so that surface n+1 starts page-aligned
+ * like surface n, which a plain [MAX][PX] array would not. */
+static uint32_t app_surf_mem[APP_SURF_MAX][APP_SURF_WORDS]
+    __attribute__((aligned(4096)));
+
+struct app_surface {
+    uint32_t *px;
+    uint32_t  refs;        /* address spaces mapping it; 0 means free   */
+    uint32_t  gen;         /* bumped whenever the owner draws           */
+    uint32_t  pid;         /* whoever created it, for the taskbar       */
+    uint32_t  gpu_addr;    /* GGTT address, or 0 if unreachable         */
+    char      name[SCHED_NAME_LEN];
+};
+typedef struct app_surface app_surface_t;
+
+static app_surface_t app_surf[APP_SURF_MAX];
+
+/* The surface the application window shows: the most recent one to have
+ * been claimed and still live. Null means the window shows the shared
+ * fallback canvas, which is what a single-application machine did before
+ * any of this and what it still does if the pool is exhausted. */
+static app_surface_t *app_surf_front = 0;
+
+/* Page-aligned for the same reason the pool is. Still here because a
+ * process that could not be given a surface has to draw somewhere, and
+ * because term.h points the video decoder at it. */
 static uint32_t app_canvas[APP_CANVAS_W * APP_CANVAS_H]
     __attribute__((aligned(4096)));
 static char     app_win_title[64] = "hello";
 static int      silent_launch = 0;
+
+static void app_surf_init(void) {
+    for (int i = 0; i < APP_SURF_MAX; i++) {
+        app_surf[i].px   = app_surf_mem[i];
+        app_surf[i].refs = 0;
+        app_surf[i].gen  = 0;
+        app_surf[i].pid  = 0;
+        app_surf[i].name[0] = '\0';
+    }
+}
+
+static void app_surf_clear(app_surface_t *s) {
+    for (uint32_t i = 0; i < APP_SURF_PX; i++) s->px[i] = 0;
+    s->gen++;
+}
+
+/* Claim one for a process that is starting. Null when the pool is full,
+ * which the caller reports rather than treats as a failure to launch. */
+static app_surface_t *app_surf_claim(const char *name) {
+    for (int i = 0; i < APP_SURF_MAX; i++) {
+        if (app_surf[i].refs) continue;
+        app_surf[i].refs = 1;
+        app_surf[i].pid  = 0;
+        str_copy(app_surf[i].name, name, SCHED_NAME_LEN);
+        app_surf_clear(&app_surf[i]);
+        return &app_surf[i];
+    }
+    return 0;
+}
+
+/* A fork maps the parent's pixels rather than copying them: the two
+ * halves of a forked program are one program as far as the window is
+ * concerned, and giving the child a blank surface of its own would show
+ * whichever of them drew last on a canvas the other had never seen. */
+static void app_surf_ref(app_surface_t *s) {
+    if (s) s->refs++;
+}
+
+static void app_surf_release(app_surface_t *s) {
+    if (!s || !s->refs) return;
+    if (--s->refs) return;
+    s->pid     = 0;
+    s->name[0] = '\0';
+    /* The window has to show something. When the program that owned it
+     * ends, the front falls to whatever else is still running rather
+     * than to the empty fallback canvas -- closing one of two
+     * applications should reveal the other, not a blank frame. */
+    if (app_surf_front == s) {
+        app_surf_front = 0;
+        for (int i = 0; i < APP_SURF_MAX; i++)
+            if (app_surf[i].refs) { app_surf_front = &app_surf[i]; break; }
+    }
+}
+
+/*
+ * What the last frame cost the engine.
+ *
+ * Declared up here with the surfaces rather than down in the compositor
+ * that writes them, because the system monitor reads them and its
+ * header is included before the compositor's section. Two counters and
+ * an include order is a smaller price than a forward declaration nobody
+ * would think to keep in step.
+ */
+static uint32_t aero_gpu_batches = 0;   /* submissions in the last frame */
+static uint32_t aero_gpu_ops     = 0;   /* operations the engine took    */
+
+/* How many surfaces have a live process behind them — what the taskbar
+ * needs to know before it decides whether to draw previews at all. */
+static int app_surf_live(void) {
+    int n = 0;
+    for (int i = 0; i < APP_SURF_MAX; i++) if (app_surf[i].refs) n++;
+    return n;
+}
+
+/* Where the calling process's pixels are, whichever kind it turned out
+ * to be. Every syscall that writes pixels goes through this rather than
+ * naming a buffer, which is what makes the fallback invisible to the
+ * service routines. */
+static uint32_t *app_surf_current(void) {
+    if (vmm_current && vmm_current->surface)
+        return vmm_current->surface->px;
+    return app_canvas;
+}
 
 /* Set while a user thread is running so a refusal can name it. */
 static char     app_fault_note[96];
@@ -1115,6 +1265,221 @@ static int sys_canvas_ok(uint64_t buf, int64_t bw, int64_t bh) {
 
 static uint64_t sys_sbrk(int64_t delta);
 
+/*
+ * ===== 4b. THE ELEVATION GATEWAY =====
+ *
+ * Every process in this system starts restricted, and that sentence is
+ * doing more work than it looks like.
+ *
+ * users.h has always been careful to say what its administrator flag is
+ * not: "a security boundary". It governed the interface, and it could
+ * only govern the interface, because the interface was the only way a
+ * person reached the disk — there were no file system calls, so a ring-3
+ * program had nothing to be restricted *from*. The flag decided which
+ * buttons a person saw. It decided nothing at all about a program.
+ *
+ * The three doors added below change that, and they are chosen rather
+ * than arbitrary: writing a file rewrites NTFS metadata, writing the
+ * registry rewrites the configuration hive, and writing a block goes
+ * straight past both to the disk. Those are the three ways a program can
+ * change this machine permanently, and now that a program can ask, the
+ * question of whether it may has an answer that has to be made rather
+ * than assumed.
+ *
+ * ---- why an administrator's program is still restricted ----
+ *
+ * The obvious design is that a program run by an administrator is an
+ * administrative program. It is also the design that makes the account
+ * flag worthless: everything that account launches — a downloaded
+ * binary, a store package, something that arrived over the network —
+ * inherits the whole machine without anybody being asked.
+ *
+ * So the flag is demoted to what it actually is: permission to *be
+ * asked*. A restricted token is what a process gets, an administrator's
+ * session is what makes elevation possible, and an answer at the
+ * keyboard is what makes it happen. A non-administrator's program is
+ * refused without a prompt, because there is no answer that could grant
+ * it.
+ *
+ * The elevation lasts for the life of that process and is not inherited
+ * across a fork; see the note in SYS_FORK about why a program that could
+ * pass it on would only have to fork to launder it.
+ *
+ * ---- what the policy level does ----
+ *
+ * uac_level has existed in the policy file since the security module was
+ * split out, with four settings and a comment saying it governed "how
+ * often privileged actions should ask". Nothing read it, because nothing
+ * had a privileged action to gate. This is what reads it.
+ */
+#define UAC_OP_LEN     28
+#define UAC_DETAIL_LEN 96
+
+/* What the privileged calls will accept in one go.
+ *
+ * A cap rather than a stream, and a kernel buffer rather than a walk
+ * through user memory: the bytes have to be readable *after* the person
+ * has answered the prompt, and the only way to guarantee that is to
+ * have taken a copy before asking. Half a megabyte is more than any
+ * configuration file and small enough to sit in the image. */
+#define SYS_WRITE_MAX  (512u * 1024u)
+#define FS_PATH_MAX    256
+
+/* How long a frozen thread waits for an answer before the silence is
+ * taken as a refusal. Long enough to read the prompt and think about it;
+ * bounded, because a program that blocks forever on a dialog nobody is
+ * looking at is indistinguishable from one that has hung. */
+#define UAC_WAIT_TICKS 60000u          /* scheduler ticks: one minute */
+
+static struct {
+    volatile int  pending;             /* a question is on the screen  */
+    volatile int  answered;
+    volatile int  granted;
+    uint32_t      pid;
+    char          program[SCHED_NAME_LEN];
+    char          op[UAC_OP_LEN];
+    char          detail[UAC_DETAIL_LEN];
+} uac_req;
+
+static uint32_t uac_grants = 0;
+static uint32_t uac_denials = 0;
+
+/*
+ * May the calling process do this?
+ *
+ * Returns 1 to allow and 0 to refuse. When the answer is not already
+ * known it freezes the calling thread and asks — which is why this is
+ * only ever called from a system call on a ring-3 thread, and never
+ * from the compositor, whose own thread is the one that has to stay
+ * running to draw the question.
+ */
+static int uac_guard(const char *op, const char *detail) {
+    addr_space_t *as = vmm_current;
+
+    /*
+     * A kernel-mode caller: the shell, the package installer, a boot
+     * self-test. There is no application to ask about and no ring-3
+     * thread to freeze — the person is already at the keyboard driving
+     * it, and the interface asked them whatever it needed to.
+     */
+    if (!as || !cur_thread || !sched_running) return 1;
+
+    if (as->token == UAC_TOKEN_ELEVATED) return 1;
+
+    /* The policy says not to ask. Recorded on the token rather than
+     * merely returned, so a later call does not re-derive it. */
+    if (uac_level == UAC_NEVER) {
+        as->token = UAC_TOKEN_ELEVATED;
+        return 1;
+    }
+
+    if (!as->sid_admin) {
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Refused: ", sizeof(note));
+        str_append(note, cur_thread->name, sizeof(note));
+        str_append(note, " is not running as an administrator", sizeof(note));
+        notify_push(NOTE_WARN, note);
+        serial_puts("[uac] refused (not an administrator's session): ");
+        serial_puts(cur_thread->name);
+        serial_puts(" wanted to ");
+        serial_puts(op);
+        serial_putc('\n');
+        uac_denials++;
+        return 0;
+    }
+
+    /*
+     * One question at a time.
+     *
+     * A queue would be the general answer and the wrong one here: a
+     * prompt is a claim about what the person is looking at, and two
+     * stacked prompts about two different programs is exactly how
+     * somebody ends up granting the second while reading the first.
+     * The loser is refused and told why.
+     */
+    if (uac_req.pending) {
+        serial_puts("[uac] refused (another request is being decided): ");
+        serial_puts(cur_thread->name);
+        serial_putc('\n');
+        uac_denials++;
+        return 0;
+    }
+
+    uac_req.answered = 0;
+    uac_req.granted  = 0;
+    uac_req.pid      = cur_thread->pid;
+    str_copy(uac_req.program, cur_thread->name, SCHED_NAME_LEN);
+    str_copy(uac_req.op, op, UAC_OP_LEN);
+    str_copy(uac_req.detail, detail ? detail : "", UAC_DETAIL_LEN);
+    uac_req.pending  = 1;
+
+    serial_puts("[uac] ");
+    serial_puts(uac_req.program);
+    serial_puts(" wants to ");
+    serial_puts(op);
+    serial_puts(": ");
+    serial_puts(uac_req.detail);
+    serial_puts(" - asking\n");
+
+    /*
+     * Freeze the thread.
+     *
+     * The channel is the request's own address, which is the usual
+     * convention here — nothing dereferences it, it is only compared.
+     * Waking in quarter-second steps rather than waiting on the channel
+     * alone: a wake that arrives between the state being set and the
+     * yield is a wake that is lost, and re-testing the condition on a
+     * timer costs four wakeups a second to make that impossible to care
+     * about.
+     *
+     * This runs with interrupts masked, because every system call does.
+     * That is exactly what makes the sleep safe rather than unsafe here
+     * — sched_block_on_locked takes the flags as it finds them, and the
+     * yield that follows is a software-raised vector, which an INT
+     * delivers whether or not IF is set.
+     */
+    {
+        const uint64_t deadline = sched_ticks + UAC_WAIT_TICKS;
+        while (!uac_req.answered && sched_ticks < deadline)
+            sched_block_on((void *)&uac_req, 250);
+    }
+
+    const int ok = uac_req.answered && uac_req.granted;
+    uac_req.pending  = 0;
+    uac_req.answered = 0;
+
+    if (ok) {
+        as->token = UAC_TOKEN_ELEVATED;
+        uac_grants++;
+        serial_puts("[uac] granted; ");
+        serial_puts(uac_req.program);
+        serial_puts(" is elevated for the rest of this run\n");
+    } else {
+        uac_denials++;
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Denied: ", sizeof(note));
+        str_append(note, uac_req.program, sizeof(note));
+        notify_push(NOTE_WARN, note);
+        serial_puts("[uac] denied\n");
+    }
+    return ok;
+}
+
+/*
+ * The answer, from the compositor's thread.
+ *
+ * Writes the verdict and releases whoever is parked on the request. It
+ * cannot be the same thread that asked -- the asker is asleep -- which
+ * is the whole reason the prompt is drawn by the interface rather than
+ * by the program.
+ */
+static void uac_answer(int granted) {
+    if (!uac_req.pending) return;
+    uac_req.granted  = granted;
+    uac_req.answered = 1;
+    sched_wake_chan((void *)&uac_req, 1);
+}
+
 static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3, uint64_t a4,
                                 uint64_t a5) {
@@ -1140,7 +1505,11 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         int32_t px = (int32_t)a0;
         int32_t py = (int32_t)a1;
         if (px >= 0 && px < APP_CANVAS_W && py >= 0 && py < APP_CANVAS_H)
-            app_canvas[py * APP_CANVAS_W + px] = (uint32_t)a2;
+            app_surf_current()[py * APP_CANVAS_W + px] = (uint32_t)a2;
+        /* The compositor reads this to know whether a preview is worth
+         * rescaling. One store per pixel-plotting call is nothing beside
+         * the syscall that carried it. */
+        if (vmm_current && vmm_current->surface) vmm_current->surface->gen++;
         return 0;
     }
 
@@ -1215,12 +1584,30 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         }
         child->canvas_va = vmm_current->canvas_va;
         child->tramp_va  = vmm_current->tramp_va;
+        /* vmm_fork copied the page tables, so the child already *maps*
+         * the parent's surface; what it does not yet have is a claim on
+         * it. Without the reference the parent's exit would put the
+         * surface back in the pool while the child was still drawing
+         * into it, and the next program to launch would inherit a
+         * window somebody else was painting. */
+        child->surface = vmm_current->surface;
+        app_surf_ref(child->surface);
+
+        /* The token is inherited, and the elevation is not. A child of
+         * an elevated process starts restricted: the answer at the
+         * keyboard was about one program, and a program that could pass
+         * it on would only have to fork to launder it. */
+        child->sid       = vmm_current->sid;
+        child->sid_admin = vmm_current->sid_admin;
+        child->token     = UAC_TOKEN_RESTRICTED;
 
         /* The child resumes at the same instruction with RAX zero. Its
          * frame is built from the parent's, which the syscall stub has
          * already saved. */
         thread_t *t = sched_fork_thread(cur_thread, child);
         if (!t) {
+            app_surf_release(child->surface);
+            child->surface = 0;
             vmm_destroy(child);
             kfree(child);
             return (uint64_t)-1;
@@ -1240,10 +1627,21 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         }
         uint64_t *out = (uint64_t *)(uintptr_t)a0;
         if (!out) return (uint64_t)-1;
+        /* The address is unchanged from what it always was; what is
+         * behind it is now this process's own pages rather than a
+         * canvas shared with everything else running. */
         out[0] = vmm_current ? vmm_current->canvas_va
                              : (uint64_t)(uintptr_t)app_canvas;
         out[1] = APP_CANVAS_W;
         out[2] = APP_CANVAS_H;
+        /* A program that asks for this address writes through it
+         * afterwards with no syscall to notice, so `gen` cannot be a
+         * dirty flag for that path and is not treated as one — the
+         * compositor rescales previews on a fixed cadence. What the
+         * bump does say is that this surface has been claimed by a
+         * program that intends to draw, which is what stops an empty
+         * preview appearing for one that never will. */
+        if (vmm_current && vmm_current->surface) vmm_current->surface->gen++;
         /* The address in RAX as well, so a caller that treats this as a
          * function returning a pointer -- which is the natural way to
          * write it -- gets one without also reading the buffer. */
@@ -1300,6 +1698,260 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
          * caller of this syscall will reuse. */
         for (uint32_t i = 0; i < sizeof(chunk); i++) chunk[i] = 0;
         return done;
+    }
+
+    /*
+     * ===== SYS_FUTEX =====
+     *
+     * The kernel half of a lock that is not usually a system call.
+     *
+     * A mutex in this system used to have nowhere to go. There was one
+     * synchronisation primitive available to ring 3 — sched_yield, spun
+     * on — which burns a whole scheduling slice per attempt and, at
+     * PRIO_NORMAL against a compositor at PRIO_UI, can spin for a very
+     * long time waiting for a thread that is ready to run and simply is
+     * not being run.
+     *
+     * A futex splits the problem where the cost actually is. The
+     * uncontended case — which is nearly every case — is a compare and
+     * exchange on a word in the program's own memory, and the kernel
+     * never hears about it at all. Only a collision comes here, and what
+     * it asks for is not a lock but a *place to sleep*: park this thread
+     * until somebody says that word changed.
+     *
+     * ---- what the channel is, and why it is not the pointer ----
+     *
+     * The scheduler's wait channels are addresses that nothing
+     * dereferences and everything compares. The obvious channel is the
+     * user pointer, and it is wrong: two processes sharing a page map it
+     * at different virtual addresses, so a waiter and a waker would
+     * agree about the memory and disagree about the channel, and the
+     * wake would go nowhere. The physical address is the same number on
+     * both sides of that, which is what makes a futex work across a fork
+     * rather than only within one process.
+     *
+     * Resolving it also has a second effect worth having: a word that
+     * had been paged out is read back in before anybody sleeps on it,
+     * rather than after.
+     *
+     * It has one cost, and it is worth naming so that it is not
+     * rediscovered later as a mystery. A frame is not forever: if the
+     * page holding the word is evicted and faulted back in while a
+     * thread is parked on it, the word's physical address changes, and a
+     * wake issued afterwards names the new frame while the sleeper is
+     * still waiting on the old one. The wake is missed. What catches it
+     * is the bounded park below -- the waiter returns to its own retry
+     * loop within FUTEX_PARK_MS and takes the lock it should already
+     * have had -- so the failure mode is a fifth of a second of latency
+     * rather than a hang. It cannot happen at all to a lock in a shared
+     * mapping, which is flagged PTE_SHARED and never a candidate for
+     * eviction; only a lock on the heap can see it.
+     *
+     * ---- the lost wakeup ----
+     *
+     * "If the value is still what I expect, sleep" is two statements,
+     * and between them is a window in which the value changes and the
+     * wake is delivered to a thread that is not yet asleep — which then
+     * sleeps, having already been woken. sched_block_on_locked exists
+     * for exactly this and is used exactly as its comment describes: the
+     * flags are taken before the test and handed to the sleep, so
+     * nothing can run in between.
+     *
+     * Interrupts are already masked here, as they are for the whole of
+     * every system call, and application processors never run user
+     * threads — so on this machine there is genuinely no other
+     * processor that could be the waker. If that changes, this is one of
+     * the places src/smp.h lists as needing a real lock.
+     */
+    case SYS_FUTEX: {
+        const uint64_t uaddr = a0;
+        const uint64_t op    = a1;
+        const uint32_t val   = (uint32_t)a2;
+
+        if (uaddr & 3u) {
+            app_refuse("futex: address is not four-byte aligned");
+            return (uint64_t)-1;
+        }
+        if (vmm_current && !user_range_mapped(vmm_current, uaddr, 4, 1)) {
+            app_refuse("futex: word is not writable by the caller");
+            return (uint64_t)-1;
+        }
+
+        /* The channel: the word's physical address, so that every
+         * process mapping the page agrees about it. */
+        void *chan;
+        if (vmm_current) {
+            uint64_t phys = vmm_resolve(vmm_current, uaddr);
+            if (!phys) {
+                app_refuse("futex: word is not resident");
+                return (uint64_t)-1;
+            }
+            chan = (void *)(uintptr_t)phys;
+        } else {
+            chan = (void *)(uintptr_t)uaddr;
+        }
+
+        if (op == FUTEX_WAKE) {
+            /* val is how many to release. One is the handover a mutex
+             * wants; anything more is a broadcast, which is what a
+             * condition variable wants. */
+            sched_wake_chan(chan, val > 1);
+            return 0;
+        }
+        if (op != FUTEX_WAIT) {
+            app_refuse("futex: unknown operation");
+            return (uint64_t)-1;
+        }
+
+        uint64_t flags = irq_save();
+        const uint32_t seen = *(volatile uint32_t *)(uintptr_t)uaddr;
+        if (seen != val) {
+            /* It changed before we could sleep, which means the
+             * condition the caller was waiting for has already
+             * happened. Not an error -- the caller re-tests and
+             * proceeds. */
+            irq_restore(flags);
+            return 1;
+        }
+        /*
+         * A bounded park rather than an indefinite one, re-entered by
+         * the caller's own loop. The bound is what stops a program that
+         * waits on a word nobody will ever wake from becoming a thread
+         * this kernel can never reap, and a spurious return is
+         * something every futex caller has to handle anyway.
+         */
+        sched_block_on_locked(chan, FUTEX_PARK_MS, flags);
+        return 0;
+    }
+
+    /*
+     * ---- the three privileged doors ----
+     *
+     * The shape is the same in all three and the order matters: copy
+     * the arguments across the boundary first, so that what is checked
+     * is what is used; then ask the gateway, which may freeze this
+     * thread and put a question on the screen; then do the work.
+     *
+     * Asking *after* the copy is not an accident. The prompt names the
+     * file, the key or the sector the program asked for, and a name read
+     * out of user memory a second time, after the person has answered
+     * about the first, is the oldest trick there is.
+     */
+    case SYS_FS_WRITE: {
+        /* a0 path, a1 buffer, a2 length */
+        char path[FS_PATH_MAX];
+        if (sys_copy_string(a0, path, sizeof(path)) < 0) {
+            app_refuse("fs_write: unreadable path");
+            return (uint64_t)-1;
+        }
+        uint32_t len = (uint32_t)a2;
+        if (len > SYS_WRITE_MAX) {
+            app_refuse("fs_write: buffer too large");
+            return (uint64_t)-1;
+        }
+        if (vmm_current && !user_range_mapped(vmm_current, a1, len, 0)) {
+            app_refuse("fs_write: unreadable buffer");
+            return (uint64_t)-1;
+        }
+
+        /* The profile boundary first: it is not a question anybody gets
+         * to answer, it is another account's private tree. */
+        char abs[FS_PATH_MAX];
+        fs_abs(path, abs, sizeof(abs));
+        if (!prof_may(abs, 1)) {
+            app_refuse("fs_write: outside this account's profile");
+            return (uint64_t)-1;
+        }
+        if (!uac_guard("write a file", abs)) return (uint64_t)-1;
+
+        /*
+         * The copy happens *after* the question, and the order is not
+         * interchangeable.
+         *
+         * uac_guard blocks -- that is its whole job -- and while this
+         * thread is parked at the prompt every other thread on the
+         * machine runs. Staging into this buffer beforehand meant a
+         * second program entering the same call could overwrite it while
+         * the first was frozen: the second is refused, because only one
+         * question may be outstanding, but the damage is done at the top
+         * of its case rather than at the end, and the first thread then
+         * wakes up granted and writes the *second* program's bytes to
+         * its own path.
+         *
+         * Copying afterwards is safe for a reason worth writing down.
+         * Interrupts are masked for the whole of a system call, and the
+         * only place that changes is inside uac_guard, which restores
+         * them exactly as it found them and returns with them still
+         * masked. So from here to the end of the case nothing else on
+         * this processor runs, and application processors never run user
+         * threads at all. The copy and the write are one indivisible
+         * step.
+         *
+         * The path is not re-read here, which is the other half of the
+         * same argument: it was copied to a stack local before the
+         * prompt named it, so what was asked about and what is written
+         * to cannot differ.
+         */
+        static uint8_t staged[SYS_WRITE_MAX];
+        const uint8_t *src = (const uint8_t *)(uintptr_t)a1;
+        for (uint32_t i = 0; i < len; i++) staged[i] = src[i];
+
+        return fs_write_file(abs, staged, len) == 0 ? len : (uint64_t)-1;
+    }
+
+    case SYS_REG_SET: {
+        /* a0 key path, a1 value name, a2 string */
+        char key[128], name[64], val[192];
+        if (sys_copy_string(a0, key, sizeof(key)) < 0 ||
+            sys_copy_string(a1, name, sizeof(name)) < 0 ||
+            sys_copy_string(a2, val, sizeof(val)) < 0) {
+            app_refuse("reg_set: unreadable arguments");
+            return (uint64_t)-1;
+        }
+        char what[UAC_DETAIL_LEN];
+        str_copy(what, key, sizeof(what));
+        str_append(what, "\\", sizeof(what));
+        str_append(what, name, sizeof(what));
+        if (!uac_guard("change a registry value", what)) return (uint64_t)-1;
+        return reg_set_string(key, name, val) == 0 ? 0 : (uint64_t)-1;
+    }
+
+    case SYS_BLK_WRITE: {
+        /* a0 LBA, a1 buffer, a2 sector count. The rawest door in the
+         * system: it does not know what a file is, so nothing above it
+         * can protect anything below it. */
+        uint32_t count = (uint32_t)a2;
+        if (!count || count > SYS_WRITE_MAX / 512u) {
+            app_refuse("blk_write: sector count out of range");
+            return (uint64_t)-1;
+        }
+        uint32_t len = count * 512u;
+        if (vmm_current && !user_range_mapped(vmm_current, a1, len, 0)) {
+            app_refuse("blk_write: unreadable buffer");
+            return (uint64_t)-1;
+        }
+
+        char what[UAC_DETAIL_LEN];
+        char nb[16];
+        str_copy(what, "sector ", sizeof(what));
+        uint_to_str((uint32_t)a0, nb);
+        str_append(what, nb, sizeof(what));
+        str_append(what, ", ", sizeof(what));
+        uint_to_str(count, nb);
+        str_append(what, nb, sizeof(what));
+        str_append(what, " of them", sizeof(what));
+        if (!uac_guard("write directly to the disk", what))
+            return (uint64_t)-1;
+
+        /* After the question, for the reason set out in SYS_FS_WRITE
+         * above: the guard is the only point in a system call where
+         * another thread can run, so anything staged before it can be
+         * overwritten by a program that is then refused. */
+        static uint8_t staged[SYS_WRITE_MAX];
+        const uint8_t *src = (const uint8_t *)(uintptr_t)a1;
+        for (uint32_t i = 0; i < len; i++) staged[i] = src[i];
+
+        return blk_write(a0, count, staged) == 0 ? len : (uint64_t)-1;
     }
 
     case SYS_TTF_TEXT_WIDTH: {
@@ -1914,6 +2566,20 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
     const uint64_t canvas_va = lay->canvas_va;
     as->brk = as->brk_top = lay->heap_base;
 
+    /*
+     * The token, and it is restricted whoever launched this.
+     *
+     * The account's administrator flag is recorded beside it rather than
+     * folded into it, because the two answer different questions: the
+     * flag says this session *may be asked* to elevate, the token says
+     * whether it has been. A program started by an administrator gets
+     * exactly the same privileges as one started by anybody else until
+     * somebody answers a prompt about it. See uac_guard.
+     */
+    as->sid       = (uint32_t)(user_current + 1);
+    as->sid_admin = (uint8_t)(user_is_admin(user_current) ? 1 : 0);
+    as->token     = UAC_TOKEN_RESTRICTED;
+
     /* Now that this process's trampoline address is known, resolve the
      * staged image's imports against it. Doing it here rather than in
      * the loader is what lets the page move. */
@@ -1962,10 +2628,24 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
 
     /* The window's pixels, so a program can draw without a syscall per
      * pixel. No-execute, because a canvas full of attacker-chosen bytes
-     * that the program can also jump to is the whole of the exploit. */
-    if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
-                       PTE_USER | PTE_WRITE | PTE_NX) != 0)
-        goto fail;
+     * that the program can also jump to is the whole of the exploit.
+     *
+     * This process's own surface, not the shared canvas: two programs
+     * running at once each get their pages, and neither can read or
+     * write the other's. */
+    as->surface = app_surf_claim(name);
+    if (as->surface) {
+        if (vmm_map_shared(as, canvas_va, as->surface->px, APP_SURF_BYTES,
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            goto fail;
+    } else {
+        serial_puts("[compositor] no free surface; ");
+        serial_puts(name);
+        serial_puts(" shares the fallback canvas\n");
+        if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            goto fail;
+    }
     as->canvas_va = canvas_va;
     as->tramp_va  = tramp_va;
 
@@ -1987,16 +2667,27 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
     thread_t *t = sched_spawn_user(as, entry_va, sp, name, PRIO_NORMAL);
     if (!t) goto fail;
 
+    if (as->surface) {
+        as->surface->pid = t->pid;
+        app_surf_front   = as->surface;
+    }
+
     serial_puts("[exec] ");
     serial_puts(name);
     serial_puts(" -> pid ");
     serial_put_dec(t->pid);
     serial_puts(", ring 3, ");
     serial_put_dec((uint32_t)pages);
-    serial_puts(" image pages\n");
+    serial_puts(" image pages, ");
+    serial_puts(as->surface ? "own surface" : "shared canvas");
+    serial_puts(", ");
+    serial_puts(as->token == UAC_TOKEN_ELEVATED ? "elevated" : "restricted");
+    serial_puts(" token\n");
     return t;
 
 fail:
+    app_surf_release(as->surface);
+    as->surface = 0;
     vmm_destroy(as);
     kfree(as);
     if (verbose) term_print_c("run: could not build the address space\n", 2);
@@ -2060,6 +2751,20 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     const uint64_t tramp_va  = lay->tramp_va;
     const uint64_t canvas_va = lay->canvas_va;
     as->brk = as->brk_top = lay->heap_base;
+
+    /*
+     * The token, and it is restricted whoever launched this.
+     *
+     * The account's administrator flag is recorded beside it rather than
+     * folded into it, because the two answer different questions: the
+     * flag says this session *may be asked* to elevate, the token says
+     * whether it has been. A program started by an administrator gets
+     * exactly the same privileges as one started by anybody else until
+     * somebody answers a prompt about it. See uac_guard.
+     */
+    as->sid       = (uint32_t)(user_current + 1);
+    as->sid_admin = (uint8_t)(user_is_admin(user_current) ? 1 : 0);
+    as->token     = UAC_TOKEN_RESTRICTED;
     uint64_t pages = (img->image_size + 4095) / 4096;
     for (uint64_t p = 0; p < pages; p++) {
         uint8_t prot = pe_page_prot[p];
@@ -2088,9 +2793,22 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     if (vmm_map_shared(as, tramp_va, utramp_start,
                        (uint64_t)(utramp_end - utramp_start), PTE_USER) != 0)
         goto fail;
-    if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
-                       PTE_USER | PTE_WRITE | PTE_NX) != 0)
-        goto fail;
+    /* Its own surface, on the same terms as an ELF or .vx image: a
+     * Windows program is a process here like any other and gets the
+     * same isolation. */
+    as->surface = app_surf_claim(name);
+    if (as->surface) {
+        if (vmm_map_shared(as, canvas_va, as->surface->px, APP_SURF_BYTES,
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            goto fail;
+    } else {
+        serial_puts("[compositor] no free surface; ");
+        serial_puts(name);
+        serial_puts(" shares the fallback canvas\n");
+        if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            goto fail;
+    }
     as->canvas_va = canvas_va;
     as->tramp_va  = tramp_va;
 
@@ -2190,6 +2908,11 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     thread_t *t = sched_spawn_user(as, img->entry, sp, name, PRIO_NORMAL);
     if (!t) goto fail;
 
+    if (as->surface) {
+        as->surface->pid = t->pid;
+        app_surf_front   = as->surface;
+    }
+
     /* One write, for every Windows process there will ever be: the TEB
      * is at the same virtual address in each of them, and GS_BASE is a
      * linear address resolved through the current CR3. See the note in
@@ -2200,6 +2923,8 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     return t;
 
 fail:
+    app_surf_release(as->surface);
+    as->surface = 0;
     vmm_destroy(as);
     kfree(as);
     if (verbose) term_print_c("run: could not map the PE image\n", 2);
@@ -2216,6 +2941,22 @@ fail:
  * notice, so the Action Center is told.
  */
 static void app_reaped(thread_t *t) {
+    /*
+     * The surface goes back to the pool first, and unconditionally —
+     * before the early return below, because a silent launch is still a
+     * process that held one and a pool that leaked six slots would leave
+     * every later program on the shared canvas with no way to tell why.
+     *
+     * sched_reap calls this hook before it destroys the address space,
+     * which is the only window in which t->as is still readable. The
+     * refcount is what makes a forked pair safe: the surface is only
+     * returned when the second of them ends.
+     */
+    if (t->as && t->as->surface) {
+        app_surf_release(t->as->surface);
+        t->as->surface = 0;
+    }
+
     if (silent_launch) return;
     char note[NOTIFY_TEXT];
     str_copy(note, t->name, sizeof(note));
@@ -2489,11 +3230,29 @@ static int execute_bin(const char *filepath) {
 #include "chip8.h"
 #include "chamber.h"
 
-/* Canvas app (WK_HELLO) content drawer */
+/*
+ * Canvas app (WK_HELLO) content drawer.
+ *
+ * The pixels come from whichever surface is at the front — the process's
+ * own, isolated from every other one — and from the shared fallback
+ * canvas only when the pool was exhausted at spawn. Nothing else about
+ * the window changed: it is the same rectangle in the same place, and a
+ * program cannot tell which of the two it was given.
+ *
+ * Reported through app_composite_surface so that the compositor's
+ * batched path and this one can never disagree about whose pixels the
+ * application window is showing.
+ */
+static const uint32_t *app_composite_surface(void) {
+    if (app_surf_front && app_surf_front->refs) return app_surf_front->px;
+    return app_canvas;
+}
+
 static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
                        int32_t cx, int32_t cy, int32_t cw, int32_t chh,
                        uint32_t tick, int focused) {
     (void)tick; (void)focused;
+    const uint32_t *src = app_composite_surface();
     int32_t bw2 = cw < APP_CANVAS_W ? cw : APP_CANVAS_W;
     int32_t bh2 = chh < APP_CANVAS_H ? chh : APP_CANVAS_H;
     for (int32_t y = 0; y < bh2; y++) {
@@ -2503,7 +3262,7 @@ static void hello_draw(uint32_t *buf, uint32_t w, uint32_t h,
             int32_t dx = cx + x;
             if (dx < 0 || dx >= (int32_t)w) continue;
             buf[(uint32_t)dy * w + (uint32_t)dx] =
-                app_canvas[y * APP_CANVAS_W + x];
+                src[y * APP_CANVAS_W + x];
         }
     }
 }
@@ -3238,19 +3997,257 @@ static void wm_capture_thumb(const uint32_t *buf, uint32_t w, uint32_t h,
     wm_thumb_valid[kind] = 1;
 }
 
+/* ===================================================================
+ * 6b. THE COMPOSITING ENGINE
+ * ===================================================================
+ *
+ * One routine owns the frame. It walks the window stack once, back to
+ * front, and for each window puts down a soft shadow, a translucent
+ * frame and the window's contents — where the contents of an
+ * application window are the pixels of that process's own offscreen
+ * surface and nothing else.
+ *
+ * What is new here is not the walk, which is the order the desktop has
+ * always drawn in. It is that the expensive, opaque half of the work is
+ * handed to the Gen9 blitter as batched ring commands, and the cheap,
+ * blended half stays on the processor because the blitter has no alpha
+ * term to give it. igpu.h argues that split at length; the short
+ * version is that XY_SRC_COPY_BLT is a raster operation, source-over is
+ * not one, and pretending otherwise would mean a 3D pipeline this
+ * driver does not implement.
+ *
+ * ---- the ordering rule, and why it needs stating ----
+ *
+ * A batched command executes when the batch is submitted, not when it
+ * is emitted. So a GPU copy queued while walking window 2, and a
+ * processor-side blend performed while walking window 3, can reach the
+ * same pixel in the wrong order: the blend lands first and the copy
+ * overwrites it. Nothing about that is visible in the source, and it
+ * would present as a window intermittently painting over the shadow of
+ * the one above it.
+ *
+ * The rule that rules it out is one line: before the processor writes
+ * anywhere, the pending batch is submitted if — and only if — that
+ * write touches a rectangle the batch is going to write. Windows that
+ * do not overlap therefore accumulate into one submission, and windows
+ * that do cost a submission each, which is exactly the trade the
+ * hardware imposes and not one chosen here.
+ */
+
+/* The destination rectangle the pending batch will write, as a bounding
+ * box. A box rather than a list because the test below is conservative
+ * in the safe direction: a false overlap costs one early submission, a
+ * missed one costs a corrupt frame. */
+static int32_t aero_gpu_x0, aero_gpu_y0, aero_gpu_x1, aero_gpu_y1;
+static int     aero_gpu_pending = 0;
+/* aero_gpu_batches and aero_gpu_ops are declared with the surfaces, in
+ * section 4a, because the system monitor is included before this. */
+
+static void aero_gpu_reset(void) {
+    aero_gpu_pending = 0;
+    aero_gpu_x0 = aero_gpu_y0 = 0;
+    aero_gpu_x1 = aero_gpu_y1 = 0;
+}
+
+static void aero_gpu_note(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (w <= 0 || h <= 0) return;
+    if (!aero_gpu_pending) {
+        aero_gpu_x0 = x; aero_gpu_y0 = y;
+        aero_gpu_x1 = x + w; aero_gpu_y1 = y + h;
+        aero_gpu_pending = 1;
+        return;
+    }
+    if (x < aero_gpu_x0)         aero_gpu_x0 = x;
+    if (y < aero_gpu_y0)         aero_gpu_y0 = y;
+    if (x + w > aero_gpu_x1)     aero_gpu_x1 = x + w;
+    if (y + h > aero_gpu_y1)     aero_gpu_y1 = y + h;
+}
+
+/* Submit whatever is queued, wait for the engine to retire it, and make
+ * the processor's view of the affected rectangle agree with what was
+ * written. Everything after this call may read those pixels. */
+static void aero_gpu_flush(uint32_t *buf, uint32_t w) {
+    if (!aero_gpu_pending) return;
+    if (igpu_comp_submit() == 0) {
+        igpu_comp_sync_cpu(buf, w * 4u, aero_gpu_x0, aero_gpu_y0,
+                           aero_gpu_x1 - aero_gpu_x0,
+                           aero_gpu_y1 - aero_gpu_y0);
+        aero_gpu_batches++;
+        aero_gpu_ops += igpu_comp.ops;
+    }
+    aero_gpu_reset();
+}
+
+/* The barrier. Called immediately before any processor-side write, with
+ * the rectangle that write covers. */
+static void aero_gpu_barrier(uint32_t *buf, uint32_t w,
+                             int32_t x, int32_t y, int32_t rw, int32_t rh) {
+    if (!aero_gpu_pending) return;
+    if (x >= aero_gpu_x1 || x + rw <= aero_gpu_x0 ||
+        y >= aero_gpu_y1 || y + rh <= aero_gpu_y0)
+        return;                              /* disjoint: nothing to wait for */
+    aero_gpu_flush(buf, w);
+}
+
+/*
+ * ---- live previews, taken from the process rather than the screen ----
+ *
+ * The taskbar's thumbnails were captured out of the back buffer at the
+ * moment a window had just been drawn, which is exact and cheap and
+ * only works for a window that is on screen. An application that is
+ * running behind another one has no pixels in the back buffer to
+ * capture, and before private surfaces there was nothing else to read.
+ *
+ * There is now. Each process owns its window's pixels for the whole of
+ * its life, on screen or not, so a preview is a downscale straight from
+ * the surface — correct for every running application at once rather
+ * than for whichever of them the window happened to be showing.
+ */
+static uint32_t aero_surf_thumb[APP_SURF_MAX][THUMB_W * THUMB_H];
+static uint8_t  aero_surf_thumb_valid[APP_SURF_MAX];
+
+static void aero_surface_previews(void) {
+    if ((desktop_tick % THUMB_EVERY) != 0) return;
+    for (int i = 0; i < APP_SURF_MAX; i++) {
+        if (!app_surf[i].refs || !app_surf[i].gen) {
+            aero_surf_thumb_valid[i] = 0;
+            continue;
+        }
+        gfx_downscale(aero_surf_thumb[i], THUMB_W, THUMB_H,
+                      app_surf[i].px, APP_CANVAS_W, APP_CANVAS_H,
+                      0, 0, APP_CANVAS_W, APP_CANVAS_H);
+        aero_surf_thumb_valid[i] = 1;
+    }
+}
+
+/*
+ * ---- the glass edge ----
+ *
+ * A one-pixel gold outline said "focused" and nothing else. What a
+ * window is missing without a translucent border is the sense of being
+ * a pane held above the desktop rather than a rectangle stamped onto
+ * it, and that is entirely an alpha effect: a few concentric strips
+ * whose colour is mixed with whatever is already underneath, brightest
+ * at the edge the light would catch.
+ *
+ * Drawn outside the window's own rectangle so it costs the window
+ * nothing and cannot be mistaken for content. Four strips rather than a
+ * gradient loop because the falloff is short and the strips are one
+ * pixel each — a loop would be the same arithmetic with an index.
+ */
+#define AERO_GLASS      4       /* strips of border outside the frame    */
+#define AERO_GLASS_FOC  96      /* peak alpha, focused                   */
+#define AERO_GLASS_UNF  40      /* and not                               */
+
+static void aero_glass_border(uint32_t *buf, uint32_t w, uint32_t h,
+                              const win_t *win, int focused) {
+    const uint32_t tint = focused ? C_GOLD : 0x6E7890u;
+    const uint32_t peak = focused ? AERO_GLASS_FOC : AERO_GLASS_UNF;
+
+    for (int d = 1; d <= AERO_GLASS; d++) {
+        /* Linear falloff from the frame outward. The +1 keeps the
+         * outermost strip from vanishing entirely at low peak alpha,
+         * which is what made an unfocused window's edge flicker in and
+         * out as the shadow underneath it changed. */
+        const uint32_t a = peak * (uint32_t)(AERO_GLASS - d + 1)
+                                / (uint32_t)AERO_GLASS;
+        if (!a) continue;
+        const int32_t x = win->x - d, y = win->y - d;
+        const int32_t bw = win->w + 2 * d, bh = win->h + 2 * d;
+        gfx_rect_blend(buf, w, h, x,          y,          bw, 1,  tint, a);
+        gfx_rect_blend(buf, w, h, x,          y + bh - 1, bw, 1,  tint, a);
+        gfx_rect_blend(buf, w, h, x,          y,          1,  bh, tint, a);
+        gfx_rect_blend(buf, w, h, x + bw - 1, y,          1,  bh, tint, a);
+    }
+}
+
+/*
+ * The application window's contents: this process's surface, copied by
+ * the engine where it can reach both ends and by the processor where it
+ * cannot.
+ *
+ * Returns 1 if the copy was queued on the engine, so that the caller
+ * knows to record the rectangle with aero_gpu_note rather than treating
+ * the pixels as already present.
+ */
+static int aero_blit_surface_gpu(int32_t cx, int32_t cy,
+                                 int32_t cw, int32_t chh) {
+    if (!igpu_comp_active()) return 0;
+    if (!app_surf_front || !app_surf_front->refs) return 0;
+    if (!app_surf_front->gpu_addr) return 0;
+
+    int32_t bw2 = cw  < APP_CANVAS_W ? cw  : APP_CANVAS_W;
+    int32_t bh2 = chh < APP_CANVAS_H ? chh : APP_CANVAS_H;
+    if (bw2 <= 0 || bh2 <= 0) return 0;
+
+    return igpu_comp_blit(app_surf_front->gpu_addr, APP_CANVAS_W * 4u,
+                          0, 0, cx, cy, bw2, bh2) == 0;
+}
+
+/*
+ * Every window, bottom of the stack upward.
+ *
+ * Shadow, glass, frame, content -- in that order and per window, not
+ * shadows for all of them and then frames for all of them. Drawn in one
+ * pass over the stack, a window's shadow lands on whatever is already
+ * beneath it and is then covered by whatever is drawn after, which is
+ * what makes the stack read as a stack. Hoisting the shadows into a
+ * pass of their own would put the topmost window's shadow underneath
+ * every other window, which is exactly the depth cue inverted -- and it
+ * is also why the batch has a barrier rather than being submitted once
+ * at the end.
+ */
 static void wm_draw_all(uint32_t *buf, uint32_t w, uint32_t h) {
     const int grab = (desktop_tick % THUMB_EVERY) == 0;
+
     for (int i = 0; i < wm_stack_n; i++) {
         int kind = wm_stack[i];
         if (wins[kind].min) continue;              /* it is on the taskbar */
         if (wm_anim_hides(kind))
             continue;   /* revealed when the animation lands */
         const win_t *win = &wins[kind];
+
+        /* The shadow reaches outside the window on every side; the glass
+         * reaches AERO_GLASS further still. One barrier covering both is
+         * cheaper than two and no less exact. */
+        const int32_t mx0 = win->x - GFX_SHADOW_R - AERO_GLASS;
+        const int32_t my0 = win->y - GFX_SHADOW_R - AERO_GLASS;
+        const int32_t mw  = win->w + 2 * (GFX_SHADOW_R + AERO_GLASS);
+        const int32_t mh  = win->h + 2 * (GFX_SHADOW_R + AERO_GLASS);
+        aero_gpu_barrier(buf, w, mx0, my0, mw, mh);
+
         gfx_shadow(buf, w, h, win->x, win->y, win->w, win->h);
+        aero_glass_border(buf, w, h, win, wm_focus == kind);
         wm_draw_frame(buf, w, h, kind);
-        wm_draw_content(buf, w, h, kind);
-        if (grab) wm_capture_thumb(buf, w, h, kind);
+
+        /*
+         * The application window is the one whose contents live outside
+         * this file, in a page some ring-3 program owns, so it is the
+         * one the engine can move without the processor reading a
+         * single pixel. Everything else is drawn here by code that is
+         * already holding the values it needs.
+         */
+        int32_t cx, cy, cw, chh;
+        wm_content_rect(kind, &cx, &cy, &cw, &chh);
+        if (kind == WK_HELLO && aero_blit_surface_gpu(cx, cy, cw, chh)) {
+            aero_gpu_note(cx, cy,
+                          cw  < APP_CANVAS_W ? cw  : APP_CANVAS_W,
+                          chh < APP_CANVAS_H ? chh : APP_CANVAS_H);
+        } else {
+            wm_draw_content(buf, w, h, kind);
+        }
+
+        /* The capture reads the back buffer, so anything queued for this
+         * window has to have landed in it first. */
+        if (grab) {
+            aero_gpu_barrier(buf, w, win->x, win->y, win->w, win->h);
+            wm_capture_thumb(buf, w, h, kind);
+        }
     }
+
+    /* Nothing below this point belongs to a window, and the chrome is
+     * drawn over all of it, so the frame's last batch retires here. */
+    aero_gpu_flush(buf, w);
 }
 
 /* --- window motion, drawn --- */
@@ -3459,6 +4456,79 @@ static void wallpaper_regen(uint32_t w, uint32_t h) {
 
     wall_gen_w = w;
     wall_gen_h = h;
+}
+
+/*
+ * ---- giving the engine everything it has to be able to address ----
+ *
+ * The wallpaper, the back buffer and all six window surfaces, mapped
+ * into the compositor's GGTT window once and never again. All of them
+ * are static kernel arrays for exactly this reason: the GPU's address
+ * allocator is a bump pointer with no free, so anything mapped into it
+ * has to be something that lives as long as the machine does.
+ *
+ * A failure anywhere here is not a failure of anything. Every user of
+ * these addresses tests for zero and takes the processor's path, which
+ * is the path that runs on every machine without an Intel Gen9 part —
+ * including, notably, the emulator this is most often booted in.
+ */
+static uint32_t aero_wall_gpu = 0;
+
+static void aero_gpu_init(void *back, uint32_t w, uint32_t h) {
+    if (igpu_comp_init(back, w, h) != 0) return;
+
+    aero_wall_gpu = igpu_comp_map_virt(wallpaper, sizeof(wallpaper));
+
+    int mapped = 0;
+    for (int i = 0; i < APP_SURF_MAX; i++) {
+        app_surf[i].gpu_addr = igpu_comp_map_virt(app_surf_mem[i],
+                                                  APP_SURF_BYTES);
+        if (app_surf[i].gpu_addr) mapped++;
+    }
+
+    serial_puts("[compositor] blitter compositing enabled: wallpaper ");
+    serial_puts(aero_wall_gpu ? "mapped" : "unmapped");
+    serial_puts(", ");
+    serial_put_dec((uint32_t)mapped);
+    serial_puts(" of ");
+    serial_put_dec((uint32_t)APP_SURF_MAX);
+    serial_puts(" surfaces reachable by the engine\n");
+}
+
+/*
+ * The frame's clear, as one blitter command.
+ *
+ * Returns 0 when there is no engine or the wallpaper never reached the
+ * GGTT, and the caller does the copy itself.
+ *
+ * ---- the stride, which is not the array's width ----
+ *
+ * The obvious pitch is WALL_MAX_W, because that is how the array is
+ * declared, and it is wrong at every resolution except the largest one.
+ * wallpaper_regen passes the *panel's* width to every drawing call it
+ * makes, so the cache is packed at stride w with the rest of the array
+ * left untouched — which is also why the processor's version of this
+ * clear is a flat `buf[i] = wallpaper[i]` and not a row loop. A blit
+ * that stepped by WALL_MAX_W would read each row from further and
+ * further into the one below it and smear the whole frame diagonally.
+ *
+ * There is no way for a test on this machine to have caught that: QEMU
+ * has no Gen9 part, so this function returns 0 there and the processor
+ * path is the only one that ever runs.
+ *
+ * The generated size is compared rather than assumed. desktop_render
+ * regenerates the cache before it gets here, so they agree; if they ever
+ * did not, the honest answer is the processor's copy rather than a blit
+ * with a pitch that describes a different image.
+ */
+static int aero_wallpaper_gpu(uint32_t w, uint32_t h) {
+    if (!igpu_comp_active() || !aero_wall_gpu) return 0;
+    if (wall_gen_w != w || wall_gen_h != h) return 0;
+    if (igpu_comp_blit(aero_wall_gpu, wall_gen_w * 4u,
+                       0, 0, 0, 0, (int)w, (int)h) != 0)
+        return 0;
+    aero_gpu_note(0, 0, (int32_t)w, (int32_t)h);
+    return 1;
 }
 
 static void wallpaper_set_theme(int idx) {
@@ -4573,7 +5643,30 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
     if (hover >= 0 && hover != jl_open) {
         const char *name = dock_item_name(hover);
         const int rk = dock_running_kind(hover);
-        const int show_thumb = (rk >= 0 && wm_thumb_valid[rk]);
+
+        /*
+         * Where the picture comes from.
+         *
+         * For the application button it comes from the running process's
+         * own surface, downscaled by the compositor a few frames ago,
+         * and not from the back buffer -- an application running behind
+         * another one has no pixels on screen to capture, and before
+         * private surfaces there was nothing else to read. For every
+         * other window it is still the screen capture, because those
+         * windows are drawn by this file and have no surface of their
+         * own to read instead.
+         */
+        const uint32_t *thumb = 0;
+        if (rk == WK_HELLO) {
+            for (int i = 0; i < APP_SURF_MAX; i++) {
+                if (&app_surf[i] != app_surf_front) continue;
+                if (aero_surf_thumb_valid[i]) thumb = aero_surf_thumb[i];
+                break;
+            }
+        }
+        if (!thumb && rk >= 0 && wm_thumb_valid[rk]) thumb = wm_thumb[rk];
+
+        const int show_thumb = (thumb != 0);
         const int pad = 6;
         const int32_t pw = show_thumb ? THUMB_W + 2 * pad
                                       : ttf_text_width(name, 12) + 16;
@@ -4601,16 +5694,20 @@ static void dock_draw(uint32_t *buf, uint32_t w, uint32_t h,
         gfx_rect_outline(buf, w, h, tx, ty, pw, ph, C_GOLD_DIM);
 
         if (show_thumb) {
-            /* Blit the captured thumbnail row by row; it is already at
-             * the size it is drawn, so this is a copy, not a resample. */
+            /* Blended rather than copied, and at an alpha just short of
+             * opaque: the preview reads as a pane of the same glass the
+             * window frames are made of rather than a photograph pasted
+             * over the desktop. It is already at the size it is drawn,
+             * so there is no resample here either way. */
             for (int32_t r = 0; r < THUMB_H; r++) {
                 const int32_t yy = ty + pad + r;
                 if (yy < 0 || yy >= (int32_t)h) continue;
                 for (int32_t c = 0; c < THUMB_W; c++) {
                     const int32_t xx = tx + pad + c;
                     if (xx < 0 || xx >= (int32_t)w) continue;
-                    buf[(uint32_t)yy * w + (uint32_t)xx] =
-                        wm_thumb[rk][(uint32_t)r * THUMB_W + (uint32_t)c];
+                    uint32_t *d = &buf[(uint32_t)yy * w + (uint32_t)xx];
+                    *d = gfx_mix(thumb[(uint32_t)r * THUMB_W + (uint32_t)c],
+                                 *d, 232);
                 }
             }
             gfx_rect_outline(buf, w, h, tx + pad, ty + pad,
@@ -4683,6 +5780,26 @@ static int desktop_open_app_by_name(const char *name) {
 /* Route one keyboard character to the focused window */
 static void desktop_key_input(char ch) {
     dim_wake();
+
+    /*
+     * An elevation question takes the keyboard as completely as it takes
+     * the pointer, and for the same reason: while it is up, nothing
+     * behind it is live, and a keystroke that reached an application
+     * would be a keystroke that reached a program which is supposed to
+     * be frozen.
+     *
+     * Return allows and Escape refuses, which are the answers those two
+     * keys give to every other dialog in this system. Anything else is
+     * swallowed rather than passed on -- there is no third answer, and
+     * letting a stray key through would be the one way to type into a
+     * window that is not accepting input.
+     */
+    if (uac_req.pending) {
+        if (ch == '\n' || ch == '\r') uac_answer(1);
+        else if (ch == 27)            uac_answer(0);
+        return;
+    }
+
     if (menu_open_valid()) {
         /*
          * With the Apps menu open the keyboard belongs to its search
@@ -4878,6 +5995,97 @@ static void ai_dialog_draw(uint32_t *buf, uint32_t w, uint32_t h,
 }
 
 /*
+ * ===== THE ELEVATION PROMPT =====
+ *
+ * The other half of uac_guard: a question drawn over everything, while
+ * the thread that asked it is frozen in a system call.
+ *
+ * It is drawn last in the frame and it takes every click, which is the
+ * whole of what makes it a *secure* prompt rather than a dialog. A
+ * program cannot draw over it, because a program draws into its own
+ * offscreen surface and this is composited afterwards. A program cannot
+ * click it, because there is no system call that moves the pointer or
+ * synthesises a button. And a program cannot outlast it, because the
+ * only thread that could ask a second question is already asleep
+ * waiting for the answer to the first.
+ *
+ * The whole frame behind it is halved in brightness rather than
+ * blurred — the same treatment the model opt-in uses, for the same
+ * reason: it says unambiguously that nothing behind it is live.
+ */
+#define UAC_W 500
+#define UAC_H 224
+
+static int uac_prompt_hit(int32_t mx, int32_t my, uint32_t w, uint32_t h,
+                          int which) {
+    int32_t x0 = ((int32_t)w - UAC_W) / 2;
+    int32_t y0 = ((int32_t)h - UAC_H) / 2;
+    int32_t by = y0 + UAC_H - 52;
+    int32_t bx = which == 0 ? x0 + UAC_W - 250 : x0 + UAC_W - 126;
+    return mx >= bx && mx < bx + 110 && my >= by && my < by + 34;
+}
+
+static void uac_prompt_draw(uint32_t *buf, uint32_t w, uint32_t h,
+                            int32_t mx, int32_t my) {
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint32_t p = buf[i];
+        buf[i] = ((p >> 1) & 0x7F7F7Fu);
+    }
+
+    int32_t x0 = ((int32_t)w - UAC_W) / 2;
+    int32_t y0 = ((int32_t)h - UAC_H) / 2;
+
+    gfx_shadow_popup(buf, w, h, x0, y0, UAC_W, UAC_H);
+    gfx_rect(buf, w, h, x0, y0, UAC_W, UAC_H, 0x14161Eu);
+    gfx_rect_outline(buf, w, h, x0, y0, UAC_W, UAC_H, C_GOLD);
+    gfx_rect(buf, w, h, x0, y0, UAC_W, 2, C_GOLD);
+
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 20,
+                    "A program is asking for permission", C_GOLD, 17);
+
+    /* The program, then what it wants, then the thing it wants it on.
+     * In that order because it is the order the question is asked in,
+     * and each line is clipped rather than wrapped -- a path that runs
+     * off the end of the box is still readable at its start, which is
+     * the part that says which directory it is in. */
+    {
+        char line[UAC_DETAIL_LEN + 48];
+        str_copy(line, uac_req.program, sizeof(line));
+        str_append(line, " wants to ", sizeof(line));
+        str_append(line, uac_req.op, sizeof(line));
+        ttf_draw_string_clip(buf, (int)w, (int)h, x0 + 24, y0 + 60, line,
+                             C_TEXT, 14, x0 + UAC_W - 24);
+    }
+    ttf_draw_string_clip(buf, (int)w, (int)h, x0 + 24, y0 + 86,
+                         uac_req.detail, C_GOLD_DIM, 13, x0 + UAC_W - 24);
+
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 118,
+                    "It was started from an administrator account, so this",
+                    C_TEXT_DIM, 12);
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 136,
+                    "can be allowed. It has not been allowed anything yet.",
+                    C_TEXT_DIM, 12);
+    ttf_draw_string(buf, (int)w, (int)h, x0 + 24, y0 + 158,
+                    "Allowing it lasts until the program exits. "
+                    "Return allows, Escape refuses.",
+                    0x707888u, 12);
+
+    for (int i = 0; i < 2; i++) {
+        int32_t by = y0 + UAC_H - 52;
+        int32_t bx = i == 0 ? x0 + UAC_W - 250 : x0 + UAC_W - 126;
+        int hot = uac_prompt_hit(mx, my, w, h, i);
+        int yes = (i == 1);
+        gfx_rect(buf, w, h, bx, by, 110, 34, yes ? 0x2A2410u : 0x1B1E26u);
+        gfx_rect_outline(buf, w, h, bx, by, 110, 34,
+                         hot ? C_GOLD : (yes ? C_GOLD_DIM : 0x3A4050u));
+        const char *lbl = yes ? "Allow" : "Don't allow";
+        int tw = ttf_text_width(lbl, 14);
+        ttf_draw_string(buf, (int)w, (int)h, bx + (110 - tw) / 2, by + 9,
+                        lbl, yes ? C_GOLD : C_TEXT_DIM, 14);
+    }
+}
+
+/*
  * Peek: fade every window towards what is behind it, then draw their
  * outlines back on, so the desktop is visible but the stack is not lost.
  *
@@ -4994,6 +6202,39 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
         return;                      /* nothing else runs while it is up */
     }
 
+    /*
+     * ---- an elevation question, while one is up ----
+     *
+     * Before any other input is looked at and instead of the rest of
+     * the frame, exactly as the model opt-in above does. That is what
+     * makes the prompt take every click: there is no path from here to
+     * the window manager, the dock or an application while it is up, so
+     * a click cannot land anywhere but on one of the two buttons.
+     *
+     * The desktop is still drawn underneath — halved in brightness by
+     * the prompt itself — so the person can see which program the
+     * question is about. It is drawn from the last frame's state and
+     * nothing in it is live.
+     */
+    if (uac_req.pending) {
+        uint8_t lmb0 = buttons & 1;
+        int click = lmb0 && !desk_prev_lmb;
+        desk_prev_lmb = lmb0;
+
+        for (uint32_t i = 0; i < w * h; i++) buf[i] = wallpaper[i];
+        gadgets_draw(buf, w, h);
+        wm_draw_all(buf, w, h);
+        menubar_draw(buf, w, h, mx, my);
+        dock_draw(buf, w, h, mx, my);
+        uac_prompt_draw(buf, w, h, mx, my);
+
+        if (click) {
+            if (uac_prompt_hit(mx, my, w, h, 1))      uac_answer(1);
+            else if (uac_prompt_hit(mx, my, w, h, 0)) uac_answer(0);
+        }
+        return;
+    }
+
     /* ---- input ---- */
     /* Anything the hand does counts as presence. Comparing against the
      * last frame rather than watching for events, because this is the
@@ -5067,9 +6308,32 @@ static void desktop_render(uint32_t *buf, uint32_t w, uint32_t h,
      * Gen9 blitter where there is one and a plain copy where there is
      * not.
      */
-    for (uint32_t i = 0; i < w * h; i++)
-        buf[i] = wallpaper[i];
+    /*
+     * The clear, and the one place in the frame where handing work to
+     * the engine needs no reasoning about order at all: it is the first
+     * write to the back buffer this frame, so there is nothing it can
+     * land on top of. It is also the largest single operation in the
+     * frame by a wide margin — two million pixels at 1920x1080, against
+     * a quarter of a million for the biggest window.
+     *
+     * The wallpaper is a static kernel array like the surfaces are, so
+     * it is mapped into the compositor's GGTT window once at boot and
+     * the copy is one command. Where there is no engine this is the
+     * loop it always was.
+     */
+    aero_gpu_batches = 0;
+    aero_gpu_ops     = 0;
+    aero_gpu_reset();
+    igpu_comp_begin();
 
+    if (!aero_wallpaper_gpu(w, h)) {
+        for (uint32_t i = 0; i < w * h; i++)
+            buf[i] = wallpaper[i];
+    }
+
+    aero_surface_previews();          /* live, straight from each process */
+
+    aero_gpu_barrier(buf, w, 0, 0, (int32_t)w, (int32_t)h);
     gadgets_draw(buf, w, h);          /* on the desktop, under everything */
     aero_snap_preview(buf, w, h);     /* under the windows: it is a target */
     wm_draw_all(buf, w, h);

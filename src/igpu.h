@@ -1018,6 +1018,258 @@ static int igpu_media_init(void) {
     return (igpu_vcs.ready || igpu_vecs.ready) ? 0 : -1;
 }
 
+/* ===========================================================
+ * THE COMPOSITOR'S WINDOW INTO THE GPU
+ * ===========================================================
+ *
+ * The blitter has been able to reach the visible framebuffer since this
+ * driver was written, and until now nothing asked it to. Everything the
+ * desktop drew was composed by the processor into a back buffer in
+ * system RAM, and the frame reached the panel through a row-by-row
+ * comparison and copy. That is a great deal of memory traffic on the
+ * hottest path in the system, and it is the traffic a 2D engine exists
+ * to carry.
+ *
+ * So the compositor gets a GGTT window of its own, and what goes in it
+ * is everything the engine has to be able to *address*: the back buffer
+ * the desktop composes into, and every application's offscreen window
+ * surface. Both are static kernel arrays that are allocated once and
+ * never move, which is what makes this tractable — the allocator below
+ * is a bump pointer with no free, exactly like the media window's, and
+ * a per-process mapping would leak a slot per launch until the window
+ * was exhausted. A fixed pool mapped once at boot cannot.
+ *
+ * ---- what the hardware will and will not do ----
+ *
+ * This has to be said plainly because the word "compositing" invites
+ * the wrong assumption. Gen9's blitter is a *raster-operation* engine:
+ * XY_COLOR_BLT paints a colour through a ROP and XY_SRC_COPY_BLT moves
+ * a rectangle through one. Neither has a per-pixel alpha term. There is
+ * hardware on this part that does source-over blending — it is the 3D
+ * pipeline, and reaching it means a render context, a pipeline state
+ * object, shaders and an execlist submission model that this driver
+ * deliberately does not implement.
+ *
+ * The division of labour is therefore explicit rather than accidental:
+ *
+ *   the engine moves the bandwidth   opaque window bodies, the frame
+ *                                    itself, and large fills — the
+ *                                    rectangles where nothing is being
+ *                                    blended and everything is being
+ *                                    copied
+ *
+ *   the processor does the alpha     translucent borders, drop shadows,
+ *                                    the glass over an unfocused
+ *                                    window, preview thumbnails
+ *
+ * That is the split that the silicon actually supports, and both halves
+ * are real. Every path below falls back to the processor cleanly if the
+ * engine is absent, wedged, or simply cannot reach the surface in
+ * question — which is the case on QEMU, where there is no Gen9 part at
+ * all and the CPU path is the only one that ever runs.
+ */
+
+#define IGPU_COMP_SLOTS 4096            /* 16 MB of GPU address space */
+
+static struct {
+    uint32_t base_slot;
+    uint32_t next_slot;
+    uint32_t limit_slot;
+    int      ready;
+
+    /* the back buffer the desktop composes into */
+    uint32_t back_gpu;
+    uint32_t back_pitch;                /* bytes */
+    uint32_t back_w, back_h;
+
+    /* accounting, for the graphics panel */
+    uint32_t frames;                    /* batches submitted            */
+    uint32_t ops;                       /* operations in the last batch */
+    uint32_t refused;                   /* batches the engine would not take */
+} igpu_comp;
+
+/*
+ * Map a run of pages that are contiguous in kernel virtual space into
+ * the compositor window. Returns 0 on exhaustion rather than wrapping:
+ * a surface that silently aliased another would put one application's
+ * pixels in another's window, which is precisely the bug the private
+ * surfaces exist to prevent.
+ */
+static uint32_t igpu_comp_map_virt(void *va, uint32_t bytes) {
+    uint32_t pages = (bytes + 4095) / 4096;
+    uint32_t slot;
+
+    if (!igpu_comp.ready) return 0;
+    if (igpu_comp.next_slot + pages > igpu_comp.limit_slot) return 0;
+
+    slot = igpu_comp.next_slot;
+    for (uint32_t i = 0; i < pages; i++)
+        igpu_ggtt_set(slot + i,
+                      kern_virt_to_phys((uint8_t *)va + (uint64_t)i * 4096));
+
+    igpu_comp.next_slot += pages;
+    igpu_ggtt_flush();
+    return slot * 4096;
+}
+
+/*
+ * Give the engine the back buffer.
+ *
+ * Called once, from the composition root, after the driver is up and the
+ * buffer's dimensions are known. The pitch is the buffer's own stride
+ * rather than the panel's: the desktop composes into a fixed-width
+ * array and only the flip knows about the panel's pitch.
+ *
+ * BR13 carries the pitch in sixteen bits, so a stride wider than 32767
+ * bytes cannot be expressed and the window is refused rather than
+ * programmed with a truncated value — which would blit a correct
+ * rectangle into the wrong rows.
+ */
+static int igpu_comp_init(void *back, uint32_t w, uint32_t h) {
+    igpu_comp.ready = 0;
+    if (!igpu.active || !igpu.mmio) return -1;
+
+    if (igpu.base_slot < IGPU_MEDIA_SLOTS + IGPU_COMP_SLOTS) {
+        igpu_log("GGTT too small for a compositor window");
+        return -1;
+    }
+    if (w * 4u > 32767u) {
+        igpu_log("back buffer stride exceeds what BR13 can carry");
+        return -1;
+    }
+
+    /* Below the media window, which is itself below the blitter's. Three
+     * regions that never overlap and are each placed by subtraction from
+     * the one above, so adding a fourth needs no arithmetic changed. */
+    igpu_comp.base_slot  = igpu.base_slot - IGPU_MEDIA_SLOTS - IGPU_COMP_SLOTS;
+    igpu_comp.next_slot  = igpu_comp.base_slot;
+    igpu_comp.limit_slot = igpu.base_slot - IGPU_MEDIA_SLOTS;
+    igpu_comp.ready      = 1;
+
+    igpu_comp.back_gpu   = igpu_comp_map_virt(back, w * h * 4u);
+    if (!igpu_comp.back_gpu) {
+        igpu_comp.ready = 0;
+        igpu_log("could not map the back buffer into the GGTT");
+        return -1;
+    }
+    igpu_comp.back_pitch = w * 4u;
+    igpu_comp.back_w     = w;
+    igpu_comp.back_h     = h;
+
+    igpu_log("compositor window programmed; back buffer is blittable");
+    return 0;
+}
+
+/* Is there a hardware path at all? Every caller asks before it batches,
+ * because the answer decides which of two complete implementations of
+ * the same frame runs. */
+static int igpu_comp_active(void) {
+    return igpu.active && igpu_comp.ready && igpu_comp.back_gpu != 0;
+}
+
+/* ---- the batch ----
+ *
+ * One command buffer per frame, filled by the compositor as it walks the
+ * window stack and submitted once at the end. The whole argument for
+ * batching is in the comment on igpu_cb_t: a submission costs a round
+ * trip to the engine and back, and paying that per rectangle is slower
+ * than doing the work on the processor.
+ */
+static igpu_cb_t igpu_comp_cb;
+
+static void igpu_comp_begin(void) {
+    igpu_cb_reset(&igpu_comp_cb);
+}
+
+/*
+ * Copy an offscreen surface into the back buffer.
+ *
+ * `src_gpu` came from igpu_comp_map_virt, so the engine can address it;
+ * everything is clipped against the back buffer here rather than in the
+ * caller, because a rectangle that runs off the edge is a page fault in
+ * the command streamer rather than a clipped blit.
+ */
+static int igpu_comp_blit(uint32_t src_gpu, uint32_t src_pitch,
+                          int sx, int sy, int dx, int dy, int w, int h) {
+    if (!igpu_comp_active() || !src_gpu) return -1;
+    if (w <= 0 || h <= 0 || sx < 0 || sy < 0) return -1;
+
+    if (dx < 0) { sx -= dx; w += dx; dx = 0; }
+    if (dy < 0) { sy -= dy; h += dy; dy = 0; }
+    if (dx + w > (int)igpu_comp.back_w) w = (int)igpu_comp.back_w - dx;
+    if (dy + h > (int)igpu_comp.back_h) h = (int)igpu_comp.back_h - dy;
+    if (w <= 0 || h <= 0) return -1;
+
+    return igpu_cb_copy(&igpu_comp_cb,
+                        igpu_comp.back_gpu, igpu_comp.back_pitch, dx, dy,
+                        src_gpu, src_pitch, sx, sy, w, h);
+}
+
+/*
+ * There is deliberately no igpu_comp_fill here.
+ *
+ * A hardware fill is the obvious companion to the copy above and it was
+ * written and then removed, because nothing in this compositor has a
+ * large enough single-colour rectangle to be worth a ring command. The
+ * frame's clear is the wallpaper, which is an image and therefore a
+ * copy; a title bar is a few thousand pixels and is drawn by code that
+ * is already holding the colour. An API with no caller is an API whose
+ * first caller discovers it was never right.
+ */
+
+/*
+ * Hand the frame's batch to the engine and wait for it to retire.
+ *
+ * The wait is not optional and not a missed optimisation. The processor
+ * is about to read these same pixels — to blend the chrome over them,
+ * and then to diff the frame against the last one — and reading a
+ * rectangle the engine has not finished writing yields a torn window
+ * whose contents depend on timing. igpu_exec's breadcrumb is exactly the
+ * synchronisation that rules that out, and it is bounded, so an engine
+ * that has died costs one frame and a hang report rather than the
+ * desktop.
+ *
+ * The flush afterwards is the other half of the same problem, in the
+ * cache rather than in the engine: the GPU's writes go through its own
+ * path to memory, and a processor line that still holds the old pixels
+ * would win. The blitter self-test in igpu_init flushes for the same
+ * reason and finds the same thing.
+ */
+static int igpu_comp_submit(void) {
+    if (!igpu_comp_active()) return -1;
+    if (igpu_comp_cb.n == 0) return 0;
+
+    igpu_comp.ops = (uint32_t)igpu_comp_cb.ops;
+
+    if (igpu_comp_cb.overflow || igpu_forcewake_get() != 0) {
+        igpu_comp.refused++;
+        igpu_cb_reset(&igpu_comp_cb);
+        return -1;
+    }
+    int rc = igpu_cb_submit(&igpu_comp_cb);
+    igpu_forcewake_put();
+    igpu_cb_reset(&igpu_comp_cb);
+
+    if (rc != 0) { igpu_comp.refused++; return -1; }
+    igpu_comp.frames++;
+    return 0;
+}
+
+/* Make the processor's view of a rectangle of the back buffer agree with
+ * what the engine just wrote into it. Line-granular, because a frame is
+ * megabytes and the windows that moved are not. */
+static void igpu_comp_sync_cpu(void *base, uint32_t pitch_bytes,
+                               int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    for (int r = 0; r < h; r++) {
+        uint8_t *row = (uint8_t *)base + (uint64_t)(y + r) * pitch_bytes
+                     + (uint64_t)x * 4u;
+        for (int c = 0; c < w * 4; c += 64)
+            __asm__ volatile("clflush (%0)" :: "r"(row + c) : "memory");
+    }
+    __asm__ volatile("mfence" ::: "memory");
+}
+
 /* ===== INITIALIZATION ===== */
 
 static void igpu_fail(const char *why) {

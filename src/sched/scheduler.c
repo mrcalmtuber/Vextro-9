@@ -112,6 +112,114 @@ static int sched_slot(thread_t *t) {
     return -1;
 }
 
+/* ===== THE PER-CORE READY QUEUES =====
+ *
+ * A queue here is a depth and a home: `sched_rq[c].n` is how many
+ * threads call processor c home, and thread_t.cpu is which one each of
+ * them chose. The membership is only ever changed when a thread is
+ * created or reaped, which is rare and never on an interrupt path — so
+ * it is maintained under the queue's own lock, and read by the picker
+ * without one.
+ *
+ * That asymmetry is deliberate and it is worth being exact about why it
+ * is sound, because "takes a lock to write and not to read" is usually a
+ * bug. Exactly one processor dispatches threads in this kernel, and it
+ * does so from inside a timer interrupt with interrupts disabled. So
+ * while the picker is running, nothing else on that processor can be
+ * halfway through a mutation, and no other processor mutates at all --
+ * the application processors run kernel workers and never touch a
+ * thread_t. The lock is there for the writers to serialise against each
+ * other the day an application processor does dispatch, and taking it in
+ * the picker would put a cross-object call inside sched_on_tick, which
+ * is the one function in this kernel where that is not worth doing.
+ */
+typedef struct {
+    spinlock_t lock;
+    int        n;               /* threads homed here */
+} sched_rq_t;
+
+static sched_rq_t sched_rq[SCHED_MAX_CPUS];
+
+/*
+ * Two counts, and they are not the same number.
+ *
+ * sched_cpus is how many queues the balancer may spread threads across,
+ * which is how many processors the machine actually started.
+ *
+ * sched_dispatchers is how many of them run this scheduler, which is
+ * one -- the application processors are a pool of kernel workers and
+ * take no threads. See the boundary argued at the top of src/smp.h.
+ *
+ * Keeping them apart is what lets the balancer do real work now while
+ * the picker stays correct: homes are assigned and counted, and the
+ * moment a second processor begins dispatching, raising the second
+ * number is the whole of what turns affinity on.
+ */
+static int sched_cpus        = 1;
+static int sched_dispatchers = 1;
+
+/*
+ * Which processor is asking.
+ *
+ * Zero, today, and the function exists so that the picker below is
+ * written in terms of "this processor" rather than in terms of a
+ * constant that would have to be found again later. When an application
+ * processor starts dispatching threads this is the one place that has to
+ * learn how to answer, and everything above it is already correct.
+ */
+__attribute__((always_inline, target("general-regs-only")))
+static inline int sched_here(void) { return 0; }
+
+void sched_set_cpu_count(int n) {
+    if (n < 1) n = 1;
+    if (n > SCHED_MAX_CPUS) n = SCHED_MAX_CPUS;
+    sched_cpus = n;
+}
+
+int sched_cpu_count(void) { return sched_cpus; }
+
+int sched_queue_depth(int cpu) {
+    if (cpu < 0 || cpu >= SCHED_MAX_CPUS) return 0;
+    return sched_rq[cpu].n;
+}
+
+/*
+ * Where a new thread should live.
+ *
+ * The interface is pinned to processor zero: it is the processor the
+ * frame clock interrupts, and everything the compositor touches --
+ * the window list, the terminal ring, the notification queue -- is
+ * reachable from a syscall on the same processor and protected by a
+ * preemption count rather than by a lock. Moving it would mean making
+ * every one of those safe against a second processor first.
+ *
+ * Everything else goes wherever there is least. Ties go to the lowest
+ * numbered queue, which keeps a machine that never starts a second
+ * processor behaving exactly as it did.
+ */
+static uint32_t sched_pick_home(uint32_t prio) {
+    if (prio >= PRIO_UI || sched_cpus <= 1) return 0;
+
+    int best = 0;
+    for (int c = 1; c < sched_cpus; c++)
+        if (sched_rq[c].n < sched_rq[best].n) best = c;
+    return (uint32_t)best;
+}
+
+static void sched_rq_join(thread_t *t) {
+    if (t->cpu >= (uint32_t)SCHED_MAX_CPUS) t->cpu = 0;
+    uint64_t f = spin_lock_irq(&sched_rq[t->cpu].lock);
+    sched_rq[t->cpu].n++;
+    spin_unlock_irq(&sched_rq[t->cpu].lock, f);
+}
+
+static void sched_rq_leave(thread_t *t) {
+    if (t->cpu >= (uint32_t)SCHED_MAX_CPUS) return;
+    uint64_t f = spin_lock_irq(&sched_rq[t->cpu].lock);
+    if (sched_rq[t->cpu].n > 0) sched_rq[t->cpu].n--;
+    spin_unlock_irq(&sched_rq[t->cpu].lock, f);
+}
+
 /*
  * Pick.
  *
@@ -119,23 +227,54 @@ static int sched_slot(thread_t *t) {
  * of starting the search one past whoever just ran rather than at zero.
  * Sleepers whose deadline has passed are woken on the way through, since
  * this is the one place that walks every thread anyway.
+ *
+ * ---- and now, whose thread it is ----
+ *
+ * A home only restricts the search when there is more than one
+ * processor doing the searching, and getting that condition wrong is
+ * not a missed optimisation -- it is starvation.
+ *
+ * The first attempt here looked right and was badly wrong: consider
+ * threads homed to this processor first, and fall back to all of them
+ * only if that found nothing. With one dispatching processor the
+ * fallback is unreachable, because the compositor is homed to processor
+ * zero and is runnable sixty times a second -- so the restricted pass
+ * always found *something*, always won, and every thread the balancer
+ * had homed elsewhere simply never ran. An application would start,
+ * print nothing, and hang, which is exactly what it did.
+ *
+ * The rule that is actually correct is that priority is global and
+ * affinity is a tie-break *between processors*, not within one. So the
+ * restriction is applied only when more than one processor dispatches,
+ * and until then this is the same single pass over the same table in the
+ * same rotated order that it has always been -- which is also why the
+ * tie-break among equal priorities is unchanged.
  */
 __attribute__((target("general-regs-only")))
 static thread_t *sched_pick(void) {
-    int start = cur_thread ? sched_slot(cur_thread) : -1;
+    const int start = cur_thread ? sched_slot(cur_thread) : -1;
+    const uint32_t here = (uint32_t)sched_here();
+    const int affine = sched_dispatchers > 1;
     thread_t *best = 0;
-    int best_i = -1;
 
-    for (int n = 1; n <= SCHED_MAX_THREADS; n++) {
-        int i = (start + n) % SCHED_MAX_THREADS;
-        thread_t *t = threads[i];
-        if (!t) continue;
-        if (t->state == T_SLEEPING && sched_ticks >= t->wake_at)
-            t->state = T_READY;
-        if (t->state != T_READY && t->state != T_RUNNING) continue;
-        if (!best || t->prio > best->prio) { best = t; best_i = i; }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int n = 1; n <= SCHED_MAX_THREADS; n++) {
+            int i = (start + n) % SCHED_MAX_THREADS;
+            thread_t *t = threads[i];
+            if (!t) continue;
+            /* Deadlines are honoured on the first pass only: the second
+             * walks the same table and would otherwise test a condition
+             * the first has already resolved. */
+            if (pass == 0 && t->state == T_SLEEPING &&
+                sched_ticks >= t->wake_at)
+                t->state = T_READY;
+            if (t->state != T_READY && t->state != T_RUNNING) continue;
+            if (pass == 0 && affine && t->cpu != here) continue;
+            if (!best || t->prio > best->prio) best = t;
+        }
+        /* One pass is the whole search unless a home restricted it. */
+        if (best || !affine) break;
     }
-    (void)best_i;
     return best;
 }
 
@@ -308,6 +447,9 @@ void sched_init(void) {
     t->user       = 0;
     t->as         = 0;
     t->kstack     = 0;
+    /* Processor zero, and not by the balancer: this thread is already
+     * executing on it, which is a stronger claim than any preference. */
+    t->cpu        = 0;
     t->kstack_top = tss.rsp0;
     __asm__ volatile("mov %%cr3, %0" : "=r"(t->cr3));
     t->cr3 &= PTE_ADDR_MASK;
@@ -315,6 +457,7 @@ void sched_init(void) {
     sched_name(t, "compositor");
 
     sched_register(t);
+    sched_rq_join(t);
     cur_thread = t;
 
     idt_set_gate_ex(APIC_VEC_TIMER, (void *)(uintptr_t)sched_timer_stub,
@@ -458,8 +601,10 @@ static thread_t *sched_new(const char *name, uint32_t prio) {
     t->prio       = prio;
     t->state      = T_READY;
     t->kstack_top = ((uint64_t)(uintptr_t)t->kstack + SCHED_KSTACK) & ~15ULL;
+    t->cpu        = sched_pick_home(prio);
     for (int i = 0; i < 512; i++) t->fx[i] = fx_template[i];
     sched_name(t, name);
+    sched_rq_join(t);
     return t;
 }
 
@@ -482,6 +627,11 @@ thread_t *sched_spawn_kernel(void (*fn)(void), const char *name,
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
+        /* sched_new counted it into a queue before the table was known
+         * to have room. Give the place back, or a full table leaks a
+         * queue slot per refused spawn and the balancer slowly comes to
+         * believe every processor is busy. */
+        sched_rq_leave(t);
         kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
@@ -519,6 +669,11 @@ thread_t *sched_spawn_kernel_arg(void (*fn)(void *), void *arg,
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
+        /* sched_new counted it into a queue before the table was known
+         * to have room. Give the place back, or a full table leaks a
+         * queue slot per refused spawn and the balancer slowly comes to
+         * believe every processor is busy. */
+        sched_rq_leave(t);
         kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
@@ -540,6 +695,11 @@ thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
+        /* sched_new counted it into a queue before the table was known
+         * to have room. Give the place back, or a full table leaks a
+         * queue slot per refused spawn and the balancer slowly comes to
+         * believe every processor is busy. */
+        sched_rq_leave(t);
         kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
@@ -595,6 +755,11 @@ thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
     uint64_t flags = irq_save();
     if (sched_register(t) < 0) {
         irq_restore(flags);
+        /* sched_new counted it into a queue before the table was known
+         * to have room. Give the place back, or a full table leaks a
+         * queue slot per refused spawn and the balancer slowly comes to
+         * believe every processor is busy. */
+        sched_rq_leave(t);
         kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
         return 0;
     }
@@ -761,6 +926,10 @@ void sched_reap(void) {
         uint64_t flags = irq_save();
         threads[i] = 0;
         irq_restore(flags);
+
+        /* Off its queue before the control block goes, so the balancer
+         * never counts a thread that no longer exists. */
+        sched_rq_leave(t);
 
         if (t->as) { vmm_destroy(t->as); kfree(t->as); }
         if (t->kstack) kstack_free(t->kstack, SCHED_KSTACK);
