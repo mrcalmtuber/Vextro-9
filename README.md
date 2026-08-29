@@ -246,23 +246,31 @@ seam. All three are vendored unmodified and verified on the machine —
 SQLite reads a database the *host's* sqlite3 wrote, and FreeType agrees
 with this kernel's own TrueType parser to the pixel.
 
-**The engine itself still does not compile**, and the blocker is now
-sharper than a missing library. `make webkit` gets past its
-prerequisites and past CMake's compiler test, and stops at
-`Unknown OS 'Generic'` — WebKit's build system has a closed list of
-operating systems and no category for a target with none. That fires
-before a single `find_package`, so it would not be fixed by porting any
-number of the other eighteen dependencies. Getting past it means a
-Vextro port *inside* WebKit.
+**The engine itself still does not compile**, but the wall has moved
+from before the dependency list to inside it. `make webkit` used to stop
+at `Unknown OS 'Generic'` — WebKit's build system has a closed list of
+operating systems and no category for a target with none, and that fired
+before a single `find_package`. It is passed now, without patching one
+byte of WebKit: `CMAKE_PROJECT_INCLUDE` runs a file inside `project()`
+that asserts `UNIX`, which selects the generic-Unix branch rather than
+the Linux one, and the toolchain adds `-D__unix__` because WTF reads
+predefined macros rather than CMake variables. Configure now runs
+WebKit's whole feature-detection pass against this C library and stops
+at `OptionsWPE.cmake:8`, the first of twenty-two required packages —
+HarfBuzz is found at 8.5.0 and rejected for wanting to be built against
+ICU. Seventeen more stand behind it, one of them an OpenGL loader for a
+machine with no GL.
 
 **The three things that were blocking before this no longer are.** There was no `libstdc++` for
 `x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;
 there are now a freestanding C++ runtime (`libcxx/`), nineteen
 descriptor and socket system calls (`src/vfs.h`), and the POSIX layer
-over them in `libc/`. What remains is breadth rather than depth — cmake
-and ninja are not installed, `libcxx/` has not grown the parts of the
-standard library WebKit uses beyond what is written, and the dependency
-ports have not been done. `third_party/wpe-config/README.md` sets it out
+over them in `libc/`. What remains is mostly breadth — eighteen
+dependency ports, and the specific `libc` gaps WebKit's own configure
+named (`sys/time.h`, `langinfo.h`, `localtime_r`, `timegm`, `regexec`).
+Two items are depth rather than breadth: an OpenGL implementation, and a
+real `WTF_OS_VEXTRO` for the places WTF assumes a process model this
+system has no answer for. `third_party/wpe-config/README.md` sets it out
 in order, and `make webkit` names what is missing at once.
 
 ## File descriptors and sockets in ring 3

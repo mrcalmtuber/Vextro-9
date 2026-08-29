@@ -1196,6 +1196,70 @@ $(WEBKIT_SRC)/CMakeLists.txt:
 		     rm -f build/$(WEBKIT_TARBALL); exit 1; }
 	@tar -C third_party -xf build/$(WEBKIT_TARBALL)
 
+# --- A sysroot for cmake to look in ---
+#
+# WebKit finds its dependencies with pkg-config first and find_path /
+# find_library second. There is no pkg-config here and the four
+# libraries this system does have are not laid out the way a Unix
+# installation lays them out -- the archives are flat in build/ under
+# the names this Makefile gave them, and the headers are wherever their
+# upstream tarball put them.
+#
+# So they are staged into one directory that looks like a sysroot, and
+# vextro-toolchain.cmake points CMAKE_FIND_ROOT_PATH at it. Nothing is
+# built here; every file is copied from something that was already
+# compiled and already ran its tests on the machine.
+#
+# Two of the copies are renames, and both are because the find modules
+# search for the *installed* name rather than ours:
+#
+#   libsqlite.a -> libsqlite3.a    find_library(NAMES sqlite3)
+#   libwpe.a    -> libwpe-1.0.a    find_library(NAMES wpe-1.0)
+#
+# ---- and one copy that would be a lie without it ----
+#
+# FreeType is compiled here with FT_CONFIG_OPTIONS_H and
+# FT_CONFIG_MODULES_H redirected on the command line to the two headers
+# in third_party/freetype-port/. Staging upstream's include/ tree alone
+# would hand a consumer the *default* configuration -- a different set
+# of FT_CONFIG_OPTION_ defines from the one libfreetype.a was built
+# with, and some of those change structure layouts. The redirected pair
+# is therefore copied over the stock ones, so the headers in the sysroot
+# describe the archive beside them rather than some other build of the
+# same version.
+#
+# HarfBuzz has the same shape of hazard and not the same severity: it is
+# built -DHB_TINY -DHB_NO_MT, which turns features off inside the
+# library without moving anything in the public headers. It is recorded
+# here because "the headers match the archive" is a claim this directory
+# makes, and it should be a checked one.
+WEBKIT_SYSROOT := build/webkit-sysroot
+
+.PHONY: webkit-sysroot
+webkit-sysroot: $(WEBKIT_SYSROOT)/.stamp
+
+$(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
+                          $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h
+	@rm -rf $(WEBKIT_SYSROOT)
+	@mkdir -p $(WEBKIT_SYSROOT)/include/harfbuzz \
+	          $(WEBKIT_SYSROOT)/include/freetype2 \
+	          $(WEBKIT_SYSROOT)/include/wpe \
+	          $(WEBKIT_SYSROOT)/lib
+	@cp $(HB_DIR)/src/hb*.h                $(WEBKIT_SYSROOT)/include/harfbuzz/
+	@cp $(SQLITE_DIR)/sqlite3.h $(SQLITE_DIR)/sqlite3ext.h \
+	                                       $(WEBKIT_SYSROOT)/include/
+	@cp $(WPE_DIR)/include/wpe/*.h         $(WEBKIT_SYSROOT)/include/wpe/
+	@cp $(FT_DIR)/include/ft2build.h       $(WEBKIT_SYSROOT)/include/freetype2/
+	@cp -R $(FT_DIR)/include/freetype      $(WEBKIT_SYSROOT)/include/freetype2/
+	@cp $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h \
+	    $(WEBKIT_SYSROOT)/include/freetype2/freetype/config/
+	@cp $(LIBHB)       $(WEBKIT_SYSROOT)/lib/libharfbuzz.a
+	@cp $(LIBFT)       $(WEBKIT_SYSROOT)/lib/libfreetype.a
+	@cp $(LIBSQLITE)   $(WEBKIT_SYSROOT)/lib/libsqlite3.a
+	@cp $(LIBWPE)      $(WEBKIT_SYSROOT)/lib/libwpe-1.0.a
+	@touch $@
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (harfbuzz, freetype, sqlite3, wpe)"
+
 # --- Building it ---
 #
 # This target names everything that is missing at once rather than
@@ -1203,13 +1267,18 @@ $(WEBKIT_SRC)/CMakeLists.txt:
 # at the top of this file extends -- discovering four prerequisites one
 # build at a time is four builds.
 #
-# It does not succeed today. What stands between this and an engine is
-# set out in third_party/wpe-config/README.md, and the first item is
-# that there is no C++ standard library for x86_64-elf: g++ exists,
-# libstdc++ does not, and WebKit is C++20 throughout. The check below
-# reports that rather than letting cmake discover it several minutes in.
+# It does not succeed today, and the reason has moved twice. It was "no
+# C++ standard library for x86_64-elf"; libcxx/ answered that. It was
+# then a FATAL_ERROR in WebKit's own OS detection, which had no branch
+# for a target without an operating system; the injection layer in
+# third_party/wpe-config/ answers that, and configure now runs through
+# WebKit's feature detection and reaches its dependency list. What
+# stands here now is the dependency list itself -- 22 REQUIRED packages,
+# of which this system has four. third_party/wpe-config/README.md has
+# the current frontier and the exact error.
 .PHONY: webkit
-webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX)
+webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
+        $(WEBKIT_SYSROOT)/.stamp
 	@missing=""; \
 	command -v cmake >/dev/null || missing="$$missing cmake"; \
 	command -v ninja >/dev/null || missing="$$missing ninja"; \
@@ -1223,16 +1292,18 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX)
 	    echo "  These are package installs rather than work. What used to"; \
 	    echo "  be in the way was not:"; \
 	    echo ""; \
-	    echo "    the C++ runtime      done  libcxx/, 28 headers over libc/"; \
+	    echo "    the C++ runtime       done  libcxx/, 35 headers over libc/"; \
 	    echo "    descriptors in ring 3 done  src/vfs.h, 19 system calls"; \
 	    echo "    sockets in ring 3     done  over src/vxnet.h"; \
+	    echo "    the OS gate           done  third_party/wpe-config/"; \
+	    echo "    sqlite, freetype, harfbuzz"; \
+	    echo "                          done  ported, and green in ring 3"; \
 	    echo ""; \
-	    echo "  What remains after installing the above is breadth: the"; \
-	    echo "  parts of the standard library WebKit uses that libcxx/ has"; \
-	    echo "  not grown yet (unordered_map, thread, chrono, variant), and"; \
-	    echo "  the dependency ports -- ICU, libxml2, freetype, harfbuzz,"; \
-	    echo "  sqlite, Skia. Each is a port onto interfaces that now exist"; \
-	    echo "  and are tested, rather than an interface to be invented."; \
+	    echo "  What remains after installing the above is the dependency"; \
+	    echo "  list: 22 packages WebKit marks REQUIRED, of which this"; \
+	    echo "  system has four. ICU is the first of the eighteen, and"; \
+	    echo "  each is a port onto interfaces that now exist and are"; \
+	    echo "  tested, rather than an interface to be invented."; \
 	    echo ""; \
 	    echo "  third_party/wpe-config/README.md has the full order."; \
 	    echo ""; \

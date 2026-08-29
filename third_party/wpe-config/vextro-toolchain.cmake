@@ -17,6 +17,67 @@
 set(CMAKE_SYSTEM_NAME       Generic)
 set(CMAKE_SYSTEM_PROCESSOR  x86_64)
 
+# ---- and why UNIX is asserted on top of it ----
+#
+# Source/cmake/WebKitCommon.cmake decides what operating system it is
+# building for from a closed list:
+#
+#     if (UNIX)
+#         ... MACOS / LINUX / UNIX
+#     elseif (CMAKE_SYSTEM_NAME MATCHES "Windows")
+#     elseif (CMAKE_SYSTEM_NAME MATCHES "Fuchsia")
+#     else ()
+#         message(FATAL_ERROR "Unknown OS '${CMAKE_SYSTEM_NAME}'")
+#
+# There is no branch for a target without an operating system, so
+# "Generic" — the honest description — is the one answer the list
+# refuses, and it refuses it at include() time, before a single
+# find_package runs. Configuring at all means landing on one of those
+# three names.
+#
+# UNIX is the one to assert, and *not* CMAKE_SYSTEM_NAME Linux, for two
+# reasons.
+#
+# The first is which branch it lands on. With UNIX true, APPLE false and
+# the system name not matching "Linux", WebKit sets WTF_OS_UNIX — the
+# generic-Unix path the BSDs use. Naming the system Linux would set
+# WTF_OS_LINUX instead and select build files written for glibc, /proc
+# and Linux-only system calls, none of which exist here. The weaker
+# claim is the true one: this system has descriptors, sockets, threads,
+# mmap and a fork that copies on write, and does not have /proc.
+#
+# The second is that CMAKE_SYSTEM_NAME Linux would also make CMake load
+# Platform/Linux.cmake, which describes a machine with a dynamic loader
+# — shared library rules, -rdynamic, CMAKE_DL_LIBS. Platform/Generic
+# describes one without, which is this one. Setting UNIX by hand takes
+# the branch without taking the platform description with it.
+#
+# So this is a claim about the target rather than a spoof of it, and the
+# claim is defensible: what UNIX selects downstream is a process model,
+# and by now this system has one.
+#
+# ---- and why it cannot simply be set here ----
+#
+# `set(UNIX 1)` in this file does not survive. project() recomputes
+# UNIX, WIN32 and APPLE from CMAKE_SYSTEM_NAME after the toolchain file
+# has been read, and overwrites whatever was there. Measured rather than
+# assumed — a four-line probe prints
+#
+#     BEFORE project(): UNIX='1'      (inherited from the host)
+#     AFTER  project(): UNIX=''       (recomputed for Generic)
+#
+# and WebKit's CMakeLists.txt calls project() on line 10 and
+# include(WebKitCommon) on line 16, so the assignment is undone six
+# lines before it is read.
+#
+# CMAKE_PROJECT_INCLUDE is the seam CMake provides for exactly this: a
+# file run as the last step of every project() call, which is after the
+# recompute and before line 16. It is the documented way to configure a
+# project whose CMakeLists you do not own, and it leaves not one byte of
+# WebKit changed.
+set(CMAKE_PROJECT_INCLUDE
+    "${CMAKE_CURRENT_LIST_DIR}/vextro-project-inject.cmake")
+
 set(CMAKE_C_COMPILER        x86_64-elf-gcc)
 set(CMAKE_CXX_COMPILER      x86_64-elf-g++)
 set(CMAKE_AR                x86_64-elf-ar)
@@ -47,9 +108,41 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 #                       resolves that call.
 #   -fno-exceptions     see the note in the README about libsupc++
 #   -fno-rtti           the same
+#
+# ---- and the two defines, which are the other half of the OS answer ----
+#
+# set(UNIX 1) above tells WebKit's *build system* what this target is.
+# It does not tell the compiler, and the two find out separately:
+# Source/WTF/wtf/PlatformOS.h derives OS() entirely from predefined
+# macros, never from the CMake variables. Its OS(UNIX) test is
+#
+#     #if OS(AIX) || OS(DARWIN) || ... || OS(LINUX) || OS(NETBSD)
+#         || OS(OPENBSD) || defined(unix) || defined(__unix)
+#         || defined(__unix__)
+#
+# and x86_64-elf-gcc, being a bare-metal compiler, predefines none of
+# them. So a build configured past line 152 would still compile every
+# WTF source with no operating system selected at all, which is not a
+# state that header has a branch for either.
+#
+# -D__unix__ is the smallest true thing to say. It claims a process
+# model — descriptors, sockets, threads, mmap, fork — and by now this
+# system has one; it does not claim Linux, so nothing reaches for
+# /proc, epoll or a glibc-shaped syscall wrapper on the strength of it.
+#
+# __vextro__ claims nothing and is here to be asked. Ported code that
+# needs to know which Unix this is has no other way to find out, and
+# `#ifdef __vextro__` in a port file is honest in a way that
+# `#ifdef __unix__` doing double duty would not be.
+#
+# Both are set here and only here. The C library, libcxx and the three
+# library ports are all built by the main Makefile without them, and
+# they stay that way — the nine suites that pass on the machine were
+# compiled the way they were compiled.
 set(VX_COMMON_FLAGS
     "-O2 -ffreestanding -fno-stack-protector -fno-stack-check -mno-red-zone \
--fPIC -msse -msse2 -mfpmath=sse -fno-math-errno -ftls-model=initial-exec")
+-fPIC -msse -msse2 -mfpmath=sse -fno-math-errno -ftls-model=initial-exec \
+-D__unix__=1 -D__vextro__=1")
 
 # ---- where the libraries actually are ----
 #
@@ -121,3 +214,33 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# ---- and the sysroot those three ONLYs refer to ----
+#
+# `make webkit-sysroot` stages the four libraries this system actually
+# has into build/webkit-sysroot, laid out the way a Unix installation
+# lays them out, because that is the only shape the find modules know
+# how to look in: pkg-config first (there is none here) and
+# find_path/find_library second.
+#
+#     include/harfbuzz/hb*.h        lib/libharfbuzz.a    8.5.0
+#     include/freetype2/            lib/libfreetype.a    2.13.2
+#     include/sqlite3.h             lib/libsqlite3.a     3.45.1
+#     include/wpe/wpe.h             lib/libwpe-1.0.a     1.16.2
+#
+# Every file in it is copied from something already compiled by the main
+# Makefile and already green in ring 3 -- 32, 35 and 32 assertions on
+# the machine for the first three. Nothing is staged that was not built,
+# and nothing is built here.
+#
+# The directory may not exist yet; find_ commands treat a missing root
+# as no root and report the libraries as not found, which is the correct
+# answer in that case rather than an error to guard against.
+set(CMAKE_FIND_ROOT_PATH "${VX_ROOT}/build/webkit-sysroot")
+
+# There are no shared objects on this target -- no runtime linker, no
+# dlopen, nothing to resolve one. Saying so here means find_library
+# looks for libfoo.a and stops, rather than looking for a .so first and
+# finding one from the host if any path ever leaks in.
+set(CMAKE_FIND_LIBRARY_PREFIXES "lib")
+set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
