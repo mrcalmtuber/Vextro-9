@@ -102,6 +102,34 @@
 #define LWIP_NETIF_STATUS_CALLBACK  1
 #define LWIP_NETIF_LINK_CALLBACK    1
 
+/*
+ * ===== the loopback interface =====
+ *
+ * On because ring 3 has sockets now, and a machine has to be able to
+ * talk to itself.
+ *
+ * Two reasons, and the second is the one that made it necessary. A
+ * program that connects to 127.0.0.1 is asking for something no network
+ * is involved in, and answering "no route" would be wrong. And the boot
+ * self-test that proves the new socket system calls actually carry bytes
+ * has to do it without a server on the far side -- a test that needs the
+ * outside world is a test that fails in a room with no network, which is
+ * exactly the room a headless harness runs in.
+ *
+ * LWIP_HAVE_LOOPIF follows from this by default and is named anyway,
+ * because what it does -- create the 127.0.0.1 interface at
+ * initialisation -- is the part being relied on.
+ *
+ * LWIP_NETIF_LOOPBACK_MULTITHREADING is lwIP's own default when NO_SYS
+ * is 0 and is what makes this safe here: a looped frame is handed to the
+ * tcpip thread through tcpip_try_callback rather than being delivered on
+ * the caller's stack, so a program sending to itself does not re-enter
+ * the stack underneath its own send.
+ */
+#define LWIP_NETIF_LOOPBACK         1
+#define LWIP_HAVE_LOOPIF            1
+#define LWIP_LOOPBACK_MAX_PBUFS     16
+
 /* ===== TCP tuning =====
  *
  * MSS is 1460: 1500 of Ethernet payload less twenty of IP and twenty of
@@ -145,6 +173,31 @@
 #define LWIP_SOCKET_SELECT          1
 #define LWIP_SOCKET_POLL            0
 #define LWIP_SO_RCVTIMEO            1
+
+/*
+ * SO_RCVTIMEO and SO_SNDTIMEO take a plain integer of milliseconds.
+ *
+ * On, and it fixes a bug rather than choosing a taste. lwIP's default is
+ * to take a `struct timeval`, and vxnet_timeout() in src/lwipglue.c has
+ * always passed an `int` -- so every call it made was rejected for a
+ * wrong option length, and every caller ignored the return value.
+ *
+ * The consequences were real and silent. The HTTPS path asks for a
+ * fifteen-second timeout before it sends a request, and never got one:
+ * a peer that vanished without a FIN held that thread until the
+ * connection was torn down some other way. The remote desktop's poll
+ * timeout was in the same position. Nothing reported anything, because
+ * a timeout that is never set looks exactly like a peer that is simply
+ * slow.
+ *
+ * It surfaced when ring 3 got sockets and a test finally checked the
+ * return value of setsockopt.
+ *
+ * Fixed here rather than in the glue because milliseconds is the unit
+ * that seam already speaks, and this is the switch lwIP provides for
+ * exactly that preference.
+ */
+#define LWIP_SO_SNDRCVTIMEO_NONSTANDARD 1
 #define LWIP_SO_SNDTIMEO            1
 #define LWIP_SO_RCVBUF              1
 #define LWIP_TCP_INFO               0

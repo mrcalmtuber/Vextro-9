@@ -112,6 +112,351 @@
 #define SYS_BLK_WRITE       29
 
 /*
+ * ===== 30-39: what a C library needs and this system had no way to say
+ * =====
+ *
+ * Nine calls, added together because they are one thing: the smallest
+ * set under which a program can have more than one thread and more
+ * memory than its break.
+ *
+ * Everything above this line was reachable from a program with one
+ * thread, one heap that only grows, and no notion of time finer than a
+ * tick count. That was enough for the programs written for it — a
+ * Mandelbrot set, a terminal, a game of life. It is not enough for a
+ * library that was written against POSIX, and the gap is not a matter of
+ * missing convenience functions: pthread_create has nowhere to put a
+ * thread, malloc's large path has nothing to ask for a region, and a
+ * thread-local variable has no register to be addressed from.
+ *
+ * ---- the three memory calls ----
+ *
+ * MMAP reserves address space; MUNMAP gives it back; MPROTECT changes
+ * what may be done with it. Reserving is not mapping — see the long note
+ * in src/vmm.h about why a promise is a record rather than a page table
+ * entry — and that distinction is the only reason a program can ask for
+ * four gigabytes on a machine with two.
+ *
+ * MPROTECT is also where W^X stops being a property of the loader and
+ * becomes a property of the system. The loader has always mapped an
+ * image's text without PTE_WRITE and its data with PTE_NX, but that was
+ * a decision taken once, about a file, by code the program does not
+ * control. A program that can change its own protections can undo it —
+ * and a just-in-time compiler is precisely a program that wants to. The
+ * refusal is in the service routine, so there is no combination of calls
+ * that arrives at a page which is both.
+ *
+ * ---- the four thread calls ----
+ *
+ * CLONE is fork's opposite number and the difference is the whole point:
+ * fork gives the new thread a copy of the address space, clone gives it
+ * *the* address space. A pthread that could not see its creator's heap
+ * would not be a pthread.
+ *
+ * THREAD_EXIT ends one thread; EXIT_GROUP ends all of them. SYS_EXIT
+ * keeps the meaning it has always had, which is now THREAD_EXIT's — that
+ * is not a redefinition, because until today no process had a second
+ * thread for the two to differ about.
+ *
+ * SET_FSBASE is what makes `__thread` work at all. GETTID is what lets a
+ * thread recognise itself, which a recursive mutex needs and cannot get
+ * any other way.
+ *
+ * ---- and the clock ----
+ *
+ * SYS_TICKS has always answered, and answers in scheduler ticks since
+ * boot, which is a unit only this kernel knows. CLOCK answers in
+ * nanoseconds, because that is the unit every timeout in every library
+ * ever written is expressed in, and converting in user space would mean
+ * every program carrying its own copy of the tick rate.
+ */
+#define SYS_MMAP            30
+#define SYS_MUNMAP          31
+#define SYS_MPROTECT        32
+#define SYS_CLONE           33
+#define SYS_THREAD_EXIT     34
+#define SYS_GETTID          35
+#define SYS_SET_FSBASE      36
+#define SYS_CLOCK           37
+#define SYS_EXIT_GROUP      38
+#define SYS_NANOSLEEP       39
+
+/*
+ * ===== 40-59: descriptors, and the two things they can name =====
+ *
+ * Until this block a ring-3 program on this system could not open
+ * anything. It had one file call — SYS_FS_WRITE, which takes a path and
+ * a buffer and replaces a whole file behind a prompt — and no way at all
+ * to reach the network, notwithstanding that the kernel has carried a
+ * complete TCP/IP stack with TLS since src/vxnet.h was written.
+ *
+ * That was not an oversight in either case; it was the absence of the
+ * one abstraction both of them need. A file you read a window at a time
+ * has a position, and a socket has a connection, and neither of those
+ * can be expressed by a call that takes a path. What a descriptor is, is
+ * a name for state the kernel holds on the program's behalf between two
+ * calls — and once there is a table of those, `read` and `recv` are the
+ * same operation applied to different things in it.
+ *
+ * ---- what a descriptor may be ----
+ *
+ * A console stream (0, 1 and 2, which every process starts with), an
+ * open file, an open directory, a TCP connection, or a TLS session. The
+ * table lives in src/vfs.h, hangs off the address space rather than the
+ * thread — see the long note in include/kernel_shared.h for why that is
+ * the semantics and not merely the storage — and is closed by the last
+ * thread of the process to leave.
+ *
+ * ---- how these report failure, and why it is different ----
+ *
+ * Every call above this line answers (uint64_t)-1 and nothing else. That
+ * is enough when there is one way to fail, and the calls above mostly
+ * have one: a pointer that is not the caller's.
+ *
+ * These have many. A port that cannot tell ENOENT from EACCES from
+ * EISDIR cannot decide whether to create the file, ask for a password,
+ * or give up, and every one of those is a different program. So the
+ * calls in this block return the *negated* error number on failure —
+ * -ENOENT, -EACCES — and a non-negative value on success, which is the
+ * convention Linux's system calls use and therefore the one the code
+ * being ported already expects its libc to unpack. libc/file.c does the
+ * unpacking; the numbers themselves are in libc/include/errno.h and are
+ * Linux's, for the same reason.
+ *
+ * The range is what makes this unambiguous: a value in [-4095, -1] is an
+ * error and everything else is a result. mmap can return an address with
+ * the top bit set and could not use this convention; nothing here can.
+ *
+ * ---- and the one door that is not here ----
+ *
+ * There is no SYS_WRITE in this block because there already is one.
+ * SYS_WRITE (6) has taken a descriptor since it was written and has
+ * always answered for 1 and 2; what changes is that it now looks a
+ * descriptor up in the table when it is given anything else. A separate
+ * number would have meant every ported program calling the wrong one.
+ */
+#define SYS_OPEN            40
+#define SYS_READ            41
+#define SYS_CLOSE           42
+#define SYS_LSEEK           43
+#define SYS_STAT            44
+#define SYS_FSTAT           45
+#define SYS_GETDENTS        46
+#define SYS_UNLINK          47
+#define SYS_MKDIR           48
+#define SYS_FSYNC           49
+#define SYS_FTRUNCATE       50
+
+/*
+ * ---- and the one that is deliberately absent ----
+ *
+ * There is no dup. On Unix a descriptor is a *name* for an open file
+ * description, and dup makes a second name for one — which is why two
+ * duplicated descriptors share a file offset, and why a fork shares one
+ * with its child rather than copying it.
+ *
+ * Here the descriptor *is* the description. There is no second layer for
+ * two names to point at, so dup could only ever be a copy: two entries
+ * with two independent offsets, two write-back images of one file, and
+ * two closes of one socket. Every one of those is silently wrong in a
+ * way a program would discover as data loss rather than as an error.
+ *
+ * So it is not provided, and libc does not declare it. A port that
+ * wants it fails to link against a name that does not exist, which is
+ * the failure that can be read, rather than calling one that lies. The
+ * same reasoning is why a fork does not inherit sockets — see
+ * vfs_clone_table in src/vfs.h.
+ */
+
+#define SYS_SOCKET          51
+#define SYS_CONNECT         52
+#define SYS_CONNECT_HOST    53
+#define SYS_SEND            54
+#define SYS_RECV            55
+#define SYS_SOCKOPT         56
+#define SYS_SHUTDOWN        57
+#define SYS_RESOLVE         58
+
+/*
+ * ---- open flags ----
+ *
+ * Linux's numbers, and octal as Linux writes them, because ported code
+ * does reach for the constants directly and a port that assembled
+ * O_WRONLY|O_CREAT|O_TRUNC out of a different set would open the wrong
+ * thing rather than fail to compile.
+ */
+#define VX_O_RDONLY     0
+#define VX_O_WRONLY     1
+#define VX_O_RDWR       2
+#define VX_O_ACCMODE    3
+#define VX_O_CREAT      0100
+#define VX_O_EXCL       0200
+#define VX_O_TRUNC      01000
+#define VX_O_APPEND     02000
+#define VX_O_DIRECTORY  0200000
+#define VX_O_CLOEXEC    02000000
+
+#define VX_SEEK_SET  0
+#define VX_SEEK_CUR  1
+#define VX_SEEK_END  2
+
+/* What SYS_STAT and SYS_FSTAT fill in. Fixed layout, checked by a
+ * static assertion on both sides of the boundary, because a structure
+ * that crosses a privilege boundary and is described twice is a
+ * structure that will one day be described differently twice.
+ *
+ * `mtime_ns` is zero and says so here rather than inventing a number:
+ * ntfs_lookup answers size and kind, the timestamps in
+ * $STANDARD_INFORMATION are not on that path, and a modification time
+ * that is always the epoch is at least honestly wrong rather than
+ * plausibly wrong. A make(1) built against it would rebuild everything,
+ * which is the safe direction. */
+typedef struct {
+    uint64_t size;
+    uint64_t ino;          /* the MFT record on NTFS; 0 elsewhere */
+    uint32_t mode;         /* VX_S_IF*                            */
+    uint32_t nlink;
+    uint64_t mtime_ns;     /* always 0 -- see above               */
+} vx_stat_t;
+_Static_assert(sizeof(vx_stat_t) == 32, "vx_stat_t crosses the boundary");
+
+#define VX_S_IFMT   0170000
+#define VX_S_IFREG  0100000
+#define VX_S_IFDIR  0040000
+#define VX_S_IFCHR  0020000     /* the console streams */
+#define VX_S_IFSOCK 0140000
+
+/* One entry from SYS_GETDENTS. Fixed-length rather than the packed,
+ * self-describing records Linux uses: a variable record means the
+ * kernel writes a length that user space then trusts to step through a
+ * buffer, and a fixed one means it cannot. 272 bytes each is a
+ * directory listing that costs a page per fifteen names, which is
+ * nothing against the read that produced it. */
+#define VX_NAME_MAX 255
+typedef struct {
+    uint64_t size;
+    uint32_t type;          /* VX_DT_* */
+    uint32_t namelen;
+    char     name[256];
+} vx_dirent_t;
+_Static_assert(sizeof(vx_dirent_t) == 272, "vx_dirent_t crosses the boundary");
+
+#define VX_DT_UNKNOWN 0
+#define VX_DT_REG     1
+#define VX_DT_DIR     2
+
+/*
+ * ---- sockets ----
+ *
+ * AF_INET and SOCK_STREAM, and nothing else, because underneath is
+ * lwIP as this system configures it: TCP over IPv4. A datagram socket
+ * is refused rather than accepted and made to fail later, for the same
+ * reason mmap refuses a non-anonymous mapping.
+ *
+ * VX_IPPROTO_TLS is this system's own and is not a protocol number
+ * anybody else uses. It selects the Mbed TLS path in src/tlsglue.c
+ * instead of the plain one, so that a program gets an encrypted stream
+ * through the same four calls rather than through a second API.
+ *
+ * It comes with a caveat that is repeated everywhere it is mentioned
+ * because it is the kind of thing that gets discovered rather than
+ * read: there is no certificate authority store on this volume, so the
+ * chain is parsed and the handshake signature checked against the key
+ * in the leaf, and nothing establishes that the leaf belongs to the
+ * host that was asked for. vxsec_verifies_certificates() returns 0.
+ * That stops somebody listening and does not stop somebody in the
+ * middle.
+ */
+#define VX_AF_INET       2
+#define VX_SOCK_STREAM   1
+#define VX_SOCK_DGRAM    2
+#define VX_IPPROTO_TCP   6
+#define VX_IPPROTO_TLS   256
+
+/* Socket options, flattened. The BSD interface names an option by a
+ * (level, name) pair whose numbering differs between every two systems
+ * that implement it; what actually crosses this boundary is one of
+ * three things, so it is one of three numbers and libc/socket.c does
+ * the mapping from whatever the caller wrote. */
+#define VX_OPT_RCVTIMEO  1      /* milliseconds */
+#define VX_OPT_SNDTIMEO  2      /* milliseconds */
+#define VX_OPT_NODELAY   3      /* boolean      */
+
+#define VX_SHUT_RD    0
+#define VX_SHUT_WR    1
+#define VX_SHUT_RDWR  2
+
+/*
+ * ---- the error numbers the kernel returns ----
+ *
+ * The kernel's copy, exactly as FUTEX_WAIT and FUTEX_WAKE are the
+ * kernel's copy of numbers that also appear in libc/include/sys/syscall.h.
+ * The reason is the one given there and it has not changed: a header
+ * shared across a privilege boundary is a header a program could edit,
+ * and the kernel must not read its constants out of anything a program
+ * can reach.
+ *
+ * They are Linux's numbers, and libc/include/errno.h has the same ones
+ * on the other side. That is not deference; it is that the code being
+ * ported was written against them, and the only thing worse than
+ * inventing a numbering here would be inventing one that overlapped.
+ *
+ * Only the codes something below actually returns are listed. A code
+ * that no service routine can produce would be a promise nothing keeps.
+ */
+#define VXE_PERM         1
+#define VXE_NOENT        2
+#define VXE_IO           5
+#define VXE_BADF         9
+#define VXE_AGAIN       11
+#define VXE_NOMEM       12
+#define VXE_ACCES       13
+#define VXE_FAULT       14
+#define VXE_BUSY        16
+#define VXE_EXIST       17
+#define VXE_NOTDIR      20
+#define VXE_ISDIR       21
+#define VXE_INVAL       22
+#define VXE_MFILE       24
+#define VXE_NOSPC       28
+#define VXE_SPIPE       29
+#define VXE_ROFS        30
+#define VXE_NAMETOOLONG 36
+#define VXE_NOSYS       38
+#define VXE_NOTEMPTY    39
+#define VXE_OVERFLOW    75
+#define VXE_NOTSOCK     88
+#define VXE_OPNOTSUPP   95
+#define VXE_AFNOSUPPORT 97
+#define VXE_NETDOWN    100
+#define VXE_ISCONN     106
+#define VXE_NOTCONN    107
+#define VXE_TIMEDOUT   110
+#define VXE_CONNREFUSED 111
+#define VXE_HOSTUNREACH 113
+
+/* The window the convention above reserves. A service routine returns
+ * -VXE_* and everything outside [-4095, -1] is a result; this is the
+ * one place that constant is written down. */
+#define VX_ERRNO_MAX  4095
+
+/* mmap protection, as the caller states it. Deliberately the same three
+ * numbers POSIX uses, because the code being ported says PROT_READ. */
+#define VX_PROT_NONE   0
+#define VX_PROT_READ   1
+#define VX_PROT_WRITE  2
+#define VX_PROT_EXEC   4
+
+/* mmap flags. MAP_ANONYMOUS is the only kind of mapping this system can
+ * make -- there is no file to map, because ring 3 has no way to open one
+ * -- and it is required rather than assumed so that a port which passes
+ * a descriptor is refused loudly instead of silently given blank pages
+ * where it expected a file. */
+#define VX_MAP_PRIVATE    0x02
+#define VX_MAP_ANONYMOUS  0x20
+#define VX_MAP_FIXED      0x10
+#define VX_MAP_NORESERVE  0x4000
+
+/*
  * Every register a user thread had, in the order the entry stubs push
  * them, is syscall_frame_t in include/kernel_shared.h. It moved there
  * because sched_fork_thread copies a parent's registers out of it and

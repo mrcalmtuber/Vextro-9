@@ -1,0 +1,24 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CSTDIO
+#define _VXCXX_CSTDIO
+
+#include <stdio.h>
+#include <cstddef>
+
+namespace std {
+using ::FILE;
+using ::fopen;   using ::fdopen;  using ::fclose;   using ::fflush;
+using ::fread;   using ::fwrite;
+using ::fgetc;   using ::getc;    using ::ungetc;   using ::fgets;
+using ::fputc;   using ::putc;    using ::fputs_stream;
+using ::fseek;   using ::ftell;   using ::rewind;
+using ::feof;    using ::ferror;  using ::clearerr; using ::fileno;
+using ::printf;  using ::fprintf; using ::snprintf; using ::sprintf;
+using ::vprintf; using ::vfprintf; using ::vsnprintf;
+using ::scanf;   using ::fscanf;  using ::sscanf;
+using ::puts;    using ::putchar; using ::perror;
+using ::remove;  using ::rename;
+using ::setvbuf; using ::setbuf;
+}  // namespace std
+
+#endif

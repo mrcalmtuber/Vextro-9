@@ -1,0 +1,487 @@
+// -*- C++ -*-
+#ifndef _VXCXX_ALGORITHM
+#define _VXCXX_ALGORITHM
+
+/*
+ * <algorithm> — the ones that get used.
+ *
+ * Two things in here are worth more than a mention.
+ *
+ * ---- sort is an introsort ----
+ *
+ * Quicksort with a median-of-three pivot, falling back to insertion sort
+ * on short runs and to heapsort when the recursion gets too deep. The
+ * last part is not decoration: plain quicksort is O(n^2) on inputs that
+ * are already sorted, reverse sorted, or crafted, and "already sorted"
+ * is not an unusual input — it is what a program sorting a list it just
+ * sorted hands over. The depth limit turns that from quadratic into
+ * n log n with a worse constant.
+ *
+ * ---- copy uses memmove when it may ----
+ *
+ * For a trivially copyable type over pointers, element-at-a-time and one
+ * memmove produce the same bytes, and the second is an order of
+ * magnitude faster. The condition is checked with the compiler's own
+ * trait rather than approximated, because an approximation that says
+ * "yes" for a type with a copy constructor is silent corruption.
+ */
+
+#include <cstddef>
+#include <cstring>
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <iterator>
+#include <initializer_list>
+
+namespace std {
+
+/* ---- the smallest ones ---- */
+
+template <class T> constexpr const T &min(const T &a, const T &b) {
+    return b < a ? b : a;
+}
+template <class T> constexpr const T &max(const T &a, const T &b) {
+    return a < b ? b : a;
+}
+template <class T, class Cmp>
+constexpr const T &min(const T &a, const T &b, Cmp c) { return c(b, a) ? b : a; }
+template <class T, class Cmp>
+constexpr const T &max(const T &a, const T &b, Cmp c) { return c(a, b) ? b : a; }
+
+template <class T>
+constexpr T min(initializer_list<T> l) {
+    const T *best = l.begin();
+    for (const T *p = l.begin(); p != l.end(); ++p) if (*p < *best) best = p;
+    return *best;
+}
+template <class T>
+constexpr T max(initializer_list<T> l) {
+    const T *best = l.begin();
+    for (const T *p = l.begin(); p != l.end(); ++p) if (*best < *p) best = p;
+    return *best;
+}
+
+template <class T>
+constexpr const T &clamp(const T &v, const T &lo, const T &hi) {
+    return v < lo ? lo : (hi < v ? hi : v);
+}
+
+/* ---- moving ranges ---- */
+
+namespace __vx {
+/* Both ends are pointers and the element can be copied with memmove:
+ * the condition under which the fast path is not merely faster but
+ * indistinguishable. */
+template <class I, class O>
+inline constexpr bool memmovable =
+    is_pointer<I>::value && is_pointer<O>::value &&
+    is_same<remove_cv_t<remove_pointer_t<I>>,
+            remove_cv_t<remove_pointer_t<O>>>::value &&
+    is_trivially_copyable<remove_cv_t<remove_pointer_t<O>>>::value;
+}
+
+template <class I, class O>
+constexpr O copy(I first, I last, O out) {
+    if constexpr (__vx::memmovable<I, O>) {
+        const size_t n = (size_t)(last - first);
+        if (n) __builtin_memmove(out, first, n * sizeof(*first));
+        return out + n;
+    } else {
+        while (first != last) *out++ = *first++;
+        return out;
+    }
+}
+
+template <class I, class O>
+constexpr O copy_n(I first, size_t n, O out) {
+    while (n--) *out++ = *first++;
+    return out;
+}
+
+template <class I, class O>
+constexpr O copy_backward(I first, I last, O out_last) {
+    while (first != last) *--out_last = *--last;
+    return out_last;
+}
+
+template <class I, class O>
+constexpr O move(I first, I last, O out) {
+    if constexpr (__vx::memmovable<I, O>) {
+        const size_t n = (size_t)(last - first);
+        if (n) __builtin_memmove(out, first, n * sizeof(*first));
+        return out + n;
+    } else {
+        while (first != last) *out++ = std::move(*first++);
+        return out;
+    }
+}
+
+template <class I, class O>
+constexpr O move_backward(I first, I last, O out_last) {
+    while (first != last) *--out_last = std::move(*--last);
+    return out_last;
+}
+
+template <class I, class T>
+constexpr void fill(I first, I last, const T &v) {
+    while (first != last) *first++ = v;
+}
+
+template <class I, class T>
+constexpr I fill_n(I first, size_t n, const T &v) {
+    while (n--) *first++ = v;
+    return first;
+}
+
+template <class I, class O>
+constexpr O swap_ranges(I first, I last, O out) {
+    while (first != last) { swap(*first++, *out++); }
+    return out;
+}
+
+template <class I>
+constexpr void reverse(I first, I last) {
+    while (first != last && first != --last) swap(*first++, *last);
+}
+
+template <class I>
+constexpr I rotate(I first, I middle, I last) {
+    if (first == middle) return last;
+    if (middle == last) return first;
+    reverse(first, middle);
+    reverse(middle, last);
+    reverse(first, last);
+    return first + (last - middle);
+}
+
+/* ---- looking ---- */
+
+template <class I, class T>
+constexpr I find(I first, I last, const T &v) {
+    while (first != last && !(*first == v)) ++first;
+    return first;
+}
+
+template <class I, class P>
+constexpr I find_if(I first, I last, P p) {
+    while (first != last && !p(*first)) ++first;
+    return first;
+}
+
+template <class I, class P>
+constexpr I find_if_not(I first, I last, P p) {
+    while (first != last && p(*first)) ++first;
+    return first;
+}
+
+template <class I, class P> constexpr bool all_of(I f, I l, P p) {
+    return find_if_not(f, l, p) == l;
+}
+template <class I, class P> constexpr bool any_of(I f, I l, P p) {
+    return find_if(f, l, p) != l;
+}
+template <class I, class P> constexpr bool none_of(I f, I l, P p) {
+    return find_if(f, l, p) == l;
+}
+
+template <class I, class F>
+constexpr F for_each(I first, I last, F f) {
+    while (first != last) f(*first++);
+    return f;
+}
+
+template <class I, class T>
+constexpr size_t count(I first, I last, const T &v) {
+    size_t n = 0;
+    while (first != last) { if (*first++ == v) n++; }
+    return n;
+}
+
+template <class I, class P>
+constexpr size_t count_if(I first, I last, P p) {
+    size_t n = 0;
+    while (first != last) { if (p(*first++)) n++; }
+    return n;
+}
+
+template <class I, class J>
+constexpr bool equal(I first, I last, J other) {
+    while (first != last) { if (!(*first++ == *other++)) return false; }
+    return true;
+}
+
+template <class I, class J>
+constexpr bool equal(I f1, I l1, J f2, J l2) {
+    while (f1 != l1 && f2 != l2) { if (!(*f1++ == *f2++)) return false; }
+    return f1 == l1 && f2 == l2;
+}
+
+template <class I, class J>
+constexpr bool lexicographical_compare(I f1, I l1, J f2, J l2) {
+    for (; f1 != l1 && f2 != l2; ++f1, ++f2) {
+        if (*f1 < *f2) return true;
+        if (*f2 < *f1) return false;
+    }
+    return f1 == l1 && f2 != l2;
+}
+
+template <class I>
+constexpr I max_element(I first, I last) {
+    if (first == last) return last;
+    I best = first;
+    while (++first != last) if (*best < *first) best = first;
+    return best;
+}
+
+template <class I>
+constexpr I min_element(I first, I last) {
+    if (first == last) return last;
+    I best = first;
+    while (++first != last) if (*first < *best) best = first;
+    return best;
+}
+
+template <class I, class O, class F>
+constexpr O transform(I first, I last, O out, F f) {
+    while (first != last) *out++ = f(*first++);
+    return out;
+}
+
+template <class I, class T>
+constexpr I remove(I first, I last, const T &v) {
+    first = find(first, last, v);
+    if (first == last) return last;
+    for (I i = next(first); i != last; ++i)
+        if (!(*i == v)) *first++ = std::move(*i);
+    return first;
+}
+
+template <class I, class P>
+constexpr I remove_if(I first, I last, P p) {
+    first = find_if(first, last, p);
+    if (first == last) return last;
+    for (I i = next(first); i != last; ++i)
+        if (!p(*i)) *first++ = std::move(*i);
+    return first;
+}
+
+template <class I>
+constexpr I unique(I first, I last) {
+    if (first == last) return last;
+    I out = first;
+    while (++first != last)
+        if (!(*out == *first) && ++out != first) *out = std::move(*first);
+    return ++out;
+}
+
+/* ---- ordered ranges ---- */
+
+template <class I, class T, class Cmp>
+constexpr I lower_bound(I first, I last, const T &v, Cmp cmp) {
+    auto n = distance(first, last);
+    while (n > 0) {
+        auto half = n / 2;
+        I mid = next(first, half);
+        if (cmp(*mid, v)) { first = next(mid); n -= half + 1; }
+        else n = half;
+    }
+    return first;
+}
+
+template <class I, class T>
+constexpr I lower_bound(I first, I last, const T &v) {
+    return lower_bound(first, last, v,
+                       [](const auto &a, const auto &b) { return a < b; });
+}
+
+template <class I, class T, class Cmp>
+constexpr I upper_bound(I first, I last, const T &v, Cmp cmp) {
+    auto n = distance(first, last);
+    while (n > 0) {
+        auto half = n / 2;
+        I mid = next(first, half);
+        if (!cmp(v, *mid)) { first = next(mid); n -= half + 1; }
+        else n = half;
+    }
+    return first;
+}
+
+template <class I, class T>
+constexpr I upper_bound(I first, I last, const T &v) {
+    return upper_bound(first, last, v,
+                       [](const auto &a, const auto &b) { return a < b; });
+}
+
+template <class I, class T>
+constexpr bool binary_search(I first, I last, const T &v) {
+    I it = lower_bound(first, last, v);
+    return it != last && !(v < *it);
+}
+
+/* ---- sorting ---- */
+
+namespace __vx {
+
+template <class I, class Cmp>
+constexpr void insertion_sort(I first, I last, Cmp cmp) {
+    for (I i = next(first); i < last; ++i) {
+        auto v = std::move(*i);
+        I j = i;
+        while (j > first && cmp(v, *prev(j))) { *j = std::move(*prev(j)); --j; }
+        *j = std::move(v);
+    }
+}
+
+template <class I, class Cmp>
+constexpr void sift_down(I first, ptrdiff_t n, ptrdiff_t root, Cmp cmp) {
+    for (;;) {
+        ptrdiff_t child = 2 * root + 1;
+        if (child >= n) return;
+        if (child + 1 < n && cmp(first[child], first[child + 1])) child++;
+        if (!cmp(first[root], first[child])) return;
+        swap(first[root], first[child]);
+        root = child;
+    }
+}
+
+/* The guaranteed-n-log-n fallback. Reached when quicksort's partitioning
+ * has gone badly enough times in a row that it is on its way to being
+ * quadratic, which is what an adversarial or already-ordered input does
+ * to it. */
+template <class I, class Cmp>
+constexpr void heap_sort(I first, I last, Cmp cmp) {
+    ptrdiff_t n = last - first;
+    for (ptrdiff_t i = n / 2 - 1; i >= 0; i--) sift_down(first, n, i, cmp);
+    for (ptrdiff_t i = n - 1; i > 0; i--) {
+        swap(first[0], first[i]);
+        sift_down(first, i, 0, cmp);
+    }
+}
+
+template <class I, class Cmp>
+constexpr I median3(I a, I b, I c, Cmp cmp) {
+    if (cmp(*a, *b)) {
+        if (cmp(*b, *c)) return b;
+        return cmp(*a, *c) ? c : a;
+    }
+    if (cmp(*a, *c)) return a;
+    return cmp(*b, *c) ? c : b;
+}
+
+template <class I, class Cmp>
+constexpr void intro_sort(I first, I last, Cmp cmp, int depth) {
+    for (;;) {
+        const ptrdiff_t n = last - first;
+        if (n < 16) { insertion_sort(first, last, cmp); return; }
+        if (depth-- == 0) { heap_sort(first, last, cmp); return; }
+
+        /* Median of three, moved out of the way. A pivot chosen as the
+         * first element is what makes an already-sorted input the worst
+         * case rather than the best. */
+        I mid = first + n / 2;
+        I piv = median3(first, mid, last - 1, cmp);
+        swap(*first, *piv);
+
+        I lo = first + 1, hi = last;
+        for (;;) {
+            while (lo < hi && cmp(*lo, *first)) ++lo;
+            while (lo < hi && !cmp(*(hi - 1), *first)) --hi;
+            if (lo >= hi) break;
+            swap(*lo, *(hi - 1));
+            ++lo; --hi;
+        }
+        swap(*first, *(lo - 1));
+
+        /* Recurse into the smaller half and loop on the larger, so the
+         * stack depth stays logarithmic whatever the partition does. */
+        if ((lo - 1) - first < last - lo) {
+            intro_sort(first, lo - 1, cmp, depth);
+            first = lo;
+        } else {
+            intro_sort(lo, last, cmp, depth);
+            last = lo - 1;
+        }
+    }
+}
+
+constexpr int log2_floor(ptrdiff_t n) {
+    int k = 0;
+    while (n > 1) { n >>= 1; k++; }
+    return k;
+}
+
+}  // namespace __vx
+
+template <class I, class Cmp>
+constexpr void sort(I first, I last, Cmp cmp) {
+    if (last - first < 2) return;
+    __vx::intro_sort(first, last, cmp, 2 * __vx::log2_floor(last - first));
+}
+
+template <class I>
+constexpr void sort(I first, I last) {
+    sort(first, last, [](const auto &a, const auto &b) { return a < b; });
+}
+
+/*
+ * A stable sort that is genuinely stable, and pays for it.
+ *
+ * Insertion sort is stable by construction, and merging two stable runs
+ * with "take from the left when they are equal" keeps it. This is a
+ * bottom-up merge with a scratch buffer, which is O(n) extra memory --
+ * the alternative, an in-place merge, is what the standard allows an
+ * implementation to fall back to when allocation fails and is markedly
+ * slower. Falling back to sort() instead would be neither: it would be
+ * fast and not stable, which is the one thing a caller of this function
+ * has asked not to happen.
+ */
+template <class I, class Cmp>
+void stable_sort(I first, I last, Cmp cmp) {
+    using T = typename iterator_traits<I>::value_type;
+    const ptrdiff_t n = last - first;
+    if (n < 2) return;
+    if (n < 16) { __vx::insertion_sort(first, last, cmp); return; }
+
+    T *tmp = (T *)::operator new((size_t)n * sizeof(T));
+    for (ptrdiff_t i = 0; i < n; i++) new (tmp + i) T(first[i]);
+
+    for (ptrdiff_t width = 1; width < n; width *= 2) {
+        for (ptrdiff_t i = 0; i < n; i += 2 * width) {
+            ptrdiff_t mid = i + width < n ? i + width : n;
+            ptrdiff_t end = i + 2 * width < n ? i + 2 * width : n;
+            ptrdiff_t a = i, b = mid, o = i;
+            while (a < mid && b < end)
+                tmp[o++] = cmp(first[b], first[a]) ? first[b++] : first[a++];
+            while (a < mid) tmp[o++] = first[a++];
+            while (b < end) tmp[o++] = first[b++];
+        }
+        for (ptrdiff_t i = 0; i < n; i++) first[i] = tmp[i];
+    }
+
+    for (ptrdiff_t i = 0; i < n; i++) tmp[i].~T();
+    ::operator delete(tmp);
+}
+
+template <class I>
+void stable_sort(I first, I last) {
+    stable_sort(first, last, [](const auto &a, const auto &b) { return a < b; });
+}
+
+template <class I, class Cmp>
+constexpr bool is_sorted(I first, I last, Cmp cmp) {
+    if (first == last) return true;
+    for (I i = next(first); i != last; ++i, ++first)
+        if (cmp(*i, *first)) return false;
+    return true;
+}
+
+template <class I>
+constexpr bool is_sorted(I first, I last) {
+    return is_sorted(first, last,
+                     [](const auto &a, const auto &b) { return a < b; });
+}
+
+}  // namespace std
+
+#endif

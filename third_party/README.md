@@ -31,6 +31,34 @@ Three exceptions are kept despite compiling to nothing by default --
 `debug.c`, `error.c` and `ssl_debug_helpers_generated.c` -- because
 `-DVX_MBEDTLS_DEBUG` switches them on.
 
+## libwpe/ — libwpe 1.16.2
+
+Release `libwpe-1.16.2`. BSD 2-clause; see `libwpe/COPYING`.
+
+15 of the 20 source files, and the complete `include/wpe` tree. Left out
+are `input-xkb.c`, which needs libxkbcommon; `gamepad.c`, for a device
+this machine does not have; `loader.c`, which is `dlopen` and is replaced
+by upstream's own `loader-static.c`; and the two C++ pasteboard files,
+since there is no C++ runtime for this target.
+
+Nothing is modified — `loader-static.c` exists upstream precisely for
+static builds, and expects `_wpe_loader_interface` to be linked in rather
+than loaded. `wpe-port/` provides it.
+
+## wpewebkit — fetched, not vendored
+
+The engine is not in this tree. It is two million lines and forty
+megabytes compressed, which is the same reason `wiki.zim` and
+`qwen2.gguf` are not here either: GitHub refuses a blob over 100 MB, and
+git stores no useful delta for compressed data.
+
+    make webkit-fetch     # download and verify against the Makefile's SHA-256
+    make webkit           # configure and build
+
+The second does not succeed yet, and names every missing prerequisite at
+once rather than stopping at the first. `wpe-config/README.md` says what
+they are and the order they have to be done in.
+
 ## The port
 
 Nothing above is modified. Everything this system adds lives beside it:
@@ -47,6 +75,15 @@ Nothing above is modified. Everything this system adds lives beside it:
     ../src/tlsglue.c            the platform hooks and the eight-slot pool
     ../src/vxport.h             the whole seam with the kernel
     ../src/vxnet.h              what the rest of the system sees
+
+    wpe-port/vxwpe.[ch]         the four libwpe interfaces, the blit,
+                                and the input translation
+    wpe-port/pasteboard-noop.c  libwpe's clipboard hook, in C rather
+                                than the C++ upstream ships
+    wpe-port/include/EGL/       two typedefs libwpe needs to name a
+                                display and a window, and never uses
+    wpe-config/                 how the engine is configured: no JIT,
+                                no GPU, one process
 
 Keeping the vendored trees unpatched is the point: upgrading lwIP means
 replacing a directory, and any incompatibility appears as a compile

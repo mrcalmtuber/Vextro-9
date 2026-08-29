@@ -1103,6 +1103,19 @@ void kmain(void) {
     sched_reap_hook = app_reaped;
     sched_start();
     sched_spawn_kernel(reclaim_thread, "reclaim", PRIO_IDLE + 1);
+    /*
+     * Somewhere it is safe to block while tidying up after a program
+     * that has ended.
+     *
+     * A process leaves behind open files whose contents have not reached
+     * the disk and connections that owe the far end a close. Both of
+     * those are slow, and the thread that discovers them is the
+     * compositor — sched_reap runs inside the frame's critical section,
+     * where a wait for the network is a machine that stops drawing. So
+     * the reaper hands the table over and this thread does the work.
+     * See the janitor section at the head of src/vfs.h.
+     */
+    vfs_janitor_start();
 
     /*
      * ---- and the rest of the machine ----
@@ -1719,6 +1732,140 @@ void kmain(void) {
     serial_puts("[vextro] futex selftest: running /mutextest\n");
     execute_bin_blocking("/mutextest", 0);
     serial_puts("[vextro] futex selftest: done\n");
+
+    /*
+     * And the rest of the C library, which needs the machine to say
+     * anything about.
+     *
+     * The arithmetic is checked on the host by tools/math_test.c, where
+     * a reference implementation exists to check it against. Threads,
+     * thread-local storage and a lazily backed mapping cannot be checked
+     * that way, because none of them is a computation -- they are the
+     * behaviour of this kernel, and the only place that exists is here.
+     *
+     * Blocking, because the harness reads the result off the serial port
+     * and a program still running when the machine is torn down has said
+     * nothing.
+     */
+    serial_puts("[vextro] libc selftest: running /threadtest\n");
+    execute_bin_blocking("/threadtest", 0);
+    serial_puts("[vextro] libc selftest: done\n");
+
+    /*
+     * And libwpe, with the backend the browser engine will plug into.
+     *
+     * WebKit is not here yet -- third_party/wpe-config/README.md sets
+     * out what stands between -- but the backend is, and a backend can
+     * be wrong in ways that would only surface as a blank window three
+     * million lines into an engine. What this checks is everything about
+     * it that does not need WebKit: that libwpe links and runs against
+     * this C library at all, that the static loader resolves without a
+     * dynamic one, that a view dispatches its size, and that the blit
+     * puts the right pixels in the right places.
+     */
+    serial_puts("[vextro] wpe selftest: running /wpetest\n");
+    execute_bin_blocking("/wpetest", 0);
+    serial_puts("[vextro] wpe selftest: done\n");
+
+    /*
+     * And descriptors: files and sockets, in ring 3, which until now
+     * were the two things a program here could not have.
+     *
+     * fdprobe is written against the raw system calls and answers the
+     * questions that could not be settled by reading code -- whether a
+     * blocking socket call made from inside a system call comes back,
+     * and whether the loopback interface routes. fdtest is the same
+     * ground covered through the C library, including the round trip
+     * that proves bytes actually move.
+     */
+    /*
+     * The write-back path first, from the kernel side.
+     *
+     * A ring-3 program cannot reach it here: opening a file for writing
+     * goes through uac_guard, and with no account yet created there is
+     * nobody to ask, so it is refused -- correctly, and fdtest asserts
+     * that refusal. Driving the same descriptor operations from here,
+     * where there is no program for the question to be about, is what
+     * covers everything on the far side of it.
+     */
+    vfs_selftest();
+
+    /*
+     * And the browser skin, read back out of a scratch buffer.
+     *
+     * A headless harness cannot look at the screen, so "the chrome is
+     * gold now" has to be asserted rather than shown: the strip is drawn
+     * into memory and the exact token values are checked at computed
+     * positions. See the note beside brw_skin_selftest in src/browser.h.
+     */
+    brw_skin_selftest();
+
+    /* And somebody for a ring-3 socket to talk to. A kernel thread
+     * echoing on 127.0.0.1, because ring 3 cannot be a server here --
+     * bind, listen and accept are deliberately not exported -- and
+     * because a test that needed a machine on the other end of a cable
+     * would fail in the room a headless harness runs in. */
+    vfs_echo_start();
+
+    serial_puts("[vextro] fd selftest: running /fdprobe\n");
+    execute_bin_blocking("/fdprobe", 0);
+    execute_bin_blocking("/fdtest", 0);
+    serial_puts("[vextro] fd selftest: done\n");
+
+    /*
+     * And C++.
+     *
+     * The first C++ program this system has run. What it checks that
+     * nothing else can: that operator new reaches the ring-3 allocator,
+     * that crt0 walks .init_array and exit() walks the destructors back,
+     * that a function-local static is constructed exactly once with four
+     * threads racing for it -- which is __cxa_guard_acquire parking on
+     * the kernel's own futex -- and that a vtable survives a loader
+     * which maps an image page by page under W^X.
+     *
+     * tools/cxx_test.cpp checks the containers themselves on the host,
+     * where the volume is free. This is the half that needs the machine.
+     */
+    serial_puts("[vextro] c++ selftest: running /cxxtest\n");
+    execute_bin_blocking("/cxxtest", 0);
+    serial_puts("[vextro] c++ selftest: done\n");
+
+    /*
+     * And SQLite, which is the first ported library of any size to run
+     * here — 255,680 lines of engine, vendored unmodified, over six
+     * hundred lines of VFS on the descriptor calls.
+     *
+     * The database it reads was written by the host's own sqlite3 at a
+     * different version, so a pass says this port reads what another
+     * implementation wrote rather than merely reading back its own
+     * output.
+     */
+    serial_puts("[vextro] sqlite selftest: running /sqltest\n");
+    execute_bin_blocking("/sqltest", 0);
+    serial_puts("[vextro] sqlite selftest: done\n");
+
+    /*
+     * And FreeType, against this kernel's own TrueType parser.
+     *
+     * src/comicneue_ttf.h is assets/ComicNeue-Regular.ttf as a byte
+     * array and the volume now carries the file as well, so the two
+     * implementations are reading identical bytes. Two independent
+     * parsers agreeing about a font's metrics is worth considerably more
+     * than either being self-consistent.
+     */
+    serial_puts("[vextro] freetype selftest: running /fttest\n");
+    execute_bin_blocking("/fttest", 0);
+    serial_puts("[vextro] freetype selftest: done\n");
+
+    /*
+     * And HarfBuzz over it, which exercises the whole stack at once:
+     * shaping in C++ on libcxx's containers, asking FreeType for metrics
+     * through upstream's own hb-ft seam, over a font read off NTFS
+     * through the C library's streams.
+     */
+    serial_puts("[vextro] harfbuzz selftest: running /hbtest\n");
+    execute_bin_blocking("/hbtest", 0);
+    serial_puts("[vextro] harfbuzz selftest: done\n");
 #endif
 
 #ifdef PE_SELFTEST

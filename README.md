@@ -10,7 +10,7 @@
   <img alt="x86_64" src="https://img.shields.io/badge/arch-x86__64-1f2430?style=flat-square">
   <img alt="bare metal" src="https://img.shields.io/badge/target-bare%20metal-d4af37?style=flat-square">
   <img alt="ring 3" src="https://img.shields.io/badge/userland-ring%203-d4af37?style=flat-square">
-  <img alt="lines" src="https://img.shields.io/badge/kernel-94k%20lines%20of%20C-1f2430?style=flat-square">
+  <img alt="lines" src="https://img.shields.io/badge/written%20here-116k%20lines%20of%20C-1f2430?style=flat-square">
   <a href="../../releases"><img alt="releases" src="https://img.shields.io/badge/download-ISO-d4af37?style=flat-square"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-1f2430?style=flat-square">
 </p>
@@ -36,9 +36,11 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**93,950 lines of C written here**, across 157 files, built as four kernel
-objects plus one for inference, over a user-space C library of its own.
-735 host checks across 14 suites on every build.
+**121,091 lines of C written here**, across 240 files, built as four kernel
+objects plus one for inference, over a user-space C library of its own —
+and, since ring 3 got file descriptors and sockets, a freestanding C++
+runtime to go with it. 3.7 million host checks across 17 suites on every
+build, and nine more on the machine itself.
 
 ---
 
@@ -160,6 +162,238 @@ pattern in XMM5 across **182 measured context switches** and requires it back
 byte-for-byte, runs four concurrent AES threads to completion, and counts the
 switches underneath them. It runs *after* `sti` — run before, the timer cannot
 fire and the test passes by never exercising the thing it is named after.
+
+## A C library a port can build against
+
+For most of this system's life the user-space C library was three files
+and a thousand lines: `string.c`, `stdio.c`, and a first-fit allocator
+over `sbrk`. That was not an oversight. It was exactly what the programs
+written for it needed — a Mandelbrot renderer takes one buffer at startup
+and keeps it — and every line of it was there because something called it.
+
+It is now nine files and about eleven thousand, and the difference is not
+more of the same. It is the four things a program written somewhere else
+takes for granted and could not find here:
+
+**`math.h`, computed.** A complete libm: the Cody-Waite and Payne-Hanek
+argument reductions, the minimax kernels, `pow` in double-double
+throughout. `sin(1e300)` is a question with an answer, which needs π to
+about eleven hundred bits because the leading thousand cancel — the table
+is in `libc/math.c`. Verified against a reference libm over 3.7 million
+arguments per build, function by function, to a stated bound in units of
+the last place. `sqrt` is exact; the elementary functions are within an
+ulp; the gamma family is not, and `math.h` says by how much.
+
+**`mmap`, which reserves without spending.** `sbrk` moves one line
+upward and never gives anything back — fine for one thread and one
+buffer, and wrong three ways for a browser. A JavaScript heap asks for
+gigabytes of address space and touches megabytes of it, so a reservation
+here is a *record* rather than a mapping: `SYS_MMAP` returns in constant
+time whatever the size, and the frames are taken one at a time by
+whichever page is actually touched. `threadtest` reserves a gigabyte on a
+machine with less free than that and measures the cost at zero.
+
+**`pthread.h`, on the scheduler that was already here.** `fork` gives a
+child a copy-on-write duplicate of the address space, which is the
+opposite of a thread; `SYS_CLONE` gives it *the* address space. Mutexes
+of all three kinds, condition variables, read-write locks, barriers,
+thread-specific data with destructors, semaphores — all of them blocking
+in the kernel through the futex that was already there, and none of them
+entering it when uncontended.
+
+**Thread-local storage**, which is the one that reaches furthest down.
+A `__thread` variable compiles to a load through the FS segment, so the
+segment base is part of a thread's register state exactly as its stack
+pointer is, and has to be restored on every switch.
+
+Underneath all four, five new system calls and one correction:
+`SYS_CLONE`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_MPROTECT`, `SYS_SET_FSBASE`
+— and `SYS_MEMINFO`, which had been reserved in the table since it was
+written and never implemented, so every call to it answered −1.
+
+## A browser engine's backend
+
+WPE is WebKit with the platform taken out: everything an engine assumes
+about a window system sits behind `libwpe`, and a *backend* supplies it.
+Upstream's two are several thousand lines each, and nearly all of it is
+machinery for handing a GPU buffer between two processes without copying
+it.
+
+That machinery has nothing to attach to here, and the reason is why the
+port is short rather than why it is hard. A Vextro window is not a handle
+to be negotiated for — it is a buffer of pixels already mapped into the
+process's own address space. The shortest path from a rendered page to
+the screen is a memory copy.
+
+`third_party/libwpe/` is vendored unmodified and cross-compiles against
+the C library above. `third_party/wpe-port/` is the backend: the four
+interfaces WebKit will not start without, the blit with its format
+conversion and clipping and scaling, and input translated from Vextro's
+*state* — which buttons are down — into the *events* an engine expects.
+`apps/wpetest.c` runs all of it in ring 3 on every self-test boot.
+
+**The JIT is off, and not as a preference.** Three of JavaScriptCore's
+four tiers work by writing machine code and jumping to it. Here that is
+impossible by construction: `SYS_MMAP` and `SYS_MPROTECT` refuse
+`PROT_WRITE|PROT_EXEC`, so no sequence of calls from user space arrives
+at a page which is both. `threadtest` asserts the refusal in both
+directions on every boot.
+
+**Three libraries are ported and run in ring 3**: SQLite 3.45.1 over a
+VFS on the descriptor calls, FreeType 2.13.2 reading fonts off NTFS, and
+HarfBuzz 8.5.0 shaping text over FreeType through upstream's own hb-ft
+seam. All three are vendored unmodified and verified on the machine —
+SQLite reads a database the *host's* sqlite3 wrote, and FreeType agrees
+with this kernel's own TrueType parser to the pixel.
+
+**The engine itself still does not compile**, and the blocker is now
+sharper than a missing library. `make webkit` gets past its
+prerequisites and past CMake's compiler test, and stops at
+`Unknown OS 'Generic'` — WebKit's build system has a closed list of
+operating systems and no category for a target with none. That fires
+before a single `find_package`, so it would not be fixed by porting any
+number of the other eighteen dependencies. Getting past it means a
+Vextro port *inside* WebKit.
+
+**The three things that were blocking before this no longer are.** There was no `libstdc++` for
+`x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;
+there are now a freestanding C++ runtime (`libcxx/`), nineteen
+descriptor and socket system calls (`src/vfs.h`), and the POSIX layer
+over them in `libc/`. What remains is breadth rather than depth — cmake
+and ninja are not installed, `libcxx/` has not grown the parts of the
+standard library WebKit uses beyond what is written, and the dependency
+ports have not been done. `third_party/wpe-config/README.md` sets it out
+in order, and `make webkit` names what is missing at once.
+
+## File descriptors and sockets in ring 3
+
+Until recently a program in ring 3 had exactly one way to touch the
+filesystem — `SYS_FS_WRITE`, which takes a path and replaces a whole
+file behind a prompt — and no way at all to reach the network, though
+the kernel has run lwIP and Mbed TLS for as long as the browser has
+existed.
+
+Neither gap was an oversight. Both were the absence of the same idea. A
+file read a window at a time has a *position*; a connection has a peer
+and a state machine; neither can be named by a call that takes a path
+and returns. A descriptor is a name for state the kernel holds between
+two calls — and once there is a table of those, `read` and `recv` stop
+being two problems.
+
+The table hangs off the address space rather than the thread, which is
+what makes the three POSIX rules fall out rather than be implemented:
+threads share descriptors because `SYS_CLONE` shares the address space,
+a fork copies them because it makes a new one, and they close when the
+last thread of a process exits because the address space is refcounted.
+
+| | |
+|---|---|
+| Files | `open`, `read`, `write`, `close`, `lseek`, `stat`, `fstat`, `unlink`, `mkdir`, `fsync`, `ftruncate` |
+| Directories | `getdents`, and `opendir`/`readdir` over it |
+| Sockets | `socket`, `connect`, `send`, `recv`, `shutdown`, `setsockopt`, and name resolution |
+| Streams | real `FILE` objects, `fopen`/`fread`/`fgets`/`fseek`, the `scanf` family |
+
+**Writing is a whole-file operation, and the interface says so.** NTFS's
+writer here replaces a file rather than updating it in place, so a
+descriptor opened for writing holds the file's image in the kernel and
+puts it back at `close()` or `fsync()`. That is what the filesystem
+underneath can actually do; a `write()` that appeared to work and lost
+everything between the last flush and a power cut would be worse.
+
+**A connection is asked about once.** The first time a program connects
+anywhere other than loopback, a prompt names the address, and the answer
+— grant *or* refusal — is remembered for the life of that program. It is
+deliberately not the same bit as the elevation prompt: saying yes to
+"may this fetch a page" must not also say yes to "may this overwrite the
+partition table". With nobody signed in the answer is no, immediately,
+which is the state a machine at its login screen is in.
+
+**TLS is a socket.** `socket(AF_INET, SOCK_STREAM, IPPROTO_TLS)` gives a
+descriptor that is a TLS 1.3 session, driven through the same `send` and
+`recv`. The caveat is unchanged and is repeated everywhere it is
+mentioned: there is no certificate authority store on this volume, so
+the chain is parsed and the handshake signature checked against the key
+in the leaf, and nothing establishes that the leaf belongs to the host
+that was asked for. That stops somebody listening; it does not stop
+somebody in the middle.
+
+## A C++ runtime
+
+`libcxx/`, written for the same reason `libc/` was. The cross compiler
+had a C++ front end and no C++ *runtime* — `-print-file-name=libstdc++.a`
+echoed its input back — and building GNU's or LLVM's would have brought
+locales, iostreams and a threading model this system does not have.
+
+What the compiler emits calls to whether or not anybody writes them:
+`operator new` and `delete` in all twelve forms, `__cxa_atexit` and the
+static destructors it runs in reverse, the guard variables that make a
+function-local static thread-safe — over the kernel's own futex, so a
+thread that loses the race is descheduled rather than spinning — and the
+three that mean the program is already wrong. Then twenty-eight headers:
+`<vector>`, `<string>`, `<memory>`, `<algorithm>`, `<atomic>`,
+`<mutex>`, `<optional>` and the rest.
+
+Since the descriptor work, four more headers that WebKit specifically
+asks for: `<chrono>` over the scheduler's tick (with `<ratio>`
+underneath, which nobody asks for and duration arithmetic cannot be
+written without), `<thread>` over `SYS_CLONE`, `<unordered_map>` with
+chained buckets — because the standard requires references to survive a
+rehash and with open addressing the elements *are* the array — and
+`<variant>`, dispatching through a function-pointer table generated by
+position.
+
+Exceptions are off, because there is no unwinder for this target. So
+`at()` out of range prints the index and stops, plain `operator new` on
+exhaustion prints and stops, and `new (std::nothrow)` returns null —
+which is what its callers check. Returning null from the plain form is
+the option that looks gentlest and is the dangerous one: code compiled
+against a throwing `new` does not check, so null is not an error path,
+it is a fault inside the constructor reported as the wrong thing
+entirely.
+
+## The interface, from utility classes
+
+The browser's chrome and start page are not drawn by colours written into
+the drawing code. They come from `assets/ui/browser.vxml` — Tailwind
+utility classes over the design tokens in `assets/ui/tokens.tw` —
+resolved at build time by `tools/tailwind.py` and laid out at run time by
+`src/vxui.h`.
+
+| | |
+|---|---|
+| `vextro-gold-light` | `#FFEFA6` — active buttons, link highlights |
+| `vextro-gold` | `#D4AF37` — the signature metallic tone |
+| `vextro-gold-dark` | `#8C6D1F` — structural borders and dividers |
+| `vextro-bronze` | `#4A3B12` — high-contrast primary text |
+| `vextro-charcoal` | `#171614` — the baseline dark background |
+
+**Why a compiler rather than a stylesheet.** Nothing here parses CSS —
+the built-in browser turns HTML into word-wrapped lines and discards
+`<style>`, and WebKit does not build yet. But Tailwind *is* a resolver:
+classes in, a small set of declarations out, only the ones used. That
+part ports to a machine with no CSS engine, because the output need not
+be CSS. Here it is a table of resolved styles the compositor draws
+directly, so the class strings are load-bearing. The stylesheet is
+emitted too, from the same resolution, against the day the engine builds.
+
+**Styles are resolved at build time; geometry is not.** A colour is a
+colour and `px-4` is sixteen pixels whatever the window is doing. But the
+browser window is resizable, so a baked coordinate would be right at one
+size only — the flex solve happens against the rectangle the compositor
+hands over. The self-test asserts exactly that, by solving the same tree
+at two widths and checking the `flex-1` address field absorbed the
+difference while the fixed groups either side did not move.
+
+**And the pixels are checked.** A headless harness cannot look at a
+screen, so the chrome is drawn into a scratch buffer and read back
+against the exact token values: the header strip must be `#171614`, the
+divider `#8C6D1F`, the address border `#D4AF37`. Twenty-four assertions
+on every self-test boot.
+
+The palette does not touch the rest of the system. `C_GOLD` in `gfx.h`
+has been `#D4AF37` since the theme was written — this formalises a design
+language rather than replacing one — and the legacy constants that colour
+the taskbar and window frames are deliberately left alone.
 
 ## Ring 3 hardware isolation
 
@@ -560,7 +794,7 @@ the ISO, generated from a 6.8 MB `.mp4` by ffmpeg.
 | **Accounts** | Multiple users, salted SHA-256 iterated 4,096 times compared in constant time, per-user home directories and profile trees, administrator rights, logout that clears session state |
 | **Firmware** | ACPI: RSDP through XSDT, MADT, FADT, HPET and MCFG, every checksum checked; CPU topology from CPUID leaf 0x0B; microcode revision read and updates applied |
 | **Applications** | Terminal (161 commands), browser, file manager, offline Wikipedia with chat, image viewer, paint, system monitor, app store, calculator, media player, 3D viewer, CHIP-8, hypervisor console, settings |
-| **Userland** | `.vx` container format, two syscall ABIs, a C library (`string.h`, `stdio.h`, malloc over sbrk), a package store, five shipped apps |
+| **Userland** | `.vx` container format, two syscall ABIs, a C library of its own — libm, pthreads, `mmap`, file descriptors, BSD sockets, `FILE` streams and the `scanf` family — a freestanding C++ runtime over it, a package store, five shipped apps |
 | **Boot** | Limine, BIOS *and* UEFI, El Torito ISO; an animation the kernel computes rather than plays back |
 
 ### The scanner is an automaton
@@ -584,7 +818,7 @@ every time.
 
 # Verification
 
-`make test` runs **735 checks across 14 suites** on the host, every build.
+`make test` runs **3,677,813 checks across 15 suites** on the host, every build.
 The bar is not "it agrees with itself" — an implementation that is merely
 self-consistent round-trips perfectly and proves nothing:
 
@@ -625,7 +859,7 @@ because a repository that blurs it is not worth reading.
 | | Why not |
 |---|---|
 | **Hardware-rasterised 3D** | There *is* a 3D API with a real shader compiler. What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work. Solid reports which backend is live. |
-| **`fork`, signals, file descriptors** | One address space per program rather than per instance, and no descriptors beyond the console. Applications cannot reach each other's memory; they simply cannot do much else either. |
+| **Signals, `exec`, pipes, `dup`** | There is no way to start a program from a program, so a pipe would have nobody at the other end. `dup` is absent for a sharper reason: here a descriptor *is* the open file description, so a second name for one could only be a copy — two offsets, two write-back images, two closes of a socket — and each is wrong in a way a program would meet as data loss. |
 | **Full-disk encryption** | Individual directories seal into encrypted containers; the volume itself is not encrypted, so filenames and free space are in the clear. |
 | **Sandboxing beyond ring 3** | Hardware isolation is real now — a program cannot read the kernel or another process. What is still only *policy* is which programs may start: the allowlist and scanner decide that, and nothing constrains what a program does within its own address space. |
 | **VPN, branch caching, SMB Direct** | Not written. Kerberos also holds tickets encrypted on disk rather than in a kernel keyring. |
@@ -845,13 +1079,20 @@ src/
   --- the desktop ---
   desktop.h  term.h  browser.h  apps.h  store.h  media.h  calc.h  chip8.h
   bootanim.h  login.h  coreutils.h  shell.h  wikidoc.h
+  vfs.h                                    descriptors, files, sockets
 
+libc/           The C library ring 3 links against: libm, pthreads over
+                the kernel's futex, mmap, descriptors, BSD sockets, FILE
+                streams, printf and scanf
+libcxx/         A freestanding C++ runtime over it — operator new, the
+                __cxa_* the compiler calls by name, and 28 headers
 vxfmt/          The .vx format, its packer, a POSIX loader, an AFL harness
 apps/           Userland source, store packages, seed files, pictures
 tools/          Formatters, test suites, an LDAP server, a KDC, an SMB
                 server, an RDP probe — every protocol proved against an
                 independently written peer
-third_party/    lwIP 2.2.1 and Mbed TLS 3.6.4, vendored unmodified
+third_party/    lwIP 2.2.1, Mbed TLS 3.6.4 and libwpe 1.16.2,
+                vendored unmodified, plus the ports onto them
 ```
 
 Underneath the network sit two libraries **not** written here: lwIP 2.2.1 and
@@ -887,7 +1128,7 @@ hypervisor to ask.
 make run RES=1920x1080x32   # display mode, up to the back buffer's bound
 make run NATIVE=1           # render at the panel's own resolution
 make cleandisk              # reset disk.img to factory contents
-make test                   # 735 host checks
+make test                   # 3.7M host checks
 make repo                   # serve the package repository on :8000
 ```
 

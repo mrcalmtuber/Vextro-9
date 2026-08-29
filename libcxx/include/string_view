@@ -1,0 +1,126 @@
+// -*- C++ -*-
+#ifndef _VXCXX_STRING_VIEW
+#define _VXCXX_STRING_VIEW
+
+/*
+ * <string_view> — a pointer and a length that owns nothing.
+ *
+ * The reason it exists is that half the functions taking a `const
+ * std::string &` never needed a string: they needed some characters and
+ * a count, and passing them a `const char *` forced an allocation to
+ * build a temporary. A string_view is two words, copies in a register
+ * pair, and costs nothing to pass.
+ *
+ * The reason it is dangerous is the other half of the same sentence. It
+ * does not own the characters, so
+ *
+ *     string_view v = make_a_string();
+ *
+ * leaves `v` pointing into a temporary that no longer exists. Nothing
+ * warns about it. A view is safe exactly as long as whatever it was made
+ * from outlives it, which is a property of the *program* and not of the
+ * type.
+ *
+ * ---- and it is not necessarily terminated ----
+ *
+ * substr() on a view is a pointer bump and a shorter length; there is no
+ * NUL after it, because writing one would mean owning the storage. So
+ * there is no c_str(), and handing a view to a C function means copying
+ * it into a std::string first. That absence is deliberate.
+ */
+
+#include <cstddef>
+#include <cstring>
+#include <iterator>
+#include <string>
+
+namespace std {
+
+class string_view {
+public:
+    using value_type      = char;
+    using size_type       = size_t;
+    using const_pointer   = const char *;
+    using const_reference = const char &;
+    using const_iterator  = const char *;
+    using iterator        = const char *;
+
+    static constexpr size_type npos = (size_type)-1;
+
+    constexpr string_view() noexcept : p_(nullptr), n_(0) {}
+    constexpr string_view(const char *s, size_type n) : p_(s), n_(n) {}
+    string_view(const char *s) : p_(s), n_(s ? __builtin_strlen(s) : 0) {}
+    string_view(const string &s) : p_(s.data()), n_(s.size()) {}
+
+    constexpr const char *data() const noexcept { return p_; }
+    constexpr size_type   size() const noexcept { return n_; }
+    constexpr size_type length() const noexcept { return n_; }
+    constexpr bool       empty() const noexcept { return n_ == 0; }
+
+    constexpr const char &operator[](size_type i) const { return p_[i]; }
+    constexpr const char &front() const { return p_[0]; }
+    constexpr const char &back()  const { return p_[n_ - 1]; }
+
+    constexpr const_iterator begin() const noexcept { return p_; }
+    constexpr const_iterator end()   const noexcept { return p_ + n_; }
+    constexpr const_iterator cbegin() const noexcept { return p_; }
+    constexpr const_iterator cend()   const noexcept { return p_ + n_; }
+
+    constexpr void remove_prefix(size_type n) {
+        if (n > n_) n = n_;
+        p_ += n; n_ -= n;
+    }
+    constexpr void remove_suffix(size_type n) {
+        if (n > n_) n = n_;
+        n_ -= n;
+    }
+
+    constexpr string_view substr(size_type at = 0, size_type n = npos) const {
+        if (at > n_) at = n_;
+        if (n > n_ - at) n = n_ - at;
+        return string_view(p_ + at, n);
+    }
+
+    int compare(string_view o) const {
+        const size_type n = n_ < o.n_ ? n_ : o.n_;
+        int r = n ? __builtin_memcmp(p_, o.p_, n) : 0;
+        if (r) return r;
+        return n_ < o.n_ ? -1 : (n_ > o.n_ ? 1 : 0);
+    }
+
+    size_type find(char c, size_type from = 0) const {
+        for (size_type i = from; i < n_; i++) if (p_[i] == c) return i;
+        return npos;
+    }
+
+    size_type find(string_view s, size_type from = 0) const {
+        if (s.n_ == 0) return from <= n_ ? from : npos;
+        if (s.n_ > n_) return npos;
+        for (size_type i = from; i + s.n_ <= n_; i++)
+            if (__builtin_memcmp(p_ + i, s.p_, s.n_) == 0) return i;
+        return npos;
+    }
+
+    bool starts_with(string_view s) const {
+        return s.n_ <= n_ && __builtin_memcmp(p_, s.p_, s.n_) == 0;
+    }
+    bool ends_with(string_view s) const {
+        return s.n_ <= n_ && __builtin_memcmp(p_ + n_ - s.n_, s.p_, s.n_) == 0;
+    }
+
+    /* The copy that has to be explicit, because it allocates. */
+    string to_string() const { return string(p_, n_); }
+
+private:
+    const char *p_;
+    size_type   n_;
+};
+
+inline bool operator==(string_view a, string_view b) { return a.compare(b) == 0; }
+inline bool operator!=(string_view a, string_view b) { return a.compare(b) != 0; }
+inline bool operator<(string_view a, string_view b)  { return a.compare(b) < 0; }
+inline bool operator>(string_view a, string_view b)  { return a.compare(b) > 0; }
+
+}  // namespace std
+
+#endif

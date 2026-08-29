@@ -1,0 +1,58 @@
+// -*- C++ -*-
+#ifndef _VXCXX_STDEXCEPT
+#define _VXCXX_STDEXCEPT
+
+/*
+ * <stdexcept> — the standard exception types, as types.
+ *
+ * They can be constructed, derived from, and asked what() they are. They
+ * cannot be thrown, because this runtime has no exceptions: the compiler
+ * rejects `throw std::runtime_error(...)` with -fno-exceptions, which is
+ * the right moment to find out.
+ *
+ * What ported code does with these when exceptions are off is usually to
+ * keep the class and replace the throw with a call to an abort helper,
+ * and this header is what lets the first half of that keep compiling.
+ * The message is stored in a fixed buffer rather than a std::string
+ * because a class whose constructor allocates is a poor thing to build
+ * when reporting that an allocation failed.
+ */
+
+#include <exception>
+#include <cstring>
+
+namespace std {
+
+class logic_error : public exception {
+public:
+    explicit logic_error(const char *w) noexcept {
+        __builtin_strncpy(msg_, w ? w : "", sizeof(msg_) - 1);
+        msg_[sizeof(msg_) - 1] = '\0';
+    }
+    const char *what() const noexcept override { return msg_; }
+protected:
+    char msg_[128];
+};
+
+class runtime_error : public exception {
+public:
+    explicit runtime_error(const char *w) noexcept {
+        __builtin_strncpy(msg_, w ? w : "", sizeof(msg_) - 1);
+        msg_[sizeof(msg_) - 1] = '\0';
+    }
+    const char *what() const noexcept override { return msg_; }
+protected:
+    char msg_[128];
+};
+
+class domain_error     : public logic_error   { using logic_error::logic_error; };
+class invalid_argument : public logic_error   { using logic_error::logic_error; };
+class length_error     : public logic_error   { using logic_error::logic_error; };
+class out_of_range     : public logic_error   { using logic_error::logic_error; };
+class range_error      : public runtime_error { using runtime_error::runtime_error; };
+class overflow_error   : public runtime_error { using runtime_error::runtime_error; };
+class underflow_error  : public runtime_error { using runtime_error::runtime_error; };
+
+}  // namespace std
+
+#endif

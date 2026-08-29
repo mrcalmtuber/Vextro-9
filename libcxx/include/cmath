@@ -1,0 +1,91 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CMATH
+#define _VXCXX_CMATH
+
+/*
+ * <cmath> — over the libm in libc/math.c.
+ *
+ * That library was written from the published algorithms and is checked
+ * against a reference by `make test`, to 0 failures in 3.6 million
+ * comparisons. What this header adds is the namespace and the float
+ * overloads C++ requires: `std::sqrt(1.0f)` must select a function
+ * taking a float, and in C it would silently promote.
+ */
+
+#include <math.h>
+
+namespace std {
+using ::sqrt;  using ::cbrt;  using ::hypot;
+using ::sin;   using ::cos;   using ::tan;
+using ::asin;  using ::acos;  using ::atan; using ::atan2;
+using ::sinh;  using ::cosh;  using ::tanh;
+using ::exp;   using ::exp2;  using ::expm1;
+using ::log;   using ::log2;  using ::log10; using ::log1p;
+using ::pow;   using ::fmod;  using ::modf;  using ::frexp; using ::ldexp;
+using ::ceil;  using ::floor; using ::round; using ::trunc;
+using ::fabs;  using ::fmin;  using ::fmax;  using ::fdim;
+using ::copysign; using ::nextafter; using ::remainder;
+using ::erf;   using ::erfc;  using ::tgamma; using ::lgamma;
+
+/* The float forms. Computed in double and narrowed, which is what a
+ * freestanding libm without a float kernel can honestly offer: the
+ * result is correctly rounded to double and then to float, so it is
+ * within a whisker of correctly rounded to float and never wrong in the
+ * exponent. */
+inline float sqrtf_(float x)  { return (float)::sqrt((double)x); }
+
+inline float sqrt(float x)  { return (float)::sqrt((double)x); }
+inline float cbrt(float x)  { return (float)::cbrt((double)x); }
+inline float sin(float x)   { return (float)::sin((double)x); }
+inline float cos(float x)   { return (float)::cos((double)x); }
+inline float tan(float x)   { return (float)::tan((double)x); }
+inline float exp(float x)   { return (float)::exp((double)x); }
+inline float log(float x)   { return (float)::log((double)x); }
+inline float log2(float x)  { return (float)::log2((double)x); }
+inline float log10(float x) { return (float)::log10((double)x); }
+inline float fabs(float x)  { return (float)::fabs((double)x); }
+inline float floor(float x) { return (float)::floor((double)x); }
+inline float ceil(float x)  { return (float)::ceil((double)x); }
+inline float round(float x) { return (float)::round((double)x); }
+inline float trunc(float x) { return (float)::trunc((double)x); }
+inline float pow(float x, float y)   { return (float)::pow((double)x, (double)y); }
+inline float fmod(float x, float y)  { return (float)::fmod((double)x, (double)y); }
+inline float atan2(float y, float x) { return (float)::atan2((double)y, (double)x); }
+inline float hypot(float x, float y) { return (float)::hypot((double)x, (double)y); }
+
+/* The integer overloads C++ requires, which are what make
+ * `std::sqrt(4)` compile at all -- in C that is a call with an int and
+ * no conversion the compiler is obliged to make. */
+inline double sqrt(int x)  { return ::sqrt((double)x); }
+inline double pow(double x, int y) { return ::pow(x, (double)y); }
+
+/*
+ * The classification predicates are *macros* in <math.h> -- they expand
+ * to __builtin_isnan and friends, which is what makes them work for a
+ * float and a double alike without two of each. A macro cannot be pulled
+ * into a namespace, so these are thin functions over the same builtins.
+ *
+ * The macros are undefined first. Leaving them would mean `std::isnan(x)`
+ * expanding to `std::__builtin_isnan(x)`, which is not a name that
+ * exists -- the classic and thoroughly confusing failure of mixing a
+ * macro with a namespace.
+ */
+#undef isnan
+#undef isinf
+#undef isfinite
+#undef isnormal
+#undef signbit
+
+inline bool isnan(double x)    { return __builtin_isnan(x); }
+inline bool isnan(float x)     { return __builtin_isnan(x); }
+inline bool isinf(double x)    { return __builtin_isinf(x); }
+inline bool isinf(float x)     { return __builtin_isinf(x); }
+inline bool isfinite(double x) { return __builtin_isfinite(x); }
+inline bool isfinite(float x)  { return __builtin_isfinite(x); }
+inline bool isnormal(double x) { return __builtin_isnormal(x); }
+inline bool isnormal(float x)  { return __builtin_isnormal(x); }
+inline bool signbit(double x)  { return __builtin_signbit(x); }
+inline bool signbit(float x)   { return __builtin_signbit(x); }
+}  // namespace std
+
+#endif

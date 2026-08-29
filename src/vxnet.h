@@ -68,8 +68,21 @@ int      vxnet_accept(int s, uint8_t peer[4]);
 int      vxnet_send(int s, const void *buf, int len);
 int      vxnet_recv(int s, void *buf, int len);
 void     vxnet_close(int s);
+
+/*
+ * Half-close. `how` is 0 for the read side, 1 for the write side, 2 for
+ * both, which is what shutdown(2) has meant everywhere since 4.2BSD.
+ *
+ * Exposed because ring 3 has sockets now and this is the only way to
+ * say "I have finished sending" without also saying "I have finished
+ * listening" -- which is precisely the sequence an HTTP client that
+ * sends a request and then reads a response until end-of-stream
+ * depends on. Closing instead would discard the answer.
+ */
+int      vxnet_shutdown(int s, int how);
 int      vxnet_timeout(int s, uint32_t ms);
 int      vxnet_rcv_timeout(int s, uint32_t ms);
+int      vxnet_snd_timeout(int s, uint32_t ms);
 int      vxnet_nodelay(int s, int on);
 int      vxnet_resolve(const char *host, uint8_t out[4]);
 

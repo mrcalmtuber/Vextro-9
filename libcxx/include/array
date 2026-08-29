@@ -1,0 +1,99 @@
+// -*- C++ -*-
+#ifndef _VXCXX_ARRAY
+#define _VXCXX_ARRAY
+
+/*
+ * <array> — a C array that knows how long it is.
+ *
+ * The whole value of it is in that sentence. `int a[10]` decays to a
+ * pointer the moment it is passed anywhere, taking its length with it;
+ * this does not, so `size()` is always right and a range-based for loop
+ * over it terminates where it should.
+ *
+ * It is an aggregate deliberately — no constructors — so that
+ * `array<int,3> a = {1,2,3}` is brace initialisation of the member array
+ * rather than a call, which is what makes it usable as a constexpr
+ * constant and what makes it as cheap as the raw array it replaces.
+ */
+
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+#include <algorithm>
+
+namespace std {
+
+template <class T, size_t N>
+struct array {
+    using value_type      = T;
+    using size_type       = size_t;
+    using difference_type = ptrdiff_t;
+    using reference       = T &;
+    using const_reference = const T &;
+    using pointer         = T *;
+    using const_pointer   = const T *;
+    using iterator        = T *;
+    using const_iterator  = const T *;
+
+    /* Public and named with the reserved spelling because the type is an
+     * aggregate: a private member would need a constructor, and a
+     * constructor would stop `= {1,2,3}` from working. */
+    T __elems[N ? N : 1];
+
+    constexpr reference       operator[](size_type i)       { return __elems[i]; }
+    constexpr const_reference operator[](size_type i) const { return __elems[i]; }
+
+    reference at(size_type i) {
+        if (i >= N) fail(i);
+        return __elems[i];
+    }
+    const_reference at(size_type i) const {
+        if (i >= N) fail(i);
+        return __elems[i];
+    }
+
+    constexpr reference       front()       { return __elems[0]; }
+    constexpr const_reference front() const { return __elems[0]; }
+    constexpr reference       back()        { return __elems[N - 1]; }
+    constexpr const_reference back()  const { return __elems[N - 1]; }
+
+    constexpr T       *data()       noexcept { return __elems; }
+    constexpr const T *data() const noexcept { return __elems; }
+
+    constexpr bool      empty()    const noexcept { return N == 0; }
+    constexpr size_type size()     const noexcept { return N; }
+    constexpr size_type max_size() const noexcept { return N; }
+
+    constexpr iterator       begin()       noexcept { return __elems; }
+    constexpr const_iterator begin() const noexcept { return __elems; }
+    constexpr iterator       end()         noexcept { return __elems + N; }
+    constexpr const_iterator end()   const noexcept { return __elems + N; }
+    constexpr const_iterator cbegin() const noexcept { return __elems; }
+    constexpr const_iterator cend()   const noexcept { return __elems + N; }
+
+    void fill(const T &v) { for (size_type i = 0; i < N; i++) __elems[i] = v; }
+    void swap(array &o) { for (size_type i = 0; i < N; i++)
+                              std::swap(__elems[i], o.__elems[i]); }
+
+private:
+    [[noreturn]] static void fail(size_type i) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "array::at(%lu) on an array of %lu\n",
+                 (unsigned long)i, (unsigned long)N);
+        fputs_stream(msg, stderr);
+        abort();
+    }
+};
+
+template <class T, size_t N>
+bool operator==(const array<T, N> &a, const array<T, N> &b) {
+    for (size_t i = 0; i < N; i++) if (!(a[i] == b[i])) return false;
+    return true;
+}
+template <class T, size_t N>
+bool operator!=(const array<T, N> &a, const array<T, N> &b) { return !(a == b); }
+
+}  // namespace std
+
+#endif

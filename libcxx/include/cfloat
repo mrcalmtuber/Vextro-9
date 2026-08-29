@@ -1,0 +1,15 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CFLOAT
+#define _VXCXX_CFLOAT
+
+/* <cfloat> — the floating-point limits, as macros.
+ *
+ * Nothing but a wrapper: <float.h> is one of the compiler's own
+ * freestanding headers, so the values are the ones the compiler will
+ * actually generate code for rather than anything this library asserts.
+ * <limits> presents the same facts as a template; both exist because
+ * ported code uses both. */
+
+#include <float.h>
+
+#endif

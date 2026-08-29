@@ -1,0 +1,139 @@
+// -*- C++ -*-
+#ifndef _VXCXX_RATIO
+#define _VXCXX_RATIO
+
+/*
+ * <ratio> — a fraction the compiler knows the value of.
+ *
+ * Nobody asks for this header. It is here because <chrono> cannot be
+ * written without it: a `duration` is a count and a *period*, the period
+ * is a compile-time fraction of a second, and converting between two
+ * durations is multiplying by the ratio of their periods. Milliseconds
+ * to nanoseconds is `ratio_divide<milli, nano>` — 1000000/1 — worked out
+ * at compile time so the conversion is one multiply.
+ *
+ * ---- why the reduction matters ----
+ *
+ * Every ratio here is reduced to lowest terms by the greatest common
+ * divisor below, and that is not tidiness. The conversion factor between
+ * two durations is a product of numerators and denominators, and on a
+ * 64-bit type an unreduced product overflows startlingly early: hours to
+ * nanoseconds unreduced is 3600 * 1000000000 twice over. Reducing first
+ * is what keeps the arithmetic in range for the spans a program actually
+ * measures.
+ *
+ * The whole file is types and constants — nothing here exists at run
+ * time, and none of it emits an instruction.
+ */
+
+#include <cstdint>
+#include <type_traits>   /* integral_constant, for the comparisons */
+
+namespace std {
+
+namespace __vx {
+
+/* Euclid, at compile time. constexpr rather than a template recursion
+ * because the recursive form instantiates a class per step and this does
+ * not. */
+constexpr intmax_t ratio_gcd(intmax_t a, intmax_t b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b) { intmax_t t = a % b; a = b; b = t; }
+    return a ? a : 1;
+}
+
+/* The sign is carried by the numerator, always. Two ratios that are
+ * arithmetically equal must be the *same type* for the conversions in
+ * <chrono> to collapse, and -1/2 and 1/-2 would otherwise not be. */
+constexpr intmax_t ratio_sign(intmax_t v) { return v < 0 ? -1 : 1; }
+
+}  // namespace __vx
+
+template <intmax_t Num, intmax_t Den = 1>
+struct ratio {
+    static_assert(Den != 0, "a ratio may not have a zero denominator");
+
+    static constexpr intmax_t __gcd = __vx::ratio_gcd(Num, Den);
+    static constexpr intmax_t __sign = __vx::ratio_sign(Num) *
+                                       __vx::ratio_sign(Den);
+
+    static constexpr intmax_t num = __sign * (Num < 0 ? -Num : Num) / __gcd;
+    static constexpr intmax_t den = (Den < 0 ? -Den : Den) / __gcd;
+
+    using type = ratio<num, den>;
+};
+
+/* ---- arithmetic on the fractions themselves ----
+ *
+ * Each result is reduced by ratio's own constructor, so
+ * ratio_multiply<milli, kilo> really is ratio<1,1> and not ratio<1000,
+ * 1000> wearing its clothes. That identity is what lets <chrono> detect
+ * "no conversion needed" as a type comparison.
+ */
+
+template <class R1, class R2>
+using ratio_multiply = typename ratio<R1::num * R2::num,
+                                      R1::den * R2::den>::type;
+
+template <class R1, class R2>
+using ratio_divide = typename ratio<R1::num * R2::den,
+                                    R1::den * R2::num>::type;
+
+template <class R1, class R2>
+using ratio_add = typename ratio<R1::num * R2::den + R2::num * R1::den,
+                                 R1::den * R2::den>::type;
+
+template <class R1, class R2>
+using ratio_subtract = typename ratio<R1::num * R2::den - R2::num * R1::den,
+                                      R1::den * R2::den>::type;
+
+/* ---- comparing ----
+ *
+ * Cross-multiplied rather than divided, so the comparison is exact for
+ * every pair a duration conversion can produce. */
+template <class R1, class R2>
+struct ratio_equal
+    : integral_constant<bool, R1::num == R2::num && R1::den == R2::den> {};
+
+template <class R1, class R2>
+struct ratio_not_equal
+    : integral_constant<bool, !ratio_equal<R1, R2>::value> {};
+
+template <class R1, class R2>
+struct ratio_less
+    : integral_constant<bool, R1::num * R2::den < R2::num * R1::den> {};
+
+template <class R1, class R2>
+struct ratio_less_equal
+    : integral_constant<bool, !ratio_less<R2, R1>::value> {};
+
+template <class R1, class R2>
+struct ratio_greater : integral_constant<bool, ratio_less<R2, R1>::value> {};
+
+template <class R1, class R2>
+struct ratio_greater_equal
+    : integral_constant<bool, !ratio_less<R1, R2>::value> {};
+
+/* ---- the SI names ----
+ *
+ * Only down to nano and up to giga. The larger and smaller ones — atto,
+ * exa and their neighbours — need an intmax_t of more than 64 bits to
+ * hold their own denominator, and a 64-bit target is allowed to omit
+ * exactly those. Leaving them out is the standard's own answer rather
+ * than a shortcut.
+ */
+using nano  = ratio<1, 1000000000>;
+using micro = ratio<1, 1000000>;
+using milli = ratio<1, 1000>;
+using centi = ratio<1, 100>;
+using deci  = ratio<1, 10>;
+using deca  = ratio<10, 1>;
+using hecto = ratio<100, 1>;
+using kilo  = ratio<1000, 1>;
+using mega  = ratio<1000000, 1>;
+using giga  = ratio<1000000000, 1>;
+
+}  // namespace std
+
+#endif

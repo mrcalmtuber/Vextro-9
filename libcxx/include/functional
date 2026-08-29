@@ -1,0 +1,233 @@
+// -*- C++ -*-
+#ifndef _VXCXX_FUNCTIONAL
+#define _VXCXX_FUNCTIONAL
+
+/*
+ * <functional> — comparators, hashes, and std::function.
+ *
+ * ---- std::function is type erasure, and it allocates ----
+ *
+ * A lambda has a type nobody can name; std::function is how one is
+ * stored in a member or passed through a boundary. It does that by
+ * holding a pointer to a small polymorphic object that knows how to
+ * call, copy and destroy whatever was put in it — which means a
+ * std::function built from a lambda with captures allocates, and one
+ * assigned in a loop allocates every time round.
+ *
+ * A small-object optimisation would avoid that for the common case and
+ * is deliberately not here: the space it needs makes every
+ * std::function larger whether or not it is used, and this library would
+ * rather the cost were visible. A hot path that must not allocate should
+ * take a template parameter rather than a std::function, which is what
+ * the algorithms in <algorithm> do.
+ *
+ * ---- the hash is FNV-1a ----
+ *
+ * Not because it is the best available, but because it is short, has no
+ * table, and is well distributed on the two things anything here hashes:
+ * short strings and integers. It is not resistant to somebody choosing
+ * keys to collide, and nothing here is exposed to a party who would.
+ */
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+#include <utility>
+#include <new>
+#include <memory>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+
+namespace std {
+
+/* ---- comparators ---- */
+
+template <class T = void> struct less {
+    constexpr bool operator()(const T &a, const T &b) const { return a < b; }
+};
+template <> struct less<void> {
+    template <class A, class B>
+    constexpr auto operator()(A &&a, B &&b) const
+        -> decltype(static_cast<A &&>(a) < static_cast<B &&>(b)) {
+        return static_cast<A &&>(a) < static_cast<B &&>(b);
+    }
+};
+
+template <class T = void> struct greater {
+    constexpr bool operator()(const T &a, const T &b) const { return a > b; }
+};
+template <> struct greater<void> {
+    template <class A, class B>
+    constexpr auto operator()(A &&a, B &&b) const
+        -> decltype(static_cast<A &&>(a) > static_cast<B &&>(b)) {
+        return static_cast<A &&>(a) > static_cast<B &&>(b);
+    }
+};
+
+template <class T = void> struct equal_to {
+    constexpr bool operator()(const T &a, const T &b) const { return a == b; }
+};
+template <> struct equal_to<void> {
+    template <class A, class B>
+    constexpr auto operator()(A &&a, B &&b) const
+        -> decltype(static_cast<A &&>(a) == static_cast<B &&>(b)) {
+        return static_cast<A &&>(a) == static_cast<B &&>(b);
+    }
+};
+
+template <class T = void> struct plus {
+    constexpr T operator()(const T &a, const T &b) const { return a + b; }
+};
+template <class T = void> struct minus {
+    constexpr T operator()(const T &a, const T &b) const { return a - b; }
+};
+
+/* ---- hashing ---- */
+
+namespace __vx {
+constexpr uint64_t FNV_OFFSET = 1469598103934665603ull;
+constexpr uint64_t FNV_PRIME  = 1099511628211ull;
+
+inline size_t fnv1a(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint64_t h = FNV_OFFSET;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= FNV_PRIME; }
+    return (size_t)h;
+}
+}
+
+template <class T> struct hash;
+
+#define _VX_HASH_INT(TYPE)                                             \
+template <> struct hash<TYPE> {                                        \
+    size_t operator()(TYPE v) const noexcept {                         \
+        return __vx::fnv1a(&v, sizeof(v));                             \
+    }                                                                  \
+};
+_VX_HASH_INT(bool) _VX_HASH_INT(char) _VX_HASH_INT(signed char)
+_VX_HASH_INT(unsigned char) _VX_HASH_INT(short) _VX_HASH_INT(unsigned short)
+_VX_HASH_INT(int) _VX_HASH_INT(unsigned int) _VX_HASH_INT(long)
+_VX_HASH_INT(unsigned long) _VX_HASH_INT(long long)
+_VX_HASH_INT(unsigned long long) _VX_HASH_INT(float) _VX_HASH_INT(double)
+#undef _VX_HASH_INT
+
+template <class T> struct hash<T *> {
+    size_t operator()(T *p) const noexcept { return __vx::fnv1a(&p, sizeof(p)); }
+};
+
+template <> struct hash<string> {
+    size_t operator()(const string &s) const noexcept {
+        return __vx::fnv1a(s.data(), s.size());
+    }
+};
+
+/* ---- std::function ---- */
+
+template <class> class function;
+
+template <class R, class... A>
+class function<R(A...)> {
+    struct base {
+        virtual ~base() {}
+        virtual R    call(A &&...) = 0;
+        virtual base *clone() const = 0;
+    };
+
+    template <class F>
+    struct holder : base {
+        F f;
+        explicit holder(F fn) : f(std::move(fn)) {}
+        R call(A &&...args) override { return f(std::forward<A>(args)...); }
+        base *clone() const override { return new holder(f); }
+    };
+
+    base *b_;
+
+public:
+    function() noexcept : b_(nullptr) {}
+    function(nullptr_t) noexcept : b_(nullptr) {}
+
+    template <class F, class = enable_if_t<
+        !is_same<decay_t<F>, function>::value>>
+    function(F f) : b_(new holder<decay_t<F>>(std::move(f))) {}
+
+    function(const function &o) : b_(o.b_ ? o.b_->clone() : nullptr) {}
+    function(function &&o) noexcept : b_(o.b_) { o.b_ = nullptr; }
+
+    ~function() { delete b_; }
+
+    function &operator=(const function &o) {
+        if (this != &o) {
+            base *fresh = o.b_ ? o.b_->clone() : nullptr;
+            delete b_;
+            b_ = fresh;
+        }
+        return *this;
+    }
+    function &operator=(function &&o) noexcept {
+        if (this != &o) { delete b_; b_ = o.b_; o.b_ = nullptr; }
+        return *this;
+    }
+    function &operator=(nullptr_t) noexcept { delete b_; b_ = nullptr; return *this; }
+
+    explicit operator bool() const noexcept { return b_ != nullptr; }
+
+    R operator()(A... args) const {
+        /* An empty function called is std::bad_function_call on a hosted
+         * implementation. There are no exceptions here, so it is a stop
+         * with a message -- the same decision at() makes and for the same
+         * reason: there is no value to return that would not be wrong. */
+        if (!b_) __vx_empty_call();
+        return b_->call(std::forward<A>(args)...);
+    }
+
+    void swap(function &o) noexcept { std::swap(b_, o.b_); }
+
+private:
+    [[noreturn]] static void __vx_empty_call();
+};
+
+template <class R, class... A>
+void function<R(A...)>::__vx_empty_call() {
+    fputs_stream("libcxx: an empty std::function was called\n", stderr);
+    abort();
+}
+
+template <class R, class... A>
+bool operator==(const function<R(A...)> &f, nullptr_t) noexcept { return !f; }
+template <class R, class... A>
+bool operator!=(const function<R(A...)> &f, nullptr_t) noexcept { return (bool)f; }
+
+/* A reference to something callable, which is what an algorithm taking a
+ * predicate by value wants when the predicate has state that must not be
+ * copied. */
+template <class T>
+class reference_wrapper {
+public:
+    using type = T;
+    explicit reference_wrapper(T &t) noexcept : p_(addressof(t)) {}
+    operator T &() const noexcept { return *p_; }
+    T &get() const noexcept { return *p_; }
+
+    template <class... A>
+    auto operator()(A &&...args) const
+        -> decltype(declval<T &>()(std::forward<A>(args)...)) {
+        return (*p_)(std::forward<A>(args)...);
+    }
+
+private:
+    T *p_;
+};
+
+template <class T> reference_wrapper<T> ref(T &t) noexcept {
+    return reference_wrapper<T>(t);
+}
+template <class T> reference_wrapper<const T> cref(const T &t) noexcept {
+    return reference_wrapper<const T>(t);
+}
+
+}  // namespace std
+
+#endif

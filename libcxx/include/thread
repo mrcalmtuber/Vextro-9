@@ -1,0 +1,277 @@
+// -*- C++ -*-
+#ifndef _VXCXX_THREAD
+#define _VXCXX_THREAD
+
+/*
+ * <thread> — over libc/pthread.c, over SYS_CLONE, over the scheduler.
+ *
+ * The whole chain from `std::thread t(f)` down to a thread control block
+ * is this system's own: this header calls pthread_create, which issues
+ * SYS_CLONE, which asks sched_spawn_thread for a thread in the caller's
+ * *own* address space — the difference from fork, and the reason two
+ * std::threads share a heap.
+ *
+ * ============================================================
+ *  hardware_concurrency() ANSWERS 1, AND MEANS IT
+ * ============================================================
+ *
+ * Not a placeholder, and not conservatism. Every ring-3 thread in this
+ * system runs on processor zero, and the reason is in src/syscall.h: the
+ * kernel stack for the next entry from user mode lives in a single
+ * global word, so two user threads entering SYS_CALL on two processors
+ * would build their frames on the same stack. sched_spawn_thread pins
+ * accordingly.
+ *
+ * So threads here buy concurrency and structure, not parallelism, and a
+ * worker pool sized from this number gets one worker — which is the
+ * right answer. third_party/wpe-config/vextro-wpe.cmake already promised
+ * that a pool "should be told there is one"; this is the function that
+ * keeps the promise.
+ *
+ * ============================================================
+ *  DESTROYING A JOINABLE THREAD STOPS THE PROGRAM
+ * ============================================================
+ *
+ * The standard says std::terminate, and this implements it rather than
+ * quietly detaching or quietly joining. Both of those are worse: a
+ * silent detach leaves a thread running into a scope whose locals it
+ * still refers to, and a silent join turns a missing `.join()` into a
+ * deadlock that only appears under load. Stopping names the mistake at
+ * the point it is made.
+ */
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+#include <new>
+#include <chrono>
+#include <exception>
+
+extern "C" {
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+}
+
+namespace std {
+
+namespace __vx {
+
+/*
+ * What pthread_create actually starts.
+ *
+ * The callable and its arguments are captured into a lambda on the heap
+ * — C++20 pack captures, so no tuple and no index_sequence is needed —
+ * and this template is the C function pthread wants, instantiated for
+ * that lambda's type. It owns the closure and releases it whether the
+ * body finishes or the thread is cancelled.
+ */
+template <class Closure>
+void *thread_trampoline(void *arg) {
+    Closure *c = static_cast<Closure *>(arg);
+    (*c)();
+    delete c;
+    return nullptr;
+}
+
+}  // namespace __vx
+
+class thread {
+public:
+    using native_handle_type = pthread_t;
+
+    /*
+     * An identifier that is comparable and hashable and nothing else.
+     *
+     * A pthread_t is an integer here, but the class is opaque on purpose:
+     * the standard allows an implementation to make it a pointer, and
+     * code that does arithmetic on a thread::id because it happened to
+     * be an integer is code that does not port.
+     */
+    class id {
+    public:
+        constexpr id() noexcept : h_(0) {}
+        explicit id(pthread_t h) noexcept : h_(h) {}
+
+        friend bool operator==(id a, id b) noexcept { return a.h_ == b.h_; }
+        friend bool operator!=(id a, id b) noexcept { return a.h_ != b.h_; }
+        friend bool operator<(id a, id b) noexcept  { return a.h_ < b.h_; }
+        friend bool operator>(id a, id b) noexcept  { return b < a; }
+        friend bool operator<=(id a, id b) noexcept { return !(b < a); }
+        friend bool operator>=(id a, id b) noexcept { return !(a < b); }
+
+        /* For std::hash below, and for nothing else. */
+        pthread_t __native() const noexcept { return h_; }
+
+    private:
+        pthread_t h_;
+    };
+
+    thread() noexcept : h_(0), joinable_(false) {}
+
+    thread(const thread &) = delete;
+    thread &operator=(const thread &) = delete;
+
+    thread(thread &&o) noexcept : h_(o.h_), joinable_(o.joinable_) {
+        o.h_ = 0;
+        o.joinable_ = false;
+    }
+
+    thread &operator=(thread &&o) noexcept {
+        if (this != &o) {
+            /* Assigning over a thread that is still running is the same
+             * mistake as letting one go out of scope, and gets the same
+             * answer. */
+            if (joinable_) terminate();
+            h_ = o.h_;
+            joinable_ = o.joinable_;
+            o.h_ = 0;
+            o.joinable_ = false;
+        }
+        return *this;
+    }
+
+    /*
+     * Start one.
+     *
+     * The arguments are *copied* into the closure — decayed, so an array
+     * becomes a pointer and a reference becomes a value. That is what the
+     * standard requires and it is not pedantry: the calling scope may end
+     * before the new thread runs, and a captured reference into it would
+     * dangle immediately. std::ref is how a caller asks for the other
+     * behaviour and takes responsibility for the lifetime.
+     */
+    template <class F, class... Args,
+              class = enable_if_t<!is_same<decay_t<F>, thread>::value>>
+    explicit thread(F &&f, Args &&...args) : h_(0), joinable_(false) {
+        auto closure = [fn = decay_t<F>(std::forward<F>(f)),
+                        ...vals = decay_t<Args>(std::forward<Args>(args))]()
+                       mutable {
+            fn(vals...);
+        };
+        using C = decltype(closure);
+
+        C *held = new C(std::move(closure));
+        pthread_t handle = 0;
+        const int rc = pthread_create(&handle, nullptr,
+                                      &__vx::thread_trampoline<C>, held);
+        if (rc != 0) {
+            /* Nothing was started, so this owns the closure still. The
+             * standard throws system_error here; with no exceptions the
+             * choice is between a thread object that silently never runs
+             * and stopping. A caller who wrote `std::thread t(work);` has
+             * no return value to check and no way to find out. */
+            delete held;
+            terminate();
+        }
+        h_ = handle;
+        joinable_ = true;
+    }
+
+    ~thread() {
+        /* See the note at the head of this file: not a detach, not a
+         * join. */
+        if (joinable_) terminate();
+    }
+
+    bool joinable() const noexcept { return joinable_; }
+
+    void join() {
+        if (!joinable_) terminate();
+        pthread_join(h_, nullptr);
+        joinable_ = false;
+        h_ = 0;
+    }
+
+    void detach() {
+        if (!joinable_) terminate();
+        pthread_detach(h_);
+        joinable_ = false;
+        h_ = 0;
+    }
+
+    id get_id() const noexcept { return joinable_ ? id(h_) : id(); }
+
+    native_handle_type native_handle() { return h_; }
+
+    void swap(thread &o) noexcept {
+        pthread_t th = h_; h_ = o.h_; o.h_ = th;
+        bool tj = joinable_; joinable_ = o.joinable_; o.joinable_ = tj;
+    }
+
+    /* One. See the head of this file for why that is the truth rather
+     * than a fallback. */
+    static unsigned hardware_concurrency() noexcept { return 1u; }
+
+private:
+    pthread_t h_;
+    bool      joinable_;
+};
+
+inline void swap(thread &a, thread &b) noexcept { a.swap(b); }
+
+namespace this_thread {
+
+inline thread::id get_id() noexcept { return thread::id(pthread_self()); }
+
+/*
+ * Give up the rest of this slice.
+ *
+ * Reaches SYS_YIELD, which software-generates the timer vector so that
+ * exactly one piece of code in this kernel knows how to change threads.
+ * A caller in a spin loop should prefer sleep_for: yielding keeps the
+ * thread *ready*, so the scheduler keeps choosing it, and a spin that
+ * yields costs as much processor as one that does not.
+ */
+inline void yield() noexcept { sched_yield(); }
+
+template <class Rep, class Period>
+void sleep_for(const chrono::duration<Rep, Period> &d) {
+    if (d <= chrono::duration<Rep, Period>::zero()) {
+        yield();
+        return;
+    }
+    const auto ns = chrono::duration_cast<chrono::nanoseconds>(d).count();
+    struct timespec req;
+    req.tv_sec  = (time_t)(ns / 1000000000);
+    req.tv_nsec = (long)(ns % 1000000000);
+    nanosleep(&req, nullptr);
+}
+
+template <class Clock, class Duration>
+void sleep_until(const chrono::time_point<Clock, Duration> &t) {
+    /* Expressed as an interval, because that is what the kernel takes:
+     * SYS_NANOSLEEP asks to be taken off the queue for a length of time,
+     * not until a moment. Re-reading `now` here rather than trusting the
+     * caller's is what keeps the two consistent. */
+    const auto now = Clock::now();
+    if (t > now) sleep_for(t - now);
+    else         yield();
+}
+
+}  // namespace this_thread
+
+/* So that a thread::id can be a key. The handle is an integer here, but
+ * it is hashed rather than used raw, because two adjacent identifiers
+ * landing in adjacent buckets is exactly the clustering a hash table
+ * does badly with. */
+template <class T> struct hash;
+
+template <>
+struct hash<thread::id> {
+    size_t operator()(thread::id v) const noexcept {
+        uint64_t h = 1469598103934665603ull;
+        uint64_t k = (uint64_t)v.__native();
+        for (int i = 0; i < 8; i++) {
+            h ^= (k & 0xFF);
+            h *= 1099511628211ull;
+            k >>= 8;
+        }
+        return (size_t)h;
+    }
+};
+
+}  // namespace std
+
+#endif

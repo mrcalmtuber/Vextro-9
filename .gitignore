@@ -57,3 +57,25 @@ __pycache__/
 # The asset stamp disk.img depends on. Deliberately outside build/ so
 # that `make clean` cannot trigger an 8 GB repack -- see the Makefile.
 .assets.list
+
+# WPE WebKit, fetched rather than vendored.
+#
+# libwpe is in the tree because it is eight thousand lines and a clone
+# should build the same system in a year's time. The engine is some
+# millions of lines and forty megabytes compressed, which is the same
+# reason wiki.zim and qwen2.gguf are downloaded: GitHub refuses a blob
+# over 100 MB, and git stores no useful delta for compressed data.
+#
+# `make webkit-fetch` brings it down and checks it against the SHA-256
+# recorded in the Makefile.
+third_party/wpewebkit-*/
+build/wpewebkit-*.tar.xz
+build/webkit/
+
+# Downloaded by their own Makefile targets and verified against a
+# checksum recorded there, exactly as WPE WebKit and the language models
+# are. 131 MB between the three; a pinned download says the same thing as
+# a committed copy and does not put it in everybody's clone.
+third_party/sqlite/
+third_party/freetype/
+third_party/harfbuzz/

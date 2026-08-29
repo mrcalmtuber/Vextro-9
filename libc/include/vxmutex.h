@@ -1,6 +1,19 @@
 #ifndef _VXMUTEX_H
 #define _VXMUTEX_H
 
+/* C++ reaches these now.
+ *
+ * libcxx/ compiles against this same library, and a C++ compiler mangles
+ * every name it sees unless told not to -- so without this the C++ side
+ * would fail to link against `malloc` and find `_Z6mallocm` missing.
+ * Placed immediately after the include guard rather than after the
+ * #includes below it, which is safe here because everything this header
+ * includes is either one of the compiler's own type-only headers or one
+ * of ours, and both want the same treatment. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * A mutex that is not usually a system call.
  *
@@ -99,5 +112,10 @@ static inline void vx_mutex_unlock(vx_mutex_t *m) {
         == VX_MUTEX_CONTESTED)
         vx_futex(m, FUTEX_WAKE, 1);
 }
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _VXMUTEX_H */

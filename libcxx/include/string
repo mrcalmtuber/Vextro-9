@@ -1,0 +1,632 @@
+// -*- C++ -*-
+#ifndef _VXCXX_STRING
+#define _VXCXX_STRING
+
+/*
+ * <string> — text, with the small-string optimisation.
+ *
+ * ============================================================
+ *  WHY THERE IS A BUFFER INSIDE THE OBJECT
+ * ============================================================
+ *
+ * Most strings a program handles are short: a key, a field name, a file
+ * extension, a number formatted for printing. Without the buffer below,
+ * every one of those is a call to the allocator and a call to free it,
+ * and a program that builds a map keyed by short strings spends more
+ * time in malloc than in what it is doing.
+ *
+ * So a string of up to 22 characters lives inside the object itself and
+ * allocates nothing. 22 rather than a round number because it is what
+ * fits: the object is 32 bytes — a pointer, a length and a capacity —
+ * and the union of that with a character array leaves 23 bytes, of which
+ * one is the terminator.
+ *
+ * The flag distinguishing the two is the top bit of the capacity word,
+ * so it costs nothing: a capacity of 2^63 is not reachable on a machine
+ * with 48-bit addresses.
+ *
+ * ============================================================
+ *  c_str() IS ALWAYS VALID AND ALWAYS TERMINATED
+ * ============================================================
+ *
+ * Every operation below writes a NUL at the new end, including the ones
+ * that shrink. That is what the standard requires since C++11 and it is
+ * what makes handing a std::string to a C function safe — which, in a
+ * system whose entire lower half is C, is most of what this class is
+ * for.
+ */
+
+#include <cstddef>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
+#include <utility>
+#include <new>
+#include <iterator>
+#include <algorithm>
+#include <initializer_list>
+
+namespace std {
+
+class string {
+public:
+    using value_type      = char;
+    using size_type       = size_t;
+    using difference_type = ptrdiff_t;
+    using reference       = char &;
+    using const_reference = const char &;
+    using pointer         = char *;
+    using const_pointer   = const char *;
+    using iterator        = char *;
+    using const_iterator  = const char *;
+    using reverse_iterator       = std::reverse_iterator<char *>;
+    using const_reverse_iterator = std::reverse_iterator<const char *>;
+
+    static constexpr size_type npos = (size_type)-1;
+
+    string() noexcept { set_small(0); }
+
+    string(const char *s) {
+        set_small(0);
+        if (s) append(s, __builtin_strlen(s));
+    }
+
+    string(const char *s, size_type n) { set_small(0); append(s, n); }
+
+    string(size_type n, char c) {
+        set_small(0);
+        resize(n, c);
+    }
+
+    string(const string &o) { set_small(0); append(o.data(), o.size()); }
+
+    string(string &&o) noexcept {
+        adopt(o);
+        /* The moved-from string must be a valid empty string, not a
+         * second owner of the same buffer. */
+        o.set_small(0);
+    }
+
+    template <class I, class = enable_if_t<!is_integral<I>::value>>
+    string(I first, I last) {
+        set_small(0);
+        for (; first != last; ++first) push_back(*first);
+    }
+
+    string(initializer_list<char> l) {
+        set_small(0);
+        for (char c : l) push_back(c);
+    }
+
+    ~string() { if (!is_small()) ::operator delete(big_.ptr); }
+
+    string &operator=(const string &o) {
+        if (this != &o) { clear(); append(o.data(), o.size()); }
+        return *this;
+    }
+
+    string &operator=(string &&o) noexcept {
+        if (this != &o) {
+            if (!is_small()) ::operator delete(big_.ptr);
+            adopt(o);
+            o.set_small(0);
+        }
+        return *this;
+    }
+
+    string &operator=(const char *s) {
+        clear();
+        if (s) append(s, __builtin_strlen(s));
+        return *this;
+    }
+
+    string &operator=(char c) { clear(); push_back(c); return *this; }
+
+    /* ---- what it is ---- */
+
+    const char *c_str() const noexcept { return data(); }
+
+    char *data() noexcept {
+        return is_small() ? sbuf_ : big_.ptr;
+    }
+    const char *data() const noexcept {
+        return is_small() ? sbuf_ : big_.ptr;
+    }
+
+    size_type size() const noexcept {
+        return is_small() ? (size_type)slen_ : big_.len;
+    }
+    size_type length() const noexcept { return size(); }
+    bool empty() const noexcept { return size() == 0; }
+
+    size_type capacity() const noexcept {
+        return is_small() ? SMALL_CAP : big_.cap;
+    }
+    size_type max_size() const noexcept { return (size_type)1 << 40; }
+
+    /* ---- access ---- */
+
+    char       &operator[](size_type i)       { return data()[i]; }
+    const char &operator[](size_type i) const { return data()[i]; }
+
+    char &at(size_type i) {
+        if (i >= size()) out_of_range(i);
+        return data()[i];
+    }
+    const char &at(size_type i) const {
+        if (i >= size()) out_of_range(i);
+        return data()[i];
+    }
+
+    char       &front()       { return data()[0]; }
+    const char &front() const { return data()[0]; }
+    char       &back()        { return data()[size() - 1]; }
+    const char &back()  const { return data()[size() - 1]; }
+
+    /* ---- changing ---- */
+
+    void reserve(size_type want) {
+        if (want <= capacity()) return;
+        regrow(want);
+    }
+
+    void clear() noexcept { set_len(0); data()[0] = '\0'; }
+
+    void resize(size_type n) { resize(n, '\0'); }
+
+    void resize(size_type n, char c) {
+        const size_type had = size();
+        if (n > had) {
+            reserve(n);
+            __builtin_memset(data() + had, c, n - had);
+        }
+        set_len(n);
+        data()[n] = '\0';
+    }
+
+    void shrink_to_fit() {
+        if (is_small()) return;
+        const size_type n = size();
+        if (n <= SMALL_CAP) {
+            /* Through a local, because sbuf_ and big_.ptr are the same
+             * storage: writing the first destroys the second. */
+            char *old = big_.ptr;
+            char tmp[SMALL_CAP + 1];
+            __builtin_memcpy(tmp, old, n);
+            set_small((unsigned char)n);
+            __builtin_memcpy(sbuf_, tmp, n);
+            sbuf_[n] = '\0';
+            ::operator delete(old);
+        }
+    }
+
+    void push_back(char c) {
+        const size_type n = size();
+        if (n + 1 > capacity()) regrow(n + 1);
+        char *p = data();
+        p[n] = c;
+        p[n + 1] = '\0';
+        set_len(n + 1);
+    }
+
+    void pop_back() {
+        const size_type n = size();
+        if (!n) return;
+        set_len(n - 1);
+        data()[n - 1] = '\0';
+    }
+
+    string &append(const char *s, size_type n) {
+        if (!s || !n) return *this;
+        const size_type had = size();
+        if (had + n > capacity()) {
+            /*
+             * `s` may point into this string's own buffer -- which is
+             * exactly what s.append(s) does -- and regrow frees that
+             * buffer. Taking the offset first and rebuilding the pointer
+             * afterwards is what makes self-append work rather than read
+             * freed memory. It is not a hypothetical: `s += s` is how a
+             * program doubles a string.
+             */
+            const char *base = data();
+            if (s >= base && s <= base + capacity()) {
+                const size_type off = (size_type)(s - base);
+                regrow(had + n);
+                s = data() + off;
+            } else {
+                regrow(had + n);
+            }
+        }
+        char *p = data();
+        /* memmove and not memcpy, because after the adjustment above the
+         * source and the destination can genuinely overlap. */
+        __builtin_memmove(p + had, s, n);
+        p[had + n] = '\0';
+        set_len(had + n);
+        return *this;
+    }
+
+    string &append(const char *s) { return s ? append(s, __builtin_strlen(s)) : *this; }
+    string &append(const string &o) { return append(o.data(), o.size()); }
+    string &append(size_type n, char c) {
+        const size_type had = size();
+        if (had + n > capacity()) regrow(had + n);
+        char *p = data();
+        __builtin_memset(p + had, c, n);
+        p[had + n] = '\0';
+        set_len(had + n);
+        return *this;
+    }
+
+    string &operator+=(const string &o) { return append(o); }
+    string &operator+=(const char *s)   { return append(s); }
+    string &operator+=(char c)          { push_back(c); return *this; }
+
+    string &assign(const char *s, size_type n) { clear(); return append(s, n); }
+    string &assign(const string &o) { clear(); return append(o); }
+
+    string &insert(size_type at, const char *s, size_type n) {
+        const size_type had = size();
+        if (at > had) at = had;
+        if (had + n > capacity()) {
+            /* The same self-reference hazard append has, and the same
+             * remedy. */
+            const char *base = data();
+            if (s >= base && s <= base + capacity()) {
+                const size_type off = (size_type)(s - base);
+                regrow(had + n);
+                s = data() + off;
+            } else {
+                regrow(had + n);
+            }
+        }
+        char *p = data();
+        __builtin_memmove(p + at + n, p + at, had - at);
+        __builtin_memmove(p + at, s, n);
+        p[had + n] = '\0';
+        set_len(had + n);
+        return *this;
+    }
+    string &insert(size_type at, const string &o) {
+        return insert(at, o.data(), o.size());
+    }
+
+    string &erase(size_type at = 0, size_type n = npos) {
+        const size_type had = size();
+        if (at >= had) return *this;
+        if (n > had - at) n = had - at;
+        char *p = data();
+        __builtin_memmove(p + at, p + at + n, had - at - n);
+        p[had - n] = '\0';
+        set_len(had - n);
+        return *this;
+    }
+
+    void swap(string &o) noexcept {
+        string tmp(std::move(*this));
+        *this = std::move(o);
+        o = std::move(tmp);
+    }
+
+    /* ---- looking ---- */
+
+    string substr(size_type at = 0, size_type n = npos) const {
+        const size_type had = size();
+        if (at > had) at = had;
+        if (n > had - at) n = had - at;
+        return string(data() + at, n);
+    }
+
+    size_type find(const char *s, size_type from = 0) const {
+        if (!s) return npos;
+        const size_type n = __builtin_strlen(s);
+        const size_type had = size();
+        if (n == 0) return from <= had ? from : npos;
+        if (n > had) return npos;
+        const char *p = data();
+        for (size_type i = from; i + n <= had; i++)
+            if (__builtin_memcmp(p + i, s, n) == 0) return i;
+        return npos;
+    }
+    size_type find(const string &o, size_type from = 0) const {
+        return find(o.c_str(), from);
+    }
+    size_type find(char c, size_type from = 0) const {
+        const size_type had = size();
+        const char *p = data();
+        for (size_type i = from; i < had; i++) if (p[i] == c) return i;
+        return npos;
+    }
+
+    size_type rfind(char c, size_type from = npos) const {
+        const size_type had = size();
+        if (!had) return npos;
+        size_type i = (from >= had) ? had - 1 : from;
+        const char *p = data();
+        for (;; i--) {
+            if (p[i] == c) return i;
+            if (i == 0) return npos;
+        }
+    }
+
+    size_type find_first_of(const char *set, size_type from = 0) const {
+        const size_type had = size();
+        const char *p = data();
+        for (size_type i = from; i < had; i++)
+            if (__builtin_strchr(set, p[i]) && p[i]) return i;
+        return npos;
+    }
+
+    int compare(const string &o) const {
+        const size_type a = size(), b = o.size();
+        const size_type n = a < b ? a : b;
+        int r = n ? __builtin_memcmp(data(), o.data(), n) : 0;
+        if (r) return r;
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+    int compare(const char *s) const { return compare(string(s)); }
+
+    bool starts_with(const char *s) const {
+        const size_type n = __builtin_strlen(s);
+        return n <= size() && __builtin_memcmp(data(), s, n) == 0;
+    }
+    bool ends_with(const char *s) const {
+        const size_type n = __builtin_strlen(s);
+        return n <= size() && __builtin_memcmp(data() + size() - n, s, n) == 0;
+    }
+
+    /* ---- iteration ---- */
+
+    iterator       begin()       noexcept { return data(); }
+    const_iterator begin() const noexcept { return data(); }
+    iterator       end()         noexcept { return data() + size(); }
+    const_iterator end()   const noexcept { return data() + size(); }
+    const_iterator cbegin() const noexcept { return data(); }
+    const_iterator cend()   const noexcept { return data() + size(); }
+    reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
+    reverse_iterator rend()   noexcept { return reverse_iterator(begin()); }
+
+private:
+    /*
+     * ============================================================
+     *  THE LAYOUT, AND ONE THING THAT WAS TRIED AND REJECTED
+     * ============================================================
+     *
+     * A pointer, a length and a capacity — 24 bytes — unioned with a
+     * character buffer, and a separate byte saying which of the two is
+     * live. Thirty-two bytes in total once that byte is padded out,
+     * which is the same size libstdc++'s string is and with a rather
+     * larger buffer inside it.
+     *
+     * ---- the byte is separate, and it did not start that way ----
+     *
+     * The obvious economy is to put the discriminant *inside* the union:
+     * a small string's length is at most 23 and a real capacity never
+     * reaches 2^63, so the top bit of the capacity word is free, and on
+     * a little-endian machine that bit lives in the same byte as the
+     * last character of the small buffer. That saves the eight bytes of
+     * padding and it is what several real implementations do.
+     *
+     * It was written that way and it is wrong here. Reading a `size_t`
+     * member of a union after writing a `char` member of it is not
+     * something C++ defines — C allows it and C++ never adopted the
+     * rule — and GCC optimises accordingly. The symptom was not subtle
+     * once it appeared: with the flag read out of the capacity word, the
+     * compiler concluded that a nineteen-character string was heap
+     * allocated, and warned that its destructor would free a pointer
+     * made of the letters "wn fox". It would have.
+     *
+     * A separate byte costs eight bytes of padding and removes the
+     * question. Every access below now reads the member that was last
+     * written, which is the only union rule this language actually
+     * gives.
+     */
+    static constexpr unsigned char LARGE = 0xFF;
+    static constexpr size_type SMALL_CAP = 3 * sizeof(size_type) - 1;
+
+    struct big_t {
+        char     *ptr;
+        size_type len;
+        size_type cap;
+    };
+
+    union {
+        big_t big_;
+        char  sbuf_[SMALL_CAP + 1];
+    };
+    unsigned char slen_;
+
+    static_assert(sizeof(big_t) == SMALL_CAP + 1,
+                  "the small buffer must fill the large form exactly");
+
+    bool is_small() const noexcept { return slen_ != LARGE; }
+
+    void set_small(unsigned char n) noexcept {
+        slen_ = n;
+        sbuf_[n] = '\0';
+    }
+
+    void set_len(size_type n) noexcept {
+        if (is_small()) slen_ = (unsigned char)n;
+        else            big_.len = n;
+    }
+
+    /* Take over another string's storage, whichever form it is in.
+     * Written member-by-member rather than as one memcpy of the object,
+     * so that the union member being read is the one that was last
+     * written on the source. */
+    void adopt(string &o) noexcept {
+        if (o.is_small()) {
+            slen_ = o.slen_;
+            __builtin_memcpy(sbuf_, o.sbuf_, (size_type)o.slen_ + 1);
+        } else {
+            big_.ptr = o.big_.ptr;
+            big_.len = o.big_.len;
+            big_.cap = o.big_.cap;
+            slen_    = LARGE;
+        }
+    }
+
+    [[noreturn]] void out_of_range(size_type i) const {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "string::at(%lu) on a string of %lu\n",
+                 (unsigned long)i, (unsigned long)size());
+        fputs_stream(msg, stderr);
+        abort();
+    }
+
+    /* Move to a heap buffer of at least `want` characters, plus the
+     * terminator. Doubling, for the reason vector doubles. */
+    void regrow(size_type want) {
+        size_type cap = capacity();
+        size_type fresh_cap = cap ? cap * 2 : 16;
+        if (fresh_cap < want) fresh_cap = want;
+
+        char *fresh = (char *)::operator new(fresh_cap + 1);
+        const size_type n = size();
+        __builtin_memcpy(fresh, data(), n);
+        fresh[n] = '\0';
+
+        if (!is_small()) ::operator delete(big_.ptr);
+
+        /* The union member changes here, so the discriminant is written
+         * last: until slen_ says LARGE, is_small() is still true and
+         * data() would hand back the buffer being overwritten. */
+        big_.ptr = fresh;
+        big_.len = n;
+        big_.cap = fresh_cap;
+        slen_    = LARGE;
+    }
+};
+
+inline bool operator==(const string &a, const string &b) { return a.compare(b) == 0; }
+inline bool operator!=(const string &a, const string &b) { return a.compare(b) != 0; }
+inline bool operator<(const string &a, const string &b)  { return a.compare(b) < 0; }
+inline bool operator>(const string &a, const string &b)  { return a.compare(b) > 0; }
+inline bool operator<=(const string &a, const string &b) { return a.compare(b) <= 0; }
+inline bool operator>=(const string &a, const string &b) { return a.compare(b) >= 0; }
+
+inline bool operator==(const string &a, const char *b) { return a.compare(b) == 0; }
+inline bool operator==(const char *a, const string &b) { return b.compare(a) == 0; }
+inline bool operator!=(const string &a, const char *b) { return a.compare(b) != 0; }
+inline bool operator!=(const char *a, const string &b) { return b.compare(a) != 0; }
+
+inline string operator+(const string &a, const string &b) {
+    string r;
+    r.reserve(a.size() + b.size());
+    r.append(a).append(b);
+    return r;
+}
+inline string operator+(const string &a, const char *b) {
+    string r(a); r.append(b); return r;
+}
+inline string operator+(const char *a, const string &b) {
+    string r(a); r.append(b); return r;
+}
+inline string operator+(const string &a, char c) {
+    string r(a); r.push_back(c); return r;
+}
+
+inline void swap(string &a, string &b) noexcept { a.swap(b); }
+
+/* ---- numbers, both ways ---- */
+
+inline string to_string(long long v) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    return string(buf);
+}
+inline string to_string(long v)               { return to_string((long long)v); }
+inline string to_string(int v)                { return to_string((long long)v); }
+inline string to_string(unsigned long long v) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%llu", v);
+    return string(buf);
+}
+inline string to_string(unsigned long v)      { return to_string((unsigned long long)v); }
+inline string to_string(unsigned int v)       { return to_string((unsigned long long)v); }
+inline string to_string(double v) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%f", v);
+    return string(buf);
+}
+inline string to_string(float v) { return to_string((double)v); }
+
+inline int    stoi(const string &s, size_t *pos = nullptr, int base = 10) {
+    char *end = nullptr;
+    long v = strtol(s.c_str(), &end, base);
+    if (pos) *pos = (size_t)(end - s.c_str());
+    return (int)v;
+}
+inline long   stol(const string &s, size_t *pos = nullptr, int base = 10) {
+    char *end = nullptr;
+    long v = strtol(s.c_str(), &end, base);
+    if (pos) *pos = (size_t)(end - s.c_str());
+    return v;
+}
+inline long long stoll(const string &s, size_t *pos = nullptr, int base = 10) {
+    char *end = nullptr;
+    long long v = strtoll(s.c_str(), &end, base);
+    if (pos) *pos = (size_t)(end - s.c_str());
+    return v;
+}
+inline unsigned long stoul(const string &s, size_t *pos = nullptr, int base = 10) {
+    char *end = nullptr;
+    unsigned long v = strtoul(s.c_str(), &end, base);
+    if (pos) *pos = (size_t)(end - s.c_str());
+    return v;
+}
+inline double stod(const string &s, size_t *pos = nullptr) {
+    char *end = nullptr;
+    double v = strtod(s.c_str(), &end);
+    if (pos) *pos = (size_t)(end - s.c_str());
+    return v;
+}
+inline float  stof(const string &s, size_t *pos = nullptr) {
+    return (float)stod(s, pos);
+}
+
+/* char_traits, for the code that names it. Only the char specialisation
+ * exists: there is no wide character support in this system, and a
+ * generic template that would silently do the wrong thing for wchar_t is
+ * worse than its absence. */
+template <class C> struct char_traits;
+
+template <>
+struct char_traits<char> {
+    using char_type = char;
+    using int_type  = int;
+
+    static void assign(char &a, const char &b) noexcept { a = b; }
+    static bool eq(char a, char b) noexcept { return a == b; }
+    static bool lt(char a, char b) noexcept {
+        return (unsigned char)a < (unsigned char)b;
+    }
+    static size_t length(const char *s) noexcept { return __builtin_strlen(s); }
+    static int compare(const char *a, const char *b, size_t n) noexcept {
+        return n ? __builtin_memcmp(a, b, n) : 0;
+    }
+    static const char *find(const char *s, size_t n, const char &c) noexcept {
+        return (const char *)__builtin_memchr(s, c, n);
+    }
+    static char *move(char *d, const char *s, size_t n) noexcept {
+        return (char *)__builtin_memmove(d, s, n);
+    }
+    static char *copy(char *d, const char *s, size_t n) noexcept {
+        return (char *)__builtin_memcpy(d, s, n);
+    }
+    static char *assign(char *d, size_t n, char c) noexcept {
+        return (char *)__builtin_memset(d, c, n);
+    }
+    static constexpr int_type eof() noexcept { return -1; }
+    static constexpr int_type to_int_type(char c) noexcept {
+        return (int_type)(unsigned char)c;
+    }
+    static constexpr char to_char_type(int_type c) noexcept { return (char)c; }
+};
+
+}  // namespace std
+
+#endif

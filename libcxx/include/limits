@@ -1,0 +1,133 @@
+// -*- C++ -*-
+#ifndef _VXCXX_LIMITS
+#define _VXCXX_LIMITS
+
+/*
+ * <limits> — the bounds of a type, as values rather than macros.
+ *
+ * The point of numeric_limits over INT_MAX is that it can be asked about
+ * a *template parameter*: `numeric_limits<T>::max()` compiles for
+ * whatever T turns out to be, and there is no way to spell that with the
+ * macros in <limits.h>.
+ *
+ * The floating-point figures are the IEEE 754 ones for binary32 and
+ * binary64, which is what this machine has and what libc/math.c is
+ * written against.
+ */
+
+#include <cstddef>
+#include <climits>
+
+namespace std {
+
+enum float_round_style {
+    round_indeterminate       = -1,
+    round_toward_zero         = 0,
+    round_to_nearest          = 1,
+    round_toward_infinity     = 2,
+    round_toward_neg_infinity = 3
+};
+
+template <class T>
+struct numeric_limits {
+    static constexpr bool is_specialized = false;
+    static constexpr T min() noexcept { return T(); }
+    static constexpr T max() noexcept { return T(); }
+    static constexpr T lowest() noexcept { return T(); }
+    static constexpr int  digits = 0;
+    static constexpr int  digits10 = 0;
+    static constexpr bool is_signed = false;
+    static constexpr bool is_integer = false;
+    static constexpr bool is_exact = false;
+    static constexpr bool has_infinity = false;
+    static constexpr bool has_quiet_NaN = false;
+    static constexpr T epsilon() noexcept { return T(); }
+    static constexpr T infinity() noexcept { return T(); }
+    static constexpr T quiet_NaN() noexcept { return T(); }
+};
+
+#define _VX_INT_LIMITS(TYPE, MIN, MAX, DIGITS, SIGNED)                     \
+template <> struct numeric_limits<TYPE> {                                  \
+    static constexpr bool is_specialized = true;                           \
+    static constexpr TYPE min() noexcept { return MIN; }                   \
+    static constexpr TYPE max() noexcept { return MAX; }                   \
+    static constexpr TYPE lowest() noexcept { return MIN; }                \
+    static constexpr int  digits = DIGITS;                                 \
+    static constexpr int  digits10 = DIGITS * 301 / 1000;                  \
+    static constexpr bool is_signed = SIGNED;                              \
+    static constexpr bool is_integer = true;                               \
+    static constexpr bool is_exact = true;                                 \
+    static constexpr bool has_infinity = false;                            \
+    static constexpr bool has_quiet_NaN = false;                           \
+    static constexpr TYPE epsilon() noexcept { return 0; }                 \
+    static constexpr TYPE infinity() noexcept { return 0; }                \
+    static constexpr TYPE quiet_NaN() noexcept { return 0; }               \
+};                                                                         \
+template <> struct numeric_limits<const TYPE> : numeric_limits<TYPE> {};
+
+_VX_INT_LIMITS(bool,               false, true,       1,  false)
+_VX_INT_LIMITS(char,               CHAR_MIN, CHAR_MAX, 7, (CHAR_MIN < 0))
+_VX_INT_LIMITS(signed char,        SCHAR_MIN, SCHAR_MAX, 7, true)
+_VX_INT_LIMITS(unsigned char,      0, UCHAR_MAX,       8,  false)
+_VX_INT_LIMITS(short,              SHRT_MIN, SHRT_MAX, 15, true)
+_VX_INT_LIMITS(unsigned short,     0, USHRT_MAX,       16, false)
+_VX_INT_LIMITS(int,                INT_MIN, INT_MAX,   31, true)
+_VX_INT_LIMITS(unsigned int,       0u, UINT_MAX,       32, false)
+_VX_INT_LIMITS(long,               LONG_MIN, LONG_MAX, 63, true)
+_VX_INT_LIMITS(unsigned long,      0ul, ULONG_MAX,     64, false)
+_VX_INT_LIMITS(long long,          LLONG_MIN, LLONG_MAX, 63, true)
+_VX_INT_LIMITS(unsigned long long, 0ull, ULLONG_MAX,  64, false)
+
+#undef _VX_INT_LIMITS
+
+template <> struct numeric_limits<float> {
+    static constexpr bool is_specialized = true;
+    static constexpr float min() noexcept { return 1.17549435e-38F; }
+    static constexpr float max() noexcept { return 3.40282347e+38F; }
+    static constexpr float lowest() noexcept { return -3.40282347e+38F; }
+    static constexpr float epsilon() noexcept { return 1.19209290e-7F; }
+    static constexpr float denorm_min() noexcept { return 1.40129846e-45F; }
+    static constexpr float infinity() noexcept { return __builtin_huge_valf(); }
+    static constexpr float quiet_NaN() noexcept { return __builtin_nanf(""); }
+    static constexpr int  digits = 24;
+    static constexpr int  digits10 = 6;
+    static constexpr int  max_digits10 = 9;
+    static constexpr int  min_exponent = -125;
+    static constexpr int  max_exponent = 128;
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = false;
+    static constexpr bool is_exact = false;
+    static constexpr bool has_infinity = true;
+    static constexpr bool has_quiet_NaN = true;
+    static constexpr bool is_iec559 = true;
+    static constexpr float_round_style round_style = round_to_nearest;
+};
+
+template <> struct numeric_limits<double> {
+    static constexpr bool is_specialized = true;
+    static constexpr double min() noexcept { return 2.2250738585072014e-308; }
+    static constexpr double max() noexcept { return 1.7976931348623157e+308; }
+    static constexpr double lowest() noexcept { return -1.7976931348623157e+308; }
+    static constexpr double epsilon() noexcept { return 2.2204460492503131e-16; }
+    static constexpr double denorm_min() noexcept { return 4.9406564584124654e-324; }
+    static constexpr double infinity() noexcept { return __builtin_huge_val(); }
+    static constexpr double quiet_NaN() noexcept { return __builtin_nan(""); }
+    static constexpr int  digits = 53;
+    static constexpr int  digits10 = 15;
+    static constexpr int  max_digits10 = 17;
+    static constexpr int  min_exponent = -1021;
+    static constexpr int  max_exponent = 1024;
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = false;
+    static constexpr bool is_exact = false;
+    static constexpr bool has_infinity = true;
+    static constexpr bool has_quiet_NaN = true;
+    static constexpr bool is_iec559 = true;
+    static constexpr float_round_style round_style = round_to_nearest;
+};
+
+template <> struct numeric_limits<long double> : numeric_limits<double> {};
+
+}  // namespace std
+
+#endif

@@ -712,6 +712,16 @@ int vxnet_recv(int s, void *buf, int len) {
 void vxnet_close(int s) { lwip_close(s); }
 
 /*
+ * Half-close, for a client that has finished talking and is still
+ * listening. lwip_shutdown takes the same three constants BSD does and
+ * they are passed straight through; the seam exists so that src/vfs.h
+ * never has to include lwIP's headers to name SHUT_WR.
+ */
+int vxnet_shutdown(int s, int how) {
+    return lwip_shutdown(s, how);
+}
+
+/*
  * Bound how long a read may block.
  *
  * Without this a socket whose peer has vanished without a FIN -- a
@@ -739,6 +749,15 @@ int vxnet_timeout(int s, uint32_t ms) {
 int vxnet_rcv_timeout(int s, uint32_t ms) {
     int v = (int)ms;
     return lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &v, sizeof(v));
+}
+
+/* And the send side alone, which ring 3 needs for the same reason the
+ * remote desktop needed the receive side alone: SO_SNDTIMEO and
+ * SO_RCVTIMEO are two options and a program that sets one has not asked
+ * about the other. */
+int vxnet_snd_timeout(int s, uint32_t ms) {
+    int v = (int)ms;
+    return lwip_setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &v, sizeof(v));
 }
 
 int vxnet_nodelay(int s, int on) {

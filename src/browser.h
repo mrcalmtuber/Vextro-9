@@ -47,6 +47,26 @@ static int   brw_scroll = 0;         /* px */
 static int   brw_total_h = 0;        /* px */
 static int   brw_loading = 0;
 
+/*
+ * Whether the page on screen is the built-in start page.
+ *
+ * It is drawn from the skin rather than from the line list every other
+ * page uses — a heading, three panels and a search field are a layout,
+ * and expressing them as word-wrapped lines with one of eight styles
+ * would be describing a shape in a vocabulary that cannot hold it.
+ */
+static int   brw_is_home = 0;
+
+/*
+ * The packages figure, which lives on the other side of an include.
+ *
+ * store.h is included after this file (it stores its catalog through the
+ * filesystem layer, which is defined before both), so store_inst_count
+ * is not in scope here. Declared here and defined there, which is the
+ * arrangement this file already uses for prof_may and fs_native.
+ */
+static int brw_installed_count(void);
+
 /* ===== the secure fetch =====
  *
  * https:// used to print "this kernel does not have TLS", which stopped
@@ -114,7 +134,22 @@ static char  brw_history[8][BRW_ADDR_MAX];
 static int   brw_hist_n = 0;
 
 /* Layout constants */
-#define BRW_TOOLBAR_H 36
+/*
+ * ---- the skin ----
+ *
+ * The chrome below is drawn from assets/ui/browser.vxml, resolved
+ * against assets/ui/tokens.tw by tools/tailwind.py at build time and
+ * laid out here by src/vxui.h. Changing a colour or a spacing is
+ * changing the shell, not this file.
+ */
+#include "vxui.h"
+
+/*
+ * The toolbar's height comes from the token rather than a number here,
+ * so `h-12` in the shell and the space the page gets below it cannot
+ * drift apart. It was 36; the shell asks for 48.
+ */
+#define BRW_TOOLBAR_H ((int32_t)vxui_nodes[VXUI_ID_CHROME].h)
 #define BRW_STATUS_H  22
 #define BRW_MARGIN    14
 #define BRW_SCROLLW   10
@@ -201,6 +236,9 @@ static void brw_add_text(const char *s, int style, const char *href) {
 }
 
 static void brw_doc_reset(void) {
+    /* Cleared here and set again by brw_page_home, so that every other
+     * way of arriving at a page turns the skinned start page off. */
+    brw_is_home = 0;
     brw_line_count = 0;
     brw_cur_len = 0;
     brw_cur_px = 0;
@@ -643,6 +681,11 @@ static void brw_parse_plain(const uint8_t *src, int len) {
 
 static void brw_page_home(void) {
     brw_doc_reset();
+    /* After the reset, not before: brw_doc_reset clears this, so that
+     * every other way of arriving at a page turns the skinned start page
+     * off. Setting it first meant it was cleared a line later and the
+     * start page never drew. */
+    brw_is_home = 1;
     str_copy(brw_title, "Home - Vextro Browser", BRW_TITLE_MAX);
 
     brw_add_text("Vextro Browser", BS_H1, 0);
@@ -1177,14 +1220,26 @@ static void brw_key(char ch) {
 /* ===== MOUSE + DRAW ===== */
 
 /* geometry helpers shared by draw + mouse */
+/*
+ * Where everything in the chrome is, this frame.
+ *
+ * The solve is what both the painter and the click handler read, which
+ * is the point of routing it through here: the address field's
+ * rectangle is computed once, so a click lands exactly where the gold
+ * border is drawn. The two used to be separate arithmetic that happened
+ * to agree.
+ */
 static void brw_layout(int32_t cx, int32_t cy, int32_t cw, int32_t chh,
                        int32_t *addr_x, int32_t *addr_y,
                        int32_t *addr_w, int32_t *addr_h,
                        int32_t *view_y, int32_t *view_h) {
-    *addr_x = cx + 78;
-    *addr_y = cy + 6;
-    *addr_w = cw - 78 - 56;
-    *addr_h = BRW_TOOLBAR_H - 12;
+    vxui_solve(VXUI_ID_CHROME, cx, cy, cw, BRW_TOOLBAR_H);
+
+    const vxui_rect_t a = vxui_rects[VXUI_ID_ADDRESS];
+    *addr_x = a.x;
+    *addr_y = a.y;
+    *addr_w = a.w;
+    *addr_h = a.h;
     *view_y = cy + BRW_TOOLBAR_H;
     *view_h = chh - BRW_TOOLBAR_H - BRW_STATUS_H;
 }
@@ -1281,52 +1336,123 @@ static void brw_draw(uint32_t *buf, uint32_t w, uint32_t h,
     brw_view_h_cache = vh;
     brw_wrap_px = cw - 2 * BRW_MARGIN - BRW_SCROLLW - 8;
 
-    /* toolbar */
-    gfx_rect(buf, w, h, cx, cy, cw, BRW_TOOLBAR_H, C_BG_PANEL);
-    gfx_rect(buf, w, h, cx, cy + BRW_TOOLBAR_H - 1, cw, 1, 0x2A3040u);
+    /*
+     * ---- the chrome ----
+     *
+     * Painted from the resolved shell rather than from colours written
+     * here. Every rectangle, every border and every gold below comes
+     * from assets/ui/browser.vxml through build/ui/vxui_gen.h; the only
+     * thing this code decides is what *text* goes in the address field
+     * and which of the two nav glyphs is lit.
+     */
+    vxui_paint_tree(buf, w, h, VXUI_ID_CHROME);
 
-    /* back + reload buttons */
-    int back_ok = brw_hist_n >= 1;
-    gfx_rect(buf, w, h, cx + 8, ay, 30, ah, 0x202535u);
-    gfx_rect_outline(buf, w, h, cx + 8, ay, 30, ah, 0x323A4Eu);
+    /* Back and reload, which are glyphs rather than text and so are
+     * drawn over the boxes the shell placed. */
     {
-        uint32_t col = back_ok ? C_TEXT : 0x555C6Eu;
-        int bx = cx + 23, by = ay + ah / 2;
-        gfx_line(buf, w, h, bx + 4, by - 5, bx - 3, by, 2, col);
-        gfx_line(buf, w, h, bx - 3, by, bx + 4, by + 5, 2, col);
+        const int back_ok = brw_hist_n >= 1;
+        const vxui_rect_t b = vxui_rects[VXUI_ID_NAV_BACK];
+        const uint32_t col = back_ok ? VXUI_VEXTRO_GOLD_LIGHT
+                                     : VXUI_VEXTRO_GOLD_DARK;
+        const int bx = b.x + b.w / 2, by = b.y + b.h / 2;
+        gfx_line(buf, w, h, bx + 3, by - 5, bx - 3, by, 2, col);
+        gfx_line(buf, w, h, bx - 3, by, bx + 3, by + 5, 2, col);
+
+        const vxui_rect_t r = vxui_rects[VXUI_ID_NAV_RELOAD];
+        const int rx = r.x + r.w / 2, ry = r.y + r.h / 2;
+        gfx_circle_outline(buf, w, h, rx, ry, 6, VXUI_VEXTRO_GOLD_LIGHT);
+        gfx_tri(buf, w, h, rx + 3, ry - 8, rx + 9, ry - 6, rx + 3, ry - 2,
+                VXUI_VEXTRO_GOLD_LIGHT);
     }
-    gfx_rect(buf, w, h, cx + 42, ay, 30, ah, 0x202535u);
-    gfx_rect_outline(buf, w, h, cx + 42, ay, 30, ah, 0x323A4Eu);
-    gfx_circle_outline(buf, w, h, cx + 57, ay + ah / 2, 6, C_TEXT);
-    gfx_tri(buf, w, h, cx + 60, ay + ah / 2 - 8, cx + 66, ay + ah / 2 - 6,
-            cx + 60, ay + ah / 2 - 2, C_TEXT);
 
-    /* address field */
-    uint32_t field_bg = brw_addr_focus ? 0x0D1017u : 0x191E2Bu;
-    gfx_rect(buf, w, h, ax, ay, aw, ah, field_bg);
-    gfx_rect_outline(buf, w, h, ax, ay, aw, ah,
-                     brw_addr_focus ? C_GOLD : 0x323A4Eu);
+    /* The address text, in the field the solver placed. Focus is the one
+     * thing the skin cannot express, so it is drawn on top: a brighter
+     * border and a caret, both in tokens. */
     {
-        int fs = 14;
-        int ty = ay + (ah - fs) / 2 - 2;
-        ttf_draw_string(buf, (int)w, (int)h, ax + 8, ty, brw_addr,
-                        brw_addr_focus ? C_TEXT : C_TEXT_DIM, fs);
+        const vxui_node_t *an = &vxui_nodes[VXUI_ID_ADDRESS];
+        const int fs = an->font_size;
+        const int sc = vxui_mono_scale(fs);
+        const int ty = ay + (ah - 8 * sc) / 2;
+
+        if (brw_addr_focus)
+            vxui_stroke(buf, w, h, ax, ay, aw, ah, an->radius,
+                        an->border_sides, VXUI_VEXTRO_GOLD_LIGHT);
+
+        vxui_paint_node(buf, w, h, VXUI_ID_ADDRESS, brw_addr);
+        (void)ty;
+
         if (brw_addr_focus && ((tick / 30) & 1) == 0) {
             char tmp[BRW_ADDR_MAX];
             str_copy(tmp, brw_addr, BRW_ADDR_MAX);
             tmp[brw_addr_cur] = '\0';
-            int cx_px = ax + 8 + ttf_text_width(tmp, fs);
-            gfx_rect(buf, w, h, cx_px, ay + 4, 2, ah - 8, C_GOLD);
+            int n = 0;
+            while (tmp[n]) n++;
+            const int cx_px = ax + an->pad[3] + n * MONO_ADV(sc);
+            gfx_rect(buf, w, h, cx_px, ay + 4, 2, ah - 8,
+                     VXUI_VEXTRO_GOLD_LIGHT);
         }
     }
 
-    /* Go button */
-    {
-        int32_t gx = ax + aw + 6;
-        gfx_rect(buf, w, h, gx, ay, 44, ah, 0x2A2410u);
-        gfx_rect_outline(buf, w, h, gx, ay, 44, ah, C_GOLD_DIM);
-        ttf_draw_string(buf, (int)w, (int)h, gx + 12, ay + (ah - 13) / 2 - 2,
-                        "Go", C_GOLD, 13);
+    /*
+     * ---- the start page ----
+     *
+     * The one page in this browser that is a layout rather than a
+     * document, so it is drawn from the shell like the chrome is. Every
+     * other page is HTML somebody else wrote and goes through the line
+     * list below.
+     *
+     * The three figures are read from the system rather than written
+     * into the shell: the archive's own article count, the number of
+     * packages actually installed, and this machine's address. A start
+     * page that invented them would be the one thing in this repository
+     * that did.
+     */
+    if (brw_is_home) {
+        static char wiki_metric[64];
+        static char store_metric[64];
+        static char net_metric[64];
+        char nb[16];
+
+        if (zim.open) {
+            uint_to_str(zim.article_count, nb);
+            str_copy(wiki_metric, nb, sizeof(wiki_metric));
+            str_append(wiki_metric, " articles, offline", sizeof(wiki_metric));
+        } else {
+            /* The same thing the Wikipedia window says when the archive
+             * was not fetched. Degrading to the truth rather than to a
+             * zero that reads as an empty encyclopedia. */
+            str_copy(wiki_metric, "no archive on this volume",
+                     sizeof(wiki_metric));
+        }
+
+        uint_to_str((uint32_t)brw_installed_count(), nb);
+        str_copy(store_metric, nb, sizeof(store_metric));
+        str_append(store_metric, " installed from the store",
+                   sizeof(store_metric));
+
+        if (vxnet_up()) {
+            uint8_t ip[4], mask[4], gw[4];
+            vxnet_addr(ip, mask, gw);
+            net_metric[0] = '\0';
+            for (int i = 0; i < 4; i++) {
+                uint_to_str(ip[i], nb);
+                str_append(net_metric, nb, sizeof(net_metric));
+                if (i != 3) str_append(net_metric, ".", sizeof(net_metric));
+            }
+            str_append(net_metric, vxsec_verifies_certificates()
+                                       ? ", TLS verified"
+                                       : ", TLS unverified",
+                       sizeof(net_metric));
+        } else {
+            str_copy(net_metric, "not connected", sizeof(net_metric));
+        }
+
+        vxui_solve(VXUI_ID_START, cx, vy, cw, vh);
+        vxui_paint_tree(buf, w, h, VXUI_ID_START);
+        vxui_paint_node(buf, w, h, VXUI_ID_PANEL_WIKI_METRIC, wiki_metric);
+        vxui_paint_node(buf, w, h, VXUI_ID_PANEL_STORE_METRIC, store_metric);
+        vxui_paint_node(buf, w, h, VXUI_ID_PANEL_NET_METRIC, net_metric);
+        return;
     }
 
     /* page background */
@@ -1395,5 +1521,186 @@ static void brw_draw(uint32_t *buf, uint32_t w, uint32_t h,
     }
     (void)focused;
 }
+
+
+#ifdef APP_SELFTEST
+/*
+ * ===== the skin, checked by its pixels =====
+ *
+ * A headless harness cannot look at the screen, and "the browser is gold
+ * now" is not a claim a boot log can make. So the chrome is drawn into a
+ * scratch buffer and the buffer is read back: the header strip must be
+ * exactly the charcoal token, the divider under it exactly the dark gold
+ * token, the address field's border exactly the gold one.
+ *
+ * Exact values, not approximate ones. Every colour here came from
+ * assets/ui/tokens.tw through the generator, so a token that was
+ * mistyped, a class that silently resolved to nothing, or a painter that
+ * blended when it should not have all change a pixel — and each of those
+ * is invisible in a screenshot on a machine nobody is watching.
+ *
+ * The same buffer is what checks the *layout*: the address field is
+ * flex-1 between two fixed groups, so widening the window must widen the
+ * field and move nothing else. Solving twice at two widths and comparing
+ * is how that is asserted without a person resizing anything.
+ */
+/*
+ * Tall enough for the whole start page, which is the point: the panel
+ * row sits below a 48-pixel title, a subtitle and a search field, about
+ * three hundred pixels down. A shorter buffer solved the layout
+ * correctly and then sampled a pixel that was never drawn, so the
+ * rectangle checks passed and the colour check did not — which is a
+ * confusing way to be told the buffer is too small.
+ *
+ * 1.6 MB of it, and only in an APP_SELFTEST build.
+ */
+#define BRW_SKIN_W 800
+#define BRW_SKIN_H 520
+static uint32_t brw_skin_buf[BRW_SKIN_W * BRW_SKIN_H];
+
+static int brw_skin_checks = 0;
+static int brw_skin_failures = 0;
+
+static void brw_skin_ok(const char *what, int good) {
+    brw_skin_checks++;
+    if (!good) brw_skin_failures++;
+    serial_puts(good ? " ok   " : "FAIL  ");
+    serial_puts(what);
+    serial_putc('\n');
+}
+
+static uint32_t brw_skin_px(int x, int y) {
+    if (x < 0 || y < 0 || x >= BRW_SKIN_W || y >= BRW_SKIN_H) return 0xDEADBEEFu;
+    return brw_skin_buf[y * BRW_SKIN_W + x] & 0x00FFFFFFu;
+}
+
+static void brw_skin_selftest(void) {
+    for (int i = 0; i < BRW_SKIN_W * BRW_SKIN_H; i++) brw_skin_buf[i] = 0;
+
+    brw_draw(brw_skin_buf, BRW_SKIN_W, BRW_SKIN_H, 0, 0, BRW_SKIN_W,
+             BRW_SKIN_H, 0, 0);
+
+    const int toolbar_h = BRW_TOOLBAR_H;
+
+    /* ---- the tokens reached the pixels ---- */
+    brw_skin_ok("the header strip is the charcoal token",
+                brw_skin_px(2, 2) == VXUI_VEXTRO_CHARCOAL);
+    brw_skin_ok("and so is the far side of it",
+                brw_skin_px(BRW_SKIN_W - 3, 2) == VXUI_VEXTRO_CHARCOAL);
+    brw_skin_ok("the divider under it is the dark gold token",
+                brw_skin_px(BRW_SKIN_W / 2, toolbar_h - 1) ==
+                    VXUI_VEXTRO_GOLD_DARK);
+
+    /* ---- the strip is exactly as tall as h-12 asked ---- */
+    brw_skin_ok("the strip is as tall as the token says", toolbar_h == 48);
+    brw_skin_ok("and the row below the divider is not charcoal",
+                brw_skin_px(BRW_SKIN_W / 2, toolbar_h) !=
+                    VXUI_VEXTRO_GOLD_DARK);
+
+    /* ---- the address field ---- */
+    {
+        const vxui_rect_t a = vxui_rects[VXUI_ID_ADDRESS];
+        brw_skin_ok("the address field has a rectangle", a.w > 0 && a.h > 0);
+        brw_skin_ok("its left border is the gold token",
+                    brw_skin_px(a.x, a.y + a.h / 2) == VXUI_VEXTRO_GOLD);
+        brw_skin_ok("and so is its right",
+                    brw_skin_px(a.x + a.w - 1, a.y + a.h / 2) ==
+                        VXUI_VEXTRO_GOLD);
+        brw_skin_ok("it is h-8 tall", a.h == 32);
+
+        /* mx-6 is 24 pixels of margin on each side, between the field and
+         * the groups either side of it. */
+        const vxui_rect_t nav = vxui_rects[VXUI_ID_NAV];
+        const vxui_rect_t act = vxui_rects[VXUI_ID_ACTIONS];
+        brw_skin_ok("mx-6 sits it 24px from the nav group",
+                    a.x - (nav.x + nav.w) == 24);
+        brw_skin_ok("and 24px from the actions group",
+                    act.x - (a.x + a.w) == 24);
+
+        /* px-4 on the chrome: the nav group starts 16 pixels in, and the
+         * actions group ends 16 pixels from the right. */
+        brw_skin_ok("px-4 indents the left group", nav.x == 16);
+        brw_skin_ok("and the right one", act.x + act.w == BRW_SKIN_W - 16);
+    }
+
+    /* ---- the layout is solved, not baked ---- */
+    {
+        const int16_t narrow_w = vxui_rects[VXUI_ID_ADDRESS].w;
+        const int16_t narrow_go_x = vxui_rects[VXUI_ID_GO].x;
+
+        vxui_solve(VXUI_ID_CHROME, 0, 0, BRW_SKIN_W + 200, BRW_TOOLBAR_H);
+        const int16_t wide_w = vxui_rects[VXUI_ID_ADDRESS].w;
+        const int16_t wide_go_x = vxui_rects[VXUI_ID_GO].x;
+
+        brw_skin_ok("widening the window widens the flex-1 field",
+                    wide_w == narrow_w + 200);
+        brw_skin_ok("and moves the fixed group with the right edge",
+                    wide_go_x == narrow_go_x + 200);
+        brw_skin_ok("while the fixed nav group does not move",
+                    vxui_rects[VXUI_ID_NAV].x == 16);
+
+        /* Back to where it was, so nothing after this sees a stale
+         * solve. */
+        vxui_solve(VXUI_ID_CHROME, 0, 0, BRW_SKIN_W, BRW_TOOLBAR_H);
+    }
+
+    /* ---- the start page ---- */
+    {
+        brw_page_home();
+        for (int i = 0; i < BRW_SKIN_W * BRW_SKIN_H; i++) brw_skin_buf[i] = 0;
+        brw_draw(brw_skin_buf, BRW_SKIN_W, BRW_SKIN_H, 0, 0, BRW_SKIN_W,
+                 BRW_SKIN_H, 0, 0);
+
+        brw_skin_ok("the start page paints the charcoal background",
+                    brw_skin_px(BRW_SKIN_W / 2, toolbar_h + 4) ==
+                        VXUI_VEXTRO_CHARCOAL);
+
+        /* The gradient title: sampled at its left and right, where the
+         * two end stops are. A title drawn in one flat colour -- which is
+         * what a broken bg-clip-text would give -- has the same pixel at
+         * both. */
+        const vxui_rect_t t = vxui_rects[VXUI_ID_START_TITLE];
+        brw_skin_ok("the title has a rectangle", t.w > 0 && t.h > 0);
+
+        uint32_t left_ink = 0, right_ink = 0;
+        for (int y = t.y; y < t.y + t.h && y < BRW_SKIN_H; y++) {
+            for (int x = t.x; x < t.x + t.w / 4 && x < BRW_SKIN_W; x++) {
+                const uint32_t p = brw_skin_px(x, y);
+                if (p != VXUI_VEXTRO_CHARCOAL && p != 0) { left_ink = p; break; }
+            }
+            if (left_ink) break;
+        }
+        for (int y = t.y; y < t.y + t.h && y < BRW_SKIN_H; y++) {
+            for (int x = t.x + t.w - 1; x > t.x + t.w * 3 / 4 && x >= 0; x--) {
+                const uint32_t p = brw_skin_px(x, y);
+                if (p != VXUI_VEXTRO_CHARCOAL && p != 0) { right_ink = p; break; }
+            }
+            if (right_ink) break;
+        }
+        brw_skin_ok("the title is drawn at all", left_ink != 0);
+        brw_skin_ok("and its two ends are different colours",
+                    left_ink != right_ink);
+
+        /* The three panels share the row equally: flex-1 each. */
+        const vxui_rect_t p1 = vxui_rects[VXUI_ID_PANEL_WIKI];
+        const vxui_rect_t p2 = vxui_rects[VXUI_ID_PANEL_STORE];
+        const vxui_rect_t p3 = vxui_rects[VXUI_ID_PANEL_NET];
+        brw_skin_ok("the three panels are the same width",
+                    p1.w == p2.w && (p3.w == p1.w || p3.w == p1.w + 1));
+        brw_skin_ok("laid out left to right", p1.x < p2.x && p2.x < p3.x);
+        brw_skin_ok("with gap-4 between them", p2.x - (p1.x + p1.w) == 16);
+        brw_skin_ok("and a dark gold border",
+                    brw_skin_px(p1.x, p1.y + p1.h / 2) ==
+                        VXUI_VEXTRO_GOLD_DARK);
+    }
+
+    serial_puts("[skin] browser skin: ");
+    serial_put_dec((uint32_t)brw_skin_checks);
+    serial_puts(" checks, ");
+    serial_put_dec((uint32_t)brw_skin_failures);
+    serial_puts(brw_skin_failures ? " failures - FAILED\n"
+                                  : " failures - all passed\n");
+}
+#endif /* APP_SELFTEST */
 
 #endif /* BROWSER_H */

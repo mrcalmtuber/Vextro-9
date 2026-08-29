@@ -1,0 +1,18 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CSTRING
+#define _VXCXX_CSTRING
+
+#include <string.h>
+#include <cstddef>
+
+namespace std {
+using ::memcpy;   using ::memmove;  using ::memset;
+using ::memcmp;   using ::memchr;
+using ::strcpy;   using ::strncpy;  using ::strcat;   using ::strncat;
+using ::strcmp;   using ::strncmp;  using ::strlen;   using ::strnlen;
+using ::strchr;   using ::strrchr;  using ::strstr;
+using ::strspn;   using ::strcspn;  using ::strpbrk;  using ::strtok;
+using ::strdup;   using ::strerror;
+}  // namespace std
+
+#endif

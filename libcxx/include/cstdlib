@@ -1,0 +1,23 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CSTDLIB
+#define _VXCXX_CSTDLIB
+
+#include <stdlib.h>
+#include <cstddef>
+
+namespace std {
+using ::malloc;  using ::calloc;  using ::realloc;  using ::free;
+using ::aligned_alloc;
+using ::abort;   using ::exit;    using ::atexit;
+using ::atoi;    using ::atol;    using ::atoll;    using ::atof;
+using ::strtol;  using ::strtoul; using ::strtoll;  using ::strtoull;
+using ::strtod;  using ::strtof;
+using ::abs;     using ::labs;    using ::llabs;
+using ::div;     using ::ldiv;    using ::lldiv;
+using ::div_t;   using ::ldiv_t;  using ::lldiv_t;
+using ::qsort;   using ::bsearch;
+using ::rand;    using ::srand;
+using ::getenv;
+}  // namespace std
+
+#endif

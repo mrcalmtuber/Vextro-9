@@ -1,0 +1,58 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CSTDDEF
+#define _VXCXX_CSTDDEF
+
+/*
+ * <cstddef> — and the pattern every c-prefixed header here follows.
+ *
+ * Include the C header, then pull the names into namespace std with
+ * `using`. That is what the standard asks for and it has one practical
+ * consequence worth knowing: because the C header put them in the global
+ * namespace first, both `std::size_t` and `::size_t` work. A hosted
+ * implementation is allowed to hide the second and none of them do,
+ * which is why ported code writes both and expects both.
+ */
+
+#include <stddef.h>
+
+namespace std {
+using ::size_t;
+using ::ptrdiff_t;
+
+/* C++11's own, which the C header has no equivalent of: a type whose
+ * alignment is as strict as any scalar's. */
+using max_align_t = long double;
+
+/* A byte that is not a character. The enum class is the point — it does
+ * not implicitly convert to or from an integer, so a buffer of these
+ * cannot be accidentally treated as text. */
+enum class byte : unsigned char {};
+
+template <class T> constexpr byte operator<<(byte b, T shift) noexcept {
+    return static_cast<byte>(static_cast<unsigned char>(
+        static_cast<unsigned>(b) << shift));
+}
+template <class T> constexpr byte operator>>(byte b, T shift) noexcept {
+    return static_cast<byte>(static_cast<unsigned char>(
+        static_cast<unsigned>(b) >> shift));
+}
+constexpr byte operator|(byte a, byte b) noexcept {
+    return static_cast<byte>(static_cast<unsigned char>(
+        static_cast<unsigned>(a) | static_cast<unsigned>(b)));
+}
+constexpr byte operator&(byte a, byte b) noexcept {
+    return static_cast<byte>(static_cast<unsigned char>(
+        static_cast<unsigned>(a) & static_cast<unsigned>(b)));
+}
+constexpr byte operator^(byte a, byte b) noexcept {
+    return static_cast<byte>(static_cast<unsigned char>(
+        static_cast<unsigned>(a) ^ static_cast<unsigned>(b)));
+}
+template <class T> constexpr T to_integer(byte b) noexcept {
+    return static_cast<T>(b);
+}
+
+using nullptr_t = decltype(nullptr);
+}  // namespace std
+
+#endif

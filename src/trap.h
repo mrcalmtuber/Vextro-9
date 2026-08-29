@@ -92,7 +92,50 @@ __asm__(
     "  pushq %r15\n"
     "  cld\n"
     "  movq %rsp, %rdi\n"
+    /*
+     * ---- and the vector registers ----
+     *
+     * The fifteen pushes above are the general-purpose set, and for most
+     * of this kernel's life that was the whole of a thread's state that
+     * an exception could disturb. It is not, and the difference is
+     * invisible until the day it is not.
+     *
+     * exception_handle is ordinary C, compiled with SSE available. It
+     * uses vector registers — a structure copy, a zeroing loop the
+     * compiler turned into stores of sixteen bytes at a time — and it
+     * does not put them back. That is exactly what the syscall path
+     * already accounts for, and there it is accounted for on the *other*
+     * side: apps/vextro.h declares all sixteen XMM registers clobbered,
+     * because the program asked for the system call and knows where it
+     * is.
+     *
+     * A fault is not asked for. It happens in the middle of an
+     * instruction the program never annotated and cannot annotate, and
+     * the processor re-executes that instruction on return. If the
+     * instruction was a vector store — which is what GCC compiles a
+     * loop that fills an array into — then it re-executes with a source
+     * register the handler has since overwritten, and stores whatever
+     * the handler left there.
+     *
+     * The symptom is a program that writes an array and finds the first
+     * few elements correct and the rest wrong, with no fault, no
+     * refusal, and nothing on the wire. That is how this was found: a
+     * lazily backed mapping faults *inside* such a loop by design, so
+     * the case that used to require a copy-on-write page in exactly the
+     * wrong place is now the ordinary one.
+     *
+     * The save area is on this exception's own kernel stack, sixteen-
+     * aligned because FXSAVE64 faults on anything else. RBP carries the
+     * unaligned stack pointer across, and RBP's own value is already
+     * safe in the frame above.
+     */
+    "  movq %rsp, %rbp\n"
+    "  subq $512, %rsp\n"
+    "  andq $-16, %rsp\n"
+    "  fxsave64 (%rsp)\n"
     "  call exception_handle\n"
+    "  fxrstor64 (%rsp)\n"
+    "  movq %rbp, %rsp\n"
     "  popq %r15\n"
     "  popq %r14\n"
     "  popq %r13\n"
@@ -227,6 +270,26 @@ void exception_handle(exc_frame_t *f) {
      */
     if (f->vector == 14 && !(f->error & 1)) {
         if (swap_handle_fault(cr2, f->error)) return;
+
+        /*
+         * Nor is the first touch of an anonymous reservation.
+         *
+         * mmap does not map anything; it records that a range has been
+         * promised and returns, because a program that reserves gigabytes
+         * to use megabytes of them should not be charged for the
+         * difference. This is where the bill is finally presented, one
+         * page at a time, by whichever access actually needed it.
+         *
+         * After the pager rather than before, and the order is free
+         * rather than delicate: the two cannot both be true of one
+         * address. A swapped page has an entry with the pagefile slot in
+         * it; a reserved page has no entry at all, and often no page
+         * table to hold one. But asking the pager first keeps the common
+         * case on a machine under memory pressure first, and vmm_area_find
+         * is a linear scan that a resident program should not pay for.
+         */
+        if (vmm_current && (f->error & 4) && vmm_fault_anon(vmm_current, cr2))
+            return;
     }
 
     /* A fault on the page below a kernel stack has exactly one cause,

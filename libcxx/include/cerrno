@@ -1,0 +1,5 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CERRNO
+#define _VXCXX_CERRNO
+#include <errno.h>
+#endif

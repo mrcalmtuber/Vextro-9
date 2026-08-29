@@ -1,6 +1,7 @@
 CC      := x86_64-elf-gcc
 LD      := x86_64-elf-ld
 AR      := x86_64-elf-ar
+CXX     := x86_64-elf-g++
 HOSTCC  := cc
 
 # --- Kernel flags ---
@@ -33,7 +34,7 @@ HOSTCC  := cc
 CFLAGS  := -O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
             -fno-stack-check -fno-lto -fPIE -m64 -march=x86-64 \
             -msse -msse2 -mfpmath=sse -fno-math-errno -mno-red-zone \
-            -Isrc -Iinclude -Ikernel/include -Ivxfmt $(EXTRA)
+            -Isrc -Iinclude -Ibuild -Ikernel/include -Ivxfmt $(EXTRA)
 
 # --- Preflight ---
 #
@@ -145,14 +146,92 @@ LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
 # maps into every process push arguments onto the caller's stack, so the
 # 128 bytes below RSP that the ABI promises a leaf function are not
 # actually untouched here.
-LIBC_SRC  := libc/string.c libc/stdio.c libc/malloc.c
+#
+# ---- what the library grew into ----
+#
+# Three files became nine, and the four new ones are what a port needs
+# rather than what the demos here needed:
+#
+#   math.c      a complete libm, written from the published algorithms
+#               and checked against a reference by `make test`
+#   mmap.c      memory obtained as a region rather than by moving a break
+#   pthread.c   threads, on SYS_CLONE and the futex that was already here
+#   posix.c     time, character classes, setjmp, and the process calls
+#   stdlib2.c   the conversions, qsort, and the string helpers
+#   crt0.c      thread-local storage and static constructors, before main
+#
+# crt0.o is *not* in the archive. It has to be named on the link line so
+# that its _start is chosen, and a definition of _start sitting in an
+# archive would be pulled in only when nothing else defined one -- which
+# is the opposite of what a program that wants its own entry point
+# expects, and silently wrong either way.
+LIBC_SRC  := libc/string.c libc/stdio.c libc/malloc.c libc/math.c \
+             libc/mmap.c libc/pthread.c libc/posix.c libc/stdlib2.c \
+             libc/file.c libc/socket.c libc/exit.c
 LIBC_OBJ  := $(patsubst libc/%.c,build/libc/%.o,$(LIBC_SRC))
 LIBC      := build/libvextro.a
+LIBC_CRT0 := build/libc/crt0.o
 
+# -ftls-model=initial-exec is new and is load-bearing.
+#
+# Without it GCC emits the general-dynamic TLS sequence for a
+# `__thread` variable, which is a call to __tls_get_addr through a
+# module table -- machinery that exists to let a shared library be
+# loaded at run time. There are no shared libraries here and no dynamic
+# loader, so that call has nothing to resolve against. The initial-exec
+# model compiles the same variable to a single load at a fixed offset
+# from the FS segment, which is what libc/pthread.c actually sets up.
 APP_CFLAGS := -O2 -Wall -ffreestanding -fno-stack-protector \
               -fno-stack-check -mno-red-zone -fPIC \
               -msse -msse2 -mfpmath=sse -fno-math-errno \
+              -ftls-model=initial-exec \
               -Ilibc/include -Iapps
+
+# --- The C++ runtime ---
+#
+# `make webkit` used to stop here with "there is no C++ standard library
+# for x86_64-elf: g++ exists, libstdc++ does not". That was true and is
+# no longer: libcxx/ is a freestanding C++ runtime and header set built
+# against the C library above.
+#
+# Written rather than ported, for the same reason libc/ was. Building
+# GNU's libstdc++ needs the matching GCC source tree and a sysroot
+# configure; LLVM's libc++ needs cmake, which is deliberately not
+# installed here. Both would also drag in locales, iostreams and a
+# threading model this system does not have. What is here is the subset
+# that actually gets used, and third_party/wpe-config/README.md says
+# plainly which parts of the standard library are not in it.
+#
+# ---- the four flags that are not negotiable ----
+#
+#   -nostdinc++    do not look in the host's C++ headers. Without it the
+#                  cross compiler happily finds /usr/include/c++ and
+#                  compiles against a library for a different operating
+#                  system, which links and then does not run.
+#   -fno-exceptions  there is no unwinder for this target.
+#   -fno-rtti      and no type information to unwind through.
+#   -ftls-model=initial-exec  as for every other user-space object here.
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -ffreestanding \
+            -fno-exceptions -fno-rtti -fno-stack-protector \
+            -fno-stack-check -mno-red-zone -fPIC \
+            -msse -msse2 -mfpmath=sse -fno-math-errno \
+            -ftls-model=initial-exec \
+            -nostdinc++ -Ilibcxx/include -Ilibc/include -Iapps
+
+LIBCXX_SRC := libcxx/src/new.cpp libcxx/src/cxa.cpp
+LIBCXX_OBJ := $(patsubst libcxx/src/%.cpp,build/libcxx/%.o,$(LIBCXX_SRC))
+LIBCXX     := build/libvextrocxx.a
+
+build/libcxx/%.o: libcxx/src/%.cpp $(wildcard libcxx/include/*)
+	@mkdir -p build/libcxx
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(LIBCXX): $(LIBCXX_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(LIBCXX_OBJ)
+
+.PHONY: libcxx
+libcxx: $(LIBCXX)
 
 LIMINE  := limine-binary
 ISO     := iso_root
@@ -198,7 +277,9 @@ all: os.iso disk.img
 test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test \
       build/ntcrypto_test build/aes_test build/krb5_test build/wifi_test \
       build/media_test build/rdp_test build/ntfs_test build/vmx_test \
-      build/av_test build/mbedtls_test
+      build/av_test build/mbedtls_test build/math_test build/cxx_test
+	@./build/math_test
+	@./build/cxx_test
 	@./build/wikidoc_test
 	@./build/profile_test
 	@./build/ttfhint_test
@@ -226,6 +307,7 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	@./build/vmx_test
 	@./build/av_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
+	@python3 tools/tailwind.py --check
 	@python3 tools/linecount.py --check
 
 # The stripped Mbed TLS, proved on the host before it is trusted on the
@@ -262,11 +344,57 @@ build/mbedhost/%.o: $(MBED_DIR)/library/%.c $(MBED_DIR)/vextro_config.h
 	@$(HOSTCC) -c -O1 -w -I$(MBED_DIR)/include -I$(MBED_DIR) \
 		-DMBEDTLS_CONFIG_FILE='"vextro_config.h"' -o $@ $<
 
+# The C++ containers, on the host, against the same headers the target
+# builds against.
+#
+# The host's compiler and the host's operator new, with -nostdinc++ so
+# that the only C++ headers in scope are ours. What that buys is the
+# volume a boot test cannot afford: sorting twenty thousand elements in
+# five adversarial orders, every string length across the small-buffer
+# boundary, ten thousand tracked objects checked for leaks. What it
+# cannot check is anything that is not computation -- the allocator, the
+# static constructors, the guard variables under real threads -- and
+# apps/cxxtest.cpp does that on the machine.
+#
+# -include tools/cxx_hostshim.h supplies the one name libc/ has and a
+# hosted C library does not; see that file.
+build/cxx_test: tools/cxx_test.cpp tools/cxx_hostshim.h \
+                $(wildcard libcxx/include/*)
+	@mkdir -p build
+	@$(HOSTCC) -std=c++20 -O1 -Wall -Wextra -nostdinc++ \
+		-Ilibcxx/include -include tools/cxx_hostshim.h \
+		-x c++ tools/cxx_test.cpp -o $@ -lc++ 2>/dev/null || \
+	 $(HOSTCC) -std=c++20 -O1 -Wall -Wextra -nostdinc++ \
+		-Ilibcxx/include -include tools/cxx_hostshim.h \
+		-x c++ tools/cxx_test.cpp -o $@ -lstdc++
+
 build/mbedtls_test: tools/mbedtls_test.c $(MBED_HOST_OBJ)
 	@mkdir -p build
 	@$(HOSTCC) -O1 -w -I$(MBED_DIR)/include -I$(MBED_DIR) \
 		-DMBEDTLS_CONFIG_FILE='"vextro_config.h"' \
 		-o $@ tools/mbedtls_test.c $(MBED_HOST_OBJ)
+
+# --- The C library's arithmetic, against a reference ---
+#
+# libc/math.c is compiled a second time for the *host*, with every
+# function renamed by tools/math_rename.h, so that our exp() and the
+# host's can be linked into one program and called side by side. There is
+# no other way to check a transcendental function: the only other
+# implementation available to this repository is the one being checked.
+#
+# -w rather than -Wall, and deliberately. The file is compiled here for
+# an architecture it was not written for, and the warnings that produces
+# -- about the x86 assembly it does not use on this path -- would bury
+# the ones that matter. It is compiled with warnings on for its real
+# target by the rule below it.
+build/math_host.o: libc/math.c tools/math_rename.h libc/include/math.h
+	@mkdir -p build
+	@$(HOSTCC) -O1 -w -std=gnu11 -Ilibc/include \
+		-include tools/math_rename.h -c $< -o $@
+
+build/math_test: tools/math_test.c build/math_host.o
+	@mkdir -p build
+	@$(HOSTCC) -O1 -w -std=gnu11 -o $@ $< build/math_host.o -lm
 
 build/wikidoc_test: tools/wikidoc_test.c src/wikidoc.h
 	@mkdir -p build
@@ -596,7 +724,7 @@ build/ca-bundle.crt:
 # at boot and cannot use a fragmented one; and it allocates every file
 # sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
 # archive's run list would not fit in its own MFT record.
-disk.img: $(ASSET_LIST) | build/hello build/faulter build/mutextest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -605,6 +733,16 @@ disk.img: $(ASSET_LIST) | build/hello build/faulter build/mutextest $(WINAPPS) $
 	cmd="python3 tools/mkntfs.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello build/faulter \
 		build/mutextest \
+		build/threadtest \
+		build/wpetest \
+		build/fdprobe \
+		build/fdtest \
+		build/cxxtest \
+		build/sqltest \
+		build/fttest \
+		build/hbtest \
+		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
+		build/sqlseed.db:sqlseed.db \
 		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \
 		build/ca-bundle.crt:etc/ca-bundle.crt \
@@ -632,6 +770,10 @@ build/limine-tool: $(LIMINE)/limine.c
 
 # --- User-space C library ---
 build/libc/%.o: libc/%.c $(wildcard libc/include/*.h) $(wildcard libc/include/sys/*.h)
+	@mkdir -p build/libc
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/libc/crt0.o: libc/crt0.c libc/include/pthread.h
 	@mkdir -p build/libc
 	$(CC) $(APP_CFLAGS) -c $< -o $@
 
@@ -722,6 +864,566 @@ build/mutextest: build/mutextest.o apps/app.ld $(LIBC)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		build/mutextest.o $(LIBC) -o $@
 
+# --- libwpe, and the Vextro backend for it ---
+#
+# WPE is WebKit with the platform taken out: everything an engine assumes
+# about a window system sits behind libwpe, and a *backend* supplies it.
+# third_party/libwpe is vendored unmodified; third_party/wpe-port is the
+# backend, which is where this system's window actually gets its pixels.
+#
+# Built with upstream's src/loader-static.c rather than src/loader.c,
+# which is the whole of what it takes to make libwpe work without a
+# dynamic loader: the static form does no dlopen and expects
+# `_wpe_loader_interface` to be linked in, which the port defines.
+# input-xkb.c and gamepad.c are left out because they need libxkbcommon
+# and a device this machine does not have.
+#
+# WPE_COMPILATION is what libwpe's headers check before letting anything
+# but <wpe/wpe.h> be included; the sources include each other directly.
+WPE_DIR     := third_party/libwpe
+WPE_PORT    := third_party/wpe-port
+WPE_INC     := -I$(WPE_DIR)/include -I$(WPE_DIR)/src \
+               -I$(WPE_PORT) -I$(WPE_PORT)/include
+WPE_SRC     := $(WPE_DIR)/src/alloc.c $(WPE_DIR)/src/loader-static.c \
+               $(WPE_DIR)/src/process.c $(WPE_DIR)/src/renderer-backend-egl.c \
+               $(WPE_DIR)/src/renderer-host.c $(WPE_DIR)/src/version.c \
+               $(WPE_DIR)/src/view-backend.c $(WPE_DIR)/src/pasteboard.c \
+               $(WPE_DIR)/src/key-unicode.c \
+               $(WPE_PORT)/vxwpe.c $(WPE_PORT)/pasteboard-noop.c
+WPE_OBJ     := $(addprefix build/wpe/,$(notdir $(WPE_SRC:.c=.o)))
+LIBWPE      := build/libwpe.a
+
+# One pattern rule per source directory, because make matches on the
+# whole path and the two trees are not siblings.
+build/wpe/%.o: $(WPE_DIR)/src/%.c
+	@mkdir -p build/wpe
+	$(CC) $(APP_CFLAGS) -DWPE_COMPILATION $(WPE_INC) -c $< -o $@
+
+build/wpe/%.o: $(WPE_PORT)/%.c $(WPE_PORT)/vxwpe.h
+	@mkdir -p build/wpe
+	$(CC) $(APP_CFLAGS) -DWPE_COMPILATION $(WPE_INC) -c $< -o $@
+
+$(LIBWPE): $(WPE_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(WPE_OBJ)
+
+.PHONY: libwpe
+libwpe: $(LIBWPE)
+
+# ============================================================
+#  SQLite
+# ============================================================
+#
+# The amalgamation, vendored as lwIP and Mbed TLS are, and pinned by
+# checksum for the same reason WEBKIT_SHA256 is: a download that is not
+# checked is a download that can be replaced, and this one is compiled
+# and run.
+#
+# ---- the flags, and why each one ----
+#
+#   SQLITE_OS_OTHER=1        excludes os_unix.c and os_win.c entirely.
+#                            third_party/sqlite-port/vx_vfs.c is the
+#                            operating system instead.
+#   SQLITE_OMIT_WAL          write-ahead logging needs xShmMap, which is
+#                            shared memory between processes. There is
+#                            none. Rollback journalling needs only files.
+#   SQLITE_TEMP_STORE=3      temporary tables in memory. Against a
+#                            filesystem that rewrites a whole file per
+#                            sync, temp-file churn is pathological.
+#   SQLITE_OMIT_LOAD_EXTENSION   no dynamic loader.
+#   SQLITE_OMIT_LOCALTIME    no timezone database, and inventing one
+#                            would be worse than the absence.
+#   SQLITE_THREADSAFE=1      the engine's serialisation logic is present.
+#                            The mutexes themselves are *not* selected
+#                            here: SQLITE_OS_OTHER forces
+#                            SQLITE_MUTEX_NOOP whatever the command line
+#                            says, and adding SQLITE_MUTEX_PTHREADS
+#                            compiles both implementations at once. The
+#                            port installs real ones at run time through
+#                            sqlite3_config(SQLITE_CONFIG_MUTEX); see the
+#                            long note in vx_vfs.c.
+#   SQLITE_DEFAULT_PAGE_SIZE=4096  the NTFS cluster this volume is
+#                            formatted with, so a page write is one
+#                            cluster write.
+#
+# -w for the same reason the Mbed TLS objects carry it: this is vendored
+# code compiled unmodified, and the zero-warning claim is about code
+# written here.
+SQLITE_VERSION := 3450100
+SQLITE_ZIP     := sqlite-amalgamation-$(SQLITE_VERSION).zip
+SQLITE_URL     := https://sqlite.org/2024/$(SQLITE_ZIP)
+SQLITE_SHA256  := 5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
+
+SQLITE_DIR   := third_party/sqlite
+SQLITE_PORT  := third_party/sqlite-port
+SQLITE_DEFS  := -DSQLITE_OS_OTHER=1 -DSQLITE_OMIT_WAL \
+                -DSQLITE_TEMP_STORE=3 -DSQLITE_OMIT_LOAD_EXTENSION \
+                -DSQLITE_OMIT_LOCALTIME -DSQLITE_THREADSAFE=1 \
+                -DSQLITE_DEFAULT_PAGE_SIZE=4096 \
+                -DSQLITE_DEFAULT_MEMSTATUS=0
+SQLITE_INC   := -I$(SQLITE_DIR)
+LIBSQLITE    := build/libsqlite.a
+
+build/sqlite/sqlite3.o: $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h
+	@mkdir -p build/sqlite
+	$(CC) $(APP_CFLAGS) -w $(SQLITE_DEFS) $(SQLITE_INC) -c $< -o $@
+
+build/sqlite/vx_vfs.o: $(SQLITE_PORT)/vx_vfs.c $(SQLITE_DIR)/sqlite3.h
+	@mkdir -p build/sqlite
+	$(CC) $(APP_CFLAGS) $(SQLITE_DEFS) $(SQLITE_INC) -c $< -o $@
+
+$(LIBSQLITE): build/sqlite/sqlite3.o build/sqlite/vx_vfs.o
+	@mkdir -p build
+	$(AR) rcs $@ $^
+
+.PHONY: sqlite
+sqlite: $(LIBSQLITE)
+
+# ============================================================
+#  FreeType
+# ============================================================
+#
+# Vendored at 2.13.2 and compiled by naming its sources, exactly as lwIP
+# and Mbed TLS are — upstream's own build is autoconf or cmake, and
+# neither is needed to compile a list of C files with a cross compiler.
+#
+# Four modules out of nineteen megabytes of source: TrueType outlines,
+# the SFNT container they live in, the anti-aliasing rasteriser, and the
+# PostScript name table sfnt needs. third_party/freetype-port/ftmodule.h
+# is the list and says why.
+#
+# ---- the two headers that redirect the configuration ----
+#
+# FT_CONFIG_OPTIONS_H and FT_CONFIG_MODULES_H are FreeType's documented
+# way to supply your own without editing the tree, which is what keeps
+# third_party/freetype/ a clean copy of the release.
+#
+# ---- ftsystem.c is upstream's ANSI one, unmodified ----
+#
+# It is written against fopen, fseek, ftell, fread, fclose, malloc,
+# realloc and free — every one of which this C library now has. That is
+# the whole "port": there is no Vextro-specific FreeType code at all,
+# because the C library grew to the point where the stock file compiles.
+FREETYPE_VERSION := 2.13.2
+FREETYPE_TARBALL := freetype-$(FREETYPE_VERSION).tar.gz
+FREETYPE_URL     := https://download.savannah.gnu.org/releases/freetype/$(FREETYPE_TARBALL)
+FREETYPE_SHA256  := 1ac27e16c134a7f2ccea177faba19801131116fd682efc1f5737037c5db224b5
+
+FT_DIR  := third_party/freetype
+FT_PORT := third_party/freetype-port
+FT_INC  := -I$(FT_DIR)/include -I$(FT_PORT)
+FT_DEFS := -DFT2_BUILD_LIBRARY \
+           -DFT_CONFIG_OPTIONS_H='<ftoption.h>' \
+           -DFT_CONFIG_MODULES_H='<ftmodule.h>'
+
+# Each of these is itself an amalgamation: FreeType's sources #include
+# their siblings, so one object per module rather than per file.
+#
+# ftmm.c is here because the TrueType driver references
+# FT_Set_Named_Instance unconditionally — variable-font support is not
+# something ftoption.h can switch off at this seam, so the file that
+# defines it has to be linked whether or not any variable font is ever
+# opened. Found the way such things are: an undefined symbol at the
+# first link, not at the first compile.
+FT_SRC := $(FT_DIR)/src/base/ftsystem.c $(FT_DIR)/src/base/ftinit.c \
+          $(FT_DIR)/src/base/ftdebug.c  $(FT_DIR)/src/base/ftbase.c \
+          $(FT_DIR)/src/base/ftbitmap.c $(FT_DIR)/src/base/ftglyph.c \
+          $(FT_DIR)/src/base/ftmm.c \
+          $(FT_DIR)/src/sfnt/sfnt.c     $(FT_DIR)/src/truetype/truetype.c \
+          $(FT_DIR)/src/smooth/smooth.c $(FT_DIR)/src/psnames/psnames.c
+FT_OBJ := $(patsubst $(FT_DIR)/src/%.c,build/freetype/%.o,$(FT_SRC))
+LIBFT  := build/libfreetype.a
+
+build/freetype/%.o: $(FT_DIR)/src/%.c $(FT_DIR)/include/ft2build.h \
+                    $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h
+	@mkdir -p $(dir $@)
+	$(CC) $(APP_CFLAGS) -w $(FT_DEFS) $(FT_INC) -c $< -o $@
+
+$(LIBFT): $(FT_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(FT_OBJ)
+
+.PHONY: freetype
+freetype: $(LIBFT)
+
+# ============================================================
+#  HarfBuzz
+# ============================================================
+#
+# One translation unit. HarfBuzz ships src/harfbuzz.cc, which #includes
+# every other source in the library — the same amalgamation idea SQLite
+# uses — so its meson and cmake builds are not needed to produce an
+# object, any more than lwIP's Makefile was.
+#
+# ---- what it needed from this system, and what it did not ----
+#
+# It compiled against libcxx/ with three additions and no patches:
+# <inttypes.h>, which this C library simply did not have; <cfloat>; and
+# the is_trivially_copy_assignable family, which hb-meta.hh uses to
+# choose between a memmove and an element loop. That is the whole
+# integration. Nothing in third_party/harfbuzz/ is modified.
+#
+#   HB_NO_MT        one lock-free path. HarfBuzz's atomics would work —
+#                   <atomic> is real here — but nothing shapes text from
+#                   two threads, and the single-threaded path is smaller
+#                   and has fewer places to be wrong.
+#   HB_TINY         drops the shapers and tables a browser on this
+#                   machine will not reach, which is most of the size.
+#   HAVE_FREETYPE   pulls in hb-ft.cc, so an hb_font can be built from an
+#                   FT_Face. That is upstream's own integration between
+#                   the two libraries and is the right seam: HarfBuzz
+#                   asks FreeType for glyph metrics rather than parsing
+#                   the font a third time.
+HARFBUZZ_VERSION := 8.5.0
+HARFBUZZ_TARBALL := harfbuzz-$(HARFBUZZ_VERSION).tar.xz
+HARFBUZZ_URL     := https://github.com/harfbuzz/harfbuzz/releases/download/$(HARFBUZZ_VERSION)/$(HARFBUZZ_TARBALL)
+HARFBUZZ_SHA256  := 77e4f7f98f3d86bf8788b53e6832fb96279956e1c3961988ea3d4b7ca41ddc27
+
+HB_DIR  := third_party/harfbuzz
+HB_INC  := -I$(HB_DIR)/src
+HB_DEFS := -DHB_NO_MT -DHB_TINY -DHAVE_FREETYPE=1
+LIBHB   := build/libharfbuzz.a
+
+build/harfbuzz/harfbuzz.o: $(HB_DIR)/src/harfbuzz.cc
+	@mkdir -p build/harfbuzz
+	$(CXX) $(CXXFLAGS) -w $(HB_DEFS) $(HB_INC) $(FT_INC) $(FT_DEFS) \
+		-c $< -o $@
+
+$(LIBHB): build/harfbuzz/harfbuzz.o
+	@mkdir -p build
+	$(AR) rcs $@ $^
+
+.PHONY: harfbuzz
+harfbuzz: $(LIBHB)
+
+
+# ---- fetching the three, and why they are not committed ----
+#
+# Each is downloaded and checked against the hash recorded above before
+# anything is unpacked. A download that is not verified is a download
+# that can be replaced, and all three of these are compiled and run in
+# ring 3 on this machine.
+#
+# They are fetched rather than vendored because together they are 131
+# megabytes of source, against lwIP and Mbed TLS which are committed at
+# eight. The line is the same one wiki.zim and the language models sit
+# on: a pinned download says exactly what a committed copy says and does
+# not put it in everybody's clone.
+#
+# Each rule keys off one file, so `make` brings a library down the first
+# time it is needed and never again.
+
+$(SQLITE_DIR)/sqlite3.c:
+	@echo "  fetching $(SQLITE_ZIP)"
+	@mkdir -p build $(SQLITE_DIR)
+	@curl -fL --retry 3 -o build/$(SQLITE_ZIP) $(SQLITE_URL)
+	@printf '%s  build/%s\n' "$(SQLITE_SHA256)" "$(SQLITE_ZIP)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(SQLITE_ZIP) does not match its checksum; not unpacked."; \
+		     rm -f build/$(SQLITE_ZIP); exit 1; }
+	@cd build && rm -rf sqlite-amalgamation-$(SQLITE_VERSION) && unzip -q $(SQLITE_ZIP)
+	@cp build/sqlite-amalgamation-$(SQLITE_VERSION)/sqlite3.c \
+	    build/sqlite-amalgamation-$(SQLITE_VERSION)/sqlite3.h \
+	    build/sqlite-amalgamation-$(SQLITE_VERSION)/sqlite3ext.h $(SQLITE_DIR)/
+	@echo "  SQLITE   $(SQLITE_DIR) ($(SQLITE_VERSION))"
+
+$(SQLITE_DIR)/sqlite3.h: $(SQLITE_DIR)/sqlite3.c
+
+$(FT_DIR)/include/ft2build.h:
+	@echo "  fetching $(FREETYPE_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(FREETYPE_TARBALL) $(FREETYPE_URL)
+	@printf '%s  build/%s\n' "$(FREETYPE_SHA256)" "$(FREETYPE_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(FREETYPE_TARBALL) does not match its checksum."; \
+		     rm -f build/$(FREETYPE_TARBALL); exit 1; }
+	@rm -rf $(FT_DIR) third_party/freetype-$(FREETYPE_VERSION)
+	@tar -C third_party -xzf build/$(FREETYPE_TARBALL)
+	@mv third_party/freetype-$(FREETYPE_VERSION) $(FT_DIR)
+	@echo "  FREETYPE $(FT_DIR) ($(FREETYPE_VERSION))"
+
+$(HB_DIR)/src/harfbuzz.cc:
+	@echo "  fetching $(HARFBUZZ_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(HARFBUZZ_TARBALL) $(HARFBUZZ_URL)
+	@printf '%s  build/%s\n' "$(HARFBUZZ_SHA256)" "$(HARFBUZZ_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(HARFBUZZ_TARBALL) does not match its checksum."; \
+		     rm -f build/$(HARFBUZZ_TARBALL); exit 1; }
+	@rm -rf $(HB_DIR) third_party/harfbuzz-$(HARFBUZZ_VERSION)
+	@tar -C third_party -xf build/$(HARFBUZZ_TARBALL)
+	@mv third_party/harfbuzz-$(HARFBUZZ_VERSION) $(HB_DIR)
+	@echo "  HARFBUZZ $(HB_DIR) ($(HARFBUZZ_VERSION))"
+
+.PHONY: libs-fetch
+libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc
+
+# --- Fetching WPE WebKit itself ---
+#
+# libwpe is vendored, as lwIP and Mbed TLS are, because it is eight
+# thousand lines and a clone of this repository should build the same
+# system a year from now. WPE WebKit is not: it is some millions of
+# lines and half a gigabyte of tarball, which is the same reason
+# wiki.zim and qwen2.gguf are downloaded rather than committed.
+#
+# The tarball is verified against a checksum recorded here. A download
+# that is not checked is a download that can be replaced, and this one
+# would be compiled and run.
+WEBKIT_VERSION := 2.46.5
+WEBKIT_TARBALL := wpewebkit-$(WEBKIT_VERSION).tar.xz
+WEBKIT_URL     := https://wpewebkit.org/releases/$(WEBKIT_TARBALL)
+# Recorded from the published tarball rather than trusted from it: a
+# download that is not checked is a download that can be replaced, and
+# this one would be compiled and run in ring 3 on this machine.
+WEBKIT_SHA256  := 2efd4831efcf86e29546c028d6f17a7b775b61b6499ed62399a00da8f06ea456
+WEBKIT_SRC     := third_party/wpewebkit-$(WEBKIT_VERSION)
+
+.PHONY: webkit-fetch
+webkit-fetch: $(WEBKIT_SRC)/CMakeLists.txt
+
+$(WEBKIT_SRC)/CMakeLists.txt:
+	@echo "  fetching $(WEBKIT_TARBALL) (39 MB compressed)"
+	@mkdir -p third_party
+	@curl -fL --retry 3 -o build/$(WEBKIT_TARBALL) $(WEBKIT_URL)
+	@echo "  verifying"
+	@printf '%s  build/%s\n' "$(WEBKIT_SHA256)" "$(WEBKIT_TARBALL)" \
+		| shasum -a 256 -c - \
+		|| { echo ""; \
+		     echo "  The tarball does not match the checksum in the Makefile."; \
+		     echo "  Either the release was re-rolled upstream or the download"; \
+		     echo "  was tampered with. It has NOT been unpacked."; \
+		     echo ""; \
+		     rm -f build/$(WEBKIT_TARBALL); exit 1; }
+	@tar -C third_party -xf build/$(WEBKIT_TARBALL)
+
+# --- Building it ---
+#
+# This target names everything that is missing at once rather than
+# stopping at the first, which is the same courtesy the toolchain check
+# at the top of this file extends -- discovering four prerequisites one
+# build at a time is four builds.
+#
+# It does not succeed today. What stands between this and an engine is
+# set out in third_party/wpe-config/README.md, and the first item is
+# that there is no C++ standard library for x86_64-elf: g++ exists,
+# libstdc++ does not, and WebKit is C++20 throughout. The check below
+# reports that rather than letting cmake discover it several minutes in.
+.PHONY: webkit
+webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX)
+	@missing=""; \
+	command -v cmake >/dev/null || missing="$$missing cmake"; \
+	command -v ninja >/dev/null || missing="$$missing ninja"; \
+	command -v ruby  >/dev/null || missing="$$missing ruby"; \
+	command -v gperf >/dev/null || missing="$$missing gperf"; \
+	command -v $(CXX) >/dev/null || missing="$$missing $(CXX)"; \
+	if [ -n "$$missing" ]; then \
+	    echo ""; \
+	    echo "  WPE WebKit cannot be built here yet. Missing:$$missing"; \
+	    echo ""; \
+	    echo "  These are package installs rather than work. What used to"; \
+	    echo "  be in the way was not:"; \
+	    echo ""; \
+	    echo "    the C++ runtime      done  libcxx/, 28 headers over libc/"; \
+	    echo "    descriptors in ring 3 done  src/vfs.h, 19 system calls"; \
+	    echo "    sockets in ring 3     done  over src/vxnet.h"; \
+	    echo ""; \
+	    echo "  What remains after installing the above is breadth: the"; \
+	    echo "  parts of the standard library WebKit uses that libcxx/ has"; \
+	    echo "  not grown yet (unordered_map, thread, chrono, variant), and"; \
+	    echo "  the dependency ports -- ICU, libxml2, freetype, harfbuzz,"; \
+	    echo "  sqlite, Skia. Each is a port onto interfaces that now exist"; \
+	    echo "  and are tested, rather than an interface to be invented."; \
+	    echo ""; \
+	    echo "  third_party/wpe-config/README.md has the full order."; \
+	    echo ""; \
+	    exit 1; \
+	fi; \
+	mkdir -p build/webkit; \
+	cd build/webkit && cmake -G Ninja \
+	    -DCMAKE_TOOLCHAIN_FILE="$(CURDIR)/third_party/wpe-config/vextro-toolchain.cmake" \
+	    -C "$(CURDIR)/third_party/wpe-config/vextro-wpe.cmake" \
+	    -DCMAKE_INSTALL_PREFIX="$(CURDIR)/build/webkit/root" \
+	    "$(CURDIR)/$(WEBKIT_SRC)" && ninja
+
+# --- The browser, packaged ---
+#
+# The .vx container the store and the loader both speak. Built from
+# whatever object files exist: today that is the backend and a shell
+# around it, and when WebKit builds it is the engine as well.
+#
+# Kept as a rule rather than left until the engine exists, because the
+# packaging is a real question with a real answer -- a .vx is an ELF
+# repacked by vx_maker, and an engine linked into one is loaded exactly
+# like `mandel` is.
+build/store/browser.elf: build/wpetest.o $(LIBWPE) $(LIBC) $(LIBC_CRT0) vxfmt/vx.ld
+	@mkdir -p build/store
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T vxfmt/vx.ld \
+		build/wpetest.o $(LIBC_CRT0) $(LIBWPE) $(LIBC) -o $@
+
+# --- User app: wpetest ---
+#
+# The backend, exercised in ring 3 without WebKit. Everything about a WPE
+# backend that does not need the engine can be checked here -- that
+# libwpe links and runs against this C library at all, that the static
+# loader resolves, that a view dispatches its size, that the blit puts
+# the right pixels in the right places against a source stride that does
+# not match the window's, and that input arrives as events rather than as
+# a state repeated every frame.
+#
+# It links crt0, unlike every other application here, because libwpe is
+# ordinary POSIX C that expects a main() and a running C library rather
+# than a bare _start.
+build/wpetest.o: apps/wpetest.c $(WPE_PORT)/vxwpe.h apps/vextro.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) $(WPE_INC) -c $< -o $@
+
+build/wpetest: build/wpetest.o apps/app.ld $(LIBWPE) $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/wpetest.o $(LIBC_CRT0) $(LIBWPE) $(LIBC) -o $@
+
+# --- User app: threadtest ---
+#
+# The rest of the C library, exercised in ring 3 on the real machine.
+# `make test` checks the arithmetic on the host, where a reference
+# exists; nothing about threads, thread-local storage or a lazily backed
+# mapping can be checked that way, because none of them is a computation
+# -- they are the behaviour of the kernel underneath. This is where that
+# is checked.
+#
+# It keeps the old entry convention rather than linking crt0, so that it
+# also demonstrates the case a program written before any of this still
+# has to work in.
+build/threadtest.o: apps/threadtest.c apps/vextro.h libc/include/pthread.h \
+                    libc/include/sys/mman.h libc/include/math.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/threadtest: build/threadtest.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/threadtest.o $(LIBC) -o $@
+
+# --- User app: fdprobe ---
+#
+# The smallest program that can say whether descriptors and sockets work
+# at all, written against the raw system calls rather than the library
+# built on them. It exists because the two things that could not be
+# settled by reading code -- whether a blocking socket call made from a
+# system call comes back, and whether the loopback interface routes --
+# are cheap to find out with fifty lines and expensive to find out
+# underneath five thousand.
+build/fdprobe.o: apps/fdprobe.c apps/vextro.h libc/include/sys/syscall.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/fdprobe: build/fdprobe.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/fdprobe.o $(LIBC) -o $@
+
+# --- User app: fdtest ---
+#
+# The same ground fdprobe covers, one layer up: through open(), fopen(),
+# opendir(), socket() and the errno convention, rather than through the
+# raw calls. The two together say which side a failure is on -- the
+# kernel or the library -- which without a debugger is worth a second
+# program.
+build/fdtest.o: apps/fdtest.c apps/vextro.h libc/include/fcntl.h \
+                libc/include/dirent.h libc/include/sys/socket.h \
+                libc/include/sys/stat.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/fdtest: build/fdtest.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/fdtest.o $(LIBC) -o $@
+
+# --- User app: cxxtest ---
+#
+# The first C++ program this system runs, and the only place several
+# properties of the runtime can be checked at all: that operator new
+# reaches the ring-3 allocator, that static constructors run before main
+# and destructors after it, that a function-local static is constructed
+# once with four threads racing for it, and that a vtable survives a
+# loader which maps an image page by page under W^X.
+#
+# Linked with crt0, unlike the other tests, because the whole point is
+# that .init_array is walked.
+build/cxxtest.o: apps/cxxtest.cpp apps/vextro.h $(wildcard libcxx/include/*)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+build/cxxtest: build/cxxtest.o apps/app.ld $(LIBCXX) $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/cxxtest.o $(LIBC_CRT0) $(LIBCXX) $(LIBC) -o $@
+
+# --- User app: sqltest ---
+#
+# SQLite in ring 3, on this system's own filesystem. Links the vendored
+# engine, the VFS over the descriptor calls, and the C library.
+build/sqltest.o: apps/sqltest.c apps/vextro.h $(SQLITE_DIR)/sqlite3.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) $(SQLITE_INC) -c $< -o $@
+
+build/sqltest: build/sqltest.o apps/app.ld $(LIBSQLITE) $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/sqltest.o $(LIBSQLITE) $(LIBC) -o $@
+
+# --- The seeded database ---
+#
+# Written by the *host's* sqlite3, which is a separate implementation at
+# a different version. A port that reads this is a port that reads
+# databases other engines wrote — a much stronger claim than reading back
+# something it wrote itself, and the same reason tools/ntfsdir.py exists
+# to check the filesystem driver against an independent reader.
+build/sqlseed.db: Makefile
+	@mkdir -p build
+	@rm -f $@
+	@command -v sqlite3 >/dev/null || { \
+	    echo "  sqlite3 is not installed; the seeded-database check"; \
+	    echo "  cannot be built. Install it or the machine test will"; \
+	    echo "  report the read path as untested."; exit 1; }
+	@sqlite3 $@ \
+	  "CREATE TABLE seeded(key TEXT PRIMARY KEY, value TEXT); \
+	   INSERT INTO seeded VALUES('engine','written by another sqlite'); \
+	   INSERT INTO seeded VALUES('purpose','the VFS read path'); \
+	   INSERT INTO seeded VALUES('volume','NTFS'); \
+	   INSERT INTO seeded VALUES('zebra','last by sort order');"
+	@echo "  SEED   $@ (`sqlite3 $@ 'select count(*) from seeded'` rows, \
+by sqlite3 `sqlite3 -version | cut -d' ' -f1`)"
+
+# --- User app: fttest ---
+#
+# FreeType in ring 3, reading the same face the kernel has embedded, so
+# two independent TrueType parsers can be asked the same questions about
+# the same bytes.
+build/fttest.o: apps/fttest.c apps/vextro.h $(FT_PORT)/ftoption.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) $(FT_INC) -c $< -o $@
+
+build/fttest: build/fttest.o apps/app.ld $(LIBFT) $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/fttest.o $(LIBFT) $(LIBC) -o $@
+
+# --- User app: hbtest ---
+#
+# HarfBuzz shaping text in ring 3, over an FT_Face, over the C library.
+# C++ because HarfBuzz is, so this links libvextrocxx as well.
+build/hbtest.o: apps/hbtest.cpp apps/vextro.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(HB_INC) $(FT_INC) -c $< -o $@
+
+# $(LIBGCC) is on this link and on no other app's, which is worth a line.
+# HarfBuzz counts bits — hb_popcount over a 64-bit word — and GCC lowers
+# __builtin_popcountll to a call into its own runtime rather than to an
+# instruction, because POPCNT is not in the base x86-64 instruction set.
+# Applications link -nostdlib and so have never needed libgcc before; the
+# kernel has always linked it. Found as three undefined references to
+# __popcountdi2 at the first link, which is the only way this shows up.
+build/hbtest: build/hbtest.o apps/app.ld $(LIBHB) $(LIBFT) $(LIBCXX) \
+              $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/hbtest.o $(LIBC_CRT0) $(LIBHB) $(LIBFT) $(LIBCXX) \
+		$(LIBC) $(LIBGCC) -o $@
+
 build/faulter.o: apps/faulter.c apps/vextro.h
 	@mkdir -p build
 	$(CC) $(APP_CFLAGS) -c $< -o $@
@@ -760,10 +1462,15 @@ build/pics/%.sci: apps/pics/%.png tools/mkimg.py
 # The store payloads ride along here too, so the storefront still has
 # something to install on an ISO-only boot with no disk attached.
 build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter \
-                  build/mutextest $(WINAPPS) $(STORE_BINS)
+                  build/mutextest build/threadtest build/wpetest build/fdprobe \
+                  build/fdtest build/cxxtest build/sqltest build/fttest \
+                  build/hbtest \
+                  $(WINAPPS) $(STORE_BINS)
 	@mkdir -p build/initrd_staging/store/pkg
 	cp apps/*.txt build/initrd_staging/ 2>/dev/null || true
-	cp build/hello build/faulter build/mutextest build/initrd_staging/
+	cp build/hello build/faulter build/mutextest build/threadtest build/wpetest \
+	   build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest \
+	   build/initrd_staging/
 	$(foreach w,$(WINAPPS),cp $(w) build/initrd_staging/;)
 	$(foreach a,$(STORE_APPS),cp build/store/$(a).vx build/initrd_staging/store/pkg/$(a).vx;)
 	tar --format=ustar -cf $@ -C build/initrd_staging .
@@ -808,7 +1515,32 @@ KERN_HDRS := $(wildcard src/*.h) $(wildcard include/*.h) \
              $(wildcard src/sched/*.h) $(wildcard src/fs/ntfs/*.h) \
              $(wildcard src/security/*.h)
 
-build/core/main.o: src/core/main.c $(KERN_HDRS) \
+# --- The interface skin ---
+#
+# assets/ui/*.vxml carries the browser shell as Tailwind utility classes;
+# tools/tailwind.py resolves them against assets/ui/tokens.tw and emits a
+# node table the compositor draws (src/vxui.h) plus the equivalent
+# stylesheet for the day WebKit builds.
+#
+# The dependency below is named explicitly and that matters: KERN_HDRS is
+# a wildcard over src/ and include/, and the generated header is under
+# build/. Without this line a change to a colour token would leave the
+# kernel object untouched and the old palette on screen — silently, which
+# is the same class of stale-build bug the note beside BUILD_FLAGS at the
+# top of this file describes.
+UI_TOKENS := assets/ui/tokens.tw
+UI_SHELL  := assets/ui/browser.vxml
+UI_GEN    := build/ui/vxui_gen.h
+UI_CSS    := build/ui/vextro.css
+
+$(UI_GEN) $(UI_CSS): tools/tailwind.py $(UI_TOKENS) $(UI_SHELL)
+	@mkdir -p build/ui
+	@python3 tools/tailwind.py
+
+.PHONY: ui
+ui: $(UI_GEN)
+
+build/core/main.o: src/core/main.c $(KERN_HDRS) $(UI_GEN) \
                    $(wildcard src/net/*.c) $(wildcard src/media/*.c) \
                    build/res.stamp
 	@mkdir -p build/core
@@ -825,7 +1557,7 @@ build/core/main.o: src/core/main.c $(KERN_HDRS) \
 # that the kernel proper does not. Explicit rules do win over pattern
 # rules, so it would have worked; it would also have left a rule quietly
 # claiming to build three objects it must never build.
-$(KERN_MODULE_OBJ): build/%.o: src/%.c $(KERN_HDRS)
+$(KERN_MODULE_OBJ): build/%.o: src/%.c $(KERN_HDRS) $(UI_GEN)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

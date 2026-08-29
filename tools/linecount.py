@@ -32,7 +32,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-LOCAL_DIRS = ["src", "libc", "apps", "tools", "vxfmt", "include"]
+LOCAL_DIRS = ["src", "libc", "libcxx", "apps", "tools", "vxfmt", "include"]
 
 # Real lines, but nobody sat down and wrote them.
 DATA_FILES = {
@@ -51,7 +51,39 @@ PORT_FILES = {
     "third_party/lwip-port/arch/sys_arch.h",
     "third_party/mbedtls/vextro_config.h",
     "third_party/mbedtls/threading_alt.h",
+    "third_party/wpe-port/vxwpe.c",
+    "third_party/wpe-port/vxwpe.h",
+    "third_party/wpe-port/pasteboard-noop.c",
+    "third_party/wpe-port/include/EGL/eglplatform.h",
+    "third_party/sqlite-port/vx_vfs.c",
+    "third_party/freetype-port/ftoption.h",
+    "third_party/freetype-port/ftmodule.h",
 }
+
+# Fetched rather than vendored, and so not counted at all.
+#
+# The line between the two is whether a clone of this repository contains
+# it. lwIP, Mbed TLS and libwpe are in the tree, so they are reported as
+# vendored upstream. WPE WebKit is forty megabytes compressed and two
+# million lines; `make webkit-fetch` brings it down and .gitignore keeps
+# it out, exactly as for wiki.zim and the language models. Counting a
+# directory that is absent from a fresh clone would make this number
+# depend on whether somebody had run a download.
+# SQLite, FreeType and HarfBuzz join WPE WebKit here rather than in the
+# vendored count, and for the same test: a fresh clone does not contain
+# them. Each is downloaded by its own Makefile target, verified against a
+# checksum recorded there, and kept out by .gitignore — 131 megabytes
+# between the three, which is not something to put in a repository when
+# a pinned download says the same thing.
+#
+# The *ports* onto them are ours and are counted: the SQLite VFS is in
+# PORT_FILES above, and FreeType's two configuration headers with it.
+FETCHED_PREFIXES = (
+    "third_party/wpewebkit-",
+    "third_party/sqlite/",
+    "third_party/freetype/",
+    "third_party/harfbuzz/",
+)
 
 
 def lines(path):
@@ -60,9 +92,25 @@ def lines(path):
 
 
 def walk(top):
+    """Every source file under `top`.
+
+    The extension test grew a second half when the C++ runtime arrived.
+    A standard C++ header has no extension at all -- the file is called
+    `vector`, not `vector.h` -- so matching on a suffix finds the
+    implementation in libcxx/src and none of the twenty-eight headers
+    it exists to support. Anything with no dot in its name under
+    libcxx/include is one of those.
+    """
     for root, _, files in os.walk(os.path.join(ROOT, top)):
+        rel_root = os.path.relpath(root, ROOT)
         for f in files:
-            if f.endswith((".c", ".h")):
+            if f.startswith("."):
+                continue
+            is_source = f.endswith((".c", ".h", ".cpp"))
+            is_cxx_header = ("." not in f and
+                             rel_root.startswith(os.path.join("libcxx",
+                                                              "include")))
+            if is_source or is_cxx_header:
                 full = os.path.join(root, f)
                 yield os.path.relpath(full, ROOT), full
 
@@ -88,6 +136,8 @@ def main():
     if os.path.isdir(os.path.join(ROOT, "third_party")):
         for rel, full in walk("third_party"):
             key = rel.replace(os.sep, "/")
+            if key.startswith(FETCHED_PREFIXES):
+                continue
             n = lines(full)
             if key in PORT_FILES or key.startswith("third_party/include/"):
                 port += n

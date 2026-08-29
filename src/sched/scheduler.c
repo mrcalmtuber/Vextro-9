@@ -93,6 +93,41 @@ void sched_set_gs_base(uint64_t va) {
 }
 
 /*
+ * IA32_FS_BASE, which is per-thread and therefore cannot take the way
+ * out that GS did.
+ *
+ * Two words rather than one, and they mean different things. `want` is
+ * what the thread about to run needs, published by sched_on_tick as an
+ * ordinary store. `live` is what the machine actually has loaded. The
+ * stub compares them and issues WRMSR only when they differ, which on a
+ * system with no thread-local storage anywhere is never: every thread
+ * that predates pthreads has a base of zero, both words stay zero, and
+ * the MSR is not written once.
+ *
+ * `live` tracks the processor and not the thread, which is what makes
+ * clearing work. A switch from a thread with a base to one without moves
+ * `want` to zero, the comparison fails, and the base is zeroed — rather
+ * than left loaded for a thread that has no TCB and would find somebody
+ * else's if it looked.
+ *
+ * Not static: the stub names them, and a name the assembler resolves has
+ * to survive into the object file.
+ */
+uint64_t sched_fsbase_want = 0;
+uint64_t sched_fsbase_live = 0;
+
+/* Install one immediately, for the thread that is running now. The
+ * switch would get to it on the next tick anyway; doing it here is what
+ * lets a thread set its base and read a __thread variable on the very
+ * next instruction, which is what the C ABI expects. */
+void sched_set_fsbase(uint64_t va) {
+    if (cur_thread) cur_thread->fsbase = va;
+    sched_fsbase_want = va;
+    sched_fsbase_live = va;
+    wrmsr(0xC0000100u, va);
+}
+
+/*
  * Raised for the length of a software-requested switch.
  *
  * A thread that gives up the processor does it by raising the timer
@@ -331,6 +366,30 @@ uint64_t sched_on_tick(uint64_t rsp) {
     if ((have & PTE_ADDR_MASK) != want)
         __asm__ volatile("mov %0, %%cr3" :: "r"(want) : "memory");
 
+    /*
+     * Thread-local storage, announced rather than installed.
+     *
+     * A `__thread` variable is addressed as an offset from FS, so the
+     * base is part of a thread's register state exactly like RSP is, and
+     * has to be restored on every switch or a thread reads somebody
+     * else's variables. That much is not optional.
+     *
+     * What is optional is doing it *here*. The comment on gs_base_live
+     * above records what happened the last time a WRMSR was put in this
+     * function: a #GP on the FXRSTOR two instructions later. That was for
+     * a value that never changes and so was simply moved out. This one
+     * genuinely changes per thread, so it cannot be moved out — but it
+     * can be moved *later*, past the FXRSTOR entirely, which is the part
+     * of the sequence that objected.
+     *
+     * So the switch publishes the value and the stub below installs it,
+     * after this function has returned and the extended state is already
+     * back in the registers. A plain store to a global is the one thing
+     * this window is definitely safe for; it is what CR3 and RSP0 above
+     * are, too.
+     */
+    sched_fsbase_want = next->fsbase;
+
     __asm__ volatile("fxrstor64 %0" :: "m"(*next->fx) : "memory");
     return next->rsp;
 }
@@ -371,6 +430,28 @@ __asm__(
     "  andq $-16, %rsp\n"
     "  call sched_on_tick\n"
     "  movq %rax, %rsp\n"
+    /*
+     * The thread-local base, installed here and nowhere else.
+     *
+     * This is past the FXRSTOR inside sched_on_tick, which is the whole
+     * reason it is down here rather than beside the CR3 load: see the
+     * comment on sched_fsbase_want. RAX, RCX and RDX are destroyed and
+     * that is free — the pops immediately below restore all three from
+     * the frame, and RSP has already been taken out of RAX.
+     *
+     * The compare is what makes this cost nothing on a machine with no
+     * thread-local storage: both words are zero and the branch is taken
+     * every time.
+     */
+    "  movq sched_fsbase_want(%rip), %rax\n"
+    "  cmpq sched_fsbase_live(%rip), %rax\n"
+    "  je 1f\n"
+    "  movq %rax, sched_fsbase_live(%rip)\n"
+    "  movq %rax, %rdx\n"
+    "  shrq $32, %rdx\n"
+    "  movl $0xC0000100, %ecx\n"
+    "  wrmsr\n"
+    "1:\n"
     "  popq %r15\n"
     "  popq %r14\n"
     "  popq %r13\n"
@@ -708,6 +789,82 @@ thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
 }
 
 /*
+ * A second thread in an address space that already has one.
+ *
+ * Everything a pthread needs and nothing a fork does. There is no page
+ * table copy and no copy-on-write pass, because there is nothing to
+ * separate: the new thread runs on its creator's mappings, sees its
+ * creator's heap, and writes its creator's globals. That is the contract
+ * a threading library is built to provide, and it is also why the
+ * address space now has to be counted — see the reaper.
+ *
+ * The argument travels in the frame's RDI, which is where the System V
+ * ABI puts a first parameter. A thread is started by IRETQ-ing into a
+ * frame this function wrote, so there is no call to pass it through and
+ * no trampoline needed to hold it: the register is simply set before the
+ * thread ever runs.
+ *
+ * ---- why it is pinned to processor zero ----
+ *
+ * src/syscall.h keeps the kernel stack for the next entry from user mode
+ * in `syscall_kstack`, one global word for the machine. That is sound
+ * while exactly one processor ever runs ring-3 code: the word is
+ * rewritten by every switch, and only the processor doing the switching
+ * reads it. Two user threads entering SYSCALL simultaneously on two
+ * processors would both load that one word and the second would build
+ * its register frame on top of the first one's kernel stack.
+ *
+ * The futex comment in src/desktop.h already relies on this being true.
+ * A process with several threads is the first thing in this system that
+ * could make it false by accident, so the home is set rather than
+ * chosen. sched_pick's fallback still lets another processor run the
+ * thread if its own queue is empty — that is a separate question, and
+ * one src/smp.h lists among the things a real lock would have to cover
+ * before application processors dispatch user work at all.
+ */
+thread_t *sched_spawn_thread(addr_space_t *as, uint64_t entry,
+                             uint64_t user_stack, uint64_t arg,
+                             uint64_t fsbase, const char *name) {
+    if (!as) return 0;
+
+    thread_t *t = sched_new(name, PRIO_NORMAL);
+    if (!t) return 0;
+    t->user   = 1;
+    t->as     = as;
+    t->cr3    = as->pml4_phys;
+    t->fsbase = fsbase;
+
+    /* Off the queue it was put on by name, and onto processor zero's.
+     * sched_new has already counted it somewhere, so the move has to be
+     * a leave and a join rather than an assignment. */
+    if (t->cpu != 0) {
+        sched_rq_leave(t);
+        t->cpu = 0;
+        sched_rq_join(t);
+    }
+
+    uint64_t frame = sched_build_frame(t, entry, user_stack, 1);
+    ((trap_frame_t *)(uintptr_t)frame)->rdi = arg;
+    t->rsp = frame;
+
+    uint64_t flags = irq_save();
+    if (sched_register(t) < 0) {
+        irq_restore(flags);
+        sched_rq_leave(t);
+        kstack_free(t->kstack, SCHED_KSTACK);
+        kfree(t);
+        return 0;
+    }
+    /* Counted only once the thread is certain to exist. A failed
+     * registration that had already incremented would leave a process
+     * whose last real thread could never take the count to zero, and the
+     * address space would outlive every thread in it. */
+    as->refs++;
+    irq_restore(flags);
+    return t;
+}
+
+/*
  * A thread that resumes where its parent is, in a different address
  * space.
  *
@@ -931,7 +1088,37 @@ void sched_reap(void) {
          * never counts a thread that no longer exists. */
         sched_rq_leave(t);
 
-        if (t->as) { vmm_destroy(t->as); kfree(t->as); }
+        /*
+         * The address space goes when the last thread standing in it
+         * does, and not before.
+         *
+         * This used to be an unconditional destroy, which was right for
+         * as long as an address space had exactly one thread — a process
+         * was a thread that carried one. SYS_CLONE breaks that: a pthread
+         * shares its creator's space, because sharing the heap and the
+         * globals is what threading *is*. Destroying on the first exit
+         * would unmap the page tables out from under every sibling still
+         * running on them.
+         *
+         * A count of zero rather than one is the guard for spaces that
+         * were never counted at all. Nothing creates one now — vmm_create
+         * sets it to one — but a zero here would wrap to four billion and
+         * leak the space forever, and a subtraction that can wrap is
+         * worth one comparison to prevent.
+         *
+         * No atomic and no lock: this runs on the compositor thread,
+         * which is the only caller of sched_reap, and the increment side
+         * runs inside a system call with interrupts masked. There is
+         * never a second writer.
+         */
+        if (t->as) {
+            if (t->as->refs > 1) {
+                t->as->refs--;
+            } else {
+                vmm_destroy(t->as);
+                kfree(t->as);
+            }
+        }
         if (t->kstack) kstack_free(t->kstack, SCHED_KSTACK);
         serial_puts("[sched] reaped ");
         serial_puts(t->name);

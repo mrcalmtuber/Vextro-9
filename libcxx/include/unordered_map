@@ -1,0 +1,549 @@
+// -*- C++ -*-
+#ifndef _VXCXX_UNORDERED_MAP
+#define _VXCXX_UNORDERED_MAP
+
+/*
+ * <unordered_map> — a hash table with chained buckets.
+ *
+ * ============================================================
+ *  CHAINING, NOT OPEN ADDRESSING
+ * ============================================================
+ *
+ * Open addressing is faster on a modern processor and is what a
+ * from-scratch table would reach for. It is the wrong choice here, and
+ * the reason is a guarantee rather than a preference:
+ *
+ *   The standard requires that references and pointers to elements stay
+ *   valid across a rehash. Only iterators are invalidated.
+ *
+ * Ported code relies on that constantly — a pointer taken to a mapped
+ * value, held while more entries are inserted. With open addressing the
+ * elements *are* the array, so growing it moves every one of them and
+ * every outstanding pointer dangles. With chaining the elements are
+ * nodes the bucket array merely points at, so a rehash rebuilds the
+ * array and moves nothing. The guarantee falls out of the structure.
+ *
+ * ============================================================
+ *  WHAT IT COSTS
+ * ============================================================
+ *
+ * One allocation per element, from `operator new` — which for anything
+ * of a quarter megabyte or more is a mapping of its own, though a node
+ * here never is. Buckets are a power of two, so the index is a mask
+ * rather than a division; a division by a non-constant is around twenty
+ * cycles and it would be on the lookup path.
+ *
+ * The load factor is 1.0 by default: on average one element per bucket.
+ * Growth doubles.
+ *
+ * ============================================================
+ *  DEVIATIONS, STATED
+ * ============================================================
+ *
+ *   at() on a missing key prints the failure and stops, because there
+ *   are no exceptions here. Same decision as vector::at, same reason —
+ *   at() is the accessor a caller chose *because* it wanted the check,
+ *   and there is no reference to a nonexistent element to return.
+ *
+ *   The allocator parameter is accepted and unused; every allocation
+ *   goes through ::operator new. A container that took an allocator and
+ *   ignored it silently would be worse, so this says so.
+ *
+ *   Local (per-bucket) iterators and the bucket() interface are not
+ *   here. They exist for code inspecting a table's distribution, and
+ *   nothing does.
+ */
+
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <functional>
+#include <memory>
+#include <iterator>
+#include <initializer_list>
+
+namespace std {
+
+template <class Key, class T,
+          class Hash = hash<Key>,
+          class KeyEqual = equal_to<Key>,
+          class Alloc = allocator<pair<const Key, T>>>
+class unordered_map {
+public:
+    using key_type        = Key;
+    using mapped_type     = T;
+    using value_type      = pair<const Key, T>;
+    using size_type       = size_t;
+    using difference_type = ptrdiff_t;
+    using hasher          = Hash;
+    using key_equal       = KeyEqual;
+    using allocator_type  = Alloc;
+    using reference       = value_type &;
+    using const_reference = const value_type &;
+
+private:
+    struct node {
+        node      *next;
+        size_t     hash;      /* kept, so a rehash never recomputes it  */
+        value_type kv;
+
+        template <class... A>
+        explicit node(size_t h, A &&...args)
+            : next(nullptr), hash(h), kv(std::forward<A>(args)...) {}
+    };
+
+    node     **buckets_ = nullptr;
+    size_type  nbuckets_ = 0;
+    size_type  count_ = 0;
+    float      max_load_ = 1.0f;
+    hasher     hash_{};
+    key_equal  eq_{};
+
+public:
+    /*
+     * A forward iterator over every element, in no order anybody should
+     * rely on.
+     *
+     * It walks the bucket array and each chain in turn, which is why it
+     * holds both a bucket index and a node: stepping off the end of one
+     * chain means finding the next non-empty bucket, and that needs the
+     * array.
+     */
+    template <bool Const>
+    class iter {
+        friend class unordered_map;
+        using map_t  = conditional_t<Const, const unordered_map, unordered_map>;
+        using node_t = conditional_t<Const, const node, node>;
+
+        map_t  *m_ = nullptr;
+        size_t  b_ = 0;
+        node_t *n_ = nullptr;
+
+        void skip_empty() {
+            while (!n_ && b_ + 1 < m_->nbuckets_) n_ = m_->buckets_[++b_];
+        }
+
+    public:
+        using iterator_category = forward_iterator_tag;
+        using value_type        = unordered_map::value_type;
+        using difference_type   = ptrdiff_t;
+        using pointer           = conditional_t<Const, const value_type *,
+                                                       value_type *>;
+        using reference         = conditional_t<Const, const value_type &,
+                                                       value_type &>;
+
+        iter() = default;
+        iter(map_t *m, size_t b, node_t *n) : m_(m), b_(b), n_(n) {
+            if (!n_) skip_empty();
+        }
+
+        /* A non-const iterator converts to a const one, and not the
+         * other way, which is what cbegin()/find() on a const map need. */
+        template <bool C2, class = enable_if_t<Const && !C2>>
+        iter(const iter<C2> &o) : m_(o.m_), b_(o.b_), n_(o.n_) {}
+
+        reference operator*()  const { return n_->kv; }
+        pointer   operator->() const { return &n_->kv; }
+
+        iter &operator++() {
+            n_ = n_->next;
+            skip_empty();
+            return *this;
+        }
+        iter operator++(int) { iter t = *this; ++*this; return t; }
+
+        template <bool C2>
+        bool operator==(const iter<C2> &o) const { return n_ == o.n_; }
+        template <bool C2>
+        bool operator!=(const iter<C2> &o) const { return n_ != o.n_; }
+
+        template <bool> friend class iter;
+    };
+
+    using iterator       = iter<false>;
+    using const_iterator = iter<true>;
+
+    unordered_map() = default;
+
+    explicit unordered_map(size_type buckets) { rehash(buckets); }
+
+    unordered_map(initializer_list<value_type> l) {
+        reserve(l.size());
+        for (const value_type *p = l.begin(); p != l.end(); ++p) insert(*p);
+    }
+
+    template <class I, class = enable_if_t<!is_integral<I>::value>>
+    unordered_map(I first, I last) {
+        for (; first != last; ++first) insert(*first);
+    }
+
+    unordered_map(const unordered_map &o) {
+        reserve(o.count_);
+        for (const_iterator it = o.begin(); it != o.end(); ++it) insert(*it);
+    }
+
+    unordered_map(unordered_map &&o) noexcept
+        : buckets_(o.buckets_), nbuckets_(o.nbuckets_), count_(o.count_),
+          max_load_(o.max_load_), hash_(std::move(o.hash_)),
+          eq_(std::move(o.eq_)) {
+        o.buckets_ = nullptr;
+        o.nbuckets_ = 0;
+        o.count_ = 0;
+    }
+
+    ~unordered_map() { clear(); ::operator delete(buckets_); }
+
+    unordered_map &operator=(const unordered_map &o) {
+        if (this != &o) {
+            clear();
+            reserve(o.count_);
+            for (const_iterator it = o.begin(); it != o.end(); ++it) insert(*it);
+        }
+        return *this;
+    }
+
+    unordered_map &operator=(unordered_map &&o) noexcept {
+        if (this != &o) {
+            clear();
+            ::operator delete(buckets_);
+            buckets_ = o.buckets_; nbuckets_ = o.nbuckets_; count_ = o.count_;
+            max_load_ = o.max_load_;
+            o.buckets_ = nullptr; o.nbuckets_ = 0; o.count_ = 0;
+        }
+        return *this;
+    }
+
+    /* ---- size ---- */
+
+    bool      empty() const noexcept { return count_ == 0; }
+    size_type size()  const noexcept { return count_; }
+    size_type max_size() const noexcept { return (size_type)-1 / sizeof(node); }
+    size_type bucket_count() const noexcept { return nbuckets_; }
+
+    float load_factor() const noexcept {
+        return nbuckets_ ? (float)count_ / (float)nbuckets_ : 0.0f;
+    }
+    float max_load_factor() const noexcept { return max_load_; }
+    void  max_load_factor(float f) { if (f > 0.0f) max_load_ = f; }
+
+    hasher    hash_function() const { return hash_; }
+    key_equal key_eq() const { return eq_; }
+    allocator_type get_allocator() const { return allocator_type(); }
+
+    /* ---- iteration ---- */
+
+    /*
+     * begin() has to report the bucket the first element is *in*, not
+     * zero.
+     *
+     * An iterator carries both a node and the index of its bucket, and
+     * the index is what stepping off the end of a chain resumes the
+     * scan from. Handing back the first node with an index of zero
+     * therefore made the scan restart at the beginning of the array and
+     * hand out that same first element a second time — so a walk visited
+     * one element twice and reported a count one larger than size().
+     * Caught by tools/cxx_test.cpp on a table of five thousand.
+     */
+    iterator begin() {
+        size_type b = 0;
+        while (b < nbuckets_ && !buckets_[b]) b++;
+        return iterator(this, b, b < nbuckets_ ? buckets_[b] : nullptr);
+    }
+    const_iterator begin() const {
+        size_type b = 0;
+        while (b < nbuckets_ && !buckets_[b]) b++;
+        return const_iterator(this, b, b < nbuckets_ ? buckets_[b] : nullptr);
+    }
+    iterator       end()          { return iterator(this, nbuckets_, nullptr); }
+    const_iterator end()    const { return const_iterator(this, nbuckets_, nullptr); }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend()   const { return end(); }
+
+    /* ---- looking up ---- */
+
+    iterator find(const Key &k) {
+        node *n = find_node(k);
+        return n ? iterator(this, bucket_of(n->hash), n) : end();
+    }
+    const_iterator find(const Key &k) const {
+        const node *n = find_node(k);
+        return n ? const_iterator(this, bucket_of(n->hash), n) : end();
+    }
+
+    size_type count(const Key &k) const { return find_node(k) ? 1 : 0; }
+    bool contains(const Key &k) const { return find_node(k) != nullptr; }
+
+    T &operator[](const Key &k) {
+        node *n = find_node(k);
+        if (n) return n->kv.second;
+        /* Default-constructs the mapped value, which is what makes
+         * `counts[word]++` work on a key that was not there. */
+        return insert_new(k, T()).first->second;
+    }
+
+    T &operator[](Key &&k) {
+        node *n = find_node(k);
+        if (n) return n->kv.second;
+        return insert_new(std::move(k), T()).first->second;
+    }
+
+    T &at(const Key &k) {
+        node *n = find_node(k);
+        if (!n) missing();
+        return n->kv.second;
+    }
+    const T &at(const Key &k) const {
+        const node *n = find_node(k);
+        if (!n) missing();
+        return n->kv.second;
+    }
+
+    /* ---- inserting ---- */
+
+    pair<iterator, bool> insert(const value_type &v) {
+        node *n = find_node(v.first);
+        if (n) return { iterator(this, bucket_of(n->hash), n), false };
+        return insert_new(v.first, v.second);
+    }
+
+    pair<iterator, bool> insert(value_type &&v) {
+        node *n = find_node(v.first);
+        if (n) return { iterator(this, bucket_of(n->hash), n), false };
+        return insert_new(std::move(const_cast<Key &>(v.first)),
+                          std::move(v.second));
+    }
+
+    template <class I, class = enable_if_t<!is_integral<I>::value>>
+    void insert(I first, I last) {
+        for (; first != last; ++first) insert(*first);
+    }
+
+    void insert(initializer_list<value_type> l) {
+        for (const value_type *p = l.begin(); p != l.end(); ++p) insert(*p);
+    }
+
+    template <class... A>
+    pair<iterator, bool> emplace(A &&...args) {
+        /*
+         * Built first, then looked up, which is the one place this is
+         * less efficient than it could be: a construction is wasted when
+         * the key turns out to be present. The alternative needs the key
+         * before the value exists, and for `emplace(a, b)` the key *is*
+         * one of the arguments being forwarded — deducing it without
+         * constructing is what a full implementation's several
+         * overloads are for.
+         */
+        value_type v(std::forward<A>(args)...);
+        return insert(std::move(v));
+    }
+
+    template <class... A>
+    pair<iterator, bool> try_emplace(const Key &k, A &&...args) {
+        node *n = find_node(k);
+        if (n) return { iterator(this, bucket_of(n->hash), n), false };
+        return insert_new(k, T(std::forward<A>(args)...));
+    }
+
+    /* ---- removing ---- */
+
+    size_type erase(const Key &k) {
+        if (!nbuckets_) return 0;
+        const size_t h = hash_(k);
+        const size_t b = h & (nbuckets_ - 1);
+        node **link = &buckets_[b];
+        while (*link) {
+            if ((*link)->hash == h && eq_((*link)->kv.first, k)) {
+                node *dead = *link;
+                *link = dead->next;
+                delete dead;
+                count_--;
+                return 1;
+            }
+            link = &(*link)->next;
+        }
+        return 0;
+    }
+
+    iterator erase(const_iterator pos) {
+        iterator next(this, pos.b_, const_cast<node *>(pos.n_));
+        ++next;
+        erase(pos.n_->kv.first);
+        return next;
+    }
+
+    void clear() noexcept {
+        for (size_type i = 0; i < nbuckets_; i++) {
+            node *n = buckets_[i];
+            while (n) { node *d = n; n = n->next; delete d; }
+            buckets_[i] = nullptr;
+        }
+        count_ = 0;
+    }
+
+    void swap(unordered_map &o) noexcept {
+        std::swap(buckets_, o.buckets_);
+        std::swap(nbuckets_, o.nbuckets_);
+        std::swap(count_, o.count_);
+        std::swap(max_load_, o.max_load_);
+    }
+
+    /* ---- growing ---- */
+
+    void rehash(size_type want) {
+        size_type n = 8;
+        while (n < want) n *= 2;
+        if (n == nbuckets_) return;
+
+        node **fresh = (node **)::operator new(n * sizeof(node *));
+        for (size_type i = 0; i < n; i++) fresh[i] = nullptr;
+
+        /*
+         * Relinked, not reinserted. Each node keeps the hash it was
+         * built with, so moving it is finding its new bucket and
+         * splicing it in — no key is hashed twice and, crucially, no
+         * element is copied, which is what keeps every outstanding
+         * pointer to a mapped value valid.
+         */
+        for (size_type i = 0; i < nbuckets_; i++) {
+            node *n2 = buckets_[i];
+            while (n2) {
+                node *next = n2->next;
+                const size_t b = n2->hash & (n - 1);
+                n2->next = fresh[b];
+                fresh[b] = n2;
+                n2 = next;
+            }
+        }
+
+        ::operator delete(buckets_);
+        buckets_ = fresh;
+        nbuckets_ = n;
+    }
+
+    void reserve(size_type n) {
+        if (max_load_ > 0.0f) rehash((size_type)((float)n / max_load_) + 1);
+    }
+
+private:
+    size_t bucket_of(size_t h) const { return nbuckets_ ? h & (nbuckets_ - 1) : 0; }
+
+    node *find_node(const Key &k) const {
+        if (!nbuckets_) return nullptr;
+        const size_t h = hash_(k);
+        for (node *n = buckets_[h & (nbuckets_ - 1)]; n; n = n->next)
+            if (n->hash == h && eq_(n->kv.first, k)) return n;
+        return nullptr;
+    }
+
+    template <class K2, class V2>
+    pair<iterator, bool> insert_new(K2 &&k, V2 &&v) {
+        if (!nbuckets_ ||
+            (float)(count_ + 1) > max_load_ * (float)nbuckets_) {
+            rehash(nbuckets_ ? nbuckets_ * 2 : 8);
+        }
+        const size_t h = hash_(k);
+        const size_t b = h & (nbuckets_ - 1);
+
+        node *n = new node(h, std::forward<K2>(k), std::forward<V2>(v));
+        n->next = buckets_[b];
+        buckets_[b] = n;
+        count_++;
+        return { iterator(this, b, n), true };
+    }
+
+    [[noreturn]] static void missing() {
+        fputs_stream("libcxx: unordered_map::at() on a key that is not "
+                     "there\n", stderr);
+        abort();
+    }
+};
+
+template <class K, class T, class H, class E, class A>
+void swap(unordered_map<K, T, H, E, A> &a, unordered_map<K, T, H, E, A> &b) noexcept {
+    a.swap(b);
+}
+
+template <class K, class T, class H, class E, class A>
+bool operator==(const unordered_map<K, T, H, E, A> &a,
+                const unordered_map<K, T, H, E, A> &b) {
+    if (a.size() != b.size()) return false;
+    for (auto it = a.begin(); it != a.end(); ++it) {
+        auto found = b.find(it->first);
+        if (found == b.end() || !(found->second == it->second)) return false;
+    }
+    return true;
+}
+
+template <class K, class T, class H, class E, class A>
+bool operator!=(const unordered_map<K, T, H, E, A> &a,
+                const unordered_map<K, T, H, E, A> &b) {
+    return !(a == b);
+}
+
+/*
+ * unordered_set, over the same table.
+ *
+ * A set is a map whose mapped type carries nothing, and rather than a
+ * second implementation of the same chaining this is that — the value is
+ * a `monostate`-shaped empty struct, and the interface presents keys.
+ * The one visible consequence is that an element is a pair internally;
+ * nothing outside sees it.
+ */
+struct __vx_empty_value {
+    bool operator==(const __vx_empty_value &) const { return true; }
+};
+
+template <class Key, class Hash = hash<Key>, class KeyEqual = equal_to<Key>>
+class unordered_set {
+    using table = unordered_map<Key, __vx_empty_value, Hash, KeyEqual>;
+    table t_;
+
+public:
+    using key_type   = Key;
+    using value_type = Key;
+    using size_type  = size_t;
+
+    unordered_set() = default;
+
+    unordered_set(initializer_list<Key> l) {
+        for (const Key *p = l.begin(); p != l.end(); ++p) insert(*p);
+    }
+
+    bool      empty() const noexcept { return t_.empty(); }
+    size_type size()  const noexcept { return t_.size(); }
+    void      clear() noexcept { t_.clear(); }
+    void      reserve(size_type n) { t_.reserve(n); }
+
+    pair<bool, bool> __insert_raw(const Key &k) {
+        auto r = t_.insert({ k, __vx_empty_value{} });
+        return { true, r.second };
+    }
+
+    bool insert(const Key &k) { return t_.insert({ k, __vx_empty_value{} }).second; }
+    bool contains(const Key &k) const { return t_.contains(k); }
+    size_type count(const Key &k) const { return t_.count(k); }
+    size_type erase(const Key &k) { return t_.erase(k); }
+
+    /* Iteration yields the key, which is the first of the pair the table
+     * actually holds. */
+    class const_iterator {
+        typename table::const_iterator i_;
+    public:
+        explicit const_iterator(typename table::const_iterator i) : i_(i) {}
+        const Key &operator*() const { return i_->first; }
+        const Key *operator->() const { return &i_->first; }
+        const_iterator &operator++() { ++i_; return *this; }
+        bool operator==(const const_iterator &o) const { return i_ == o.i_; }
+        bool operator!=(const const_iterator &o) const { return i_ != o.i_; }
+    };
+
+    const_iterator begin() const { return const_iterator(t_.begin()); }
+    const_iterator end()   const { return const_iterator(t_.end()); }
+};
+
+}  // namespace std
+
+#endif

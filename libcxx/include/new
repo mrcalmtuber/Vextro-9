@@ -1,0 +1,148 @@
+// -*- C++ -*-
+#ifndef _VXCXX_NEW
+#define _VXCXX_NEW
+
+/*
+ * <new> — where objects come from.
+ *
+ * ============================================================
+ *  WHAT `new` DOES WHEN THERE IS NO MEMORY
+ * ============================================================
+ *
+ * It stops the program, with a message.
+ *
+ * The standard says plain `operator new` throws std::bad_alloc, and this
+ * runtime is built with -fno-exceptions: there is no unwinder, no
+ * personality routine and nothing to catch it, so `throw` is not
+ * available to be honest with. The three ways out of that are to return
+ * null, to throw anyway, or to stop, and only one of them is safe.
+ *
+ * Returning null is the dangerous one and it is worth saying why, since
+ * it looks like the gentlest option. Code compiled against a throwing
+ * `new` does not check its result — that is the entire contract — so a
+ * null return is not an error path, it is a null pointer dereference
+ * some lines later, at whichever member the constructor touches first.
+ * The failure would then be reported as a fault in the object rather
+ * than as running out of memory.
+ *
+ * So plain `new` aborts, and `new (std::nothrow)` returns null, which is
+ * exactly what its callers are written to check. That is what every
+ * embedded build of libstdc++ does with exceptions off, and what WebKit
+ * itself expects: its own allocator calls CRASH() on failure.
+ *
+ * ============================================================
+ *  WHERE THE MEMORY COMES FROM
+ * ============================================================
+ *
+ * malloc, which since descriptors arrived has an mmap-backed path for
+ * anything of a quarter megabyte or more — so a large `new` is a mapping
+ * of its own and giving it back with `delete` returns the frames rather
+ * than parking them on a free list forever.
+ *
+ * Going to mmap directly from here would be the other way to satisfy
+ * "operator new is mmap-backed", and it would be worse: two allocators
+ * over one address space, each unable to reuse what the other freed, and
+ * a `new char[16]` costing a page. One allocator with a large path is
+ * the same property with none of that.
+ */
+
+#include <cstddef>
+
+namespace std {
+
+/*
+ * bad_alloc exists as a type because ported code names it — in a
+ * declaration, in a `catch` clause the compiler removes, in a comment
+ * that became code. Nothing here ever constructs one, because nothing
+ * here throws.
+ */
+class bad_alloc {
+public:
+    bad_alloc() noexcept {}
+    virtual ~bad_alloc();
+    virtual const char *what() const noexcept;
+};
+
+class bad_array_new_length : public bad_alloc {
+public:
+    bad_array_new_length() noexcept {}
+    ~bad_array_new_length() override;
+    const char *what() const noexcept override;
+};
+
+struct nothrow_t { explicit nothrow_t() = default; };
+extern const nothrow_t nothrow;
+
+/* C++17's over-aligned allocation. The compiler emits calls to the
+ * aligned forms by itself for any type whose alignment exceeds
+ * __STDCPP_DEFAULT_NEW_ALIGNMENT__, so these are not optional even for
+ * code that never names them. */
+enum class align_val_t : size_t {};
+
+using new_handler = void (*)();
+new_handler set_new_handler(new_handler h) noexcept;
+new_handler get_new_handler() noexcept;
+
+/* C++17. A no-op here that the optimiser must not see through, which is
+ * what the attribute is for: this system has no type-based aliasing
+ * surprises for it to launder, but code that calls it expects the
+ * pointer back unmolested. */
+template <class T>
+[[nodiscard]] constexpr T *launder(T *p) noexcept { return __builtin_launder(p); }
+
+}  // namespace std
+
+/* ---- the allocation functions ----
+ *
+ * All twelve of them, and the count is not padding. The compiler chooses
+ * between them by itself: sized delete has been emitted by default since
+ * C++14, and the aligned forms are emitted for any over-aligned type. A
+ * runtime missing one of those does not fail to compile — it fails to
+ * link, at the end of a long build, with an undefined symbol whose name
+ * has to be demangled before it says anything.
+ */
+void *operator new(std::size_t n);
+void *operator new[](std::size_t n);
+void *operator new(std::size_t n, const std::nothrow_t &) noexcept;
+void *operator new[](std::size_t n, const std::nothrow_t &) noexcept;
+void *operator new(std::size_t n, std::align_val_t a);
+void *operator new[](std::size_t n, std::align_val_t a);
+void *operator new(std::size_t n, std::align_val_t a,
+                   const std::nothrow_t &) noexcept;
+void *operator new[](std::size_t n, std::align_val_t a,
+                     const std::nothrow_t &) noexcept;
+
+void operator delete(void *p) noexcept;
+void operator delete[](void *p) noexcept;
+void operator delete(void *p, std::size_t n) noexcept;
+void operator delete[](void *p, std::size_t n) noexcept;
+void operator delete(void *p, const std::nothrow_t &) noexcept;
+void operator delete[](void *p, const std::nothrow_t &) noexcept;
+void operator delete(void *p, std::align_val_t a) noexcept;
+void operator delete[](void *p, std::align_val_t a) noexcept;
+void operator delete(void *p, std::size_t n, std::align_val_t a) noexcept;
+void operator delete[](void *p, std::size_t n, std::align_val_t a) noexcept;
+void operator delete(void *p, std::align_val_t a,
+                     const std::nothrow_t &) noexcept;
+void operator delete[](void *p, std::align_val_t a,
+                       const std::nothrow_t &) noexcept;
+
+/* Placement new: constructs at an address and allocates nothing. Inline
+ * and marked so, because every container in this library calls it once
+ * per element and a function call per element would be the whole cost of
+ * a vector.
+ *
+ * The (void)n is not decoration -- without it GCC warns about an unused
+ * parameter in a header that every translation unit includes. */
+[[nodiscard]] inline void *operator new(std::size_t n, void *p) noexcept {
+    (void)n;
+    return p;
+}
+[[nodiscard]] inline void *operator new[](std::size_t n, void *p) noexcept {
+    (void)n;
+    return p;
+}
+inline void operator delete(void *, void *) noexcept {}
+inline void operator delete[](void *, void *) noexcept {}
+
+#endif  // _VXCXX_NEW

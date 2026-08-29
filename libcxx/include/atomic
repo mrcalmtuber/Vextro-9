@@ -1,0 +1,180 @@
+// -*- C++ -*-
+#ifndef _VXCXX_ATOMIC
+#define _VXCXX_ATOMIC
+
+/*
+ * <atomic> — over the compiler's own builtins.
+ *
+ * There is nothing else it could be built on. An atomic operation is a
+ * property of the instruction the compiler emits, so a library cannot
+ * implement one; what it can do is name the memory orderings and map
+ * them onto __atomic_*, which is what this does.
+ *
+ * ---- one deliberate restriction ----
+ *
+ * Only types of one, two, four and eight bytes. A sixteen-byte atomic on
+ * x86-64 needs CMPXCHG16B and, for the read side, a call into libatomic
+ * — a library this toolchain does not have. Rather than leave that to be
+ * discovered as an undefined symbol at the end of a build, the static
+ * assertion below says so at the declaration.
+ *
+ * ---- and one thing that is free here ----
+ *
+ * Every ring-3 thread in this system runs on processor zero; the note in
+ * third_party/wpe-config/vextro-wpe.cmake explains why. So the fences
+ * below are compiler barriers that happen to also be processor barriers,
+ * and the atomics are genuinely atomic against preemption, which is the
+ * only concurrency a user program here has. Nothing depends on that: the
+ * builtins emit the LOCK prefixes regardless, so this remains correct
+ * the day a second processor starts dispatching user threads.
+ */
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+namespace std {
+
+enum memory_order : int {
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST
+};
+
+inline void atomic_thread_fence(memory_order o) noexcept {
+    __atomic_thread_fence((int)o);
+}
+inline void atomic_signal_fence(memory_order o) noexcept {
+    __atomic_signal_fence((int)o);
+}
+
+template <class T>
+struct atomic {
+    static_assert(is_trivially_copyable<T>::value,
+                  "an atomic must be trivially copyable");
+    static_assert(sizeof(T) <= 8,
+                  "atomics wider than eight bytes would need libatomic, "
+                  "which this toolchain does not have");
+
+    atomic() noexcept = default;
+    constexpr atomic(T v) noexcept : v_(v) {}
+    atomic(const atomic &) = delete;
+    atomic &operator=(const atomic &) = delete;
+
+    static constexpr bool is_always_lock_free = sizeof(T) <= 8;
+    bool is_lock_free() const noexcept { return is_always_lock_free; }
+
+    void store(T v, memory_order o = memory_order_seq_cst) noexcept {
+        __atomic_store_n(&v_, v, (int)o);
+    }
+    T load(memory_order o = memory_order_seq_cst) const noexcept {
+        return __atomic_load_n(&v_, (int)o);
+    }
+    T exchange(T v, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_exchange_n(&v_, v, (int)o);
+    }
+
+    bool compare_exchange_strong(T &expected, T desired,
+                                 memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange_n(&v_, &expected, desired, false,
+                                           (int)o, __ATOMIC_RELAXED);
+    }
+    bool compare_exchange_weak(T &expected, T desired,
+                               memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange_n(&v_, &expected, desired, true,
+                                           (int)o, __ATOMIC_RELAXED);
+    }
+    bool compare_exchange_strong(T &expected, T desired, memory_order succ,
+                                 memory_order fail) noexcept {
+        return __atomic_compare_exchange_n(&v_, &expected, desired, false,
+                                           (int)succ, (int)fail);
+    }
+    bool compare_exchange_weak(T &expected, T desired, memory_order succ,
+                               memory_order fail) noexcept {
+        return __atomic_compare_exchange_n(&v_, &expected, desired, true,
+                                           (int)succ, (int)fail);
+    }
+
+    /* The arithmetic forms, which only make sense for something you can
+     * add to. Guarded so that atomic<SomeStruct> still compiles and
+     * simply does not have them, rather than failing to instantiate. */
+    template <class U = T, class = enable_if_t<is_integral<U>::value ||
+                                               is_pointer<U>::value>>
+    T fetch_add(ptrdiff_t d, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_add(&v_, d, (int)o);
+    }
+    template <class U = T, class = enable_if_t<is_integral<U>::value ||
+                                               is_pointer<U>::value>>
+    T fetch_sub(ptrdiff_t d, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_sub(&v_, d, (int)o);
+    }
+    template <class U = T, class = enable_if_t<is_integral<U>::value>>
+    T fetch_and(T m, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_and(&v_, m, (int)o);
+    }
+    template <class U = T, class = enable_if_t<is_integral<U>::value>>
+    T fetch_or(T m, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_or(&v_, m, (int)o);
+    }
+    template <class U = T, class = enable_if_t<is_integral<U>::value>>
+    T fetch_xor(T m, memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_xor(&v_, m, (int)o);
+    }
+
+    operator T() const noexcept { return load(); }
+    T operator=(T v) noexcept { store(v); return v; }
+
+    T operator++()    noexcept { return __atomic_add_fetch(&v_, 1, __ATOMIC_SEQ_CST); }
+    T operator++(int) noexcept { return __atomic_fetch_add(&v_, 1, __ATOMIC_SEQ_CST); }
+    T operator--()    noexcept { return __atomic_sub_fetch(&v_, 1, __ATOMIC_SEQ_CST); }
+    T operator--(int) noexcept { return __atomic_fetch_sub(&v_, 1, __ATOMIC_SEQ_CST); }
+    T operator+=(T d) noexcept { return __atomic_add_fetch(&v_, d, __ATOMIC_SEQ_CST); }
+    T operator-=(T d) noexcept { return __atomic_sub_fetch(&v_, d, __ATOMIC_SEQ_CST); }
+
+private:
+    T v_{};
+};
+
+using atomic_bool     = atomic<bool>;
+using atomic_char     = atomic<char>;
+using atomic_int      = atomic<int>;
+using atomic_uint     = atomic<unsigned int>;
+using atomic_long     = atomic<long>;
+using atomic_ulong    = atomic<unsigned long>;
+using atomic_llong    = atomic<long long>;
+using atomic_ullong   = atomic<unsigned long long>;
+using atomic_size_t   = atomic<size_t>;
+using atomic_intptr_t = atomic<intptr_t>;
+using atomic_int32_t  = atomic<int32_t>;
+using atomic_uint32_t = atomic<uint32_t>;
+using atomic_int64_t  = atomic<int64_t>;
+using atomic_uint64_t = atomic<uint64_t>;
+
+/*
+ * atomic_flag: the one type the standard guarantees is lock free on
+ * every implementation, because it is the one every implementation can
+ * build a lock out of.
+ */
+struct atomic_flag {
+    constexpr atomic_flag() noexcept : v_(false) {}
+    atomic_flag(const atomic_flag &) = delete;
+    atomic_flag &operator=(const atomic_flag &) = delete;
+
+    bool test_and_set(memory_order o = memory_order_seq_cst) noexcept {
+        return __atomic_test_and_set(&v_, (int)o);
+    }
+    void clear(memory_order o = memory_order_seq_cst) noexcept {
+        __atomic_clear(&v_, (int)o);
+    }
+private:
+    bool v_;
+};
+
+#define ATOMIC_FLAG_INIT {}
+
+}  // namespace std
+
+#endif

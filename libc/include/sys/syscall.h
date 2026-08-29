@@ -1,6 +1,19 @@
 #ifndef _SYS_SYSCALL_H
 #define _SYS_SYSCALL_H
 
+/* C++ reaches these now.
+ *
+ * libcxx/ compiles against this same library, and a C++ compiler mangles
+ * every name it sees unless told not to -- so without this the C++ side
+ * would fail to link against `malloc` and find `_Z6mallocm` missing.
+ * Placed immediately after the include guard rather than after the
+ * #includes below it, which is safe here because everything this header
+ * includes is either one of the compiler's own type-only headers or one
+ * of ours, and both want the same treatment. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * The system call interface, as user space sees it.
  *
@@ -44,6 +57,7 @@
  * has nothing in. Declaring the truth is cheaper and just as correct.
  */
 #include <stdint.h>
+#include <errno.h>
 
 #define VX_CLOBBER_XMM \
     "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7", \
@@ -68,6 +82,62 @@
 #define SYS_FS_WRITE        27
 #define SYS_REG_SET         28
 #define SYS_BLK_WRITE       29
+
+/*
+ * 30-39: memory that is not the break, and threads that are not forks.
+ *
+ * The kernel's copy of these numbers and the reasoning behind each of
+ * them is in src/syscall.h. What matters on this side is which of them
+ * return a value, because that decides which door they may use: all of
+ * them do, so all of them go through SYSCALL. None of these may ever be
+ * called through `int 0x80` -- the legacy gate preserves RAX by an old
+ * promise to binaries already on disk, so mmap through it would return
+ * the number 30 rather than an address.
+ */
+#define SYS_MMAP            30
+#define SYS_MUNMAP          31
+#define SYS_MPROTECT        32
+#define SYS_CLONE           33
+#define SYS_THREAD_EXIT     34
+#define SYS_GETTID          35
+#define SYS_SET_FSBASE      36
+#define SYS_CLOCK           37
+#define SYS_EXIT_GROUP      38
+#define SYS_NANOSLEEP       39
+
+/*
+ * 40-58: descriptors, and the two things one can name.
+ *
+ * The kernel's copy of these numbers, and the argument for every one of
+ * them, is in src/syscall.h. What matters on this side is the *return
+ * convention*, because it is not the one the calls above use.
+ *
+ * Everything below 40 answers -1 and nothing else. These answer the
+ * negated error number — -ENOENT, -EACCES, -EISDIR — and a non-negative
+ * value on success, which is what Linux's system calls do and therefore
+ * what the code being ported already expects its C library to unpack.
+ * __syscall_ret below is where the unpacking happens, once, so that no
+ * wrapper has to remember.
+ */
+#define SYS_OPEN            40
+#define SYS_READ            41
+#define SYS_CLOSE           42
+#define SYS_LSEEK           43
+#define SYS_STAT            44
+#define SYS_FSTAT           45
+#define SYS_GETDENTS        46
+#define SYS_UNLINK          47
+#define SYS_MKDIR           48
+#define SYS_FSYNC           49
+#define SYS_FTRUNCATE       50
+#define SYS_SOCKET          51
+#define SYS_CONNECT         52
+#define SYS_CONNECT_HOST    53
+#define SYS_SEND            54
+#define SYS_RECV            55
+#define SYS_SOCKOPT         56
+#define SYS_SHUTDOWN        57
+#define SYS_RESOLVE         58
 
 /* futex operations. See <vxmutex.h> for what to build on them. */
 #define FUTEX_WAIT          0
@@ -109,5 +179,32 @@ static inline long __syscall4(long n, long a, long b, long c, long d) {
                      : "rcx", "r11", "memory", VX_CLOBBER_XMM);
     return r;
 }
+
+/*
+ * ---- turning a kernel answer into a C answer ----
+ *
+ * The calls from 40 upwards report failure as a negated error number.
+ * Every C function built on them reports it as -1 with the reason in
+ * errno. This is that conversion, and it exists exactly once so that
+ * eighteen wrappers do not each carry their own copy of the range test.
+ *
+ * The range is what makes it unambiguous. A value in [-4095, -1] is an
+ * error; everything else is a result. That is why an mmap-style call
+ * — which can legitimately return an address whose top bit is set —
+ * could not use this convention and does not, and why nothing that does
+ * use it returns a pointer.
+ */
+static inline long __syscall_ret(long r) {
+    if (r < 0 && r >= -4095) {
+        *__errno_location() = (int)-r;
+        return -1;
+    }
+    return r;
+}
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_SYSCALL_H */

@@ -470,18 +470,30 @@ static void fs_abs(const char *in, char *out, int max) {
 }
 
 /* Does the path exist, and what is it?  Replaces every direct driver
- * lookup that used to be scattered through the apps. */
-static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
+ * lookup that used to be scattered through the apps.
+ *
+ * `ino` is the fourth output and the newest: a number that identifies
+ * the file rather than the path to it. On NTFS that is the MFT record,
+ * which the lookup already has in its hand — this is what lets stat(2)
+ * in ring 3 fill in st_ino, and therefore what lets ported code decide
+ * whether two paths are the same file. Zero on the filesystems that
+ * have no such number to give, which is honest: a caller comparing two
+ * zeroes learns nothing, where a caller comparing two invented numbers
+ * would learn something false. */
+static int fs_stat_ex(const char *path, uint64_t *size, int *is_dir,
+                      uint64_t *ino) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 0)) return 0;
+    if (ino) *ino = 0;
 
     if (fs_kind == FS_NTFS) {
-        uint64_t sz = 0;
+        uint64_t sz = 0, rec = 0;
         int dir = 0;
-        if (ntfs_lookup(abs, 0, 0, &dir, &sz) != 0) return 0;
+        if (ntfs_lookup(abs, &rec, 0, &dir, &sz) != 0) return 0;
         if (size) *size = sz;
         if (is_dir) *is_dir = dir;
+        if (ino) *ino = rec;
         return 1;
     }
     if (fs_kind == FS_EXFAT) {
@@ -505,6 +517,10 @@ static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
         return 1;
     }
     return 0;
+}
+
+static int fs_stat(const char *path, uint64_t *size, int *is_dir) {
+    return fs_stat_ex(path, size, is_dir, 0);
 }
 
 const void *fs_read_file(const char *filename, uint64_t *out_size) {
@@ -824,30 +840,73 @@ int fs_mkdir(const char *path) {
 
 typedef void (*fs_list_cb)(const char *name, uint32_t size, int is_dir);
 
+/*
+ * The same enumeration, with somewhere to put the answer.
+ *
+ * Every caller in the interface was happy with a bare function pointer,
+ * because each of them had exactly one listing in flight and could keep
+ * the running total in a file-scope variable. src/vfs.h is not: a
+ * program calling opendir() wants the entries in *its* buffer, and a
+ * static one shared between callers is a listing that comes back wrong
+ * the moment two things enumerate at once.
+ *
+ * So the context-carrying form is the real one and fs_list is a wrapper
+ * over it. Nothing about the existing callers changes.
+ */
+typedef void (*fs_list_ctx_cb)(void *ctx, const char *name, uint32_t size,
+                               int is_dir);
+
+static void fs_ntfs_list_adapt(void *ctx, const char *name, uint64_t size,
+                               int is_dir);
+
+typedef struct {
+    fs_list_ctx_cb cb;
+    void          *ctx;
+} fs_list_bridge_t;
+
 static void fs_ntfs_list_adapt(void *ctx, const char *name, uint64_t size,
                                int is_dir) {
-    ((fs_list_cb)ctx)(name, (uint32_t)size, is_dir);
+    fs_list_bridge_t *b = (fs_list_bridge_t *)ctx;
+    b->cb(b->ctx, name, (uint32_t)size, is_dir);
 }
 
-static int fs_list(const char *path, fs_list_cb cb) {
+/* exFAT and FAT32 hand the callback no context of their own, so the
+ * bridge for those two has to be reached through a file-scope pointer.
+ * That is safe for exactly the reason the general case is not: neither
+ * driver blocks inside an enumeration, and a system call cannot be
+ * preempted between the store below and the walk that reads it. */
+static fs_list_bridge_t *fs_list_active = 0;
+
+static void fs_plain_list_adapt(const char *name, uint32_t size, int is_dir) {
+    if (fs_list_active) fs_list_active->cb(fs_list_active->ctx, name, size,
+                                           is_dir);
+}
+
+static int fs_list_ctx(const char *path, fs_list_ctx_cb cb, void *ctx) {
     char abs[256];
     fs_abs(path, abs, sizeof(abs));
     if (!prof_may(abs, 0)) return -1;
 
+    fs_list_bridge_t bridge = { cb, ctx };
+
     if (fs_kind == FS_NTFS) {
         /* The driver hands back a 64-bit size and a context pointer;
-         * this layer's callback takes neither. The adapter is the whole
-         * difference, and it lives here rather than in the driver
+         * this layer's callback takes a 32-bit one. The adapter is the
+         * whole difference, and it lives here rather than in the driver
          * because the driver should not know what the desktop's
          * callback signature happens to be. */
-        if (ntfs_list(abs, fs_ntfs_list_adapt, (void *)cb) != 0) {
+        if (ntfs_list(abs, fs_ntfs_list_adapt, &bridge) != 0) {
             fs_errstr = "no such directory";
             return -1;
         }
         return 0;
     }
     if (fs_kind == FS_EXFAT) {
-        if (exf_list(abs, (exf_list_cb)cb) != 0) {
+        fs_list_bridge_t *saved = fs_list_active;
+        fs_list_active = &bridge;
+        int rc = exf_list(abs, (exf_list_cb)fs_plain_list_adapt);
+        fs_list_active = saved;
+        if (rc != 0) {
             fs_errstr = exf_errstr;
             return -1;
         }
@@ -863,10 +922,19 @@ static int fs_list(const char *path, fs_list_cb cb) {
         fat_iter_init(&it, d.first_clus);
         fat_dirent_t e;
         while (fat_iter_next(&it, &e) == 1)
-            cb(e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
+            cb(ctx, e.name, e.size, (e.attr & FAT_ATTR_DIR) ? 1 : 0);
         return 0;
     }
     return -1;
+}
+
+static void fs_list_plain_bridge(void *ctx, const char *name, uint32_t size,
+                                 int is_dir) {
+    ((fs_list_cb)ctx)(name, size, is_dir);
+}
+
+static int fs_list(const char *path, fs_list_cb cb) {
+    return fs_list_ctx(path, fs_list_plain_bridge, (void *)cb);
 }
 
 #include "zim.h"
@@ -1345,49 +1413,25 @@ static uint32_t uac_grants = 0;
 static uint32_t uac_denials = 0;
 
 /*
- * May the calling process do this?
+ * Put the question on the screen and wait for the answer.
  *
- * Returns 1 to allow and 0 to refuse. When the answer is not already
- * known it freezes the calling thread and asks — which is why this is
- * only ever called from a system call on a ring-3 thread, and never
+ * Extracted from uac_guard, which used to be the only thing that asked
+ * anybody anything. There are two guards now — this one's caller, and
+ * net_guard in src/vfs.h — and they differ in the policy in front of the
+ * question and in where the answer is recorded, not in the question
+ * itself. Sharing the asking is what keeps "only one prompt may be
+ * outstanding" a property of the system rather than of one function.
+ *
+ * Deliberately does *not* touch the token. That is the whole point of
+ * the split: elevating for one answer is uac_guard's decision about the
+ * three privileged doors, and the network is not one of them. See the
+ * note beside `net_ok` in include/kernel_shared.h.
+ *
+ * Only ever called from a system call on a ring-3 thread, and never
  * from the compositor, whose own thread is the one that has to stay
- * running to draw the question.
+ * running to draw what it is asking about.
  */
-static int uac_guard(const char *op, const char *detail) {
-    addr_space_t *as = vmm_current;
-
-    /*
-     * A kernel-mode caller: the shell, the package installer, a boot
-     * self-test. There is no application to ask about and no ring-3
-     * thread to freeze — the person is already at the keyboard driving
-     * it, and the interface asked them whatever it needed to.
-     */
-    if (!as || !cur_thread || !sched_running) return 1;
-
-    if (as->token == UAC_TOKEN_ELEVATED) return 1;
-
-    /* The policy says not to ask. Recorded on the token rather than
-     * merely returned, so a later call does not re-derive it. */
-    if (uac_level == UAC_NEVER) {
-        as->token = UAC_TOKEN_ELEVATED;
-        return 1;
-    }
-
-    if (!as->sid_admin) {
-        char note[NOTIFY_TEXT];
-        str_copy(note, "Refused: ", sizeof(note));
-        str_append(note, cur_thread->name, sizeof(note));
-        str_append(note, " is not running as an administrator", sizeof(note));
-        notify_push(NOTE_WARN, note);
-        serial_puts("[uac] refused (not an administrator's session): ");
-        serial_puts(cur_thread->name);
-        serial_puts(" wanted to ");
-        serial_puts(op);
-        serial_putc('\n');
-        uac_denials++;
-        return 0;
-    }
-
+static int uac_prompt(const char *op, const char *detail) {
     /*
      * One question at a time.
      *
@@ -1448,17 +1492,71 @@ static int uac_guard(const char *op, const char *detail) {
     uac_req.pending  = 0;
     uac_req.answered = 0;
 
+    if (ok) uac_grants++;
+    else    uac_denials++;
+    return ok;
+}
+
+/*
+ * May the calling process do one of the three privileged things?
+ *
+ * Returns 1 to allow and 0 to refuse. When the answer is not already
+ * known it asks through uac_prompt above, which freezes the calling
+ * thread until somebody answers.
+ */
+static int uac_guard(const char *op, const char *detail) {
+    addr_space_t *as = vmm_current;
+
+    /*
+     * A kernel-mode caller: the shell, the package installer, a boot
+     * self-test. There is no application to ask about and no ring-3
+     * thread to freeze — the person is already at the keyboard driving
+     * it, and the interface asked them whatever it needed to.
+     */
+    if (!as || !cur_thread || !sched_running) return 1;
+
+    if (as->token == UAC_TOKEN_ELEVATED) return 1;
+
+    /* The policy says not to ask. Recorded on the token rather than
+     * merely returned, so a later call does not re-derive it. */
+    if (uac_level == UAC_NEVER) {
+        as->token = UAC_TOKEN_ELEVATED;
+        return 1;
+    }
+
+    if (!as->sid_admin) {
+        char note[NOTIFY_TEXT];
+        str_copy(note, "Refused: ", sizeof(note));
+        str_append(note, cur_thread->name, sizeof(note));
+        str_append(note, " is not running as an administrator", sizeof(note));
+        notify_push(NOTE_WARN, note);
+        serial_puts("[uac] refused (not an administrator's session): ");
+        serial_puts(cur_thread->name);
+        serial_puts(" wanted to ");
+        serial_puts(op);
+        serial_putc('\n');
+        uac_denials++;
+        return 0;
+    }
+
+    /* Named before the prompt rather than after it. uac_prompt parks
+     * this thread and reuses uac_req for whoever asks next, so the only
+     * copy of the name that is certainly still about this request when
+     * the answer comes back is one taken here. */
+    char who[SCHED_NAME_LEN];
+    str_copy(who, cur_thread->name, sizeof(who));
+
+    const int ok = uac_prompt(op, detail);
+
     if (ok) {
         as->token = UAC_TOKEN_ELEVATED;
-        uac_grants++;
         serial_puts("[uac] granted; ");
-        serial_puts(uac_req.program);
+        serial_puts(who);
         serial_puts(" is elevated for the rest of this run\n");
     } else {
-        uac_denials++;
         char note[NOTIFY_TEXT];
         str_copy(note, "Denied: ", sizeof(note));
-        str_append(note, uac_req.program, sizeof(note));
+        str_append(note, who, sizeof(note));
         notify_push(NOTE_WARN, note);
         serial_puts("[uac] denied\n");
     }
@@ -1480,10 +1578,127 @@ static void uac_answer(int granted) {
     sched_wake_chan((void *)&uac_req, 1);
 }
 
+/*
+ * File descriptors, and the two things one can name.
+ *
+ * Here rather than higher up because it needs all of it: the filesystem
+ * layer to read through, the accounts to ask permission of, and
+ * uac_prompt immediately above to put a question about the network on
+ * the screen. Immediately before the system call gateway, because that
+ * is the only thing that uses it.
+ */
+#include "vfs.h"
+
+/*
+ * ===== 4c. THE TWO SOCKET OPERATIONS THAT PARK =====
+ *
+ * Out of the switch below because they are the only service routines in
+ * this kernel that touch user memory on *both* sides of a wait, and the
+ * shape of that is worth being able to read in one piece:
+ *
+ *     check the buffer, copy it in, park, copy it out, check again.
+ *
+ * The last step is not belt and braces. Every other thread on the
+ * machine runs while this one is parked — see the note at the head of
+ * src/vfs.h — and one of them may be a sibling of the caller with a
+ * perfect right to munmap the very buffer this call was given. Writing
+ * to it afterwards without asking again is a page fault taken in ring 0
+ * at an address a program chose, which is the one class of bug this
+ * boundary exists to make impossible.
+ */
+static int64_t sys_sock_send(addr_space_t *as, vfs_desc_t *d,
+                             uint64_t uptr, uint64_t len) {
+    if (!d->connected) return -VXE_NOTCONN;
+    if (d->busy_tx) {
+        app_refuse("send: another thread is already sending on that socket");
+        return -VXE_BUSY;
+    }
+    if (len > VFS_SOCK_BOUNCE) len = VFS_SOCK_BOUNCE;
+    if (!len) return 0;
+
+    if (!user_range_mapped(as, uptr, len, 0)) {
+        app_refuse("send: unreadable buffer");
+        return -VXE_FAULT;
+    }
+    const int staged = vfs_sock_stage(&d->tx);
+    if (staged != 0) return staged;
+
+    const uint8_t *src = (const uint8_t *)(uintptr_t)uptr;
+    for (uint64_t i = 0; i < len; i++) d->tx[i] = src[i];
+
+    d->busy_tx = 1;
+    d->busy++;
+    const int n = d->tls ? vxsec_write(d->sock, d->tx, (int)len)
+                         : vxnet_send(d->sock, d->tx, (int)len);
+    d->busy--;
+    d->busy_tx = 0;
+
+    if (n < 0) return -VXE_IO;
+    return n;
+}
+
+static int64_t sys_sock_recv(addr_space_t *as, vfs_desc_t *d,
+                             uint64_t uptr, uint64_t len) {
+    if (!d->connected) return -VXE_NOTCONN;
+    if (d->busy_rx) {
+        app_refuse("recv: another thread is already receiving on that socket");
+        return -VXE_BUSY;
+    }
+    if (len > VFS_SOCK_BOUNCE) len = VFS_SOCK_BOUNCE;
+    if (!len) return 0;
+
+    if (!user_range_mapped(as, uptr, len, 1)) {
+        app_refuse("recv: unwritable buffer");
+        return -VXE_FAULT;
+    }
+    const int staged = vfs_sock_stage(&d->rx);
+    if (staged != 0) return staged;
+
+    d->busy_rx = 1;
+    d->busy++;
+    const int n = d->tls ? vxsec_read(d->sock, d->rx, (int)len)
+                         : vxnet_recv(d->sock, d->rx, (int)len);
+    d->busy--;
+    d->busy_rx = 0;
+
+    if (n < 0) return -VXE_IO;
+    if (n == 0) return 0;               /* the peer closed: end of stream */
+
+    if (!user_range_mapped(as, uptr, (uint64_t)n, 1)) {
+        app_refuse("recv: the buffer stopped being writable while waiting");
+        return -VXE_FAULT;
+    }
+    uint8_t *dst = (uint8_t *)(uintptr_t)uptr;
+    for (int i = 0; i < n; i++) dst[i] = d->rx[i];
+    return n;
+}
+
+/* An address and a port in a form a person reading a prompt can act on.
+ * "Do you want this program to reach 93.184.216.34:443" is a question
+ * with an answer; "do you want this program to use the network" is
+ * not. */
+static void sys_net_describe(char *out, int cap, const uint8_t ip[4],
+                             uint16_t port) {
+    char nb[16];
+    out[0] = '\0';
+    for (int i = 0; i < 4; i++) {
+        uint_to_str(ip[i], nb);
+        str_append(out, nb, cap);
+        if (i != 3) str_append(out, ".", cap);
+    }
+    str_append(out, ":", cap);
+    uint_to_str(port, nb);
+    str_append(out, nb, cap);
+}
+
 static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3, uint64_t a4,
                                 uint64_t a5) {
-    (void)a3; (void)a4; (void)a5;
+    /* a3 is a real argument now -- send and recv carry their flags
+     * there -- so it is no longer in this list. a4 and a5 still have no
+     * caller and are named here so that the compiler does not have to
+     * take a view about it. */
+    (void)a4; (void)a5;
 
     switch (num) {
     case SYS_PRINT: {
@@ -1535,8 +1750,50 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         return sys_sbrk((int64_t)a0);
 
     case SYS_WRITE: {
+        /*
+         * ---- one call, three destinations ----
+         *
+         * This has taken a descriptor since it was written and has
+         * always answered for 1 and 2. Now that descriptors exist it
+         * looks the number up: a file, a socket, or the console. A
+         * second call number for "write to a file" would have meant
+         * every ported program calling the wrong one, since what a
+         * program has in its hand is an integer it got from open().
+         *
+         * The failure value changed with it, from a bare -1 to the
+         * negated error numbers the calls from 40 upwards use. Nothing
+         * on disk notices: apps/vextro.h has never had a wrapper for
+         * this call — a program that prints uses SYS_PRINT — and both
+         * values are negative, which is what the one caller in libc
+         * tests. It is worth noticing anyway that the old -1 lands on
+         * EPERM under the new reading, which is not a wrong answer to
+         * "you may not write to that".
+         */
+        addr_space_t *as = vmm_current;
+        const int kind = vfs_kind_of(as, (int64_t)a0);
+
+        if (kind == FD_FREE)  return (uint64_t)(int64_t)-VXE_BADF;
+        if (kind == FD_DIR)   return (uint64_t)(int64_t)-VXE_BADF;
+
+        if (kind == FD_FILE || kind == FD_SOCK) {
+            vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+            if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+
+            if (kind == FD_SOCK)
+                return (uint64_t)sys_sock_send(as, d, a1, a2);
+
+            uint64_t len = a2 > VFS_IO_MAX ? VFS_IO_MAX : a2;
+            if (!len) return 0;
+            if (!user_range_mapped(as, a1, len, 0)) {
+                app_refuse("write: unreadable buffer");
+                return (uint64_t)(int64_t)-VXE_FAULT;
+            }
+            return (uint64_t)vfs_file_write(d, (const void *)(uintptr_t)a1,
+                                            (uint32_t)len);
+        }
+
         /* fd 1 and 2 both land in the terminal; there is one console. */
-        if (a0 != 1 && a0 != 2) return (uint64_t)-1;
+        if (a0 != 1 && a0 != 2) return (uint64_t)(int64_t)-VXE_BADF;
         uint64_t len = a2 > 255 ? 255 : a2;
         if (vmm_current && !user_range_mapped(vmm_current, a1, len, 0)) {
             app_refuse("write: unreadable buffer");
@@ -1601,6 +1858,33 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         child->sid_admin = vmm_current->sid_admin;
         child->token     = UAC_TOKEN_RESTRICTED;
 
+        /* And the network answer is not inherited either, for exactly
+         * the reason the elevation is not: it was an answer about one
+         * program, and a program that could hand it on would only have
+         * to fork to launder it. */
+        child->net_ok    = NET_UNASKED;
+
+        /*
+         * The open files, duplicated.
+         *
+         * A failure here is a failure of the whole fork, not something
+         * to carry on past: a child that starts with some of its
+         * parent's descriptors and not others is a program whose next
+         * read comes from the wrong place. vfs_clone_table leaves the
+         * partial table behind on the child, which the teardown below
+         * releases along with everything else.
+         */
+        if (vfs_clone_table(child, vmm_current) != 0) {
+            app_surf_release(child->surface);
+            child->surface = 0;
+            if (child->files) { vfs_table_destroy(child->files);
+                                child->files = 0; }
+            vmm_destroy(child);
+            kfree(child);
+            app_refuse("fork: could not duplicate the open files");
+            return (uint64_t)-1;
+        }
+
         /* The child resumes at the same instruction with RAX zero. Its
          * frame is built from the parent's, which the syscall stub has
          * already saved. */
@@ -1617,6 +1901,32 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
 
     case SYS_TICKS:
         return sched_ticks;
+
+    /*
+     * How much memory there is, and how much of it is left.
+     *
+     * The number has been reserved since the syscall table was written
+     * and the case was never added, so every call to it fell through to
+     * the refusal at the bottom of this switch and answered -1. Nothing
+     * noticed, because nothing in ring 3 asked until sysconf() in the C
+     * library had a reason to.
+     *
+     * Two words in kilobytes: free first, then total. Kilobytes rather
+     * than pages because a page size is a thing this system might one
+     * day have two of, and a unit that is the same on both sides of the
+     * boundary is one less thing for a program to be wrong about.
+     */
+    case SYS_MEMINFO: {
+        if (vmm_current && !user_range_mapped(vmm_current, a0, 16, 1)) {
+            app_refuse("meminfo: unwritable buffer");
+            return (uint64_t)-1;
+        }
+        uint64_t *out = (uint64_t *)(uintptr_t)a0;
+        if (!out) return (uint64_t)-1;
+        out[0] = pmm_free_kb();
+        out[1] = pmm_total_kb();
+        return 0;
+    }
 
     case SYS_CANVAS: {
         /* Where the window's pixels are, so a program can write them
@@ -1993,6 +2303,1008 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         gfx_rect((uint32_t *)(uintptr_t)v[0], (uint32_t)v[1], (uint32_t)v[2],
                  (int32_t)v[3], (int32_t)v[4], (int32_t)v[5], (int32_t)v[6],
                  (uint32_t)v[7]);
+        return 0;
+    }
+
+    /*
+     * ===== THE MEMORY CALLS =====
+     *
+     * mmap, munmap and mprotect: address space reserved, released, and
+     * re-permitted. The reservation machinery is in src/vmm.h and the
+     * long note there explains why a promise is a record rather than a
+     * mapping; what is here is the boundary — argument checking, the
+     * address decision, and the one refusal that is a security property
+     * rather than a validation.
+     */
+    case SYS_MMAP: {
+        /* a0 hint, a1 length, a2 protection, a3 flags */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)-1;
+
+        const uint64_t prot  = a2;
+        const uint64_t flags = a3;
+
+        if (!a1) { app_refuse("mmap: zero length"); return (uint64_t)-1; }
+
+        /*
+         * Anonymous or nothing.
+         *
+         * There is no file to map, because ring 3 has no way to open one
+         * -- the only file system call a program has is SYS_FS_WRITE, and
+         * it takes a path and writes it whole. A port that asks to map a
+         * descriptor is asking for something this system cannot do, and
+         * the honest answer is a refusal it can see rather than a page of
+         * zeros where it expected a file.
+         */
+        if (!(flags & VX_MAP_ANONYMOUS)) {
+            app_refuse("mmap: only anonymous mappings exist here");
+            return (uint64_t)-1;
+        }
+
+        uint64_t len = PAGE_ALIGN_UP(a1);
+        if (len < a1) { app_refuse("mmap: length overflows"); return (uint64_t)-1; }
+
+        /*
+         * Neither writable nor executable, ever, in one page.
+         *
+         * This is the same rule the loader has always applied to an image
+         * and it has to be applied here too, or it is not a rule. A
+         * just-in-time compiler's whole method is to ask for memory it
+         * can write and then run, and if mmap will hand that out then
+         * everything the two-segment linker script and the page-by-page
+         * loader accomplish is one system call away from being undone.
+         *
+         * Refused rather than quietly downgraded. A JIT given
+         * non-executable pages it believes are executable does not fail
+         * at the mmap; it fails much later, jumping into a page it wrote
+         * machine code into, with a fault that names an address in the
+         * middle of a buffer and nothing to connect it to this decision.
+         */
+        if ((prot & VX_PROT_WRITE) && (prot & VX_PROT_EXEC)) {
+            app_refuse("mmap: a page may be writable or executable, "
+                       "not both");
+            return (uint64_t)-1;
+        }
+
+        uint64_t pte = PTE_USER;
+        if (prot & VX_PROT_WRITE) pte |= PTE_WRITE;
+        if (!(prot & VX_PROT_EXEC)) pte |= PTE_NX;
+
+        uint64_t base;
+        if ((flags & VX_MAP_FIXED) && a0) {
+            base = PAGE_ALIGN_DOWN(a0);
+            if (!user_range_ok(base, len)) {
+                app_refuse("mmap: fixed address outside user space");
+                return (uint64_t)-1;
+            }
+            /* A fixed mapping replaces whatever was there, which is what
+             * MAP_FIXED means everywhere else and what a program relies
+             * on when it carves a smaller mapping out of a larger
+             * reservation it already holds. */
+            vmm_unmap_range(as, base, len);
+            vmm_area_remove(as, base, len);
+        } else {
+            base = as->mmap_next;
+            if (base + len < base || base + len > USER_MMAP_MAX) {
+                app_refuse("mmap: the mapping region is exhausted");
+                return (uint64_t)-1;
+            }
+            /* A page of separation between consecutive mappings, so that
+             * a run off the end of one lands in nothing rather than in
+             * the next -- the same argument kstack_alloc makes for
+             * kernel stacks, for the same price. */
+            as->mmap_next = base + len + PAGE_SIZE;
+        }
+
+        if (vmm_area_add(as, base, len, pte,
+                         (flags & VX_MAP_FIXED) ? VMA_FIXED : 0) != 0) {
+            app_refuse("mmap: too many separate mappings");
+            return (uint64_t)-1;
+        }
+        return base;
+    }
+
+    case SYS_MUNMAP: {
+        /* a0 address, a1 length */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)-1;
+        if (!a1) return 0;
+
+        uint64_t base = PAGE_ALIGN_DOWN(a0);
+        uint64_t len  = PAGE_ALIGN_UP(a0 + a1) - base;
+        if (!user_range_ok(base, len)) {
+            app_refuse("munmap: range outside user space");
+            return (uint64_t)-1;
+        }
+        /*
+         * The image, the trampolines, the canvas and the stack are not a
+         * program's to unmap. Nothing stops a program trying -- the
+         * addresses are in its own half of the space -- and a program
+         * that unmapped its own trampoline page would take every later
+         * system call with it, for reasons that would appear as a fault
+         * on an address the program never named.
+         */
+        if (base < USER_MMAP_BASE) {
+            app_refuse("munmap: that range was not obtained from mmap");
+            return (uint64_t)-1;
+        }
+
+        vmm_unmap_range(as, base, len);
+        if (vmm_area_remove(as, base, len) != 0) {
+            app_refuse("munmap: no room to split the reservation");
+            return (uint64_t)-1;
+        }
+
+        /* Give the addresses back if they were the last handed out. Not
+         * a general free list -- the region is forty-eight terabytes and
+         * does not need one -- but the allocate-and-release-in-order
+         * pattern is what a thread pool does with its stacks, and left
+         * unhandled it would walk the region for as long as the program
+         * ran. */
+        if (base + len + PAGE_SIZE == as->mmap_next) as->mmap_next = base;
+        return 0;
+    }
+
+    case SYS_MPROTECT: {
+        /* a0 address, a1 length, a2 protection */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)-1;
+        if (!a1) return 0;
+
+        uint64_t base = PAGE_ALIGN_DOWN(a0);
+        uint64_t len  = PAGE_ALIGN_UP(a0 + a1) - base;
+        if (!user_range_ok(base, len)) {
+            app_refuse("mprotect: range outside user space");
+            return (uint64_t)-1;
+        }
+        /* The same refusal as mmap, and it has to be in both. Asking for
+         * writable-and-executable in one step and asking for it in two
+         * are the same request. */
+        if ((a2 & VX_PROT_WRITE) && (a2 & VX_PROT_EXEC)) {
+            app_refuse("mprotect: a page may be writable or executable, "
+                       "not both");
+            return (uint64_t)-1;
+        }
+        /*
+         * And a program may not re-permit memory it did not get from
+         * mmap. Without this line the image's own text is one call away
+         * from being writable -- the range is in the caller's half of the
+         * space, so every other check here passes -- and W^X would hold
+         * only for programs that did not think to ask.
+         */
+        if (base < USER_MMAP_BASE) {
+            app_refuse("mprotect: that range was not obtained from mmap");
+            return (uint64_t)-1;
+        }
+
+        uint64_t pte = PTE_USER;
+        if (a2 & VX_PROT_WRITE) pte |= PTE_WRITE;
+        if (!(a2 & VX_PROT_EXEC)) pte |= PTE_NX;
+        vmm_protect_range(as, base, len, pte);
+        return 0;
+    }
+
+    /*
+     * ===== THE THREAD CALLS =====
+     */
+    case SYS_CLONE: {
+        /* a0 entry, a1 stack top, a2 argument, a3 thread pointer */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live || !cur_thread) return (uint64_t)-1;
+
+        if (!user_range_ok(a0, 1) || !user_range_ok(a1, 1)) {
+            app_refuse("clone: entry or stack outside user space");
+            return (uint64_t)-1;
+        }
+        /*
+         * The stack has to be there before the thread is, and this is the
+         * one place that can check it. A new thread does not start by
+         * calling anything -- it is IRETQ-ed into with RSP already
+         * loaded -- so the first instruction it executes pushes, and a
+         * stack that was merely *reserved* would fault on that push with
+         * no frame yet built and nothing to attribute it to.
+         *
+         * user_range_mapped is what backs it: a reservation is faulted in
+         * by the check itself. The word below the top, because the top is
+         * one past the end of the allocation and is not itself part of
+         * it.
+         */
+        if (!user_range_mapped(as, a1 - 16, 16, 1)) {
+            app_refuse("clone: the new thread's stack is not writable");
+            return (uint64_t)-1;
+        }
+        /* Sixteen-byte aligned, as the ABI requires of a function's stack
+         * on entry. A thread whose stack is misaligned runs correctly
+         * until the first MOVAPS against a local, which is a fault a long
+         * way from the call that caused it. */
+        if (a1 & 15u) {
+            app_refuse("clone: the stack pointer is not sixteen-aligned");
+            return (uint64_t)-1;
+        }
+
+        thread_t *t = sched_spawn_thread(as, a0, a1, a2, a3, cur_thread->name);
+        if (!t) {
+            app_refuse("clone: no room for another thread");
+            return (uint64_t)-1;
+        }
+        return t->pid;
+    }
+
+    /*
+     * End this thread and nothing else.
+     *
+     * The same code SYS_EXIT runs, under a name that says which of the
+     * two meanings is wanted. Until a process could have two threads the
+     * distinction did not exist and SYS_EXIT meant both; it keeps meaning
+     * what it always did, which is this, and the whole-process form is
+     * the new one below.
+     */
+    case SYS_THREAD_EXIT:
+        sched_exit((int)a0);
+        return 0;                       /* never reached */
+
+    /*
+     * End every thread of this process.
+     *
+     * What exit() means in C, and what main() returning means. A library
+     * that starts worker threads and then calls exit expects the program
+     * to stop, not to keep running on the workers with the thread that
+     * called it gone.
+     *
+     * Marking the siblings is enough to end them and it is worth saying
+     * why, because it looks too easy. A thread marked T_ZOMBIE is never
+     * chosen by sched_pick again, so it executes no further user
+     * instruction from this moment. What it does not do is release its
+     * kernel stack -- the reaper does that, on the compositor thread, for
+     * the same reason a thread cannot free the stack it is standing on.
+     *
+     * There is no thread of this process running anywhere else while this
+     * executes: interrupts are masked for the whole of a system call, and
+     * user threads are pinned to processor zero precisely so that this
+     * kind of statement stays true. A sibling parked in the futex service
+     * is asleep in the kernel rather than running, and is reaped from the
+     * sleeping state exactly as one that had exited.
+     */
+    case SYS_EXIT_GROUP: {
+        addr_space_t *as = vmm_current;
+        if (as && cur_thread) {
+            for (int i = 0; i < SCHED_MAX_THREADS; i++) {
+                thread_t *t = threads[i];
+                if (!t || t == cur_thread) continue;
+                if (t->as != as || t->state == T_FREE) continue;
+                t->exit_code = (int)a0;
+                t->state     = T_ZOMBIE;
+            }
+        }
+        sched_exit((int)a0);
+        return 0;                       /* never reached */
+    }
+
+    case SYS_GETTID:
+        return cur_thread ? cur_thread->pid : 0;
+
+    /*
+     * Where this thread's own variables are.
+     *
+     * The address is not checked for being *mapped*, only for being in
+     * user space, and that is deliberate. A thread control block is
+     * ordinary memory the program allocated; if it is wrong, the program
+     * faults reading its own thread-local variable, in its own address
+     * space, at an address it chose. That is a bug in the program and it
+     * is reported as one. What the check prevents is the case that is not
+     * the program's business at all: a base in the higher half, which
+     * would let a `__thread` reference read kernel memory.
+     */
+    case SYS_SET_FSBASE:
+        if (a0 && !user_range_ok(a0, 1)) {
+            app_refuse("set_fsbase: base outside user space");
+            return (uint64_t)-1;
+        }
+        sched_set_fsbase(a0);
+        return 0;
+
+    /*
+     * Nanoseconds since boot.
+     *
+     * Derived from the tick count rather than from the timestamp counter,
+     * which is the less precise of the two and the one that is actually
+     * monotonic here: TSC frequency is not something this kernel
+     * calibrates, and a value that jumped when the processor changed
+     * speed would be worse than a coarse one. The tick is a millisecond,
+     * so the bottom six digits are always zero and the unit is a promise
+     * about the scale rather than about the resolution.
+     */
+    case SYS_CLOCK:
+        return sched_ticks * 1000000ull;
+
+    /*
+     * Sleep, in milliseconds.
+     *
+     * A program could build this out of SYS_TICKS and SYS_YIELD, and one
+     * that did would spin: yielding in a loop keeps the thread ready to
+     * run, so the scheduler keeps running it, and a hundred millisecond
+     * wait costs a hundred milliseconds of processor rather than none.
+     * Asking to be taken off the queue is the thing that cannot be done
+     * from user space.
+     */
+    case SYS_NANOSLEEP: {
+        uint64_t ms = a0;
+        if (!ms) { sched_yield(); return 0; }
+        if (ms > 60000ull) ms = 60000ull;
+        sched_sleep_ms(ms);
+        return 0;
+    }
+
+    /*
+     * ===== THE DESCRIPTOR CALLS =====
+     *
+     * Everything from here down returns a negated error number rather
+     * than a bare -1; src/syscall.h explains why at the point the
+     * numbers are assigned, and the short version is that a port which
+     * cannot tell ENOENT from EACCES from EISDIR cannot decide whether
+     * to create the file, ask for a password, or give up.
+     *
+     * Two rules hold across all of them and are worth stating once
+     * rather than eighteen times:
+     *
+     *   A kernel-mode caller is refused. `vmm_current` being null means
+     *   the shell or a boot self-test is calling, and that code has
+     *   fs_open and vxnet_socket directly — there is no process for a
+     *   descriptor to belong to and no table to put one in.
+     *
+     *   A path is copied across the boundary before anything looks at
+     *   it twice, and normalised once. What is checked is what is used,
+     *   which is the property sys_copy_string exists for.
+     */
+    case SYS_OPEN: {
+        /* a0 path, a1 flags, a2 mode.
+         *
+         * The mode is accepted and ignored. There are no permission
+         * bits on this volume — what may touch a file is decided by the
+         * profile the path is in and by uac_guard — so storing a
+         * caller's 0644 would be recording a number nothing ever reads,
+         * and refusing the argument would break every port that passes
+         * one. */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        (void)a2;
+
+        char path[FS_PATH_MAX];
+        if (sys_copy_string(a0, path, sizeof(path)) < 0) {
+            app_refuse("open: unreadable path");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        char abs[FS_PATH_MAX];
+        fs_abs(path, abs, sizeof(abs));
+
+        const uint32_t fl  = (uint32_t)a1;
+        const uint32_t acc = fl & VX_O_ACCMODE;
+        const int wants_write = (acc == VX_O_WRONLY || acc == VX_O_RDWR);
+
+        /* The profile boundary first: it is not a question anybody gets
+         * to answer, it is another account's private tree. */
+        if (!prof_may(abs, wants_write)) {
+            app_refuse("open: outside this account's profile");
+            return (uint64_t)(int64_t)-VXE_ACCES;
+        }
+        if (wants_write && swap_owns_path(abs)) {
+            app_refuse("open: the pagefile is in use");
+            return (uint64_t)(int64_t)-VXE_BUSY;
+        }
+
+        /*
+         * ---- the question, and where it is asked ----
+         *
+         * At open, and never at close. That placement is what makes the
+         * write-back scheme in src/vfs.h safe rather than merely
+         * convenient: uac_guard works by freezing a ring-3 thread and
+         * putting a prompt on the screen, and by the time a descriptor's
+         * image is being written the program may have ended — there
+         * would be no thread to freeze and nobody the question is about.
+         * Asking here means the grant is already in hand when the bytes
+         * reach the disk, including when that happens on the janitor's
+         * thread after the process is gone.
+         */
+        if (wants_write && !uac_guard("write a file", abs))
+            return (uint64_t)(int64_t)-VXE_PERM;
+
+        /*
+         * The descriptor is taken *after* the prompt, not before.
+         *
+         * uac_guard is the one point in a system call where another
+         * thread of this same process runs, and a number reserved
+         * beforehand is a number that thread could be handed too. This
+         * is the same hazard the long note on SYS_FS_WRITE works
+         * through, in its other form.
+         */
+        const int fd = vfs_alloc(as);
+        if (fd < 0) return (uint64_t)(int64_t)fd;
+
+        vfs_desc_t *d = &as->files->d[fd];
+        const int rc = vfs_open(d, abs, fl);
+        if (rc != 0) {
+            vfs_desc_reset(d);
+            return (uint64_t)(int64_t)rc;
+        }
+        return (uint64_t)(int64_t)fd;
+    }
+
+    case SYS_READ: {
+        /* a0 fd, a1 buffer, a2 length */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        const int kind = vfs_kind_of(as, (int64_t)a0);
+        if (kind == FD_FREE) return (uint64_t)(int64_t)-VXE_BADF;
+
+        if (kind == FD_CONSOLE) {
+            /*
+             * There is no console input in ring 3, and this says so
+             * rather than answering zero.
+             *
+             * Zero is end-of-file, and a parser told it has reached the
+             * end of a file it never opened will conclude the input was
+             * empty and carry on — which is the exact failure the note
+             * at the top of libc/include/stdio.h says fread and fgets
+             * were left out to avoid. The keyboard belongs to the
+             * terminal window, and giving a background program a claim
+             * on it is a feature with a design, not a return value.
+             */
+            app_refuse("read: there is no console input in ring 3");
+            return (uint64_t)(int64_t)-VXE_IO;
+        }
+
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (kind == FD_DIR) return (uint64_t)(int64_t)-VXE_ISDIR;
+        if (kind == FD_SOCK) return (uint64_t)sys_sock_recv(as, d, a1, a2);
+
+        uint64_t len = a2 > VFS_IO_MAX ? VFS_IO_MAX : a2;
+        if (!len) return 0;
+        if (!user_range_mapped(as, a1, len, 1)) {
+            app_refuse("read: unwritable buffer");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        return (uint64_t)vfs_file_read(d, (void *)(uintptr_t)a1,
+                                       (uint32_t)len);
+    }
+
+    case SYS_CLOSE: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        const int kind = vfs_kind_of(as, (int64_t)a0);
+        if (kind == FD_FREE) return (uint64_t)(int64_t)-VXE_BADF;
+
+        /* Closing a console stream is a real operation, not a no-op:
+         * it frees the number, and vfs_alloc hands the lowest free one
+         * back out — which is how `close(0); open(...)` has redirected
+         * a program's own input since the seventh edition. The table is
+         * created here if it did not exist, because that is the only
+         * place the fact can be recorded. */
+        struct proc_files *f = vfs_files(as, 1);
+        if (!f) return (uint64_t)(int64_t)-VXE_NOMEM;
+
+        vfs_desc_t *d = &f->d[a0];
+        if (d->busy) {
+            app_refuse("close: a call is still waiting in that descriptor");
+            return (uint64_t)(int64_t)-VXE_BUSY;
+        }
+        /* Marked before the work, because closing a socket parks and a
+         * sibling could reach this same descriptor while it does. It is
+         * cleared by the reset inside vfs_close_desc. */
+        d->busy = 1;
+        vfs_close_desc(d);
+        return 0;
+    }
+
+    case SYS_LSEEK: {
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) {
+            return (uint64_t)(int64_t)(vfs_kind_of(as, (int64_t)a0)
+                                       == FD_CONSOLE ? -VXE_SPIPE
+                                                     : -VXE_BADF);
+        }
+        return (uint64_t)vfs_seek(d, (int64_t)a1, (int)a2);
+    }
+
+    case SYS_STAT: {
+        /* a0 path, a1 a vx_stat_t to fill in */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        char path[FS_PATH_MAX];
+        if (sys_copy_string(a0, path, sizeof(path)) < 0) {
+            app_refuse("stat: unreadable path");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        if (!user_range_mapped(as, a1, sizeof(vx_stat_t), 1)) {
+            app_refuse("stat: unwritable buffer");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+
+        char abs[FS_PATH_MAX];
+        fs_abs(path, abs, sizeof(abs));
+
+        uint64_t size = 0, ino = 0;
+        int is_dir = 0;
+        /* A path in another account's profile answers "no such file",
+         * not "permission denied", and that is deliberate: the second
+         * answer tells a program that something it may not look at
+         * exists, which is itself the thing being kept from it. */
+        if (!fs_stat_ex(abs, &size, &is_dir, &ino))
+            return (uint64_t)(int64_t)-VXE_NOENT;
+
+        vfs_fill_stat((vx_stat_t *)(uintptr_t)a1, size, is_dir, ino);
+        return 0;
+    }
+
+    case SYS_FSTAT: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        if (!user_range_mapped(as, a1, sizeof(vx_stat_t), 1)) {
+            app_refuse("fstat: unwritable buffer");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+
+        const int kind = vfs_kind_of(as, (int64_t)a0);
+        if (kind == FD_FREE) return (uint64_t)(int64_t)-VXE_BADF;
+
+        vx_stat_t *st = (vx_stat_t *)(uintptr_t)a1;
+        if (kind == FD_CONSOLE) {
+            vfs_fill_stat(st, 0, 0, 0);
+            st->mode = VX_S_IFCHR;
+            return 0;
+        }
+
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+
+        if (kind == FD_SOCK) {
+            vfs_fill_stat(st, 0, 0, 0);
+            st->mode = VX_S_IFSOCK;
+            return 0;
+        }
+        if (kind == FD_DIR) {
+            vfs_fill_stat(st, d->nents, 1, 0);
+            return 0;
+        }
+        /* The size a program should see is the one it would read back,
+         * which for a descriptor being written is the image and not what
+         * is presently on the disk. */
+        vfs_fill_stat(st, (d->writable && d->wbuf) ? d->wlen : d->file.size,
+                      0, d->file.valid ? d->file.ntfs_record : 0);
+        return 0;
+    }
+
+    case SYS_GETDENTS: {
+        /* a0 fd, a1 buffer, a2 bytes. Returns the number of *entries*
+         * written, not bytes: the records are fixed-length, so a count
+         * is the useful form and a byte total would only have to be
+         * divided again. */
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_DIR) return (uint64_t)(int64_t)-VXE_NOTDIR;
+
+        const uint64_t cap = a2 / sizeof(vx_dirent_t);
+        if (!cap) return (uint64_t)(int64_t)-VXE_INVAL;
+        if (d->pos >= d->nents) return 0;
+
+        uint64_t n = d->nents - d->pos;
+        if (n > cap) n = cap;
+
+        const uint64_t bytes = n * sizeof(vx_dirent_t);
+        if (!user_range_mapped(as, a1, bytes, 1)) {
+            app_refuse("getdents: unwritable buffer");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        const uint8_t *src = (const uint8_t *)&d->ents[d->pos];
+        uint8_t *dst = (uint8_t *)(uintptr_t)a1;
+        for (uint64_t i = 0; i < bytes; i++) dst[i] = src[i];
+        d->pos += n;
+        return n;
+    }
+
+    case SYS_UNLINK: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        char path[FS_PATH_MAX];
+        if (sys_copy_string(a0, path, sizeof(path)) < 0) {
+            app_refuse("unlink: unreadable path");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        char abs[FS_PATH_MAX];
+        fs_abs(path, abs, sizeof(abs));
+
+        if (!prof_may(abs, 1)) {
+            app_refuse("unlink: outside this account's profile");
+            return (uint64_t)(int64_t)-VXE_ACCES;
+        }
+        if (swap_owns_path(abs)) {
+            app_refuse("unlink: the pagefile is in use");
+            return (uint64_t)(int64_t)-VXE_BUSY;
+        }
+        uint64_t size = 0;
+        int is_dir = 0;
+        if (!fs_stat(abs, &size, &is_dir))
+            return (uint64_t)(int64_t)-VXE_NOENT;
+
+        /* Deleting is the fourth way a program makes a permanent change
+         * and goes through the same door as the other three. */
+        if (!uac_guard("delete a file", abs))
+            return (uint64_t)(int64_t)-VXE_PERM;
+
+        return fs_delete(abs) == 0 ? 0 : (uint64_t)(int64_t)-VXE_IO;
+    }
+
+    case SYS_MKDIR: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        (void)a1;                          /* mode; see SYS_OPEN */
+
+        char path[FS_PATH_MAX];
+        if (sys_copy_string(a0, path, sizeof(path)) < 0) {
+            app_refuse("mkdir: unreadable path");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        char abs[FS_PATH_MAX];
+        fs_abs(path, abs, sizeof(abs));
+
+        if (!prof_may(abs, 1)) {
+            app_refuse("mkdir: outside this account's profile");
+            return (uint64_t)(int64_t)-VXE_ACCES;
+        }
+        {
+            uint64_t size = 0;
+            int is_dir = 0;
+            if (fs_stat(abs, &size, &is_dir))
+                return (uint64_t)(int64_t)-VXE_EXIST;
+        }
+        if (!uac_guard("create a directory", abs))
+            return (uint64_t)(int64_t)-VXE_PERM;
+
+        return fs_mkdir(abs) == 0 ? 0 : (uint64_t)(int64_t)-VXE_IO;
+    }
+
+    case SYS_FSYNC: {
+        vfs_desc_t *d = vfs_get(vmm_current, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        return (uint64_t)(int64_t)vfs_flush(d);
+    }
+
+    case SYS_FTRUNCATE: {
+        vfs_desc_t *d = vfs_get(vmm_current, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_FILE || !d->writable || !d->wbuf)
+            return (uint64_t)(int64_t)-VXE_BADF;
+
+        const uint64_t want = a1;
+        if (want > (uint64_t)VFS_WBUF_MAX)
+            return (uint64_t)(int64_t)-VXE_NOSPC;
+        const int rc = vfs_wbuf_reserve(d, want);
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+
+        for (uint64_t i = d->wlen; i < want; i++) d->wbuf[i] = 0;
+        d->wlen  = (uint32_t)want;
+        d->dirty = 1;
+        return 0;
+    }
+
+    /*
+     * ===== THE SOCKET CALLS =====
+     *
+     * Underneath is src/vxnet.h, which is the same seam the kernel's own
+     * browser and package store reach the network through — lwIP for the
+     * plain path, Mbed TLS for the encrypted one, and about a quarter of
+     * a million lines of it that stops at that header. Nothing here
+     * knows what a pbuf is.
+     *
+     * The TLS caveat is repeated wherever TLS is mentioned because it is
+     * the kind of thing that gets discovered rather than read: there is
+     * no certificate authority store on this volume, so the chain is
+     * parsed and the handshake signature is checked against the key in
+     * the leaf, and nothing establishes that the leaf belongs to the
+     * host that was asked for. That stops somebody listening. It does
+     * not stop somebody in the middle.
+     */
+    case SYS_SOCKET: {
+        /* a0 family, a1 type, a2 protocol */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        if (a0 != VX_AF_INET) {
+            app_refuse("socket: only IPv4 exists here");
+            return (uint64_t)(int64_t)-VXE_AFNOSUPPORT;
+        }
+        if (a1 != VX_SOCK_STREAM) {
+            /* Refused rather than accepted and made to fail later, for
+             * the reason mmap refuses a non-anonymous mapping: lwIP is
+             * configured here for TCP, and a datagram socket that
+             * returned a descriptor and then could not carry anything
+             * would be discovered several layers into a port. */
+            app_refuse("socket: only stream sockets exist here");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        const int tls = (a2 == VX_IPPROTO_TLS);
+        if (a2 != 0 && a2 != VX_IPPROTO_TCP && !tls) {
+            app_refuse("socket: unknown protocol");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        if (tls && !vxsec_ready()) {
+            app_refuse("socket: TLS is not available");
+            return (uint64_t)(int64_t)-VXE_NETDOWN;
+        }
+
+        const int fd = vfs_alloc(as);
+        if (fd < 0) return (uint64_t)(int64_t)fd;
+
+        vfs_desc_t *d = &as->files->d[fd];
+        vfs_desc_reset(d);
+        d->kind     = FD_SOCK;
+        d->tls      = tls ? 1 : 0;
+        d->readable = 1;
+        d->writable = 1;
+
+        /*
+         * A plain socket gets its lwIP descriptor now; a TLS one does
+         * not get anything until connect, and that asymmetry is
+         * vxsec_open's rather than a choice made here — it takes a host
+         * and a port and does the resolution, the connection and the
+         * handshake as one operation, because a TLS session is not a
+         * socket you later encrypt.
+         */
+        if (!tls) {
+            d->sock = vxnet_socket();
+            if (d->sock < 0) {
+                vfs_desc_reset(d);
+                app_refuse("socket: the network is not up");
+                return (uint64_t)(int64_t)-VXE_NETDOWN;
+            }
+        }
+        return (uint64_t)(int64_t)fd;
+    }
+
+    case SYS_CONNECT: {
+        /* a0 fd, a1 four bytes of address, a2 port in host order.
+         *
+         * Four bytes rather than a sockaddr_in, because that structure's
+         * layout is a thing two systems can disagree about and its port
+         * field is in network order — a byte-swap that would then have
+         * to be got right on both sides of a privilege boundary. The
+         * unpacking happens once, in libc/socket.c, where a mistake is a
+         * program's own. */
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (d->connected) return (uint64_t)(int64_t)-VXE_ISCONN;
+        if (d->busy) return (uint64_t)(int64_t)-VXE_BUSY;
+        if (d->tls) {
+            app_refuse("connect: a TLS session needs the host's name, "
+                       "not its address");
+            return (uint64_t)(int64_t)-VXE_INVAL;
+        }
+        if (!user_range_mapped(as, a1, 4, 0)) {
+            app_refuse("connect: unreadable address");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        const uint16_t port = (uint16_t)a2;
+        if (!port) return (uint64_t)(int64_t)-VXE_INVAL;
+
+        uint8_t ip[4];
+        {
+            const uint8_t *src = (const uint8_t *)(uintptr_t)a1;
+            for (int i = 0; i < 4; i++) ip[i] = src[i];
+        }
+
+        if (!vfs_is_loopback(ip)) {
+            char what[UAC_DETAIL_LEN];
+            sys_net_describe(what, (int)sizeof(what), ip, port);
+            if (!net_guard(what)) return (uint64_t)(int64_t)-VXE_PERM;
+
+            /*
+             * The descriptor is looked up again, and this is hazard (a)
+             * from src/vfs.h one park earlier than the place it is
+             * described.
+             *
+             * net_guard puts a question on the screen and freezes this
+             * thread, and every other thread of this process runs while
+             * it waits -- one of which may close this descriptor and open
+             * something else, which vfs_alloc will hand the same number
+             * to. `d` would then point at a live socket belonging to a
+             * sibling, and this call would connect it. The busy count
+             * cannot help: it is not raised until after the guard, which
+             * is exactly the window.
+             */
+            d = vfs_get(as, (int64_t)a0);
+            if (!d || d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_BADF;
+            if (d->connected) return (uint64_t)(int64_t)-VXE_ISCONN;
+            if (d->busy) return (uint64_t)(int64_t)-VXE_BUSY;
+            if (d->tls) return (uint64_t)(int64_t)-VXE_INVAL;
+        }
+
+        d->busy++;
+        const int rc = vxnet_connect(d->sock, ip, port);
+        d->busy--;
+        if (rc != 0) return (uint64_t)(int64_t)-VXE_CONNREFUSED;
+        d->connected = 1;
+        return 0;
+    }
+
+    case SYS_CONNECT_HOST: {
+        /* a0 fd, a1 host name, a2 port. The only way to open a TLS
+         * session, and the way a plain socket gets a name resolved
+         * without the program having to carry a DNS client. */
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (d->connected) return (uint64_t)(int64_t)-VXE_ISCONN;
+        if (d->busy) return (uint64_t)(int64_t)-VXE_BUSY;
+
+        char host[128];
+        if (sys_copy_string(a1, host, sizeof(host)) < 0) {
+            app_refuse("connect: unreadable host name");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        const uint16_t port = (uint16_t)a2;
+        if (!port) return (uint64_t)(int64_t)-VXE_INVAL;
+
+        /* Recognised as loopback *before* the guard, because resolving a
+         * name is itself a question asked of a server somewhere else —
+         * see vfs_host_is_loopback. */
+        uint8_t ip[4];
+        const int local = vfs_host_is_loopback(host, ip);
+        if (!local) {
+            char what[UAC_DETAIL_LEN];
+            str_copy(what, host, sizeof(what));
+            str_append(what, ":", sizeof(what));
+            {
+                char nb[16];
+                uint_to_str(port, nb);
+                str_append(what, nb, sizeof(what));
+            }
+            if (!net_guard(what)) return (uint64_t)(int64_t)-VXE_PERM;
+
+            /* Looked up again after the prompt, for the reason set out
+             * in SYS_CONNECT above: the guard is a park, and a sibling
+             * may have closed this number and been handed it back for
+             * something else. */
+            d = vfs_get(as, (int64_t)a0);
+            if (!d || d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_BADF;
+            if (d->connected) return (uint64_t)(int64_t)-VXE_ISCONN;
+            if (d->busy) return (uint64_t)(int64_t)-VXE_BUSY;
+        }
+
+        d->busy++;
+        int rc;
+        if (d->tls) {
+            /* Resolution, connection and handshake in one call; the
+             * descriptor is a vxsec slot rather than an lwIP one from
+             * here on, which `tls` is what records. */
+            const int slot = vxsec_open(host, port);
+            if (slot >= 0) { d->sock = slot; rc = 0; } else rc = -1;
+        } else {
+            if (!local && !vxnet_resolve(host, ip)) {
+                d->busy--;
+                return (uint64_t)(int64_t)-VXE_HOSTUNREACH;
+            }
+            rc = vxnet_connect(d->sock, ip, port);
+        }
+        d->busy--;
+
+        if (rc != 0) return (uint64_t)(int64_t)-VXE_CONNREFUSED;
+        d->connected = 1;
+        return 0;
+    }
+
+    case SYS_SEND: {
+        /* a0 fd, a1 buffer, a2 length, a3 flags */
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (a3) {
+            /* MSG_OOB, MSG_DONTWAIT and the rest. Refused rather than
+             * ignored: a caller that asked not to block and was blocked
+             * anyway has been lied to. */
+            app_refuse("send: no message flags are supported");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        return (uint64_t)sys_sock_send(as, d, a1, a2);
+    }
+
+    case SYS_RECV: {
+        addr_space_t *as = vmm_current;
+        vfs_desc_t *d = vfs_get(as, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (a3) {
+            app_refuse("recv: no message flags are supported");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        return (uint64_t)sys_sock_recv(as, d, a1, a2);
+    }
+
+    case SYS_SOCKOPT: {
+        /* a0 fd, a1 option, a2 value */
+        vfs_desc_t *d = vfs_get(vmm_current, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (d->tls) {
+            /* The lwIP descriptor a TLS session runs over belongs to
+             * Mbed TLS and is not reachable from here. Saying so is
+             * better than accepting a timeout that would never take
+             * effect. */
+            app_refuse("setsockopt: not available on a TLS session");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        if (d->sock < 0) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+
+        int rc;
+        switch (a1) {
+        case VX_OPT_RCVTIMEO: rc = vxnet_rcv_timeout(d->sock, (uint32_t)a2); break;
+        case VX_OPT_SNDTIMEO: rc = vxnet_snd_timeout(d->sock, (uint32_t)a2); break;
+        case VX_OPT_NODELAY:  rc = vxnet_nodelay(d->sock, a2 ? 1 : 0); break;
+        default:
+            app_refuse("setsockopt: unknown option");
+            return (uint64_t)(int64_t)-VXE_INVAL;
+        }
+        return rc == 0 ? 0 : (uint64_t)(int64_t)-VXE_INVAL;
+    }
+
+    case SYS_SHUTDOWN: {
+        vfs_desc_t *d = vfs_get(vmm_current, (int64_t)a0);
+        if (!d) return (uint64_t)(int64_t)-VXE_BADF;
+        if (d->kind != FD_SOCK) return (uint64_t)(int64_t)-VXE_NOTSOCK;
+        if (!d->connected) return (uint64_t)(int64_t)-VXE_NOTCONN;
+        if (d->tls) {
+            /* A TLS session ends with a close_notify record, which is
+             * not a half-close and cannot be one: the record layer has
+             * no way to say "I have finished writing" that leaves the
+             * read direction usable. */
+            app_refuse("shutdown: a TLS session closes whole");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        if (a1 > VX_SHUT_RDWR) return (uint64_t)(int64_t)-VXE_INVAL;
+        return vxnet_shutdown(d->sock, (int)a1) == 0
+                   ? 0 : (uint64_t)(int64_t)-VXE_IO;
+    }
+
+    case SYS_RESOLVE: {
+        /* a0 host name, a1 four bytes to fill in. Separate from connect
+         * because a program that wants to print an address, or to
+         * connect to the same host twice, should not have to make a
+         * connection to find out what it is. */
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        char host[128];
+        if (sys_copy_string(a0, host, sizeof(host)) < 0) {
+            app_refuse("resolve: unreadable host name");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        if (!user_range_mapped(as, a1, 4, 1)) {
+            app_refuse("resolve: unwritable buffer");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+
+        uint8_t ip[4];
+        if (!vfs_host_is_loopback(host, ip)) {
+            if (!vfs_parse_ipv4(host, ip)) {
+                /* A name, so this is a question for a server somewhere
+                 * else, and asking it is reaching the network. */
+                if (!net_guard(host)) return (uint64_t)(int64_t)-VXE_PERM;
+                if (!vxnet_resolve(host, ip))
+                    return (uint64_t)(int64_t)-VXE_HOSTUNREACH;
+            }
+        }
+
+        uint8_t *out = (uint8_t *)(uintptr_t)a1;
+        for (int i = 0; i < 4; i++) out[i] = ip[i];
         return 0;
     }
 
@@ -2952,10 +4264,45 @@ static void app_reaped(thread_t *t) {
      * refcount is what makes a forked pair safe: the surface is only
      * returned when the second of them ends.
      */
-    if (t->as && t->as->surface) {
+    /*
+     * ---- but only for the last thread in it ----
+     *
+     * The surface follows the address space, not the thread: several
+     * threads of one program draw into one window, because they are one
+     * program. Releasing on the first exit would put the window back in
+     * the pool while the siblings were still painting it, and the next
+     * program to launch would inherit a canvas somebody else was writing.
+     *
+     * `refs` is read here and decremented by sched_reap immediately
+     * after, so one means "this is the last". Both run on the compositor
+     * thread, in that order, with nothing in between.
+     */
+    if (t->as && t->as->surface && t->as->refs <= 1) {
         app_surf_release(t->as->surface);
         t->as->surface = 0;
     }
+
+    /*
+     * And the open files, on the same "last thread out" condition and
+     * for the same reason: several threads of one program share one
+     * table, because they are one program.
+     *
+     * Detached and handed on rather than released here. This runs on the
+     * compositor's thread, inside the frame's critical section, and
+     * closing a TLS session or writing a dirty file back would block it
+     * — see the note on the janitor at the head of src/vfs.h. Reap stays
+     * a pointer swap.
+     */
+    if (t->as && t->as->files && t->as->refs <= 1) {
+        struct proc_files *f = t->as->files;
+        t->as->files = 0;
+        vfs_retire_table(f);
+    }
+
+    /* A worker thread ending is not an event anybody wants told about;
+     * the program it belongs to is still running and will announce
+     * itself when it finishes. Only the last thread out reports. */
+    if (t->as && t->as->refs > 1) return;
 
     if (silent_launch) return;
     char note[NOTIFY_TEXT];
@@ -3219,6 +4566,16 @@ static int execute_bin(const char *filepath) {
 #include "wikidoc.h"
 #include "apps.h"
 #include "store.h"
+
+/*
+ * The packages figure the browser's start page shows.
+ *
+ * Declared in src/browser.h, which is included before store.h and so
+ * cannot see the install list. Defined here, immediately after the file
+ * that owns it — the same arrangement prof_may and fs_native use for the
+ * filesystem layer's forward declarations.
+ */
+static int brw_installed_count(void) { return store_inst_count; }
 /* After apps.h and store.h: the gadgets read the same network and memory
  * state the system monitor does, and the jump lists read the recent-item
  * lists the apps push into. */

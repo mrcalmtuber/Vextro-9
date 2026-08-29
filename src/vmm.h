@@ -78,6 +78,14 @@
 #define USER_CANVAS_VA    0x0000000030000000ULL   /* the window's pixels   */
 #define USER_HEAP_BASE    0x0000000040000000ULL   /* brk starts here       */
 #define USER_HEAP_MAX     0x0000100000000000ULL
+/* Where mmap puts a mapping whose address the caller did not choose.
+ * It begins exactly at the break's ceiling and ends far below the stack,
+ * so a heap that grows to its limit and a stack that grows down can
+ * neither of them reach it. Forty-eight terabytes, which is what makes
+ * the bump allocator in SYS_MMAP an acceptable answer to a question that
+ * usually wants a free list. */
+#define USER_MMAP_BASE    0x0000100000000000ULL
+#define USER_MMAP_MAX     0x0000400000000000ULL
 #define USER_STACK_TOP    0x00007FFFFFFFF000ULL
 #define USER_STACK_SIZE   (256 * 1024)
 #define USER_SPACE_END          0x0000800000000000ULL
@@ -203,6 +211,11 @@ static uint64_t *vmm_walk(addr_space_t *as, uint64_t virt, int create) {
  */
 static void swap_rmap_record(uint64_t phys, addr_space_t *as, uint64_t virt);
 static int  swap_in_page(addr_space_t *as, uint64_t va);
+/* Back one page of an anonymous reservation. Defined below, declared here
+ * because the two resolvers above the definition both need it: a promise
+ * that only the processor's own fault path honoured would break the
+ * moment the kernel itself reached into the memory instead. */
+static int  vmm_fault_anon(addr_space_t *as, uint64_t va);
 static inline int swap_pte_is_swapped(uint64_t e);
 static void swap_discard_pte(uint64_t e);
 
@@ -246,7 +259,22 @@ static int vmm_map(addr_space_t *as, uint64_t virt, uint64_t phys,
  */
 static uint64_t vmm_resolve(addr_space_t *as, uint64_t virt) {
     uint64_t *pte = vmm_walk(as, virt, 0);
-    if (!pte) return 0;
+    if (!pte || !(*pte & PTE_PRESENT)) {
+        /*
+         * An anonymous reservation nobody has touched yet has no entry at
+         * all -- not even a table to hold one, which is why `pte` itself
+         * can be null here and that is not an error. It is exactly the
+         * case a program creates by mmap-ing a buffer and handing it
+         * straight to a system call without writing to it first, and the
+         * kernel reading through it is what "touches" it.
+         */
+        if (vmm_fault_anon(as, virt)) {
+            pte = vmm_walk(as, virt, 0);
+            if (pte && (*pte & PTE_PRESENT))
+                return (*pte & PTE_ADDR_MASK) | (virt & PAGE_MASK);
+        }
+        if (!pte) return 0;
+    }
     if (!(*pte & PTE_PRESENT)) {
         if (!swap_pte_is_swapped(*pte)) return 0;
         if (!swap_in_page(as, virt)) return 0;
@@ -311,6 +339,14 @@ static int vmm_create(addr_space_t *as) {
     as->brk       = USER_HEAP_BASE;
     as->brk_top   = USER_HEAP_BASE;
     as->live      = 1;
+    /* One thread, until something clones. Set here rather than left to
+     * the caller because every path that makes an address space goes
+     * through this one, and a count that some callers forgot would be a
+     * space destroyed under a thread still running on it. */
+    as->refs      = 1;
+    as->mmap_next = USER_MMAP_BASE;
+    as->vmas      = 0;
+    as->vma_count = 0;
     return 0;
 }
 
@@ -360,6 +396,14 @@ void vmm_destroy(addr_space_t *as) {
     as->pml4 = 0;
     as->pml4_phys = 0;
     as->live = 0;
+
+    /* The reservation table is a page like any other and goes back the
+     * same way. A process that never called mmap has none. */
+    if (as->vmas) {
+        pmm_free(kern_virt_to_phys((void *)as->vmas));
+        as->vmas = 0;
+        as->vma_count = 0;
+    }
 }
 
 static inline void vmm_switch(addr_space_t *as) {
@@ -372,6 +416,298 @@ static inline void vmm_switch_kernel(void) {
     if ((read_cr3() & PTE_ADDR_MASK) != vmm_kernel_pml4_phys)
         __asm__ volatile("mov %0, %%cr3"
                          :: "r"(vmm_kernel_pml4_phys) : "memory");
+}
+
+/*
+ * ===== ANONYMOUS MAPPINGS =====
+ *
+ * What mmap() reserves, and what the page fault handler consults to find
+ * out whether a fault on an unmapped address is a mistake or a promise.
+ *
+ * The two halves of that sentence are the whole design. Until now every
+ * address a process could legally touch was already mapped — the image
+ * at load, the stack at spawn, the heap by sbrk, one page at a time as
+ * the break moved. A fault on anything else meant the program was wrong,
+ * and the handler could say so and kill it.
+ *
+ * A reservation is the case that does not fit. `mmap(NULL, 4GB, ...)` is
+ * a program saying "I will use some of this, I do not know which parts,
+ * and I would like you not to charge me for the rest" — which is exactly
+ * what a JavaScript heap asks for and exactly what this system had no way
+ * to express. Backing it at the call would cost four gigabytes of RAM
+ * this machine may not have, inside a system call that runs with
+ * interrupts masked, to satisfy a program that will touch eight megabytes
+ * of it.
+ *
+ * So the call records the promise and returns, and the frames are taken
+ * one at a time by whichever page the program actually touches. That is
+ * the same bargain sbrk already makes with `brk_top`, generalised from
+ * one growing region to a list of them.
+ *
+ * ---- why a list and not page table entries ----
+ *
+ * The alternative is to mark each page's entry non-present-but-promised,
+ * using one of the bits the architecture leaves to software. It is a
+ * perfectly good design and it is slower here for a reason that has
+ * nothing to do with elegance: writing a marker per page means building
+ * the page tables to hold it, which for a four gigabyte reserve is eight
+ * megabytes of tables and a million stores — in the same masked-interrupt
+ * window the eager allocation was rejected for. A record is O(1) in the
+ * size of the reservation. A marker is O(pages).
+ *
+ * The table is one page, taken from the physical allocator rather than
+ * the kernel heap because kheap.h is included after this file, and never
+ * taken at all by a process that does not call mmap.
+ */
+/* Bookkeeping, distinct from the PTE flags a page gets when it is
+ * touched. VMA_FIXED records that the caller named the address, which
+ * only matters for the diagnostic; the rest of the system treats every
+ * area alike. */
+#define VMA_FIXED   (1ULL << 0)
+
+typedef struct vmm_area {
+    uint64_t base;        /* page-aligned start                          */
+    uint64_t len;         /* page-aligned length; zero means a free slot */
+    uint64_t pte_flags;   /* what a page of it gets when it is first hit */
+    uint64_t flags;       /* VMA_*                                       */
+} vmm_area_t;
+
+_Static_assert(sizeof(vmm_area_t) == 32, "a page must hold a whole number");
+
+#define VMA_MAX     ((int)(PAGE_SIZE / sizeof(vmm_area_t)))
+
+/* The table, allocated on first use. Null for every process that never
+ * reserves anything, which is every program written before this one. */
+static vmm_area_t *vmm_area_table(addr_space_t *as, int create) {
+    if (as->vmas) return (vmm_area_t *)as->vmas;
+    if (!create) return 0;
+    uint64_t phys = 0;
+    vmm_area_t *t = (vmm_area_t *)pmm_alloc_page_virt(&phys);
+    if (!t) return 0;
+    for (int i = 0; i < VMA_MAX; i++) {
+        t[i].base = 0; t[i].len = 0; t[i].pte_flags = 0; t[i].flags = 0;
+    }
+    as->vmas      = (struct vmm_area *)t;
+    as->vma_count = 0;
+    return t;
+}
+
+/* Which reservation covers this address, or null. Linear over at most a
+ * hundred and twenty-eight entries, on a path taken once per page per
+ * process — a sorted structure would be more code to answer the same
+ * question no faster at this size. */
+static vmm_area_t *vmm_area_find(addr_space_t *as, uint64_t va) {
+    vmm_area_t *t = vmm_area_table(as, 0);
+    if (!t) return 0;
+    for (int i = 0; i < VMA_MAX; i++) {
+        if (!t[i].len) continue;
+        if (va >= t[i].base && va < t[i].base + t[i].len) return &t[i];
+    }
+    return 0;
+}
+
+static vmm_area_t *vmm_area_slot(addr_space_t *as) {
+    vmm_area_t *t = vmm_area_table(as, 1);
+    if (!t) return 0;
+    for (int i = 0; i < VMA_MAX; i++) if (!t[i].len) return &t[i];
+    return 0;
+}
+
+static int vmm_area_add(addr_space_t *as, uint64_t base, uint64_t len,
+                        uint64_t pte_flags, uint64_t flags) {
+    vmm_area_t *a = vmm_area_slot(as);
+    if (!a) return -1;
+    a->base      = base;
+    a->len       = len;
+    a->pte_flags = pte_flags;
+    a->flags     = flags;
+    as->vma_count++;
+    return 0;
+}
+
+/*
+ * Back one page of a reservation, because something touched it.
+ *
+ * Returns 1 if the fault was ours to handle and has been, 0 if the
+ * address was never promised to anybody — in which case the caller
+ * reports a genuine fault, exactly as it did before reservations
+ * existed.
+ *
+ * The frame is zeroed. That is not politeness: an anonymous mapping that
+ * handed back whatever the last process left in a frame would be a way
+ * to read another program's memory, and the promise mmap makes is
+ * specifically for *fresh* memory.
+ */
+static int vmm_fault_anon(addr_space_t *as, uint64_t va) {
+    if (!as || !as->live) return 0;
+    if (va >= USER_SPACE_END) return 0;
+
+    vmm_area_t *a = vmm_area_find(as, PAGE_ALIGN_DOWN(va));
+    if (!a) return 0;
+
+    uint64_t page = PAGE_ALIGN_DOWN(va);
+
+    /* Already there. Two threads can fault the same page at the same
+     * moment -- one takes the frame, the other arrives to find the work
+     * done -- and the second must not allocate a second frame over the
+     * first, which would leak it and lose whatever the first wrote. */
+    uint64_t *pte = vmm_walk(as, page, 0);
+    if (pte && (*pte & PTE_PRESENT)) return 1;
+
+    /*
+     * And already *paged out*, which is the case that would be silently
+     * destructive rather than merely wasteful.
+     *
+     * A page of an anonymous mapping is an ordinary user page once it
+     * has been touched, so the clock may evict it like any other. Its
+     * entry then holds a pagefile slot and no frame. This function
+     * cannot tell the difference from "never touched" by looking at the
+     * reservation -- both are inside it, both are non-present -- so
+     * without this line it would hand back a fresh page of zeros, lose
+     * everything the program had written there, and leak the slot until
+     * the pagefile filled.
+     *
+     * The processor's own fault path never reaches here in that state,
+     * because src/trap.h asks the pager first. These two lines are for
+     * the two callers that do not: vmm_resolve and user_range_mapped,
+     * which are how the *kernel* reaches into user memory during a
+     * system call. A program that mmap-ed a buffer, let it be evicted,
+     * and then passed it to a syscall would have found it zeroed.
+     */
+    if (pte && swap_pte_is_swapped(*pte)) return 0;
+
+    uint64_t phys = pmm_alloc();
+    if (!phys) return 0;
+
+    uint8_t *p = (uint8_t *)(uintptr_t)phys_to_virt(phys);
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) p[i] = 0;
+
+    if (vmm_map(as, page, phys, a->pte_flags) != 0) {
+        pmm_free(phys);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Tear a range down: free the frames, clear the entries, forget the
+ * promise.
+ *
+ * Every kind of entry a page of user memory can be in has to be handled
+ * here, and each of them for its own reason. A present private page owns
+ * a frame and must give it back. A present *shared* page — the canvas,
+ * the trampolines — was never this process's frame to free, and freeing
+ * it would hand the window's pixels to the next allocation. A swapped
+ * page owns a slot in the pagefile and no frame at all, and dropping the
+ * entry without discarding the slot leaks it until the pagefile fills and
+ * nothing can be evicted.
+ *
+ * Copy-on-write needs no case of its own: a COW page is present and
+ * private, and the frame under it is reference-counted by the pager, so
+ * the ordinary present path is already correct for it.
+ */
+static void vmm_unmap_range(addr_space_t *as, uint64_t base, uint64_t len) {
+    if (!as || !as->live || !len) return;
+    uint64_t v   = PAGE_ALIGN_DOWN(base);
+    uint64_t end = PAGE_ALIGN_UP(base + len);
+    const int current = (read_cr3() & PTE_ADDR_MASK) == as->pml4_phys;
+
+    for (; v < end; v += PAGE_SIZE) {
+        uint64_t *pte = vmm_walk(as, v, 0);
+        if (!pte || !*pte) continue;
+        if (*pte & PTE_PRESENT) {
+            if (!(*pte & PTE_SHARED)) {
+                swap_rmap_record(*pte & PTE_ADDR_MASK, 0, 0);
+                pmm_free(*pte & PTE_ADDR_MASK);
+            }
+        } else {
+            swap_discard_pte(*pte);
+        }
+        *pte = 0;
+        if (current) flush_tlb_page(v);
+    }
+}
+
+/*
+ * Forget the reservations covering a range, splitting any area the range
+ * cuts through.
+ *
+ * The middle case is the one that needs a spare slot: unmapping the
+ * centre of a reservation leaves two, and a table with no room left
+ * cannot express that. Refusing is the honest answer — the alternative
+ * is to silently forget the tail, which turns a later touch of perfectly
+ * legitimate memory into a fault the program cannot explain.
+ */
+static int vmm_area_remove(addr_space_t *as, uint64_t base, uint64_t len) {
+    vmm_area_t *t = vmm_area_table(as, 0);
+    if (!t) return 0;
+    const uint64_t end = base + len;
+
+    for (int i = 0; i < VMA_MAX; i++) {
+        if (!t[i].len) continue;
+        uint64_t abase = t[i].base, aend = t[i].base + t[i].len;
+        if (end <= abase || base >= aend) continue;         /* disjoint */
+
+        if (base <= abase && end >= aend) {                 /* all of it */
+            t[i].len = 0;
+            if (as->vma_count) as->vma_count--;
+        } else if (base <= abase) {                         /* head */
+            t[i].base = end;
+            t[i].len  = aend - end;
+        } else if (end >= aend) {                           /* tail */
+            t[i].len = base - abase;
+        } else {                                            /* the middle */
+            if (vmm_area_add(as, end, aend - end,
+                             t[i].pte_flags, t[i].flags) != 0)
+                return -1;
+            t[i].len = base - abase;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Change the protection of everything already mapped in a range, and of
+ * everything in it that has not been touched yet.
+ *
+ * Both halves are needed and only the first is obvious. A program that
+ * reserves a region, protects it, and then touches it for the first time
+ * would otherwise get a page with the protection the *reservation* asked
+ * for, silently undoing the call it just made — so the areas are
+ * rewritten as well as the entries.
+ */
+static void vmm_protect_range(addr_space_t *as, uint64_t base, uint64_t len,
+                              uint64_t pte_flags) {
+    if (!as || !as->live || !len) return;
+    uint64_t v   = PAGE_ALIGN_DOWN(base);
+    uint64_t end = PAGE_ALIGN_UP(base + len);
+    const int current = (read_cr3() & PTE_ADDR_MASK) == as->pml4_phys;
+
+    for (; v < end; v += PAGE_SIZE) {
+        uint64_t *pte = vmm_walk(as, v, 0);
+        if (!pte || !(*pte & PTE_PRESENT)) continue;
+        /* PTE_SHARED and the frame number survive; the permission bits
+         * are replaced wholesale. Keeping PTE_SHARED matters -- it is
+         * what stops the canvas being freed as though the process owned
+         * it -- and it is not a permission, so the caller never names
+         * it. */
+        *pte = (*pte & (PTE_ADDR_MASK | PTE_SHARED | PTE_COW)) |
+               pte_flags | PTE_PRESENT;
+        if (current) flush_tlb_page(v);
+    }
+
+    vmm_area_t *t = vmm_area_table(as, 0);
+    if (!t) return;
+    for (int i = 0; i < VMA_MAX; i++) {
+        if (!t[i].len) continue;
+        if (base + len <= t[i].base || base >= t[i].base + t[i].len) continue;
+        /* Whole areas only. A protect that covers part of a reservation
+         * has already done the real work above, on the pages that exist;
+         * rewriting the whole area's future protection because part of it
+         * was named would be worse than leaving it. */
+        if (base <= t[i].base && base + len >= t[i].base + t[i].len)
+            t[i].pte_flags = pte_flags;
+    }
 }
 
 /*
@@ -395,6 +731,11 @@ static inline int user_range_ok(uint64_t addr, uint64_t len) {
 /* Every page of the range present in this address space? A syscall that
  * walks a user buffer without asking turns a program's bad pointer into
  * a kernel page fault. */
+/* Defined below, with the rest of the fork machinery. Declared here
+ * because the range check has to be able to resolve a copy-on-write page
+ * rather than refuse it -- see the note inside. */
+static int vmm_resolve_cow(addr_space_t *as, uint64_t va);
+
 static int user_range_mapped(addr_space_t *as, uint64_t addr, uint64_t len,
                              int need_write) {
     if (!user_range_ok(addr, len)) return 0;
@@ -403,7 +744,56 @@ static int user_range_mapped(addr_space_t *as, uint64_t addr, uint64_t len,
     uint64_t end = PAGE_ALIGN_UP(addr + len);
     for (; v < end; v += PAGE_SIZE) {
         uint64_t *pte = vmm_walk(as, v, 0);
+        /*
+         * A page of an anonymous reservation that has not been touched is
+         * memory the program is entitled to and the kernel cannot yet
+         * read. Backing it here rather than refusing is what makes
+         *
+         *     char *p = mmap(0, n, ...);
+         *     read_something_into(p);
+         *
+         * work -- the first thing to touch that buffer is the system call
+         * itself, so if this check refuses untouched pages then the only
+         * way to use mmap-ed memory with a syscall is to write over it
+         * first, which is absurd and would be discovered as a mysterious
+         * refusal rather than as a rule.
+         *
+         * A genuine bad pointer still fails: vmm_fault_anon answers 0 for
+         * any address that was never reserved, and the loop refuses.
+         */
+        if ((!pte || !(*pte & PTE_PRESENT)) && vmm_fault_anon(as, v))
+            pte = vmm_walk(as, v, 0);
         if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_USER)) return 0;
+
+        /*
+         * ---- a page that is read-only because it was forked ----
+         *
+         * A copy-on-write page is present, mapped to the caller, and
+         * *not* writable — the write bit is exactly what fork clears to
+         * catch the first store. So the test below used to refuse it,
+         * and that refusal was wrong in a way that is worth spelling
+         * out: the program is entitled to write there, would be given a
+         * private copy the instant it tried from user mode, and is told
+         * "unwritable buffer" only because the kernel is the one doing
+         * the writing.
+         *
+         * Every system call that fills in a user buffer was affected —
+         * sys_get_mouse, sys_canvas, sys_random, sys_meminfo — and all
+         * of them for the same programs: the ones that had forked and
+         * not yet written to that particular page. Nothing caught it
+         * because the one program that forks, mutextest, writes to its
+         * shared counter before it asks the kernel for anything.
+         *
+         * Resolving it here rather than refusing is the same decision,
+         * and the same shape, as backing an untouched mmap reservation
+         * just above: the first thing to touch the buffer is the system
+         * call itself, and that has to work.
+         */
+        if (need_write && !(*pte & PTE_WRITE) && (*pte & PTE_COW)) {
+            if (vmm_resolve_cow(as, v)) pte = vmm_walk(as, v, 0);
+            if (!pte || !(*pte & PTE_PRESENT)) return 0;
+        }
+
         if (need_write && !(*pte & PTE_WRITE)) return 0;
     }
     return 1;
@@ -603,6 +993,30 @@ static int vmm_fork(addr_space_t *dst, addr_space_t *src) {
     if (vmm_create(dst) != 0) return -1;
     dst->brk     = src->brk;
     dst->brk_top = src->brk_top;
+
+    /*
+     * The reservations come across too, and they have to.
+     *
+     * A child inherits its parent's *mappings* through the page table
+     * copy below — but a reservation is precisely the part of an address
+     * space that has no page table entry yet. Leaving it behind would
+     * give the child a heap whose untouched pages fault fatally while its
+     * parent's identical addresses work, and the difference would only
+     * appear the first time the child touched a page the parent happened
+     * to have touched already.
+     *
+     * The pages that have been touched are shared copy-on-write like
+     * everything else; what is copied here is the promise about the ones
+     * that have not.
+     */
+    dst->mmap_next = src->mmap_next;
+    if (src->vmas) {
+        vmm_area_t *st = (vmm_area_t *)src->vmas;
+        vmm_area_t *dt = vmm_area_table(dst, 1);
+        if (!dt) return -1;
+        for (int i = 0; i < VMA_MAX; i++) dt[i] = st[i];
+        dst->vma_count = src->vma_count;
+    }
 
     for (int i = 0; i < 256; i++) {
         if (!(src->pml4[i] & PTE_PRESENT)) continue;

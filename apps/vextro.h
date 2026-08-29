@@ -144,7 +144,25 @@ static inline uint32_t *os_canvas(int *out_w, int *out_h) {
           "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7",
           "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
     );
-    if (rc != 0) return 0;
+    /*
+     * Only -1 is a refusal.
+     *
+     * This used to read `if (rc != 0) return 0;`, and it was correct
+     * when the kernel answered zero for success. It does not: the
+     * service routine returns the canvas address in RAX as well as in
+     * the buffer, so that a caller which treats this as a function
+     * returning a pointer -- which is the natural way to write it --
+     * gets one without reading the buffer at all.
+     *
+     * The two changes together meant every success was read as a
+     * failure and this returned null, always. Nothing crashed, because
+     * every caller checks: mandel falls back to a syscall per pixel, and
+     * so quietly paid a quarter of a million kernel entries per frame
+     * for the optimisation its own comment says it makes. That is the
+     * shape of this class of bug -- a fallback that works is a bug that
+     * does not announce itself.
+     */
+    if (rc == -1) return 0;
     if (out_w) *out_w = (int)info[1];
     if (out_h) *out_h = (int)info[2];
     return (uint32_t *)(uintptr_t)info[0];

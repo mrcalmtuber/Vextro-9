@@ -1,0 +1,6 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CSTDARG
+#define _VXCXX_CSTDARG
+#include <stdarg.h>
+namespace std { using ::va_list; }
+#endif

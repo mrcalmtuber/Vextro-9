@@ -1,0 +1,149 @@
+// -*- C++ -*-
+#ifndef _VXCXX_OPTIONAL
+#define _VXCXX_OPTIONAL
+
+/*
+ * <optional> — a value, or the fact that there is not one.
+ *
+ * The thing it replaces is a sentinel: -1 for "no index", a null pointer
+ * for "not found", an empty string for "unset". Every one of those steals
+ * a value from the type to mean something else, and every one of them is
+ * eventually a bug where the sentinel was a legitimate answer.
+ *
+ * The storage is a raw buffer and a flag, not a T and a flag, because a
+ * disengaged optional must not construct one — `optional<Socket>` should
+ * not open a socket. The constructor and destructor are explicit
+ * placement-new and explicit call, which is why they are written out
+ * rather than defaulted.
+ *
+ * value() on an empty optional stops the program, as at() does, for the
+ * same reason: there is no value to return that would not be a lie.
+ * operator* does not check, which is the same distinction operator[]
+ * draws.
+ */
+
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
+#include <utility>
+#include <new>
+
+namespace std {
+
+struct nullopt_t { explicit constexpr nullopt_t(int) {} };
+inline constexpr nullopt_t nullopt{0};
+
+template <class T>
+class optional {
+public:
+    using value_type = T;
+
+    constexpr optional() noexcept : has_(false) {}
+    constexpr optional(nullopt_t) noexcept : has_(false) {}
+
+    optional(const T &v) : has_(true) { ::new ((void *)buf_) T(v); }
+    optional(T &&v) : has_(true) { ::new ((void *)buf_) T(std::move(v)); }
+
+    template <class... A>
+    explicit optional(in_place_t, A &&...args) : has_(true) {
+        ::new ((void *)buf_) T(std::forward<A>(args)...);
+    }
+
+    optional(const optional &o) : has_(o.has_) {
+        if (has_) ::new ((void *)buf_) T(*o);
+    }
+    optional(optional &&o) : has_(o.has_) {
+        if (has_) { ::new ((void *)buf_) T(std::move(*o)); o.reset(); }
+    }
+
+    ~optional() { reset(); }
+
+    optional &operator=(nullopt_t) noexcept { reset(); return *this; }
+
+    optional &operator=(const optional &o) {
+        if (this == &o) return *this;
+        if (o.has_) emplace(*o);
+        else reset();
+        return *this;
+    }
+    optional &operator=(optional &&o) {
+        if (this == &o) return *this;
+        if (o.has_) { emplace(std::move(*o)); o.reset(); }
+        else reset();
+        return *this;
+    }
+    optional &operator=(const T &v) { emplace(v); return *this; }
+    optional &operator=(T &&v) { emplace(std::move(v)); return *this; }
+
+    template <class... A>
+    T &emplace(A &&...args) {
+        reset();
+        ::new ((void *)buf_) T(std::forward<A>(args)...);
+        has_ = true;
+        return **this;
+    }
+
+    void reset() noexcept {
+        if (has_) { ptr()->~T(); has_ = false; }
+    }
+
+    constexpr bool has_value() const noexcept { return has_; }
+    constexpr explicit operator bool() const noexcept { return has_; }
+
+    T       &operator*()        { return *ptr(); }
+    const T &operator*()  const { return *ptr(); }
+    T       *operator->()       { return ptr(); }
+    const T *operator->() const { return ptr(); }
+
+    T &value() {
+        if (!has_) empty_access();
+        return *ptr();
+    }
+    const T &value() const {
+        if (!has_) empty_access();
+        return *ptr();
+    }
+
+    template <class U>
+    T value_or(U &&fallback) const {
+        return has_ ? **this : static_cast<T>(std::forward<U>(fallback));
+    }
+
+private:
+    alignas(T) unsigned char buf_[sizeof(T)];
+    bool has_;
+
+    T       *ptr()       { return reinterpret_cast<T *>(buf_); }
+    const T *ptr() const { return reinterpret_cast<const T *>(buf_); }
+
+    [[noreturn]] static void empty_access() {
+        fputs_stream("libcxx: optional::value() on an empty optional\n", stderr);
+        abort();
+    }
+};
+
+template <class T>
+constexpr bool operator==(const optional<T> &a, nullopt_t) noexcept {
+    return !a.has_value();
+}
+template <class T>
+constexpr bool operator!=(const optional<T> &a, nullopt_t) noexcept {
+    return a.has_value();
+}
+template <class T>
+bool operator==(const optional<T> &a, const optional<T> &b) {
+    if (a.has_value() != b.has_value()) return false;
+    return !a.has_value() || *a == *b;
+}
+template <class T>
+bool operator!=(const optional<T> &a, const optional<T> &b) { return !(a == b); }
+
+template <class T>
+optional<decay_t<T>> make_optional(T &&v) {
+    return optional<decay_t<T>>(std::forward<T>(v));
+}
+
+}  // namespace std
+
+#endif

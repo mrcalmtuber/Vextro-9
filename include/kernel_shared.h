@@ -430,6 +430,67 @@ static inline void lapic_eoi(void) {
  */
 struct app_surface;
 
+/*
+ * A reservation made by mmap, and why the address space carries a list of
+ * them rather than page table entries.
+ *
+ * The obvious implementation of mmap is vmm_alloc_range: walk the range,
+ * take a frame per page, write a present entry. That is what sbrk does
+ * and it is right for sbrk, because a program grows its heap in sixty-
+ * four kilobyte steps. It is wrong for a reservation, and a browser is
+ * exactly the program that makes it wrong — a JavaScript heap asks for
+ * gigabytes of address space and touches a few megabytes of it.
+ *
+ * Backing it eagerly costs the physical memory immediately, and costs it
+ * inside a system call, which runs with interrupts masked. src/syscall.h
+ * promises every service is "bounded and short — a string measured, a
+ * rectangle filled, a page mapped". A million frames allocated under that
+ * promise is how a machine stops answering its own timer.
+ *
+ * Marking the page tables instead would be cheaper in memory and no
+ * cheaper in time: a marker still has to be *written*, one entry per
+ * page, and the page tables to hold it still have to be built — eight
+ * megabytes of them for a four gigabyte reserve.
+ *
+ * So a reservation is a record, not a mapping. The list is consulted by
+ * the page fault handler, which is the only code that ever needs to know
+ * the difference between "never asked for" and "asked for and not yet
+ * touched". Sixty-four of them is a fixed cost of two kilobytes per
+ * address space and more distinct mappings than any program here makes.
+ */
+struct vmm_area;
+
+/*
+ * ---- the open descriptors, and where a process actually is ----
+ *
+ * There is no `struct pcb` in this kernel and there never was. The unit
+ * of scheduling is thread_t; the unit of *isolation* is this structure,
+ * which is what a process is here — an address space, a window, a
+ * security token, and now a table of open descriptors. src/sched/sched.h
+ * says as much at the top, and it is worth repeating at the point the
+ * table lands, because the placement decides the semantics rather than
+ * merely recording them:
+ *
+ *   Threads share descriptors. SYS_CLONE gives the new thread *the*
+ *   address space, so it gets the same table by construction — which is
+ *   what POSIX means by a thread. A table hung off thread_t would give
+ *   every worker its own fd 3 and no way to hand one to another.
+ *
+ *   Forks copy them. SYS_FORK makes a new address space, so the child
+ *   gets a duplicate: the same files open, offsets independent from the
+ *   split onwards, exactly as fork(2) has behaved since the seventh
+ *   edition.
+ *
+ *   They close when the last thread of the process ends, not the first.
+ *   `refs` below is what makes that expressible at all.
+ *
+ * Opaque here for the same reason struct app_surface is: src/vfs.h owns
+ * the definition, scheduler.o carries the pointer across a fork and a
+ * reap without ever dereferencing it, and an incomplete type is exactly
+ * what that calls for.
+ */
+struct proc_files;
+
 /* ---- the token ----
  *
  * UAC_TOKEN_RESTRICTED is what every process gets, including one started
@@ -442,6 +503,23 @@ struct app_surface;
 #define UAC_TOKEN_RESTRICTED 0
 #define UAC_TOKEN_ELEVATED   1
 
+/*
+ * Whether this process has been allowed off the machine.
+ *
+ * Three states rather than two, because "asked and refused" has to be
+ * distinguishable from "not asked yet". A program that has been told no
+ * makes its next connection attempt a millisecond later; without the
+ * third state that is a second prompt, and a stream of prompts is how a
+ * person is trained to click yes.
+ *
+ * Loopback never consults this — see the note in src/vfs.h. A connection
+ * to 127.0.0.1 does not leave the machine, so there is nothing to ask
+ * about.
+ */
+#define NET_UNASKED   0
+#define NET_ALLOWED   1
+#define NET_REFUSED   2
+
 typedef struct {
     uint64_t  pml4_phys;
     uint64_t *pml4;          /* through the HHDM */
@@ -450,6 +528,28 @@ typedef struct {
     uint64_t  canvas_va;     /* where the window's pixels landed this run */
     uint64_t  tramp_va;      /* and the trampoline page - both randomised */
     int       live;
+
+    /*
+     * ---- how many threads are standing in here ----
+     *
+     * One, for the whole of this system's life until now: a process was a
+     * thread that happened to carry an address space, and sched_reap
+     * destroyed the space when the thread that carried it ended. That is
+     * correct exactly as long as no two threads ever carry the same one.
+     *
+     * SYS_CLONE makes two, which is the point of it — a pthread is a
+     * thread in the caller's own address space, sharing its heap and its
+     * globals, because a library that ran each thread in a copy of the
+     * program's memory would not be threading. Without a count the first
+     * of them to finish tears down the page tables the others are running
+     * on, and the failure is a triple fault with no thread left to blame.
+     *
+     * Incremented by clone, decremented by the reaper, and the space is
+     * released by whichever thread takes it to zero. A fork does not touch
+     * it: fork makes a *new* address space, which starts at one like every
+     * other.
+     */
+    uint32_t  refs;
 
     struct app_surface *surface;  /* private pixels, or null for the
                                    * shared fallback canvas             */
@@ -460,6 +560,46 @@ typedef struct {
                               * flag -- which is permission to be
                               * *asked*, never permission itself        */
     uint8_t   token;         /* UAC_TOKEN_*, this run only              */
+
+    /*
+     * ---- and whether this program may leave the machine ----
+     *
+     * Deliberately *not* the token above, and this is the whole reason
+     * it is a separate byte.
+     *
+     * uac_guard grants by setting `token` to UAC_TOKEN_ELEVATED, which
+     * is a single answer covering all three privileged doors: writing a
+     * file, changing the registry, and writing raw sectors. Asking the
+     * same question about the network and recording the answer there
+     * would mean that saying yes to "may this program fetch a page"
+     * silently said yes to "may this program overwrite the partition
+     * table". Those are not the same question and must not share a bit.
+     *
+     * NET_* below, and it records a refusal as well as a grant, so a
+     * person who has said no once is not asked again by the same
+     * program.
+     */
+    uint8_t   net_ok;
+
+    /* ---- the open descriptors ----
+     *
+     * Null on a process that never opens anything, which is every
+     * program written before this and costs them nothing: the table is
+     * allocated by the first open, not at spawn. See src/vfs.h.
+     */
+    struct proc_files *files;
+
+    /* ---- the anonymous mappings ----
+     *
+     * Where the next mmap without a fixed address lands, and the list of
+     * what has been reserved so far. Both null and zero on a process that
+     * never calls mmap, which is every program written before this and
+     * costs them nothing: the array is allocated on the first reservation,
+     * not at spawn.
+     */
+    uint64_t  mmap_next;
+    struct vmm_area *vmas;
+    uint32_t  vma_count;
 } addr_space_t;
 
 /* Whose address space CR3 currently holds, or null for the kernel's

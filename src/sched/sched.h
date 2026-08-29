@@ -91,6 +91,23 @@ typedef struct thread {
      * one processor dispatches threads at all.
      */
     uint32_t       cpu;
+    /*
+     * ---- where this thread's own variables are ----
+     *
+     * The base FS is given when the thread reads a `__thread` variable.
+     * Zero on every thread that has never asked for one, which is every
+     * thread this system had before pthreads: a program with one thread
+     * keeps its globals in .data and never touches FS at all.
+     *
+     * It has to be per-thread and restored on every switch, which is the
+     * whole difference between this and sched_set_gs_base. GS holds a
+     * Windows program's Thread Environment Block, and that is written
+     * once because the TEB is at the same address in every process — one
+     * value serves them all. Thread-local storage is the opposite: the
+     * value *is* the identity of the thread, so two threads that shared
+     * it would share every variable it exists to keep apart.
+     */
+    uint64_t       fsbase;
     char           name[SCHED_NAME_LEN];
     /* 512 bytes, sixteen-aligned, exactly as FXSAVE64 wants them. The
      * attribute is on the member rather than the struct because the
@@ -164,6 +181,26 @@ thread_t *sched_spawn_user(addr_space_t *as, uint64_t entry,
                            uint64_t user_stack, const char *name,
                            uint32_t prio);
 thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as);
+
+/*
+ * A second thread in an address space that already has one.
+ *
+ * The difference from sched_spawn_user is the argument and the pinning,
+ * and both matter. The argument, because a thread function takes one and
+ * there is nowhere else to put it: a new thread is started by IRETQ-ing
+ * into a frame, so the argument goes into the frame's RDI and arrives in
+ * the first parameter register exactly as the ABI says it should.
+ *
+ * The pinning, because src/syscall.h keeps the kernel stack pointer for
+ * the next entry from user mode in one global word. Two ring-3 threads
+ * entering SYSCALL on two processors at the same instant would both load
+ * it, and the second would build its frame on the first one's stack. One
+ * processor runs user threads, so that cannot happen; this is what makes
+ * it stay true now that a process can have more than one.
+ */
+thread_t *sched_spawn_thread(addr_space_t *as, uint64_t entry,
+                             uint64_t user_stack, uint64_t arg,
+                             uint64_t fsbase, const char *name);
 void      sched_exit(int code);
 int       sched_join(thread_t *t, uint32_t timeout_ms);
 void      sched_reap(void);
@@ -204,5 +241,9 @@ void sched_frame_pulse(void);
  * its Thread Environment Block through GS, and the TEB is at the same
  * virtual address in every process, so one value serves them all. */
 void sched_set_gs_base(uint64_t va);
+
+/* And the one that is genuinely per-thread. Takes effect on this thread
+ * immediately and on every later switch to it. */
+void sched_set_fsbase(uint64_t va);
 
 #endif /* VEXTRO_SCHED_H */

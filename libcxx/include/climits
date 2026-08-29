@@ -1,0 +1,5 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CLIMITS
+#define _VXCXX_CLIMITS
+#include <limits.h>
+#endif

@@ -1,0 +1,9 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CASSERT
+/* No guard on the contents, for the reason assert.h itself has none:
+ * NDEBUG may change between two inclusions and the meaning of assert has
+ * to change with it. The guard here is only so that this file's own
+ * comment is not repeated. */
+#define _VXCXX_CASSERT
+#endif
+#include <assert.h>

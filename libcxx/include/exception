@@ -1,0 +1,54 @@
+// -*- C++ -*-
+#ifndef _VXCXX_EXCEPTION
+#define _VXCXX_EXCEPTION
+
+/*
+ * <exception> — present, and honest about what it is.
+ *
+ * This runtime is built with -fno-exceptions. There is no unwinder, no
+ * personality routine, and no way to throw: `throw` is a compile error
+ * and `catch` is dead code the compiler removes. Everything in this
+ * header is therefore about the *other* half of the machinery, which is
+ * real and does run — std::terminate, which is what a program reaches
+ * when something has gone wrong and there is nowhere to report it to.
+ *
+ * The base class is here because ported code derives from it and names
+ * it in declarations. Deriving from it works; throwing the result does
+ * not, and does not compile, which is the failure that can be read.
+ */
+
+namespace std {
+
+class exception {
+public:
+    exception() noexcept {}
+    virtual ~exception();
+    virtual const char *what() const noexcept;
+};
+
+class bad_exception : public exception {
+public:
+    ~bad_exception() override;
+    const char *what() const noexcept override;
+};
+
+using terminate_handler = void (*)();
+
+terminate_handler set_terminate(terminate_handler h) noexcept;
+terminate_handler get_terminate() noexcept;
+
+/* Reached from __cxa_pure_virtual, from a failed allocation, and from
+ * anywhere a program decides it cannot continue. Prints which and stops;
+ * see libcxx/src/cxa.cpp. */
+[[noreturn]] void terminate() noexcept;
+
+/* Always false here: nothing can be in flight when nothing can be
+ * thrown. Answering truthfully matters -- a destructor that asks this to
+ * decide whether it may itself throw would otherwise take the wrong
+ * branch. */
+inline bool uncaught_exception() noexcept { return false; }
+inline int  uncaught_exceptions() noexcept { return 0; }
+
+}  // namespace std
+
+#endif
