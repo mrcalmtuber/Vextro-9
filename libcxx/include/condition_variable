@@ -1,0 +1,208 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CONDITION_VARIABLE
+#define _VXCXX_CONDITION_VARIABLE
+
+/*
+ * <condition_variable> — over the condition variables in libc/pthread.c,
+ * which are over the kernel's futex.
+ *
+ * ---- why this exists at all ----
+ *
+ * <mutex> answers "wait until nobody else is inside". This answers "wait
+ * until something is true", and the difference is that the thing being
+ * waited for is not the lock — it is a predicate the holder of the lock
+ * changes. A mutex alone cannot express that without a spin, because
+ * releasing the lock and going to sleep have to happen as one step: a
+ * thread that unlocks, then sleeps, can miss the notify that arrives in
+ * between and sleep forever. wait() is that step, and it is the whole
+ * reason the type is separate.
+ *
+ * ---- the predicate overload is not sugar ----
+ *
+ * A bare wait() can return without anybody having called notify. That is
+ * not a defect in this implementation or in any other; it is what every
+ * condition variable is allowed to do, and code that assumes otherwise
+ * is broken on every system. So
+ *
+ *     while (!ready) cv.wait(lock);
+ *
+ * is the correct shape and cv.wait(lock, [&]{ return ready; }) is that
+ * loop written once. The overload is here because the loop is the part
+ * people forget.
+ *
+ * ---- ICU is why it is written now ----
+ *
+ * ICU 74's umutex.h includes this header unconditionally, and its
+ * one-time-initialisation and its cache both park threads on it while a
+ * value is being built. ICU used to offer U_USER_MUTEX_H for a system
+ * to plug in its own primitives; version 74 removed it and replaced it
+ * with `#error U_USER_ATOMICS and U_USER_MUTEX_H are not supported`. So
+ * std::condition_variable is not one way to satisfy ICU — it is the way.
+ */
+
+#include <cstddef>
+#include <chrono>
+#include <mutex>
+
+extern "C" {
+#include <pthread.h>
+#include <time.h>
+}
+
+namespace std {
+
+enum class cv_status { no_timeout, timeout };
+
+namespace __vx {
+
+inline long long __cv_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
+/* Saturating rather than wrapping. A caller who asks to wait for
+ * duration::max() means "effectively forever", and an overflowing
+ * multiply would turn that into a deadline in the past and a spin. */
+template <class Rep, class Period>
+inline long long __cv_to_ns(const chrono::duration<Rep, Period> &d) {
+    constexpr long long kForever = 1LL << 62;
+    const auto ns = chrono::duration_cast<chrono::nanoseconds>(d);
+    const auto n  = ns.count();
+    if (n <= 0) return 0;
+    if ((long long)n > kForever) return kForever;
+    return (long long)n;
+}
+
+}  // namespace __vx
+
+class condition_variable {
+public:
+    condition_variable() noexcept { pthread_cond_init(&c_, nullptr); }
+    ~condition_variable() { pthread_cond_destroy(&c_); }
+
+    condition_variable(const condition_variable &) = delete;
+    condition_variable &operator=(const condition_variable &) = delete;
+
+    void notify_one() noexcept { pthread_cond_signal(&c_); }
+    void notify_all() noexcept { pthread_cond_broadcast(&c_); }
+
+    /*
+     * The lock is passed by reference and must be held on entry. It is
+     * released while parked and reacquired before returning, which is
+     * the atomicity the type exists for -- pthread_cond_wait does that
+     * half, and unique_lock's own owns_ flag stays true throughout
+     * because the lock *is* held again by the time control comes back.
+     */
+    void wait(unique_lock<mutex> &lock) {
+        pthread_cond_wait(&c_, lock.mutex()->native_handle());
+    }
+
+    template <class Pred>
+    void wait(unique_lock<mutex> &lock, Pred p) {
+        while (!p()) wait(lock);
+    }
+
+    template <class Rep, class Period>
+    cv_status wait_for(unique_lock<mutex> &lock,
+                       const chrono::duration<Rep, Period> &d) {
+        return wait_until_ns(lock, __vx::__cv_now_ns() + __vx::__cv_to_ns(d));
+    }
+
+    template <class Rep, class Period, class Pred>
+    bool wait_for(unique_lock<mutex> &lock,
+                  const chrono::duration<Rep, Period> &d, Pred p) {
+        const long long deadline = __vx::__cv_now_ns() + __vx::__cv_to_ns(d);
+        while (!p())
+            if (wait_until_ns(lock, deadline) == cv_status::timeout)
+                return p();
+        return true;
+    }
+
+    /*
+     * wait_until takes a time_point, and every clock in <chrono> here is
+     * the same monotonic count -- see the note at the head of that
+     * header -- so converting through "how long from now" loses nothing
+     * and keeps one code path underneath.
+     */
+    template <class Clock, class Duration>
+    cv_status wait_until(unique_lock<mutex> &lock,
+                         const chrono::time_point<Clock, Duration> &t) {
+        const auto now = Clock::now();
+        if (t <= now) return cv_status::timeout;
+        return wait_for(lock, t - now);
+    }
+
+    template <class Clock, class Duration, class Pred>
+    bool wait_until(unique_lock<mutex> &lock,
+                    const chrono::time_point<Clock, Duration> &t, Pred p) {
+        while (!p())
+            if (wait_until(lock, t) == cv_status::timeout) return p();
+        return true;
+    }
+
+    pthread_cond_t *native_handle() noexcept { return &c_; }
+
+private:
+    cv_status wait_until_ns(unique_lock<mutex> &lock, long long abs_ns) {
+        struct timespec ts;
+        ts.tv_sec  = (time_t)(abs_ns / 1000000000LL);
+        ts.tv_nsec = (long)(abs_ns % 1000000000LL);
+        const int r = pthread_cond_timedwait(
+            &c_, lock.mutex()->native_handle(), &ts);
+        return r == 0 ? cv_status::no_timeout : cv_status::timeout;
+    }
+
+    pthread_cond_t c_;
+};
+
+/*
+ * condition_variable_any is the same thing over any lockable type
+ * rather than only unique_lock<mutex>. It cannot be built by passing
+ * the caller's lock down, because pthread_cond_wait needs a
+ * pthread_mutex_t and the caller's lock may be anything -- so it owns a
+ * mutex of its own, and the standard's own reference implementation is
+ * exactly this shape.
+ */
+class condition_variable_any {
+public:
+    condition_variable_any() = default;
+    ~condition_variable_any() = default;
+
+    condition_variable_any(const condition_variable_any &) = delete;
+    condition_variable_any &operator=(const condition_variable_any &) = delete;
+
+    void notify_one() noexcept {
+        lock_guard<mutex> held(m_);
+        cv_.notify_one();
+    }
+    void notify_all() noexcept {
+        lock_guard<mutex> held(m_);
+        cv_.notify_all();
+    }
+
+    template <class Lock>
+    void wait(Lock &outer) {
+        unique_lock<mutex> inner(m_);
+        outer.unlock();
+        /* inner is released while parked and held again on return; the
+         * order below -- reacquire outer only after dropping inner --
+         * is what keeps a notify from being lost between the two. */
+        cv_.wait(inner);
+        inner.unlock();
+        outer.lock();
+    }
+
+    template <class Lock, class Pred>
+    void wait(Lock &outer, Pred p) {
+        while (!p()) wait(outer);
+    }
+
+private:
+    mutex              m_;
+    condition_variable cv_;
+};
+
+}  // namespace std
+
+#endif

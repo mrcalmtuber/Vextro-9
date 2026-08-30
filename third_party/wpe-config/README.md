@@ -59,8 +59,11 @@ with no assembler backend.
 | threads, `mmap`, TLS in the kernel | `SYS_CLONE`, `SYS_MMAP`, `SYS_SET_FSBASE` |
 | the browser skin, from Tailwind utility classes | `assets/ui/`, `src/vxui.h` |
 | SQLite, FreeType, HarfBuzz, cross-compiled and green in ring 3 | `apps/sqltest.c`, `fttest.c`, `hbtest.cpp` |
+| ICU 74.2, and the data archive read off the volume | `apps/icutest.cpp` |
+| run-time type information, so a library may use `dynamic_cast` | `libcxx/src/typeinfo.cpp` |
+| a calendar, so that a date formatter has a real "now" | `SYS_WALLCLOCK`, `libc/calendar.c` |
 | WebKit's OS detection, passed without patching it | `vextro-project-inject.cmake` |
-| a sysroot the find modules can see the four ported libraries in | `make webkit-sysroot` |
+| a sysroot the find modules can see all five ported libraries in | `make webkit-sysroot` |
 
 `apps/wpetest.c` runs all of that in ring 3 on every `APP_SELFTEST` boot.
 
@@ -89,18 +92,42 @@ threading model this system does not have.
 **Checked**: `tools/cxx_test.cpp` runs 218 checks on the host against
 these same headers — sorting in five adversarial orders, every string
 length across the small-buffer boundary, tracked objects counted for
-leaks. `apps/cxxtest.cpp` runs 107 more in ring 3 on the machine, which
+leaks. `apps/cxxtest.cpp` runs 150 more in ring 3 on the machine, which
 is the only place the allocator, the static constructors, the guard
 variables under four racing threads, `std::thread` over `SYS_CLONE` and
 a vtable surviving the loader can be checked at all.
 
-**2. Exceptions and RTTI.** Still off, and now by a positive decision
-rather than by absence: `-fno-exceptions -fno-rtti` is what WebKit is
-normally built with, and `libcxx/` is written for it. `at()` on a vector
-out of range prints which index and stops; plain `operator new` on
-exhaustion prints and stops; `new (std::nothrow)` returns null. Those
-are the three choices available without an unwinder and the reasoning is
-in `libcxx/include/new`.
+**2. Exceptions and RTTI — and these two have come apart.**
+
+Exceptions are still off, and now by a positive decision rather than by
+absence: `-fno-exceptions` is what WebKit is normally built with, and
+`libcxx/` is written for it. `at()` on a vector out of range prints which
+index and stops; plain `operator new` on exhaustion prints and stops;
+`new (std::nothrow)` returns null. Those are the three choices available
+without an unwinder and the reasoning is in `libcxx/include/new`.
+
+RTTI is no longer off, because ICU made the question concrete. It uses
+`dynamic_cast` in 117 places and `typeid` in about forty, with no
+fallback path, so `-fno-rtti` was not a preference that could be kept —
+it was a decision not to port ICU. `libcxx/include/typeinfo`,
+`libcxx/include/cxxabi.h` and `libcxx/src/typeinfo.cpp` are what sits
+underneath it: the descriptor hierarchy GCC emits into every `-frtti`
+translation unit, and the search in `[expr.dynamic.cast]` over it.
+
+The two flags stay independent, which is the useful part. `-frtti` costs
+a pointer per polymorphic class and a table per type. Only ICU and one
+test object are built with it; everything else here, WebKit included, is
+still `-fno-exceptions -fno-rtti`.
+
+**Checked**: `apps/rtti_cases.h` is compiled twice — once on the host
+against the host's own C++ runtime, once in ring 3 against this one —
+and the 43 expectations are addresses the compiler works out statically,
+so neither run is checking an implementation against itself. They cover
+single inheritance, multiple inheritance with an offset base, both
+cross-cast directions, a virtual diamond, a repeated non-virtual base
+reachable only through the second clause of the rule, a target present
+twice that must come back null, and a private base that must not be
+found.
 
 **3. File descriptors in ring 3.** Was: "the largest remaining item."
 
@@ -128,7 +155,7 @@ program cannot reach with nobody signed in to permit it).
 
 ## What is left
 
-Four libraries are ported and checked on the machine; the rest of this
+Five libraries are ported and checked on the machine; the rest of this
 section is what a real `make webkit` says, run rather than predicted.
 
 **5. ~~cmake, ninja~~ — installed.** cmake 4.4.3 and ninja 1.13.2. The
@@ -136,15 +163,16 @@ reasoning that kept them out ("installing them unblocks nothing while
 blocker 1 stands") expired when blockers 1 to 3 were cleared, and this
 ladder listed it as step 4.
 
-**6. The C++ standard library.** `<tuple>`, `<map>`, `<set>`, ranges and
-`<condition_variable>` are still not written. What the four ports here
-actually needed was smaller than expected and is now in: `<inttypes.h>`
-(which the C library simply did not have), `<cfloat>`, and the
-`is_trivially_copy_assignable` family. HarfBuzz compiled against
-`libcxx/` with those three additions and no patches.
+**6. The C++ standard library.** `<tuple>`, `<map>`, `<set>` and ranges
+are still not written. What the five ports here actually needed was
+smaller than expected each time, and is now in: `<inttypes.h>` and
+`<cfloat>` for HarfBuzz, then
+`<condition_variable>`, `<typeinfo>`, `<cxxabi.h>`, `<complex>`,
+`<cinttypes>` and `is_standard_layout` for ICU. None of the five needed
+a patch to its own source.
 
-**7. The dependency set — four done, and the count is worse than "a few
-more".** `Source/cmake/OptionsWPE.cmake` opens with **twenty-two
+**7. The dependency set — five done, and the count is still worse than
+"a few more".** `Source/cmake/OptionsWPE.cmake` opens with **twenty-two
 unconditional `find_package(... REQUIRED)`** and has more behind
 conditionals:
 
@@ -152,22 +180,57 @@ conditionals:
     LibXml2  PNG  SQLite3  Threads  Unifdef  WebP  WPE  ZLIB
     LibSoup  GLIB  Cairo  Fontconfig  Freetype  LibXslt  ...
 
-Done: **SQLite**, **FreeType**, **HarfBuzz**, and **WPE** (libwpe, from
-the earlier work). Note that WebKit asks for `HarfBuzz COMPONENTS ICU` —
-HarfBuzz built *against* ICU — so even the one that is ported is not yet
-in the shape the configure wants.
+Ported, built, and staged into the sysroot: **SQLite**, **FreeType**,
+**WPE**, **HarfBuzz** and **ICU 74.2**.
 
-Not done, and each its own project: ICU, GLIB, LibSoup, Cairo,
-Fontconfig, libxml2, zlib, libpng, libjpeg, WebP, libgcrypt, libtasn1,
-libxkbcommon, Epoxy.
+Two of those five have actually been *found by a configure run*:
+HarfBuzz, with the `harfbuzz-icu` archive that satisfies
+`find_package(HarfBuzz COMPONENTS ICU)`, and ICU, with the
+`data i18n uc` components WebKit names. The other three sit further
+down `OptionsWPE.cmake` than configure has yet reached — behind JPEG on
+line 10 — so nothing has exercised `FindSQLite3`, `FindWPE` or CMake's
+own `FindFreetype` against the layout they are staged in. Staged and
+findable are not the same fact until a run says so.
 
-Two of those deserve naming. **ICU** is not a library that can be
-cross-compiled in the ordinary way: its build first compiles *host*
-tools which then generate a thirty-megabyte data archive, and that
-bootstrap is the work rather than the compile. **Epoxy** is an OpenGL
-function loader, and there is no GL reachable from ring 3 at all —
-`vextro-wpe.cmake` already turns the GPU off, which means this
-`find_package` has to be defeated rather than satisfied.
+Not done, and each its own project: GLIB, LibSoup, Cairo, Fontconfig,
+libxml2, zlib, libpng, libjpeg, WebP, libgcrypt, libtasn1, libxkbcommon,
+Epoxy.
+
+### ICU was easier than this file used to claim
+
+This section said ICU could not be cross-compiled in the ordinary way,
+because its build first compiles host tools that generate a
+thirty-megabyte data archive — and that the bootstrap, not the compile,
+was the work.
+
+That was wrong, and it is worth recording as wrong rather than quietly
+replacing. **The source tarball ships the finished archive**, at
+`data/in/icudt74l.dat`: thirty megabytes, already packaged, and the `l`
+on the end means little-endian, which is this machine. The host
+bootstrap exists to *filter* that archive down to a subset — which is
+what a project shipping ICU on a phone wants and is not what was needed
+here. There is no data build in this repository at all; the file is
+copied onto the volume and ICU is told where to look with
+`u_setDataDirectory("/")`, after which it opens it through its own
+stdio path.
+
+What ICU did cost was two things neither of which was the data:
+
+**RTTI.** ICU 74 uses `dynamic_cast` in 117 places and `typeid` in about
+forty, and unlike older versions it has no `U_HAVE_RTTI` fallback —
+`utypeinfo.h` includes `<typeinfo>` unconditionally. So it is the one
+library here compiled `-frtti`, and `libcxx/` grew what sits underneath
+that: `std::type_info`, the `__cxxabiv1` descriptor hierarchy, and
+`__dynamic_cast`. See `libcxx/src/typeinfo.cpp`.
+
+**A calendar.** `time()` answered from the monotonic tick, so every date
+ICU produced would have been in January 1970. `SYS_WALLCLOCK` carries
+the CMOS reading up to ring 3 and `libc/calendar.c` takes it apart.
+
+**Epoxy** still deserves its naming. It is an OpenGL function loader,
+and there is no GL reachable from ring 3 at all — `vextro-wpe.cmake`
+already turns the GPU off, which means this `find_package` has to be
+defeated rather than satisfied.
 
 ## The OS gate, and how it was passed
 
@@ -260,43 +323,54 @@ not installed to run them.
 
 ## Where it stops today
 
-`make webkit` reaches `OptionsWPE.cmake:8` — the first dependency check
-of twenty-two — and stops:
+`make webkit` reaches `OptionsWPE.cmake:10` — the *third* dependency
+check of twenty-two — and stops:
 
-    -- Found hb-features.h
-    -- Found the following HarfBuzz libraries:
-    --  HarfBuzz (required): .../build/webkit-sysroot/lib/libharfbuzz.a
-    -- The following HarfBuzz libraries were not found:
-    --  ICU (required)
-    CMake Error: Could NOT find HarfBuzz (missing:
-      _HarfBuzz_REQUIRED_LIBS_FOUND) (found suitable version "8.5.0",
-      minimum required is "1.4.2")
+    -- Found HarfBuzz: .../build/webkit-sysroot/include/harfbuzz
+       (found suitable version "8.5.0", minimum required is "1.4.2")
+    -- Found ICU: .../build/webkit-sysroot/include
+       (found suitable version "74.2", minimum required is "61.2")
+       found components: data i18n uc
+    CMake Error: Could NOT find JPEG
+      (missing: JPEG_LIBRARY JPEG_INCLUDE_DIR)
 
-Which is now an accurate statement rather than a confusing one. Before
-`make webkit-sysroot` existed, the same line read *"Required version
-(1.4.2) is higher than found version ()"* — HarfBuzz was built, tested
-and passing 32 assertions in ring 3, and the build system could not see
-it, because it looks with pkg-config (absent here) and then in the
-layout a Unix installation has (which `build/` is not).
+Both of the first two lines were errors before this. HarfBuzz was
+rejected for not being built against ICU — `find_package(HarfBuzz 1.4.2
+REQUIRED COMPONENTS ICU)` looks for a `libharfbuzz-icu` beside it, and
+there was none. And before that it was not found at all: the message
+read *"Required version (1.4.2) is higher than found version ()"* about
+a library that was built, tested, and passing 32 assertions in ring 3,
+because the find modules look with pkg-config (absent here) and then in
+the layout a Unix installation has, which `build/` is not.
 
-`build/webkit-sysroot/` is that layout, staged from artifacts the main
-Makefile already built and the machine already ran. It is not a
-substitute for anything: `libfreetype.a` in it is the archive `fttest`
-exercised, and the two redirected config headers are copied over
-upstream's so the headers in it describe the archive beside them.
+`build/webkit-sysroot/` is that layout, staged by `make webkit-sysroot`
+from artifacts the main Makefile already built and the machine already
+ran. It is not a substitute for anything: `libicuuc.a` in it is the
+archive `icutest` exercised, and FreeType's two redirected config
+headers are copied over upstream's so the headers in it describe the
+archive beside them.
 
-So the frontier is exactly ICU, and there are seventeen behind it.
+So the frontier is now JPEG, and there are sixteen behind it.
 
 ## The exit code
 
 Non-zero, and this is the honest reading of it.
 
 Clearing the OS gate moved the wall from *before* the dependency list to
-*inside* it. That is the whole of what an OS-name shim can do, and it is
-what was asked for. It is not, and could not be, a browser: eighteen
-unported REQUIRED libraries stand behind that error, one of them
+*inside* it; porting ICU moved it two entries further along that list.
+Both were worth doing and neither is a browser: sixteen unported
+REQUIRED libraries stand behind the current error, one of them
 (**Epoxy**) an OpenGL function loader for a machine whose graphics
 driver deliberately implements the blitter and not the 3D pipeline.
+
+The arithmetic is worth stating plainly, because "two down, sixteen to
+go" reads more encouraging than it is. The two done here are the two
+that had no substitute — nothing else supplies the Unicode tables, and
+nothing else supplies shaping. Several of the sixteen are small (zlib,
+libpng, libjpeg, libtasn1). Two are not: **GLib** with **LibSoup** is a
+second runtime with its own main loop, type system and TLS stack, and
+**Epoxy** wants a GL implementation this machine does not have and this
+kernel deliberately does not provide.
 
 There is also a second gate further along that no build-system work
 reaches. `WTF_OS_UNIX` gets the files chosen; the code in them still
@@ -317,16 +391,16 @@ kind from anything below it on this ladder.
    `vextro-project-inject.cmake` and `CMAKE_PROJECT_INCLUDE`
 7. ~~Make the ported libraries findable~~ — done,
    `make webkit-sysroot`
-8. **ICU**, which is where configure stops today. Not an ordinary
-   cross-compile: its build first compiles *host* tools that generate a
-   thirty-megabyte data archive, and that bootstrap is the work.
-9. The other seventeen, in dependency order. Two are structural rather
-   than laborious — **Epoxy** loads OpenGL entry points for a machine
-   with no GL, and **GLib**/**LibSoup** are a second runtime with their
-   own main loop, type system and TLS stack.
-10. The `libc/` gaps WebKit's own configure named: `sys/time.h`,
-    `langinfo.h`, `localtime_r`, `timegm`, `strnstr`, `regexec`,
-    `SIGTRAP`, `tm_gmtoff`, `tm_zone`
+8. ~~ICU~~ — done, 74.2, with `libharfbuzz-icu` beside it. Its data
+   archive ships prebuilt; what it actually cost was RTTI and a
+   calendar, both of which are now in.
+9. **JPEG**, where configure stops today, and then the rest of the
+   sixteen. Most are small; `GLib`/`LibSoup` and `Epoxy` are not, and
+   the second of those needs a GL implementation before it needs a port.
+10. The `libc/` gaps WebKit's own configure named: `langinfo.h`,
+    `strnstr`, `regexec`, `statx`, `malloc_trim`. `sys/time.h`,
+    `localtime_r`, `timegm`, `SIGTRAP`, `tm_gmtoff` and `tm_zone` were
+    on this list and are now written — ICU needed them first.
 11. A real `WTF_OS_VEXTRO` inside WebKit, for the places `OS(UNIX)`
     assumes a process model this system does not have
 12. WPE WebKit, with this configuration
@@ -334,12 +408,13 @@ kind from anything below it on this ladder.
     in `assets/ui/`
 
 Steps 1 to 3 were each comparable in size to the C library written to
-reach them. Steps 6 and 7 are small by comparison and were worth doing
-precisely because they are: they turned an error that said nothing about
-this system into a dependency list that says exactly what is left.
+reach them. Steps 6 and 7 were small and worth doing precisely because
+they are: they turned an error that said nothing about this system into
+a dependency list that says exactly what is left. Step 8 was the largest
+single port here — 445 translation units — and it is the one that made
+two long-standing gaps in the system underneath it impossible to keep
+ignoring.
 
-What remains is breadth for most of it and depth for two items. Steps 8
-to 10 are ports onto interfaces that exist and are tested. Steps 9's two
-named exceptions and step 11 are not — a GL implementation and a WTF
-platform port are each their own project, and neither is reachable by
-configuring anything.
+What remains is breadth for most of it and depth for three items: a GL
+implementation, a GLib-shaped second runtime, and a WTF platform port.
+None of those is reachable by configuring anything.

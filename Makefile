@@ -167,7 +167,8 @@ LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
 # expects, and silently wrong either way.
 LIBC_SRC  := libc/string.c libc/stdio.c libc/malloc.c libc/math.c \
              libc/mmap.c libc/pthread.c libc/posix.c libc/stdlib2.c \
-             libc/file.c libc/socket.c libc/exit.c
+             libc/file.c libc/socket.c libc/exit.c libc/locale.c \
+             libc/wchar.c libc/calendar.c
 LIBC_OBJ  := $(patsubst libc/%.c,build/libc/%.o,$(LIBC_SRC))
 LIBC      := build/libvextro.a
 LIBC_CRT0 := build/libc/crt0.o
@@ -218,7 +219,8 @@ CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -ffreestanding \
             -ftls-model=initial-exec \
             -nostdinc++ -Ilibcxx/include -Ilibc/include -Iapps
 
-LIBCXX_SRC := libcxx/src/new.cpp libcxx/src/cxa.cpp
+LIBCXX_SRC := libcxx/src/new.cpp libcxx/src/cxa.cpp \
+              libcxx/src/typeinfo.cpp
 LIBCXX_OBJ := $(patsubst libcxx/src/%.cpp,build/libcxx/%.o,$(LIBCXX_SRC))
 LIBCXX     := build/libvextrocxx.a
 
@@ -277,9 +279,11 @@ all: os.iso disk.img
 test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test \
       build/ntcrypto_test build/aes_test build/krb5_test build/wifi_test \
       build/media_test build/rdp_test build/ntfs_test build/vmx_test \
-      build/av_test build/mbedtls_test build/math_test build/cxx_test
+      build/av_test build/mbedtls_test build/math_test build/cxx_test \
+      build/rtti_test
 	@./build/math_test
 	@./build/cxx_test
+	@./build/rtti_test
 	@./build/wikidoc_test
 	@./build/profile_test
 	@./build/ttfhint_test
@@ -343,6 +347,23 @@ build/mbedhost/%.o: $(MBED_DIR)/library/%.c $(MBED_DIR)/vextro_config.h
 	@mkdir -p build/mbedhost
 	@$(HOSTCC) -c -O1 -w -I$(MBED_DIR)/include -I$(MBED_DIR) \
 		-DMBEDTLS_CONFIG_FILE='"vextro_config.h"' -o $@ $<
+
+# --- The RTTI cases, on the host ---
+#
+# apps/rtti_cases.h compiled against the host's own C++ runtime, which
+# makes it a reference rather than a second opinion. The identical file
+# runs in ring 3 inside cxxtest over libcxx/src/typeinfo.cpp, and the
+# two must agree.
+#
+# Built with the host's headers and -frtti on purpose: nothing about
+# this binary should come from libcxx/, or it would be checking the
+# implementation against itself.
+build/rtti_test: tools/rtti_test.cpp apps/rtti_cases.h
+	@mkdir -p build
+	@$(HOSTCC) -std=c++17 -O2 -Wall -Wextra -frtti -Iapps \
+		-x c++ tools/rtti_test.cpp -o $@ -lc++ 2>/dev/null || \
+	 $(HOSTCC) -std=c++17 -O2 -Wall -Wextra -frtti -Iapps \
+		-x c++ tools/rtti_test.cpp -o $@ -lstdc++
 
 # The C++ containers, on the host, against the same headers the target
 # builds against.
@@ -724,7 +745,7 @@ build/ca-bundle.crt:
 # at boot and cannot use a fragmented one; and it allocates every file
 # sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
 # archive's run list would not fit in its own MFT record.
-disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -741,7 +762,9 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		build/sqltest \
 		build/fttest \
 		build/hbtest \
+		build/icutest \
 		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
+		$(ICU_DATA):icudt74l.dat \
 		build/sqlseed.db:sqlseed.db \
 		$(foreach w,$(WINAPPS),$(w):$(notdir $(w))) \
 		apps/welcome.txt:docs/welcome.txt \
@@ -1097,6 +1120,153 @@ $(LIBHB): build/harfbuzz/harfbuzz.o
 harfbuzz: $(LIBHB)
 
 
+# ===================================================================
+#  ICU 74.2 — the character and locale tables, in ring 3
+# ===================================================================
+#
+# The largest thing ported to this system: 445 translation units and
+# 384,000 lines, plus a thirty-megabyte data archive. WebKit requires it
+# outright -- OptionsWPE.cmake asks for `ICU 61.2 COMPONENTS data i18n
+# uc` and for a HarfBuzz built against it -- and nothing else can supply
+# what it holds: the Unicode character database, collation for every
+# language, the segmentation rules, the legacy character encodings a
+# browser has to decode, and the IANA timezone database.
+#
+# ---- the data is prebuilt, and that is the whole story ----
+#
+# ICU's reputation for being unbuildable comes from its data: normally
+# you compile *host* tools -- genrb, gencnv, icupkg -- run them over a
+# few thousand locale source files, and package the result. That is a
+# second toolchain and it is genuinely the hard part.
+#
+# It is also unnecessary. The source tarball ships the finished archive
+# at data/in/icudt74l.dat: thirty megabytes, already packaged, and the
+# `l` on the end means little-endian, which is this machine. The host
+# bootstrap exists to *filter* that archive down, not to create it. So
+# there is no data build here at all -- the file is copied onto the
+# volume and ICU is told where to find it.
+#
+# ---- the configuration, and why each one ----
+#
+# U_STATIC_IMPLEMENTATION   there are no shared objects on this target
+# U_COMMON_IMPLEMENTATION   } which half is being compiled; ICU uses
+# U_I18N_IMPLEMENTATION     } these to decide what to export
+# U_HAVE_MMAP=0             there is no file-backed mmap, so umapfile.cpp
+#                           takes its stdio path -- fopen and fread,
+#                           which this C library does have
+# U_ENABLE_DYLOAD=0         no dlopen, no runtime linker
+# U_CHARSET_IS_UTF8=1       the default codepage. True of every byte
+#                           string in this system, and it removes the
+#                           charset-detection path entirely
+# U_HAVE_NL_LANGINFO_CODESET=0
+#                           there is no langinfo.h, because there is no
+#                           locale to interrogate
+# U_HAVE_TZSET / TIMEZONE / TZNAME = 0
+#                           there is no timezone database *outside* ICU;
+#                           the one inside its own data is the real one.
+#                           See libc/include/time.h.
+#
+# -frtti is the one that is not a subtraction. Everything else in this
+# repository is built -fno-rtti; ICU 74 uses dynamic_cast in 117 places
+# and typeid in about forty, with no fallback -- utypeinfo.h includes
+# <typeinfo> unconditionally. So libcxx/src/typeinfo.cpp exists, and
+# apps/rtti_cases.h checks it against the host's own C++ runtime.
+#
+# C++17 rather than the C++20 everything else uses, because that is what
+# ICU 74 is written and tested against.
+ICU_VERSION := 74.2
+ICU_TARBALL := icu4c-74_2-src.tgz
+ICU_URL     := https://github.com/unicode-org/icu/releases/download/release-74-2/$(ICU_TARBALL)
+ICU_SHA256  := 68db082212a96d6f53e35d60f47d38b962e9f9d207a74cfac78029ae8ff5e08c
+
+ICU_DIR  := third_party/icu
+ICU_DATA := $(ICU_DIR)/data/in/icudt74l.dat
+ICU_INC  := -I$(ICU_DIR)/common -I$(ICU_DIR)/i18n
+
+ICU_DEFS := -DU_STATIC_IMPLEMENTATION -DU_HAVE_MMAP=0 -DU_ENABLE_DYLOAD=0 \
+            -DU_CHARSET_IS_UTF8=1 -DU_HAVE_NL_LANGINFO_CODESET=0 \
+            -DU_HAVE_TZSET=0 -DU_HAVE_TIMEZONE=0 -DU_HAVE_TZNAME=0
+
+# CXXFLAGS minus the two that ICU cannot be built with, plus the two it
+# needs. Written as a filter rather than as a second list so that a flag
+# added to CXXFLAGS later reaches here too.
+ICU_CXXFLAGS := $(filter-out -fno-rtti -std=c++20,$(CXXFLAGS)) -std=c++17 -frtti -w
+
+ICU_UC_SRC   := $(wildcard $(ICU_DIR)/common/*.cpp)
+ICU_I18N_SRC := $(wildcard $(ICU_DIR)/i18n/*.cpp)
+ICU_DATA_SRC := $(wildcard $(ICU_DIR)/stubdata/*.cpp)
+
+ICU_UC_OBJ   := $(patsubst $(ICU_DIR)/%.cpp,build/icu/%.o,$(ICU_UC_SRC))
+ICU_I18N_OBJ := $(patsubst $(ICU_DIR)/%.cpp,build/icu/%.o,$(ICU_I18N_SRC))
+ICU_DATA_OBJ := $(patsubst $(ICU_DIR)/%.cpp,build/icu/%.o,$(ICU_DATA_SRC))
+
+LIBICUUC   := build/libicuuc.a
+LIBICUI18N := build/libicui18n.a
+LIBICUDATA := build/libicudata.a
+ICU_LIBS   := $(LIBICUI18N) $(LIBICUUC) $(LIBICUDATA)
+
+build/icu/common/%.o: $(ICU_DIR)/common/%.cpp $(ICU_DIR)/common/unicode/utypes.h
+	@mkdir -p build/icu/common
+	$(CXX) $(ICU_CXXFLAGS) -DU_COMMON_IMPLEMENTATION $(ICU_DEFS) $(ICU_INC) -c $< -o $@
+
+# stubdata is one file and it gets an archive of its own, named
+# libicudata.a, because that is the name every consumer looks for --
+# WebKit asks for `ICU COMPONENTS data i18n uc` and a build with the
+# first one missing is rejected however complete the other two are.
+#
+# What it contains is the *absence* of linked-in data: the symbol a
+# built-in archive would define, left empty, so that the archive is
+# found on disk at run time instead. That is the arrangement this system
+# uses -- icudt74l.dat sits on the volume and u_setDataDirectory points
+# at it.
+build/icu/stubdata/%.o: $(ICU_DIR)/stubdata/%.cpp $(ICU_DIR)/common/unicode/utypes.h
+	@mkdir -p build/icu/stubdata
+	$(CXX) $(ICU_CXXFLAGS) -DU_COMMON_IMPLEMENTATION $(ICU_DEFS) $(ICU_INC) -c $< -o $@
+
+build/icu/i18n/%.o: $(ICU_DIR)/i18n/%.cpp $(ICU_DIR)/common/unicode/utypes.h
+	@mkdir -p build/icu/i18n
+	$(CXX) $(ICU_CXXFLAGS) -DU_I18N_IMPLEMENTATION $(ICU_DEFS) $(ICU_INC) -c $< -o $@
+
+$(LIBICUUC): $(ICU_UC_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(ICU_UC_OBJ)
+
+$(LIBICUDATA): $(ICU_DATA_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(ICU_DATA_OBJ)
+
+$(LIBICUI18N): $(ICU_I18N_OBJ)
+	@mkdir -p build
+	$(AR) rcs $@ $(ICU_I18N_OBJ)
+
+.PHONY: icu
+icu: $(ICU_LIBS)
+
+# ---- HarfBuzz, built against ICU ----
+#
+# A separate archive because WebKit asks for it separately:
+# `find_package(HarfBuzz 1.4.2 REQUIRED COMPONENTS ICU)` looks for
+# libharfbuzz-icu alongside libharfbuzz, and a HarfBuzz without it is
+# rejected outright however new it is. That was the exact error
+# `make webkit` stopped on before ICU existed.
+#
+# It is one upstream source file. hb-icu.cc gives HarfBuzz a
+# hb_unicode_funcs_t backed by ICU's character database instead of the
+# compact copy HarfBuzz carries itself -- the same properties from the
+# same tables the rest of the system uses.
+LIBHBICU := build/libharfbuzz-icu.a
+
+build/harfbuzz/hb-icu.o: $(HB_DIR)/src/hb-icu.cc $(ICU_DIR)/common/unicode/utypes.h
+	@mkdir -p build/harfbuzz
+	$(CXX) $(ICU_CXXFLAGS) $(HB_DEFS) -DHAVE_ICU=1 -DHAVE_ICU_BUILTIN=1 \
+		$(HB_INC) $(ICU_INC) $(ICU_DEFS) -DU_SHOW_CPLUSPLUS_API=0 \
+		-c $< -o $@
+
+$(LIBHBICU): build/harfbuzz/hb-icu.o
+	@mkdir -p build
+	$(AR) rcs $@ $^
+
+
 # ---- fetching the three, and why they are not committed ----
 #
 # Each is downloaded and checked against the hash recorded above before
@@ -1155,8 +1325,24 @@ $(HB_DIR)/src/harfbuzz.cc:
 	@mv third_party/harfbuzz-$(HARFBUZZ_VERSION) $(HB_DIR)
 	@echo "  HARFBUZZ $(HB_DIR) ($(HARFBUZZ_VERSION))"
 
+$(ICU_DIR)/common/unicode/utypes.h:
+	@echo "  fetching $(ICU_TARBALL) (26 MB compressed, 113 MB unpacked)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(ICU_TARBALL) $(ICU_URL)
+	@printf '%s  build/%s\n' "$(ICU_SHA256)" "$(ICU_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(ICU_TARBALL) does not match its checksum."; \
+		     rm -f build/$(ICU_TARBALL); exit 1; }
+	@rm -rf $(ICU_DIR) build/icu-unpack
+	@mkdir -p build/icu-unpack
+	@tar -C build/icu-unpack -xzf build/$(ICU_TARBALL)
+	@mv build/icu-unpack/icu/source $(ICU_DIR)
+	@rm -rf build/icu-unpack
+	@echo "  ICU      $(ICU_DIR) ($(ICU_VERSION))"
+
 .PHONY: libs-fetch
-libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc
+libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc \
+            $(ICU_DIR)/common/unicode/utypes.h
 
 # --- Fetching WPE WebKit itself ---
 #
@@ -1228,6 +1414,14 @@ $(WEBKIT_SRC)/CMakeLists.txt:
 # describe the archive beside them rather than some other build of the
 # same version.
 #
+# ICU's headers are the other case worth a line. Upstream keeps them in
+# two directories -- common/unicode and i18n/unicode -- and every
+# consumer includes them as one <unicode/...>, because that is how an
+# installed ICU lays them out. The two are merged here for the same
+# reason: a build that only saw common/unicode would compile
+# unicode/uchar.h and fail on unicode/ucol.h with no hint that the
+# second half exists.
+#
 # HarfBuzz has the same shape of hazard and not the same severity: it is
 # built -DHB_TINY -DHB_NO_MT, which turns features off inside the
 # library without moving anything in the public headers. It is recorded
@@ -1239,6 +1433,7 @@ WEBKIT_SYSROOT := build/webkit-sysroot
 webkit-sysroot: $(WEBKIT_SYSROOT)/.stamp
 
 $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
+                          $(ICU_LIBS) $(LIBHBICU) \
                           $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h
 	@rm -rf $(WEBKIT_SYSROOT)
 	@mkdir -p $(WEBKIT_SYSROOT)/include/harfbuzz \
@@ -1257,8 +1452,14 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	@cp $(LIBFT)       $(WEBKIT_SYSROOT)/lib/libfreetype.a
 	@cp $(LIBSQLITE)   $(WEBKIT_SYSROOT)/lib/libsqlite3.a
 	@cp $(LIBWPE)      $(WEBKIT_SYSROOT)/lib/libwpe-1.0.a
+	@cp $(LIBHBICU)    $(WEBKIT_SYSROOT)/lib/libharfbuzz-icu.a
+	@cp $(LIBICUUC)    $(WEBKIT_SYSROOT)/lib/libicuuc.a
+	@cp $(LIBICUI18N)  $(WEBKIT_SYSROOT)/lib/libicui18n.a
+	@cp $(LIBICUDATA)  $(WEBKIT_SYSROOT)/lib/libicudata.a
+	@cp -R $(ICU_DIR)/common/unicode $(WEBKIT_SYSROOT)/include/
+	@cp $(ICU_DIR)/i18n/unicode/*.h  $(WEBKIT_SYSROOT)/include/unicode/
 	@touch $@
-	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (harfbuzz, freetype, sqlite3, wpe)"
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe)"
 
 # --- Building it ---
 #
@@ -1407,6 +1608,26 @@ build/fdtest: build/fdtest.o apps/app.ld $(LIBC)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		build/fdtest.o $(LIBC) -o $@
 
+# --- User app: icutest ---
+#
+# ICU in ring 3. Compiled -frtti because it uses dynamic_cast on ICU's
+# own C++ API -- see the note at the head of the file about why that is
+# the interesting part -- and linked with crt0 because ICU has static
+# constructors that must run before main.
+#
+# $(LIBGCC) is on the link for the same reason hbtest needs it: the
+# compiler emits calls to its own helpers (__popcountdi2 and friends)
+# that no C library provides.
+build/icutest.o: apps/icutest.cpp apps/vextro.h $(ICU_DIR)/common/unicode/utypes.h \
+                 $(wildcard libcxx/include/*)
+	@mkdir -p build
+	$(CXX) $(ICU_CXXFLAGS) $(ICU_DEFS) $(ICU_INC) -c $< -o $@
+
+build/icutest: build/icutest.o apps/app.ld $(ICU_LIBS) $(LIBCXX) $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/icutest.o $(LIBC_CRT0) $(ICU_LIBS) \
+		$(LIBCXX) $(LIBC) $(LIBGCC) -o $@
+
 # --- User app: cxxtest ---
 #
 # The first C++ program this system runs, and the only place several
@@ -1422,9 +1643,26 @@ build/cxxtest.o: apps/cxxtest.cpp apps/vextro.h $(wildcard libcxx/include/*)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-build/cxxtest: build/cxxtest.o apps/app.ld $(LIBCXX) $(LIBC) $(LIBC_CRT0)
+# The one object here built with RTTI on.
+#
+# -fno-rtti is in CXXFLAGS and stays there; this file is the exception
+# because typeid and dynamic_cast do not compile without it, and the
+# whole point of apps/rtti_cases.h is to run them. Filtering the flag out
+# rather than writing a second flag list keeps the two in step: anything
+# added to CXXFLAGS later applies here too.
+#
+# It is also the arrangement ICU is built with -- one library compiled
+# -frtti linked into programs that are not -- so this object checks the
+# mixture as well as the casts.
+build/rtti_probe.o: apps/rtti_probe.cpp apps/rtti_cases.h $(wildcard libcxx/include/*)
+	@mkdir -p build
+	$(CXX) $(filter-out -fno-rtti,$(CXXFLAGS)) -frtti -c $< -o $@
+
+build/cxxtest: build/cxxtest.o build/rtti_probe.o apps/app.ld \
+               $(LIBCXX) $(LIBC) $(LIBC_CRT0)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
-		build/cxxtest.o $(LIBC_CRT0) $(LIBCXX) $(LIBC) -o $@
+		build/cxxtest.o build/rtti_probe.o \
+		$(LIBC_CRT0) $(LIBCXX) $(LIBC) -o $@
 
 # --- User app: sqltest ---
 #

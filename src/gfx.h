@@ -550,6 +550,64 @@ static void rtc_read(int *hh, int *mm, int *ss, int *day, int *mon, int *yr) {
     if (yr)  *yr = 2000 + y;
 }
 
+/*
+ * The same reading as a count of seconds since 1970-01-01.
+ *
+ * ---- why this is here and not in ring 3 ----
+ *
+ * rtc_read talks to the CMOS through ports 0x70 and 0x71, which ring 3
+ * cannot reach and should not be given. Until this function existed the
+ * consequence reached all the way up: libc's time() answered from the
+ * monotonic tick, so a program that formatted "now" printed a date a few
+ * seconds after the start of 1970. That was documented rather than
+ * fixed, because nothing needed a calendar. ICU does — a date formatter
+ * whose "now" is wrong is a date formatter that cannot be checked
+ * against anything.
+ *
+ * ---- what it is not ----
+ *
+ * Not UTC, necessarily. The CMOS clock holds whatever the firmware put
+ * in it, which on a machine configured for local time is local time,
+ * and there is nowhere in the hardware that records which. Treating it
+ * as UTC is the only choice available and it is the one every simple
+ * system makes; the error, where there is one, is a whole number of
+ * hours and is the same every boot.
+ *
+ * ---- and the conversion ----
+ *
+ * Days from a civil date by Howard Hinnant's method: shift the year so
+ * that it begins in March, which puts the leap day at the end where it
+ * cannot disturb the month-length arithmetic, and the whole thing
+ * becomes four multiplications with no table and no loop. Correct for
+ * every date in the proleptic Gregorian calendar, which is a much larger
+ * range than a CMOS clock can express.
+ */
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);              /* [0, 399] */
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  /* [0, 146096] */
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t rtc_unix_seconds(void) {
+    int hh = 0, mm = 0, ss = 0, d = 1, mo = 1, yr = 1970;
+    rtc_read(&hh, &mm, &ss, &d, &mo, &yr);
+
+    /* A clock that has never been set, or one read while the chip was
+     * mid-update, can produce a date outside anything sensible. Reporting
+     * zero is better than reporting a confident wrong century: a caller
+     * that sees zero knows the clock is unset, which is exactly what
+     * "the epoch" has always meant. */
+    if (yr < 1970 || yr > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+        hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 60)
+        return 0;
+
+    return days_from_civil(yr, (unsigned)mo, (unsigned)d) * 86400
+           + (int64_t)hh * 3600 + (int64_t)mm * 60 + ss;
+}
+
 static const char *month_names[12] = {
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"

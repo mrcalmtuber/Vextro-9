@@ -1,0 +1,38 @@
+// -*- C++ -*-
+#ifndef _VXCXX_CINTTYPES
+#define _VXCXX_CINTTYPES
+
+/*
+ * <cinttypes> — the C library's <inttypes.h>, with the four functions
+ * also visible in namespace std.
+ *
+ * The PRI and SCN macros are macros and stay where they are; a macro has
+ * no namespace and putting <inttypes.h> in scope is the whole of what a
+ * caller writing PRId64 needs. What the C++ header adds is `std::imaxabs`
+ * and the other three, which the standard requires to exist in both
+ * places -- and code that writes `std::strtoimax` is not unusual, so the
+ * using-declarations are not decoration.
+ *
+ * ICU 74's rbbi.cpp is what asked for this header. It prints internal
+ * rule-based break iterator state with PRId32, which is why the file
+ * includes <cinttypes> and not <inttypes.h>.
+ */
+
+#include <cstdint>
+
+extern "C" {
+#include <inttypes.h>
+}
+
+namespace std {
+
+using ::imaxdiv_t;
+
+using ::imaxabs;
+using ::imaxdiv;
+using ::strtoimax;
+using ::strtoumax;
+
+}  // namespace std
+
+#endif

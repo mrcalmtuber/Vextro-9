@@ -175,8 +175,25 @@ namespace {
  * lock that allocated, or that asked which thread it was on through
  * machinery that allocated, could not be used to protect the first
  * allocation a program makes. */
+/*
+ * The argument order is (address, operation, value), and it is written
+ * out here rather than left to look obvious because it was wrong.
+ *
+ * This passed `op` where the kernel reads the address and the address
+ * where it reads the operation. The kernel refused every call -- a
+ * futex address of 0 or 1 is not four-byte aligned, which is the first
+ * thing SYS_FUTEX checks -- and the refusal was invisible from up here,
+ * because both callers ignore the return value.
+ *
+ * Nothing produced a wrong answer, which is why it survived: the wait
+ * below is inside a loop that re-tests its condition, so a wait that
+ * never happens is a spin rather than a hang, and the wake that never
+ * happened had nobody asleep to miss it. What it cost was the entire
+ * point of using a futex -- a thread waiting for another to finish
+ * constructing a function-local static burned a core doing it.
+ */
 inline long vx_futex(uint32_t *addr, int op, uint32_t val) {
-    return __syscall3(SYS_FUTEX, (long)op, (long)(uintptr_t)addr, (long)val);
+    return __syscall3(SYS_FUTEX, (long)(uintptr_t)addr, (long)op, (long)val);
 }
 
 /* One channel for every guard in the program.

@@ -277,6 +277,28 @@
 #define SYS_RESOLVE         58
 
 /*
+ * ===== 59: the calendar =====
+ *
+ * Seconds since 1970-01-01, read from the CMOS clock.
+ *
+ * Its own call rather than a clock id on SYS_CLOCK, because it is a
+ * different quantity from the one that call answers. SYS_CLOCK returns
+ * the scheduler tick: monotonic, starting at zero when the machine
+ * boots, and the right thing to measure an interval with. This returns
+ * a point on a calendar, which can be earlier than the last one it
+ * returned if somebody sets the clock, and which is only as accurate as
+ * the firmware that set it. Two quantities with different guarantees
+ * should not share a system call number and be told apart by an
+ * argument.
+ *
+ * Free of any permission check, which is worth saying out loud: the
+ * time of day is not a secret, every process can already see it in the
+ * taskbar, and a call that fails would only push programs back onto the
+ * monotonic count they were using before.
+ */
+#define SYS_WALLCLOCK       59
+
+/*
  * ---- open flags ----
  *
  * Linux's numbers, and octal as Linux writes them, because ported code

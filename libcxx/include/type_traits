@@ -224,6 +224,30 @@ template <class B, class D> inline constexpr bool is_base_of_v =
 template <class T> struct is_trivial : bool_constant<__is_trivial(T)> {};
 template <class T> struct is_trivially_copyable
     : bool_constant<__is_trivially_copyable(T)> {};
+
+/*
+ * is_standard_layout, which is a question about *memory* rather than
+ * about construction: no virtual functions, no virtual bases, one
+ * access control for all the non-static members, and no two of them in
+ * different classes of the hierarchy. It is the property that makes
+ * offsetof meaningful and makes a C struct and a C++ class with the same
+ * members interchangeable.
+ *
+ * ICU's formatted_string_builder.h static_asserts it on the type it
+ * stores in its buffer, which is exactly the right use: the buffer is
+ * copied with memcpy, and a type without this property may not be.
+ */
+template <class T> struct is_standard_layout
+    : bool_constant<__is_standard_layout(T)> {};
+template <class T> inline constexpr bool is_standard_layout_v =
+    is_standard_layout<T>::value;
+
+/* The pair of it, and the two together are what "POD" used to mean --
+ * which is why the standard deprecated is_pod in favour of asking the
+ * two questions separately. */
+template <class T> struct is_aggregate : bool_constant<__is_aggregate(T)> {};
+template <class T> inline constexpr bool is_aggregate_v =
+    is_aggregate<T>::value;
 template <class T> inline constexpr bool is_trivially_copyable_v =
     is_trivially_copyable<T>::value;
 

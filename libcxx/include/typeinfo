@@ -1,0 +1,135 @@
+// -*- C++ -*-
+#ifndef _VXCXX_TYPEINFO
+#define _VXCXX_TYPEINFO
+
+/*
+ * <typeinfo> — run-time type identification.
+ *
+ * ============================================================
+ *  WHY THIS IS HERE, AFTER -fno-rtti WAS A DELIBERATE CHOICE
+ * ============================================================
+ *
+ * Everything else in this runtime is built -fno-exceptions -fno-rtti,
+ * and libcxx/README.md argues for both. That argument still holds for
+ * code written here. It does not hold for code ported here.
+ *
+ * ICU 74 uses `dynamic_cast` in 117 places and `typeid` in about forty,
+ * and unlike older versions it offers no fallback: there is no
+ * U_HAVE_RTTI switch, and utypeinfo.h includes <typeinfo>
+ * unconditionally with the comment "for 'typeid' to work". So ICU is
+ * compiled -frtti, and something has to be underneath it.
+ *
+ * On a hosted system that something is libsupc++, which does not exist
+ * for x86_64-elf. This file and libcxx/src/typeinfo.cpp are the part of
+ * it that RTTI needs -- the class hierarchy the compiler emits type
+ * descriptors into, and the search that makes dynamic_cast answer.
+ *
+ * The two flags stay independent, which is the point worth keeping:
+ * -frtti costs a pointer per polymorphic class and a table per type, and
+ * nothing else. -fno-exceptions is still in force everywhere, and
+ * dynamic_cast to a *reference* -- the one form that must throw on
+ * failure -- is therefore still unavailable. Nothing in ICU uses it.
+ *
+ * ============================================================
+ *  THE LAYOUT IS NOT NEGOTIABLE
+ * ============================================================
+ *
+ * The compiler emits type descriptor objects itself, into every
+ * translation unit that needs one, with a fixed layout given by the
+ * Itanium C++ ABI: a vtable pointer, then a name pointer, then whatever
+ * the particular kind of type adds. std::type_info below is exactly
+ * those first two words and must stay exactly those two words.
+ *
+ * A field added here is not a change to this file; it is a silent
+ * disagreement with every type descriptor GCC has already emitted, and
+ * it would read a base-class pointer out of the middle of a string.
+ */
+
+#include <cstddef>
+#include <exception>
+
+namespace std {
+
+class type_info {
+public:
+    virtual ~type_info();
+
+    /*
+     * The leading '*' is the ABI's marker for "this name is unique in
+     * the program", used when the compiler can guarantee no other
+     * translation unit emitted a descriptor for the same type. It is
+     * part of the encoding rather than part of the name, so it is
+     * stripped here -- name() returns the mangled type name and nothing
+     * else.
+     */
+    const char *name() const noexcept {
+        return __name[0] == '*' ? __name + 1 : __name;
+    }
+
+    /*
+     * Two descriptors for the same type are not necessarily the same
+     * object -- the compiler may emit one per translation unit and let
+     * the linker merge them, and merging is not guaranteed. So identity
+     * is: the same object, or (when the name is not marked unique) the
+     * same name.
+     *
+     * The '*' test is what makes the string comparison skippable in the
+     * common case, and it is also what makes it *correct* to skip: a
+     * name the compiler marked unique cannot appear twice, so two
+     * distinct objects with such names are two distinct types.
+     */
+    bool operator==(const type_info &o) const noexcept {
+        if (__name == o.__name) return true;
+        if (__name[0] == '*') return false;
+        return __builtin_strcmp(__name, o.__name) == 0;
+    }
+    bool operator!=(const type_info &o) const noexcept { return !(*this == o); }
+
+    /* An ordering, for putting types in a sorted container. Any
+     * consistent order will do; the standard promises nothing about
+     * which, only that it is strict and total within one run. */
+    bool before(const type_info &o) const noexcept {
+        if (__name[0] != '*' && o.__name[0] != '*')
+            return __builtin_strcmp(__name, o.__name) < 0;
+        return __name < o.__name;
+    }
+
+    size_t hash_code() const noexcept;
+
+    type_info(const type_info &) = delete;
+    type_info &operator=(const type_info &) = delete;
+
+protected:
+    explicit type_info(const char *n) : __name(n) {}
+
+    const char *__name;
+};
+
+/*
+ * bad_cast and bad_typeid are declared because ported code names them
+ * and because the compiler references bad_cast when it sees a
+ * dynamic_cast to a reference type.
+ *
+ * They cannot be thrown here. A failed reference dynamic_cast calls
+ * __cxa_bad_cast, which in this runtime prints and stops rather than
+ * unwinding -- there is no unwinder. That is stated in
+ * libcxx/src/typeinfo.cpp where the function lives, so that the message
+ * on the wire explains itself.
+ */
+class bad_cast : public exception {
+public:
+    bad_cast() noexcept {}
+    ~bad_cast() override;
+    const char *what() const noexcept override;
+};
+
+class bad_typeid : public exception {
+public:
+    bad_typeid() noexcept {}
+    ~bad_typeid() override;
+    const char *what() const noexcept override;
+};
+
+}  // namespace std
+
+#endif

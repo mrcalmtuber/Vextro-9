@@ -248,6 +248,37 @@ constexpr O transform(I first, I last, O out, F f) {
     return out;
 }
 
+/*
+ * replace and replace_if.
+ *
+ * Written now because ICU's uloc_keytype.cpp turns a locale key's
+ * separators around with std::replace, which is the shape this is for:
+ * an in-place substitution over a whole range where the alternative is
+ * a loop with an index nobody needs.
+ *
+ * replace_copy is the out-of-place form, and it is here because the
+ * in-place one cannot be used on a const range.
+ */
+template <class I, class T>
+constexpr void replace(I first, I last, const T &old_value, const T &new_value) {
+    for (; first != last; ++first)
+        if (*first == old_value) *first = new_value;
+}
+
+template <class I, class P, class T>
+constexpr void replace_if(I first, I last, P p, const T &new_value) {
+    for (; first != last; ++first)
+        if (p(*first)) *first = new_value;
+}
+
+template <class I, class O, class T>
+constexpr O replace_copy(I first, I last, O out, const T &old_value,
+                         const T &new_value) {
+    for (; first != last; ++first, (void)++out)
+        *out = (*first == old_value) ? new_value : *first;
+    return out;
+}
+
 template <class I, class T>
 constexpr I remove(I first, I last, const T &v) {
     first = find(first, last, v);

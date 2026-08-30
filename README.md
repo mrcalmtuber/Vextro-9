@@ -36,11 +36,12 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**121,091 lines of C written here**, across 240 files, built as four kernel
+**125,142 lines of C written here**, across 257 files, built as four kernel
 objects plus one for inference, over a user-space C library of its own —
 and, since ring 3 got file descriptors and sockets, a freestanding C++
-runtime to go with it. 3.7 million host checks across 17 suites on every
-build, and nine more on the machine itself.
+runtime to go with it, down to the Itanium ABI's run-time type
+information. 3.7 million host checks across 17 suites on every build, and
+ten more on the machine itself.
 
 ---
 
@@ -239,12 +240,25 @@ impossible by construction: `SYS_MMAP` and `SYS_MPROTECT` refuse
 at a page which is both. `threadtest` asserts the refusal in both
 directions on every boot.
 
-**Three libraries are ported and run in ring 3**: SQLite 3.45.1 over a
-VFS on the descriptor calls, FreeType 2.13.2 reading fonts off NTFS, and
+**Four libraries are ported and run in ring 3**: SQLite 3.45.1 over a
+VFS on the descriptor calls, FreeType 2.13.2 reading fonts off NTFS,
 HarfBuzz 8.5.0 shaping text over FreeType through upstream's own hb-ft
-seam. All three are vendored unmodified and verified on the machine —
-SQLite reads a database the *host's* sqlite3 wrote, and FreeType agrees
-with this kernel's own TrueType parser to the pixel.
+seam, and ICU 74.2 — 445 translation units and a thirty-megabyte data
+archive on the volume. All four are compiled unmodified and verified on
+the machine: SQLite reads a database the *host's* sqlite3 wrote,
+FreeType agrees with this kernel's own TrueType parser to the pixel, and
+ICU sorts a-umlaut before b in German and after z in Swedish, decodes
+Shift-JIS, and prints an instant in New York five hours off UTC from the
+IANA rules in its archive.
+
+ICU brought two things with it. It is compiled `-frtti`, which everything
+else here is not: it uses `dynamic_cast` in 117 places with no fallback,
+so `libcxx/` grew the Itanium ABI's type-information hierarchy and
+`__dynamic_cast` — checked against the host's own C++ runtime on the same
+43 cases, diamonds and ambiguity included. And it needed a calendar, so
+`SYS_WALLCLOCK` carries the CMOS clock up to ring 3 and `time()` returns
+seconds since 1970 rather than since boot, which it had been doing all
+along.
 
 **The engine itself still does not compile**, but the wall has moved
 from before the dependency list to inside it. `make webkit` used to stop
@@ -256,10 +270,10 @@ that asserts `UNIX`, which selects the generic-Unix branch rather than
 the Linux one, and the toolchain adds `-D__unix__` because WTF reads
 predefined macros rather than CMake variables. Configure now runs
 WebKit's whole feature-detection pass against this C library and stops
-at `OptionsWPE.cmake:8`, the first of twenty-two required packages —
-HarfBuzz is found at 8.5.0 and rejected for wanting to be built against
-ICU. Seventeen more stand behind it, one of them an OpenGL loader for a
-machine with no GL.
+at `OptionsWPE.cmake:10` — the third of twenty-two required packages.
+HarfBuzz and ICU are now *found*, at 8.5.0 and 74.2, with the components
+WebKit asks for; JPEG is where it stops. Sixteen more stand behind that,
+one of them an OpenGL loader for a machine with no GL.
 
 **The three things that were blocking before this no longer are.** There was no `libstdc++` for
 `x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;

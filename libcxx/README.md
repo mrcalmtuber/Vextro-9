@@ -3,7 +3,7 @@
 A freestanding C++ runtime and standard library subset for `x86_64-elf`,
 built against `libc/`.
 
-    include/     the headers, twenty-eight of them
+    include/     the headers, forty of them
     src/         the parts the compiler calls by name
 
 ## Why this exists rather than a port
@@ -85,15 +85,60 @@ the object rather than as running out of memory.
     new initializer_list type_traits utility limits iterator
     algorithm memory functional ratio
     exception stdexcept
-    array vector string string_view optional variant
+    array vector string string_view optional variant complex
     unordered_map (and unordered_set)
-    atomic mutex thread chrono
+    atomic mutex condition_variable thread chrono
+    typeinfo cxxabi.h cinttypes cfloat
 
 `<initializer_list>` is the one whose contents the compiler already
 knows: GCC constructs one itself for every braced list, by writing a
 pointer and a length into an object of that exact layout. Getting it
 wrong does not fail to compile — it produces a list whose length is a
 pointer.
+
+## Run-time type information
+
+`-fno-rtti` was a decision here and is still the default for everything
+compiled in this repository. It stopped being a decision that could be
+kept for *ported* code when ICU arrived: ICU 74 uses `dynamic_cast` in
+117 places and `typeid` in about forty, and unlike older versions it has
+no fallback — `utypeinfo.h` includes `<typeinfo>` unconditionally. There
+was no configuration of ICU without RTTI; there was only a choice
+between RTTI and no ICU.
+
+So `include/typeinfo`, `include/cxxabi.h` and `src/typeinfo.cpp` are the
+part of `libsupc++` that RTTI needs. What that means concretely:
+
+**The layouts are the ABI's, not ours.** The compiler emits a type
+descriptor object into every `-frtti` translation unit that mentions a
+type in a `typeid` or a `dynamic_cast`, and `cxxabi.h` describes how to
+read one. A field in the wrong place there does not fail to compile — it
+reads a base-class pointer out of the middle of a string.
+
+**The vtables have to exist under their ABI names.** Those descriptors
+point at `_ZTVN10__cxxabiv120__si_class_type_infoE` and its nine
+siblings; each destructor in `src/typeinfo.cpp` is defined out of line
+so that the compiler emits one there and exactly once.
+
+**The search is written plainly.** `libsupc++` implements
+`[expr.dynamic.cast]` as a single incremental pass that threads a
+partial result through every recursion. `src/typeinfo.cpp` does the two
+clauses of the rule literally instead — collect every subobject of the
+target type, then ask of each whether the source sits publicly inside it
+— which is slower on a diamond nobody has, and can be checked one
+function at a time.
+
+**And it is checked against a reference.** `apps/rtti_cases.h` is
+compiled twice, once on the host against the host's own C++ runtime and
+once in ring 3 against this one, with every expectation written as an
+address the compiler works out statically. Both runs answer all 43 the
+same way, including the case that catches the most plausible wrong
+implementation: a base class present twice, where the target is reached
+not through the source subobject but through the complete object.
+
+`-fno-exceptions` is unaffected and stays. A `dynamic_cast` to a
+*reference* is the one form that must throw on failure, so it is still
+unavailable; `__cxa_bad_cast` prints and stops.
 
 ## What is not here
 
@@ -151,7 +196,9 @@ nothing on this target can throw. Multi-variant `visit` is absent.
 ## Checked
 
     tools/cxx_test.cpp    218 checks on the host, against these headers
-    apps/cxxtest.cpp      107 checks in ring 3, on the machine
+    apps/cxxtest.cpp      150 checks in ring 3, on the machine
+    apps/rtti_cases.h      43 of those 150, compiled on both and
+                              expected to agree
 
 The split is not redundancy. The host test carries the volume a boot
 test cannot afford — twenty thousand elements sorted in five adversarial

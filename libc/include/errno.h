@@ -105,6 +105,11 @@ int *__errno_location(void);
 #define ELOOP           40  /* too many levels of symbolic links        */
 #define ENOMSG          42  /* no message of the desired type           */
 #define EOVERFLOW       75  /* value too large for its type             */
+/* The bytes are not a valid character in the current encoding. Raised by
+ * the UTF-8 codec in libc/wchar.c, which is the only place in this
+ * system where a byte sequence can be malformed rather than merely
+ * unexpected. */
+#define EILSEQ          84  /* illegal byte sequence                    */
 #define ENOTSOCK        88  /* not a socket                             */
 #define ENOPROTOOPT     92  /* no such socket option                    */
 #define EOPNOTSUPP      95  /* not supported                            */

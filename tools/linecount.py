@@ -83,6 +83,7 @@ FETCHED_PREFIXES = (
     "third_party/sqlite/",
     "third_party/freetype/",
     "third_party/harfbuzz/",
+    "third_party/icu/",
 )
 
 

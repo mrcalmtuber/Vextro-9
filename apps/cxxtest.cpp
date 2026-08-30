@@ -65,6 +65,13 @@ static void ok(const char *what, bool good) {
     std::printf("%s %s\n", good ? " ok  " : "FAIL ", what);
 }
 
+/* The RTTI cases live in a translation unit of their own -- this one is
+ * compiled -fno-rtti, and typeid does not compile under it. They report
+ * through a plain function pointer, so ok() needs a non-inline address
+ * to hand over. */
+extern "C" void vx_rtti_run(void (*check)(const char *what, bool good));
+static void ok_rtti(const char *what, bool good) { ok(what, good); }
+
 /* ================================================================
  *  static construction, observed
  * ================================================================
@@ -611,6 +618,20 @@ int main() {
                return std::is_same<std::decay_t<decltype(x)>, double>::value;
            }, v));
     }
+
+    /* ---- dynamic_cast and typeid ----
+     *
+     * The cases are in apps/rtti_cases.h and are compiled twice: once
+     * here, over libcxx/src/typeinfo.cpp, and once on the host over the
+     * host's own C++ runtime, where `make test` runs them. Every
+     * expectation in that file is an address the compiler works out
+     * statically, so neither run checks an implementation against
+     * itself -- and the two runs must agree, including on the diamonds.
+     *
+     * The cases live in their own translation unit because this one is
+     * compiled -fno-rtti, under which typeid does not compile at all.
+     */
+    vx_rtti_run(ok_rtti);
 
     std::printf("cxxtest: %d checks, %d failures\n", checks, failures);
     std::printf(failures ? "cxxtest: FAILED\n" : "cxxtest: all passed\n");

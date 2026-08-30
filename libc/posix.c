@@ -33,9 +33,48 @@ uint64_t vx_millis(void) {
     return (uint64_t)__syscall0(SYS_TICKS);
 }
 
+/*
+ * Seconds since 1970, from the CMOS clock through SYS_WALLCLOCK.
+ *
+ * Read on every call rather than latched, for the reason the kernel side
+ * gives: a cached reading is wrong for the rest of the boot as soon as
+ * anything moves the clock.
+ */
+static time_t wall_seconds(void) {
+    return (time_t)(int64_t)__syscall0(SYS_WALLCLOCK);
+}
+
+/*
+ * clock_gettime, and the two clocks really are two clocks now.
+ *
+ * CLOCK_REALTIME is the calendar: it can jump, it can go backwards, and
+ * it is the only one whose value means anything to a person. Everything
+ * else is the scheduler tick, which starts at zero when the machine
+ * boots and only ever goes forward.
+ *
+ * That distinction was not available until the calendar was, and it
+ * matters to exactly the code that gets timeouts wrong: a deadline
+ * computed from a clock that can jump backwards is a wait that can
+ * become much longer than it was meant to be. Everything in this C
+ * library that computes a deadline -- pthread_cond_timedwait,
+ * sem_timedwait, the mutex timeouts -- uses the monotonic one.
+ */
 int clock_gettime(clockid_t id, struct timespec *ts) {
-    (void)id;
     if (!ts) { errno = EFAULT; return -1; }
+
+    if (id == CLOCK_REALTIME || id == CLOCK_REALTIME_COARSE) {
+        /* Whole seconds from the chip, and the sub-second part from the
+         * tick -- which does not divide the second the chip is in, so
+         * the nanoseconds are a fraction of *a* second rather than of
+         * this one. Stated because it is visible: two reads a
+         * millisecond apart can show the seconds advancing while the
+         * nanoseconds go backwards. */
+        const uint64_t ns = (uint64_t)__syscall0(SYS_CLOCK);
+        ts->tv_sec  = wall_seconds();
+        ts->tv_nsec = (long)(ns % 1000000000ull);
+        return 0;
+    }
+
     /*
      * Nanoseconds from the kernel rather than milliseconds converted
      * here, so that there is one place that knows the tick rate. A
@@ -59,19 +98,22 @@ int clock_getres(clockid_t id, struct timespec *ts) {
     return 0;
 }
 
+/*
+ * Seconds since 1970, which it did not used to be.
+ *
+ * This function answered from the monotonic tick until SYS_WALLCLOCK
+ * existed, and the comment here said so and called it a recognisable
+ * symptom: a program that formatted the result printed a date a few
+ * seconds after the start of 1970. The machine had a real-time clock
+ * the whole time and the kernel read it for the taskbar; what was
+ * missing was a way to carry the reading across the system call
+ * boundary, and that is now SYS_WALLCLOCK.
+ *
+ * Zero means the clock is unset or unreadable rather than "1970", which
+ * is the kernel's decision and is described there.
+ */
 time_t time(time_t *out) {
-    /*
-     * Seconds since boot, not since 1970.
-     *
-     * The machine has a real-time clock and the kernel reads it, but
-     * nothing carries that reading across the system call boundary, so
-     * there is no calendar available up here. Answering from the
-     * monotonic count is correct for every use that measures an interval
-     * and wrong for every use that formats a date — and a program that
-     * formats this will print a day in January 1970, which is at least a
-     * recognisable symptom rather than a plausible wrong date.
-     */
-    time_t t = (time_t)(vx_millis() / 1000);
+    time_t t = wall_seconds();
     if (out) *out = t;
     return t;
 }
@@ -84,11 +126,16 @@ clock_t clock(void) {
     return (clock_t)vx_millis();
 }
 
+/* The calendar, like CLOCK_REALTIME and for the same reason: every
+ * caller of this function is asking what time it is, not how long
+ * something took. The timezone argument has always been ignored and
+ * always will be -- it was a mistake in the original interface and
+ * POSIX marks it obsolete. */
 int gettimeofday(struct timeval *tv, void *tz) {
     (void)tz;
     if (!tv) { errno = EFAULT; return -1; }
     uint64_t ms = vx_millis();
-    tv->tv_sec  = (time_t)(ms / 1000);
+    tv->tv_sec  = wall_seconds();
     tv->tv_usec = (suseconds_t)((ms % 1000) * 1000);
     return 0;
 }

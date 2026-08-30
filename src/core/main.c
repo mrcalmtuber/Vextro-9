@@ -1866,6 +1866,20 @@ void kmain(void) {
     serial_puts("[vextro] harfbuzz selftest: running /hbtest\n");
     execute_bin_blocking("/hbtest", 0);
     serial_puts("[vextro] harfbuzz selftest: done\n");
+
+    /*
+     * And ICU, which is the largest of them and the one that reads the
+     * most: a thirty-megabyte data archive off the volume, then the
+     * Unicode character database, the normalisation tables, the
+     * segmentation rules, per-language collation, the legacy codepage
+     * converters and the IANA timezone rules out of it.
+     *
+     * It is also the only test that can tell whether the calendar is
+     * connected to anything -- see the note in apps/icutest.cpp.
+     */
+    serial_puts("[vextro] icu selftest: running /icutest\n");
+    execute_bin_blocking("/icutest", 0);
+    serial_puts("[vextro] icu selftest: done\n");
 #endif
 
 #ifdef PE_SELFTEST

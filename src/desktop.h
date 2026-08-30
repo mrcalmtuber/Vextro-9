@@ -2618,6 +2618,19 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         return sched_ticks * 1000000ull;
 
     /*
+     * The calendar, as seconds since 1970.
+     *
+     * The reading comes straight off the CMOS chip on every call rather
+     * than being latched at boot and advanced by the tick. That costs
+     * six port reads and buys the property that matters: a machine
+     * suspended for an hour comes back with the right date, and a
+     * kernel that had cached one would come back an hour behind and
+     * stay there.
+     */
+    case SYS_WALLCLOCK:
+        return (uint64_t)rtc_unix_seconds();
+
+    /*
      * Sleep, in milliseconds.
      *
      * A program could build this out of SYS_TICKS and SYS_YIELD, and one
