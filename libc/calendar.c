@@ -353,39 +353,17 @@ char *asctime(const struct tm *tm) { return asctime_r(tm, shared_asctime); }
 char *ctime(const time_t *t)       { return ctime_r(t, shared_asctime); }
 
 /* ============================================================
- *  signals, which this system does not deliver
+ *  signals used to be here
  * ============================================================
  *
- * The reasoning is in libc/include/signal.h. The two functions live here
- * rather than in a file of their own because between them they are
- * twenty lines and neither will grow until the kernel can push a signal
- * frame onto a user stack.
+ * signal() and raise() lived at the bottom of this file, and both had
+ * the shape a system with no delivery could take: signal() answered
+ * SIG_ERR with ENOSYS, and raise() printed the signal's name and called
+ * abort(), because there was nowhere for a handler to be.
+ *
+ * Both are real now and both moved to libc/process.c, beside the
+ * sigaction they are written over — signal() installs a handler that
+ * runs, and raise() goes through kill() so that raise(SIGUSR1) calls the
+ * handler and *returns*. What is left in this file is the calendar,
+ * which is what it was always about.
  */
-
-#include <signal.h>
-#include <stdlib.h>
-
-__sighandler_t signal(int sig, __sighandler_t handler) {
-    (void)sig;
-    (void)handler;
-    errno = ENOSYS;
-    return SIG_ERR;
-}
-
-int raise(int sig) {
-    static const char *const names[] = {
-        [SIGHUP] = "SIGHUP",   [SIGINT] = "SIGINT",   [SIGQUIT] = "SIGQUIT",
-        [SIGILL] = "SIGILL",   [SIGTRAP] = "SIGTRAP", [SIGABRT] = "SIGABRT",
-        [SIGBUS] = "SIGBUS",   [SIGFPE] = "SIGFPE",   [SIGKILL] = "SIGKILL",
-        [SIGSEGV] = "SIGSEGV", [SIGPIPE] = "SIGPIPE", [SIGALRM] = "SIGALRM",
-        [SIGTERM] = "SIGTERM", [SIGSYS] = "SIGSYS",
-    };
-
-    const char *name = (sig > 0 && sig < NSIG && names[sig]) ? names[sig] : "signal";
-    fprintf(stderr, "raise: %s, and there is no handler to run\n", name);
-
-    /* The default action for every signal this header names. abort()
-     * ends the process through the same path a failed assertion does. */
-    abort();
-    return 0;   /* not reached */
-}

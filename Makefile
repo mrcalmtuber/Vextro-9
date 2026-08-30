@@ -168,7 +168,7 @@ LDFLAGS := -nostdlib -static -pie --no-dynamic-linker -z text \
 LIBC_SRC  := libc/string.c libc/stdio.c libc/malloc.c libc/math.c \
              libc/mmap.c libc/pthread.c libc/posix.c libc/stdlib2.c \
              libc/file.c libc/socket.c libc/exit.c libc/locale.c \
-             libc/wchar.c libc/calendar.c
+             libc/wchar.c libc/calendar.c libc/process.c libc/dlfcn.c libc/err.c
 LIBC_OBJ  := $(patsubst libc/%.c,build/libc/%.o,$(LIBC_SRC))
 LIBC      := build/libvextro.a
 LIBC_CRT0 := build/libc/crt0.o
@@ -745,7 +745,7 @@ build/ca-bundle.crt:
 # at boot and cannot use a fragmented one; and it allocates every file
 # sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
 # archive's run list would not fit in its own MFT record.
-disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -763,6 +763,9 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		build/fttest \
 		build/hbtest \
 		build/icutest \
+		build/vlstest \
+		build/jpegtest \
+		build/gltest \
 		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
 		$(ICU_DATA):icudt74l.dat \
 		build/sqlseed.db:sqlseed.db \
@@ -1340,9 +1343,221 @@ $(ICU_DIR)/common/unicode/utypes.h:
 	@rm -rf build/icu-unpack
 	@echo "  ICU      $(ICU_DIR) ($(ICU_VERSION))"
 
+# --- libjpeg-turbo 3.0.4 ---
+#
+# The library that is literally next. `OptionsWPE.cmake:10` is
+# `find_package(JPEG REQUIRED)` — the third of twenty-two — and it is
+# where every configure run has stopped since ICU and HarfBuzz started
+# being found.
+#
+# ---- why turbo rather than the IJG library ----
+#
+# Both satisfy FindJPEG, which greps jconfig.h and jpeglib.h for
+# JPEG_LIB_VERSION and looks for an archive. They do not both satisfy
+# WebKit's decoder: Source/WebCore/platform/image-decoders/jpeg/ uses
+# JCS_EXT_RGBX and the other JCS_EXTENSIONS colour spaces, which are
+# libjpeg-turbo's addition, and falls back to a slower per-pixel path
+# without them. Choosing the one the consumer was written against is
+# the point of porting it at all.
+#
+# ---- three precisions, and why the archive is built three times ----
+#
+# libjpeg-turbo 3 selects data precision at *run* time, and does it by
+# compiling the same twenty-eight sources three times with
+# BITS_IN_JSAMPLE at 8, 12 and 16, letting jmorecfg.h rename every
+# symbol in the second and third passes. Skipping the 12- and 16-bit
+# passes leaves jdmaster.c's dispatch calling functions that are not in
+# the archive — an undefined symbol at the far end of a link rather than
+# a missing feature. Upstream's CMakeLists builds them unconditionally
+# and so does this.
+#
+# ---- and what is given up ----
+#
+# The SIMD, which is most of the reason the library is called turbo.
+# third_party/libjpeg-port/jconfig.h says why at length: the assembly is
+# driven by NASM through upstream's own CMake and selected at run time by
+# CPUID and getenv, none of which is reachable from here. jsimd_none.c
+# is the portable path upstream ships for exactly this case. Correctness
+# is identical; throughput is not, and this file should not pretend
+# otherwise.
+JPEG_VERSION := 3.0.4
+JPEG_TARBALL := libjpeg-turbo-$(JPEG_VERSION).tar.gz
+JPEG_URL     := https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$(JPEG_VERSION)/$(JPEG_TARBALL)
+JPEG_SHA256  := 99130559e7d62e8d695f2c0eaeef912c5828d5b84a0537dcb24c9678c9d5b76b
+JPEG_DIR     := third_party/libjpeg
+JPEG_PORT    := third_party/libjpeg-port
+
+# The three source lists, copied from upstream's CMakeLists.txt rather
+# than globbed: a glob would sweep in cjpeg.c, djpeg.c and the fuzzers,
+# each of which has a main().
+JPEG16_NAMES := jcapistd.c jccolor.c jcdiffct.c jclossls.c jcmainct.c \
+                jcprepct.c jcsample.c jdapistd.c jdcolor.c jddiffct.c \
+                jdlossls.c jdmainct.c jdpostct.c jdsample.c jutils.c
+JPEG12_NAMES := $(JPEG16_NAMES) jccoefct.c jcdctmgr.c jdcoefct.c \
+                jddctmgr.c jdmerge.c jfdctfst.c jfdctint.c jidctflt.c \
+                jidctfst.c jidctint.c jidctred.c jquant1.c jquant2.c
+JPEG8_NAMES  := $(JPEG12_NAMES) jcapimin.c jchuff.c jcicc.c jcinit.c \
+                jclhuff.c jcmarker.c jcmaster.c jcomapi.c jcparam.c \
+                jcphuff.c jctrans.c jdapimin.c jdatadst.c jdatasrc.c \
+                jdhuff.c jdicc.c jdinput.c jdlhuff.c jdmarker.c \
+                jdmaster.c jdphuff.c jdtrans.c jerror.c jfdctflt.c \
+                jmemmgr.c jmemnobs.c jpeg_nbits.c
+
+JPEG8_OBJ  := $(addprefix build/jpeg/8/,$(JPEG8_NAMES:.c=.o))
+JPEG12_OBJ := $(addprefix build/jpeg/12/,$(JPEG12_NAMES:.c=.o))
+JPEG16_OBJ := $(addprefix build/jpeg/16/,$(JPEG16_NAMES:.c=.o))
+
+# -I$(JPEG_PORT) comes first so the hand-written jconfig.h and
+# jconfigint.h are found ahead of anything upstream's tree might have,
+# which is the same ordering FreeType's redirected headers rely on.
+#
+# NO_GETENV and NO_PUTENV are upstream's own switches for a system
+# without an environment, and this one has none: jmemmgr.c reads
+# JPEGMEM to override the memory limit and is the only file that asks.
+JPEG_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+               -DNO_GETENV -DNO_PUTENV \
+               -I$(JPEG_PORT) -I$(JPEG_DIR) -Ilibc/include
+
+build/jpeg/8/%.o: $(JPEG_DIR)/%.c $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
+	@mkdir -p build/jpeg/8
+	$(CC) $(JPEG_CFLAGS) -c $< -o $@
+
+build/jpeg/12/%.o: $(JPEG_DIR)/%.c $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
+	@mkdir -p build/jpeg/12
+	$(CC) $(JPEG_CFLAGS) -DBITS_IN_JSAMPLE=12 -c $< -o $@
+
+build/jpeg/16/%.o: $(JPEG_DIR)/%.c $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
+	@mkdir -p build/jpeg/16
+	$(CC) $(JPEG_CFLAGS) -DBITS_IN_JSAMPLE=16 -c $< -o $@
+
+build/libjpeg.a: $(JPEG8_OBJ) $(JPEG12_OBJ) $(JPEG16_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  JPEG   build/libjpeg.a ($(JPEG_VERSION), no SIMD, 8/12/16-bit)"
+
+.PHONY: jpeg
+jpeg: build/libjpeg.a
+
+$(JPEG_DIR)/jpeglib.h:
+	@echo "  fetching $(JPEG_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(JPEG_TARBALL) $(JPEG_URL)
+	@printf '%s  build/%s\n' "$(JPEG_SHA256)" "build/$(JPEG_TARBALL)" \
+		| sed 's| build/build/| build/|' \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(JPEG_TARBALL) does not match its checksum."; \
+		     rm -f build/$(JPEG_TARBALL); exit 1; }
+	@rm -rf $(JPEG_DIR)
+	@mkdir -p $(JPEG_DIR)
+	@tar -C $(JPEG_DIR) --strip-components=1 -xzf build/$(JPEG_TARBALL)
+	@echo "  JPEG     $(JPEG_DIR) ($(JPEG_VERSION))"
+
+# --- libepoxy 1.5.10 ---
+#
+# `OptionsWPE.cmake:11` — the frontier the moment JPEG was found, and the
+# one dependency on the list whose *build* and whose *usefulness* are
+# genuinely different questions.
+#
+# ---- what epoxy is ----
+#
+# A dispatcher, not an implementation. It resolves some two thousand
+# OpenGL entry points by name at run time and calls through the pointer,
+# which is why it builds perfectly well on a machine with no OpenGL: the
+# generated dispatch table is portable C, and what decides the outcome is
+# what dlsym finds when a program actually calls something.
+#
+# So this satisfies find_package(Epoxy 1.5.4) honestly — the archive is
+# real, built from upstream's own generator over Khronos's registry — and
+# third_party/libepoxy-port/vxgl.c is where the truth about what is
+# behind it lives. Nine entry points are bound to the framebuffer at
+# /dev/dri/renderD128; everything past clearing and reading a rectangle
+# is absent from the table, so epoxy's own do_dlsym prints the name it
+# could not find and aborts. That is upstream's behaviour, unmodified,
+# and it names the exact call rather than drawing a black window.
+#
+# ---- the generated half ----
+#
+# Upstream generates gl_generated_dispatch.c and gl_generated.h from
+# registry/gl.xml with a Python script at build time; meson does it and
+# the tarball does not ship the result. The script is pure Python 3 and
+# the XML is in the tarball, so it is run here into build/epoxy/ — which
+# is also why the generated files are not in the repository: they are a
+# derived artifact of two things that are.
+#
+# GLX, EGL, X11 and WGL are all off in
+# third_party/libepoxy-port/config.h. Each is a binding to a window
+# system this machine does not have, and leaving them on would compile
+# three more dispatch tables whose every entry resolves to nothing —
+# after failing on <X11/Xlib.h>, which is not in this tree.
+EPOXY_VERSION := 1.5.10
+EPOXY_TARBALL := libepoxy-$(EPOXY_VERSION).tar.gz
+EPOXY_URL     := https://github.com/anholt/libepoxy/archive/refs/tags/$(EPOXY_VERSION).tar.gz
+EPOXY_SHA256  := a7ced37f4102b745ac86d6a70a9da399cc139ff168ba6b8002b4d8d43c900c15
+EPOXY_DIR     := third_party/libepoxy
+EPOXY_PORT    := third_party/libepoxy-port
+EPOXY_GEN     := build/epoxy
+
+EPOXY_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+                -I$(EPOXY_PORT) -I$(EPOXY_DIR)/include \
+                -I$(EPOXY_GEN)/include -I$(EPOXY_DIR)/src -Ilibc/include
+
+# One rule for the generator, producing both halves at once. The header
+# is listed as a sibling target so a parallel make does not run the
+# script twice.
+$(EPOXY_GEN)/src/gl_generated_dispatch.c $(EPOXY_GEN)/include/epoxy/gl_generated.h &: \
+		$(EPOXY_DIR)/registry/gl.xml $(EPOXY_DIR)/src/gen_dispatch.py
+	@mkdir -p $(EPOXY_GEN)/src $(EPOXY_GEN)/include/epoxy
+	@python3 $(EPOXY_DIR)/src/gen_dispatch.py \
+		--outputdir $(EPOXY_GEN) \
+		--includedir $(EPOXY_GEN)/include/epoxy \
+		--srcdir $(EPOXY_GEN)/src \
+		$(EPOXY_DIR)/registry/gl.xml
+	@echo "  GEN    $(EPOXY_GEN) (gl dispatch, from registry/gl.xml)"
+
+build/epoxy/dispatch_common.o: $(EPOXY_DIR)/src/dispatch_common.c \
+                               $(EPOXY_PORT)/config.h \
+                               $(EPOXY_GEN)/include/epoxy/gl_generated.h
+	@mkdir -p build/epoxy
+	$(CC) $(EPOXY_CFLAGS) -c $< -o $@
+
+build/epoxy/gl_generated_dispatch.o: $(EPOXY_GEN)/src/gl_generated_dispatch.c \
+                                     $(EPOXY_PORT)/config.h
+	@mkdir -p build/epoxy
+	$(CC) $(EPOXY_CFLAGS) -c $< -o $@
+
+build/epoxy/vxgl.o: $(EPOXY_PORT)/vxgl.c libc/include/dlfcn.h
+	@mkdir -p build/epoxy
+	$(CC) $(EPOXY_CFLAGS) -c $< -o $@
+
+EPOXY_OBJ := build/epoxy/dispatch_common.o \
+             build/epoxy/gl_generated_dispatch.o \
+             build/epoxy/vxgl.o
+
+build/libepoxy.a: $(EPOXY_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  EPOXY  build/libepoxy.a ($(EPOXY_VERSION), gl only, 9 entry points live)"
+
+.PHONY: epoxy
+epoxy: build/libepoxy.a
+
+$(EPOXY_DIR)/src/dispatch_common.c:
+	@echo "  fetching $(EPOXY_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(EPOXY_TARBALL) $(EPOXY_URL)
+	@printf '%s  build/%s\n' "$(EPOXY_SHA256)" "$(EPOXY_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(EPOXY_TARBALL) does not match its checksum."; \
+		     rm -f build/$(EPOXY_TARBALL); exit 1; }
+	@rm -rf $(EPOXY_DIR)
+	@mkdir -p $(EPOXY_DIR)
+	@tar -C $(EPOXY_DIR) --strip-components=1 -xzf build/$(EPOXY_TARBALL)
+	@echo "  EPOXY    $(EPOXY_DIR) ($(EPOXY_VERSION))"
+
 .PHONY: libs-fetch
 libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc \
-            $(ICU_DIR)/common/unicode/utypes.h
+            $(ICU_DIR)/common/unicode/utypes.h $(JPEG_DIR)/jpeglib.h \
+            $(EPOXY_DIR)/src/dispatch_common.c
 
 # --- Fetching WPE WebKit itself ---
 #
@@ -1433,8 +1648,10 @@ WEBKIT_SYSROOT := build/webkit-sysroot
 webkit-sysroot: $(WEBKIT_SYSROOT)/.stamp
 
 $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
-                          $(ICU_LIBS) $(LIBHBICU) \
-                          $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h
+                          $(ICU_LIBS) $(LIBHBICU) build/libjpeg.a \
+                          build/libepoxy.a \
+                          $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h \
+                          $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
 	@rm -rf $(WEBKIT_SYSROOT)
 	@mkdir -p $(WEBKIT_SYSROOT)/include/harfbuzz \
 	          $(WEBKIT_SYSROOT)/include/freetype2 \
@@ -1458,8 +1675,57 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	@cp $(LIBICUDATA)  $(WEBKIT_SYSROOT)/lib/libicudata.a
 	@cp -R $(ICU_DIR)/common/unicode $(WEBKIT_SYSROOT)/include/
 	@cp $(ICU_DIR)/i18n/unicode/*.h  $(WEBKIT_SYSROOT)/include/unicode/
+	@# JPEG. The four public headers plus the two hand-written config
+	@# ones, and the config pair is copied *last* so it lands on top of
+	@# anything upstream's tree carries -- the same hazard FreeType's
+	@# redirected headers have and the same fix: the headers in this
+	@# directory must describe the archive beside them. jconfigint.h is
+	@# staged too, which an installed libjpeg does not do, because
+	@# jversion.h reads it and a consumer that includes jversion.h
+	@# would otherwise get a compile error about BUILD.
+	@cp $(JPEG_DIR)/jpeglib.h $(JPEG_DIR)/jmorecfg.h \
+	    $(JPEG_DIR)/jerror.h $(JPEG_DIR)/jpegint.h \
+	                                       $(WEBKIT_SYSROOT)/include/
+	@cp $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h \
+	    $(JPEG_PORT)/jversion.h            $(WEBKIT_SYSROOT)/include/
+	@cp build/libjpeg.a $(WEBKIT_SYSROOT)/lib/libjpeg.a
+	@# Epoxy. Two public headers plus the generated one, which is the
+	@# reason build/epoxy/include exists at all: gl_generated.h is
+	@# derived from registry/gl.xml and is not in either tree.
+	@mkdir -p $(WEBKIT_SYSROOT)/include/epoxy
+	@cp $(EPOXY_DIR)/include/epoxy/common.h $(EPOXY_DIR)/include/epoxy/gl.h \
+	                                       $(WEBKIT_SYSROOT)/include/epoxy/
+	@cp $(EPOXY_GEN)/include/epoxy/gl_generated.h \
+	                                       $(WEBKIT_SYSROOT)/include/epoxy/
+	@cp build/libepoxy.a $(WEBKIT_SYSROOT)/lib/libepoxy.a
+	@# ---- and the .pc files, which are not decoration ----
+	@#
+	@# Several of WebKit's find modules ask pkg-config *first* and use
+	@# find_path/find_library only as a fallback -- and the fallback
+	@# does not recover everything. FindEpoxy.cmake sets Epoxy_VERSION
+	@# only from the pkg-config module, so a sysroot without one gives
+	@# FPHSA an empty version and it reports "Required version (1.5.4)
+	@# is higher than found version ()" about a library that is right
+	@# there. That is the exact failure HarfBuzz produced before it was
+	@# found, and it is worth pre-empting rather than meeting again.
+	@#
+	@# The toolchain file points PKG_CONFIG_LIBDIR at this directory, so
+	@# these are the only modules pkg-config can see: nothing from the
+	@# host can leak in and be linked against by mistake.
+	@mkdir -p $(WEBKIT_SYSROOT)/lib/pkgconfig
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libjpeg\nDescription: libjpeg-turbo, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -ljpeg\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(JPEG_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libjpeg.pc
+	@# Epoxy's is the one that is load-bearing rather than tidy:
+	@# FindEpoxy.cmake takes Epoxy_VERSION from pkg-config and from
+	@# nowhere else, so without this file find_path and find_library
+	@# both succeed and FPHSA still refuses the package for being
+	@# version "" against a required 1.5.4.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: epoxy\nDescription: libepoxy GL dispatch, Vextro framebuffer provider\nVersion: %s\nLibs: -L$${libdir} -lepoxy\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(EPOXY_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/epoxy.pc
 	@touch $@
-	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe)"
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy)"
 
 # --- Building it ---
 #
@@ -1607,6 +1873,64 @@ build/fdtest.o: apps/fdtest.c apps/vextro.h libc/include/fcntl.h \
 build/fdtest: build/fdtest.o apps/app.ld $(LIBC)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		build/fdtest.o $(LIBC) -o $@
+
+# --- User app: vlstest ---
+#
+# The Linux subset, asked to prove itself on the machine. It is a native
+# Vextro program that makes Linux calls by adding the bias, which is the
+# whole reason the bias exists as well as the personality flag: setting
+# the personality would take printf away on the first call, and a test
+# that cannot report is not a test.
+#
+# It depends on include/vls.h without including it, and that is worth
+# saying rather than leaving to be discovered. The structures it reads —
+# sigaction, siginfo, struct stat, linux_dirent64 — are written out in
+# the test from the published ABI rather than shared with the kernel,
+# because a layout shared with the code under test would make every
+# check circular. The dependency below is what rebuilds it when the
+# kernel's copy changes, so the two are compared rather than assumed.
+build/vlstest.o: apps/vlstest.c apps/vextro.h include/vls.h \
+                 libc/include/sys/syscall.h libc/include/stdio.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -c $< -o $@
+
+build/vlstest: build/vlstest.o apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/vlstest.o $(LIBC) -o $@
+
+# --- User app: jpegtest ---
+#
+# libjpeg-turbo in ring 3. The reference bitstream in apps/jpeg_ref.h was
+# encoded by macOS's own `sips` rather than by this library, which is the
+# whole value of the test: a round trip through our own encoder and back
+# would prove the two halves of one library agree with each other, and
+# they would even if both were wrong about the DCT.
+build/jpegtest.o: apps/jpegtest.c apps/jpeg_ref.h apps/vextro.h \
+                  $(JPEG_PORT)/jconfig.h $(JPEG_DIR)/jpeglib.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(JPEG_PORT) -I$(JPEG_DIR) -c $< -o $@
+
+build/jpegtest: build/jpegtest.o build/libjpeg.a apps/app.ld $(LIBC)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		build/jpegtest.o build/libjpeg.a $(LIBC) -o $@
+
+# --- User app: gltest ---
+#
+# libepoxy resolving entry points on a machine with no OpenGL. Every GL
+# call in it goes through epoxy's generated dispatch, so one call
+# exercises the whole chain — dispatch stub, dlopen, dlsym, the provider
+# table, the render node, the window's pixels — and the last link is
+# checked from the other end, through the canvas mapping the kernel hands
+# the program at startup.
+build/gltest.o: apps/gltest.c apps/vextro.h $(EPOXY_PORT)/config.h \
+                $(EPOXY_GEN)/include/epoxy/gl_generated.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(EPOXY_DIR)/include -I$(EPOXY_GEN)/include \
+		-c $< -o $@
+
+build/gltest: build/gltest.o build/libepoxy.a apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/gltest.o build/libepoxy.a $(LIBC) -o $@
 
 # --- User app: icutest ---
 #
@@ -1810,6 +2134,7 @@ build/initrd.tar: $(wildcard apps/*.txt) build/hello build/faulter \
 # what make a violation visible as a rebuild that should not have
 # happened.
 KERN_MODULES := src/sched/scheduler.c \
+                src/sched/vls_core.c \
                 src/fs/ntfs/ntfs_ops.c \
                 src/security/anti_virus.c
 KERN_MODULE_OBJ := $(patsubst src/%.c,build/%.o,$(KERN_MODULES))

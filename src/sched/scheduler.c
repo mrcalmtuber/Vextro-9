@@ -878,7 +878,7 @@ thread_t *sched_spawn_thread(addr_space_t *as, uint64_t entry,
  * address in RCX, so there would be nothing to build a frame from.
  */
 thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
-    if (!parent || !child_as || !syscall_cur_frame || !syscall_via_fast)
+    if (!parent || !child_as || !parent->sframe || !parent->sfast)
         return 0;
 
     thread_t *t = sched_new(parent->name, parent->prio);
@@ -889,7 +889,7 @@ thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as) {
 
     uint64_t top = ((uint64_t)(uintptr_t)t->kstack + SCHED_KSTACK) & ~15ULL;
     trap_frame_t *f = (trap_frame_t *)(uintptr_t)(top - sizeof(trap_frame_t));
-    const syscall_frame_t *p = syscall_cur_frame;
+    const syscall_frame_t *p = parent->sframe;
 
     f->r15 = p->r15; f->r14 = p->r14; f->r13 = p->r13; f->r12 = p->r12;
     f->r11 = p->r11; f->r10 = p->r10; f->r9  = p->r9;  f->r8  = p->r8;
@@ -1062,6 +1062,111 @@ void sched_exit(int code) {
     cur_thread->exit_code = code;
     cur_thread->state = T_ZOMBIE;
     for (;;) sched_yield();
+}
+
+/*
+ * ===== A THREAD IN THE ADDRESS SPACE THE CALLER IS ALREADY IN =====
+ *
+ * The other half of sched_fork_thread, and the difference between them
+ * is one field and one increment: a fork gets a new address space, a
+ * clone gets the caller's own.
+ *
+ * It exists because Linux's clone(CLONE_VM) cannot be expressed by
+ * sched_spawn_thread. That call starts a thread by naming a function and
+ * IRETQ-ing into it, which is how every thread on this machine has been
+ * started and is exactly what a pthread implementation does *not* ask
+ * for: clone's child returns from a call it never made, at the parent's
+ * next instruction, with RAX zero and a stack of its own. The only way
+ * to produce that is the way a fork produces it — copy the parent's
+ * registers out of the frame it entered the kernel through — so this is
+ * that code with the address space left alone.
+ *
+ * The reference count is taken here rather than by the caller because it
+ * is what makes the space outlive the first of its threads to end, and a
+ * count incremented anywhere but beside the registration is a count that
+ * can be incremented on a path that then fails.
+ */
+thread_t *sched_clone_thread(thread_t *parent, uint64_t user_stack,
+                             uint64_t fsbase) {
+    if (!parent || !parent->as || !parent->sframe || !parent->sfast)
+        return 0;
+
+    thread_t *t = sched_new(parent->name, parent->prio);
+    if (!t) return 0;
+    t->user   = 1;
+    t->as     = parent->as;
+    t->cr3    = parent->as->pml4_phys;
+    t->fsbase = fsbase;
+    /*
+     * Pinned to the parent's processor, and the reason is the one
+     * sched_spawn_thread gives at length: src/syscall.h keeps the kernel
+     * stack pointer for the next entry from user mode in one global
+     * word, and two ring-3 threads entering SYSCALL on two processors at
+     * the same instant would both load it.
+     */
+    t->cpu = parent->cpu;
+
+    uint64_t top = ((uint64_t)(uintptr_t)t->kstack + SCHED_KSTACK) & ~15ULL;
+    trap_frame_t *f = (trap_frame_t *)(uintptr_t)(top - sizeof(trap_frame_t));
+    const syscall_frame_t *p = parent->sframe;
+
+    f->r15 = p->r15; f->r14 = p->r14; f->r13 = p->r13; f->r12 = p->r12;
+    f->r11 = p->r11; f->r10 = p->r10; f->r9  = p->r9;  f->r8  = p->r8;
+    f->rbp = p->rbp; f->rdi = p->rdi; f->rsi = p->rsi; f->rdx = p->rdx;
+    f->rcx = p->rcx; f->rbx = p->rbx;
+    f->rax = 0;                       /* this is the child */
+
+    f->rip    = p->rcx;               /* SYSCALL left it there */
+    f->cs     = SEL_UCODE;
+    f->ss     = SEL_UDATA;
+    f->rsp    = user_stack;           /* and this is the difference */
+    f->rflags = (p->r11 | 0x202ULL) & ~0x8ULL;   /* IF on, TF off */
+
+    for (int i = 0; i < 512; i++) t->fx[i] = parent->fx[i];
+
+    t->rsp = (uint64_t)(uintptr_t)f;
+
+    uint64_t flags = irq_save();
+    if (sched_register(t) < 0) {
+        irq_restore(flags);
+        sched_rq_leave(t);
+        kstack_free(t->kstack, SCHED_KSTACK); kfree(t);
+        return 0;
+    }
+    parent->as->refs++;
+    irq_restore(flags);
+    return t;
+}
+
+/*
+ * ===== THE SAME THREAD, IN A DIFFERENT ADDRESS SPACE =====
+ *
+ * What exec needs and nothing else does. A fork makes a second thread
+ * and a clone makes a second thread; this makes no thread at all — it
+ * moves the one that is already running into a space that has just been
+ * built, which is the whole difference between exec and everything else
+ * a process can do to itself.
+ *
+ * CR3 is loaded here rather than left to the next context switch, and
+ * that is not an optimisation: the caller is inside a system call and
+ * will return through IRETQ or SYSRETQ into the *new* image, and the
+ * page tables that image lives in have to be current before the return
+ * address is even written. Loading it also invalidates the whole TLB,
+ * which is what has to happen anyway when every user mapping changes.
+ *
+ * The old space is not destroyed here. The caller holds it, because the
+ * caller is the only code that knows whether the exec succeeded — an
+ * exec that fails must leave the process exactly as it was, and a space
+ * freed on the way in cannot be gone back to.
+ */
+void sched_adopt_space(thread_t *t, addr_space_t *as) {
+    if (!t || !as) return;
+    t->as  = as;
+    t->cr3 = as->pml4_phys;
+    if (t == cur_thread) {
+        vmm_current = as;
+        __asm__ volatile("mov %0, %%cr3" :: "r"(as->pml4_phys) : "memory");
+    }
 }
 
 /*

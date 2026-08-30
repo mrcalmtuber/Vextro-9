@@ -491,6 +491,12 @@ struct vmm_area;
  */
 struct proc_files;
 
+/* And what it has asked to be told about. include/vls.h owns this one;
+ * it is here for the same reason struct proc_files is, and it is
+ * separate from that header because a process that never catches a
+ * signal never allocates it. */
+struct vls_sig;
+
 /* ---- the token ----
  *
  * UAC_TOKEN_RESTRICTED is what every process gets, including one started
@@ -600,6 +606,76 @@ typedef struct {
     uint64_t  mmap_next;
     struct vmm_area *vmas;
     uint32_t  vma_count;
+
+    /*
+     * ---- who this process is ----
+     *
+     * New, and it is worth saying what changed rather than only what
+     * these are. Until now nothing in this kernel had a process
+     * identity: thread_t.pid was the only number anywhere and it names a
+     * *thread*, so two threads of one program had two of them and
+     * neither was the program's. That was sufficient while nothing could
+     * ask about another process, and it stops being sufficient the
+     * moment kill and wait4 exist — both of which take the number of a
+     * process and must not be able to name one of its workers by
+     * accident.
+     *
+     * So `pid` here is Linux's tgid: the thread id of whichever thread
+     * created this address space, fixed for the life of the space and
+     * unchanged by exec. thread_t.pid remains the tid. The two are
+     * equal for a single-threaded program, which is why the distinction
+     * went unnoticed for so long.
+     *
+     * `ppid` is the pid of the process that forked this one, or zero for
+     * one the desktop launched. It is recorded at fork and never
+     * updated: a child whose parent has ended keeps the number, and
+     * wait4 finding no such process is exactly the answer POSIX gives.
+     */
+    uint32_t  pid;
+    uint32_t  ppid;
+
+    /*
+     * Whether this process's ending has already been told to its parent.
+     *
+     * A process can stop in four different places — exit, exit_group, a
+     * fatal signal, a fault — and only some of them are system calls.
+     * The reaper is the one point every one of them passes through, so
+     * it is the backstop; but the reaper runs on the compositor thread,
+     * and during the boot self-tests the compositor thread is the one
+     * blocked waiting for the program to finish. A wait4 that could only
+     * be satisfied by a reap that cannot happen until the waiter returns
+     * is a deadlock, and it is the exact shape of one.
+     *
+     * So the status is recorded at whichever of the four happens first
+     * and this says it has been. One bit rather than a search of the
+     * parent's records, because a second record for a pid the parent has
+     * already collected would be handed out by the next wait4 as if a
+     * second child had ended.
+     */
+    uint8_t   exit_reported;
+
+    /*
+     * ---- and which numbering its system calls are written in ----
+     *
+     * VLS_PERSONALITY_NATIVE or VLS_PERSONALITY_LINUX; include/vls.h
+     * explains the two doors and why both exist. Inherited across fork,
+     * reset by exec, and one-way within a process — a program that
+     * flips it has given up the native numbers, because 1 cannot mean
+     * both SYS_PRINT and `write`.
+     */
+    uint8_t   personality;
+
+    /*
+     * ---- what it has asked to be told about ----
+     *
+     * Null on a process that never installs a handler, which is every
+     * program written before today and costs them nothing: the table is
+     * allocated by the first rt_sigaction or the first signal posted,
+     * not at spawn. Opaque here for the same reason struct proc_files
+     * is — include/vls.h owns the definition and this header only has to
+     * carry the pointer.
+     */
+    struct vls_sig *sig;
 } addr_space_t;
 
 /* Whose address space CR3 currently holds, or null for the kernel's
@@ -656,7 +732,7 @@ void idt_set_gate_ex(int vec, void *fn, uint16_t sel, uint8_t type_attr,
  * entry stub names it, and a name the assembler has to resolve is one
  * that has to survive into the object file.
  */
-typedef struct {
+typedef struct syscall_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t user_rsp;

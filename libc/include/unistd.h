@@ -33,19 +33,10 @@ extern "C" {
  *
  * ---- what is still absent, and why ----
  *
- *   dup, dup2. On Unix a descriptor is a name for an open file
- *   description and dup makes a second name for one — which is why two
- *   duplicated descriptors share an offset. Here the descriptor *is* the
- *   description; there is no second layer for two names to point at, so
- *   dup could only be a copy, with two independent offsets, two
- *   write-back images of one file, and two closes of one socket. Every
- *   one of those is wrong in a way a program would discover as data
- *   loss.
- *
- *   pipe, exec, wait. There is no way to start a program from a program
- *   here — the loader is reached by typing at a terminal or clicking
- *   something — so a pipe would have nobody at the other end and exec
- *   would have nothing to replace this image with.
+ *   pipe. The one of the four that did not arrive with the others: a
+ *   pipe needs a descriptor kind that is a *buffer with two ends*, and
+ *   src/vfs.h has no shape for one. Asked for through the Linux
+ *   numbering it answers ENOSYS and names itself on the wire.
  *
  *   symlink, readlink, link. There are no links on this volume.
  *
@@ -134,6 +125,59 @@ int   chdir(const char *path);
 pid_t fork(void);
 pid_t getpid(void);
 pid_t gettid(void);
+
+/*
+ * The parent this process was forked from, or zero for one the desktop
+ * launched. Nothing recorded it until wait4 existed, because until then
+ * there was nothing to be told and nobody to tell.
+ */
+pid_t getppid(void);
+
+/*
+ * Replace this image, keeping this process.
+ *
+ * Returns only on failure — a call that succeeded is not a call that
+ * returned — which is why every caller in the world is written as
+ * `execve(...); _exit(127);`.
+ *
+ * What survives: the process identifier, the window, and every
+ * descriptor not opened with O_CLOEXEC. What does not: the handlers,
+ * because they are addresses in an image that no longer exists. An
+ * ignored signal stays ignored, which is a decision about the process
+ * rather than about the image.
+ *
+ * The arguments arrive in the new image as RDI, RSI and RDX — argc,
+ * argv, envp — the ordinary C calling convention, so a `_start(void)`
+ * ignores three registers it was going to ignore anyway and a
+ * `_start(int, char **, char **)` is handed them. This system's own
+ * loader convention of a return address on the stack is kept as well, so
+ * both kinds of program run.
+ *
+ * A process with more than one thread is refused with EAGAIN rather than
+ * having its siblings killed: a zombie sibling still points at the
+ * address space this call would destroy. fork-then-exec is
+ * single-threaded in the child by construction, which is the pattern
+ * that is actually used.
+ */
+int execve(const char *path, char *const argv[], char *const envp[]);
+int execv(const char *path, char *const argv[]);
+int execvp(const char *file, char *const argv[]);
+
+/*
+ * A second name for a descriptor, within the limits a system whose
+ * descriptor *is* its open file description can offer.
+ *
+ * A device node, a console stream, a directory or a file opened for
+ * reading duplicates exactly — and that is what `dup2(fd, 1)` is nearly
+ * always used on. A file open for *writing* and a connected socket are
+ * refused with EOPNOTSUPP, by name and on the wire: two write-back
+ * images of one file means whichever closed last silently wins, and two
+ * holders of one connection get alternating halves of the response.
+ * Refused rather than approximated, because both are wrong in a way a
+ * program meets as data loss.
+ */
+int dup(int fd);
+int dup2(int oldfd, int newfd);
 
 void  _exit(int status) __attribute__((noreturn));
 

@@ -1101,6 +1101,17 @@ void kmain(void) {
     aslr_seed();
     sched_init();
     sched_reap_hook = app_reaped;
+    /*
+     * The Linux subset, before the first ring-3 thread exists.
+     *
+     * It is only a table of function pointers and a check that none of
+     * them is null, but the check has to happen before a program can
+     * make a call rather than at the call: a null hook is a jump to zero
+     * inside a system call, in a kernel with no page mapped at zero, and
+     * the fault would arrive several seconds after the mistake that
+     * caused it with nothing left pointing at the cause.
+     */
+    vls_install();
     sched_start();
     sched_spawn_kernel(reclaim_thread, "reclaim", PRIO_IDLE + 1);
     /*
@@ -1880,6 +1891,52 @@ void kmain(void) {
     serial_puts("[vextro] icu selftest: running /icutest\n");
     execute_bin_blocking("/icutest", 0);
     serial_puts("[vextro] icu selftest: done\n");
+
+    /*
+     * And the Linux subset, which is last because it is the only one
+     * that makes *other* processes: it forks five children, kills one,
+     * faults another, and executes a third. Everything before it runs in
+     * a single process and would be harder to attribute a failure in if
+     * a stray child were still running.
+     *
+     * It is also the only self-test whose failures are visible on the
+     * serial line before it reports them — an unmapped Linux call prints
+     * a `[VLS]` line naming itself, which is the list of what to build
+     * next written by the programs that need it rather than guessed at.
+     */
+    serial_puts("[vextro] vls selftest: running /vlstest\n");
+    execute_bin_blocking("/vlstest", 0);
+    serial_puts("[vextro] vls selftest: done\n");
+
+    /*
+     * And libjpeg-turbo, which is the library WebKit's configure has
+     * stopped on since ICU was found. It decodes a bitstream this system
+     * did not encode — apps/jpeg_ref.h came out of macOS's own codec —
+     * because a round trip through our own encoder and back would prove
+     * the two halves of one library agree with each other, and they
+     * would even if both were wrong.
+     */
+    serial_puts("[vextro] jpeg selftest: running /jpegtest\n");
+    execute_bin_blocking("/jpegtest", 0);
+    serial_puts("[vextro] jpeg selftest: done\n");
+
+    /*
+     * And libepoxy, which is the dependency after JPEG and the one whose
+     * build and whose usefulness are different questions. Every GL call
+     * in this test goes through epoxy's generated dispatch, so one call
+     * exercises the whole chain — dlopen, dlsym, the provider table in
+     * third_party/libepoxy-port/vxgl.c, /dev/dri/renderD128, this
+     * process's window — and the pixels are checked from the other end
+     * through the canvas mapping.
+     *
+     * Last of the selftests, because its final section forks a child
+     * that libepoxy deliberately aborts: an entry point that is not in
+     * the table prints its own name and stops, which is upstream's
+     * behaviour and the honest answer for a machine with no 3D pipeline.
+     */
+    serial_puts("[vextro] gl selftest: running /gltest\n");
+    execute_bin_blocking("/gltest", 0);
+    serial_puts("[vextro] gl selftest: done\n");
 #endif
 
 #ifdef PE_SELFTEST

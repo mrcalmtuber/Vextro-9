@@ -6,45 +6,46 @@ extern "C" {
 #endif
 
 /*
- * signal.h — the names exist; delivery does not.
+ * signal.h — and now delivery exists.
  *
- * ---- what this system actually has ----
+ * ---- what this header used to say ----
  *
- * The kernel traps every processor exception -- src/trap.h installs
- * twenty-four vectors, four of them on their own stacks -- and a ring-3
- * program that divides by zero or touches an unmapped page is stopped
- * with a line on the wire saying which fault and where. What does not
- * exist is the machinery that turns that into a *call back into the
- * faulting program*: a signal frame pushed onto the user stack, a
- * handler entered with the interrupted state saved, and a sigreturn that
- * restores it. Nor is there any way for one process to send a signal to
- * another, because there is no kill.
+ * That the names were real and the machinery was not: the kernel trapped
+ * every processor exception and stopped a faulting program with a line
+ * on the wire, and what did not exist was "a signal frame pushed onto
+ * the user stack, a handler entered with the interrupted state saved,
+ * and a sigreturn that restores it. Nor is there any way for one process
+ * to send a signal to another, because there is no kill."
  *
- * So the honest shape of this header is: the constants, which are real
- * and worth having, and two functions that do what a system with no
- * handlers can do.
+ * All four of those exist now. src/sched/vls_core.c lays the frame,
+ * src/trap.h delivers a fault into it, the trampoline on the shared page
+ * returns from it, and kill is a system call. So `signal()` no longer
+ * answers SIG_ERR — it installs a handler and the handler runs.
  *
- * ---- and why that is worth a header rather than nothing ----
+ * ---- what is still worth knowing before you rely on it ----
  *
- * signal() returns SIG_ERR and sets errno to ENOSYS. That is the
- * standard's own way of saying a handler could not be installed, and a
- * caller that checks -- which is most of them, because installing a
- * handler is the sort of thing people check -- learns the truth and
- * takes its other path. A header that pretended to install one and
- * silently never called it would be far worse: the program would run its
- * whole cleanup path only on the assumption that a signal could arrive.
+ * Delivery happens at two points and only two: on the way out of a
+ * system call, and on the way out of a ring-3 fault. It is deliberately
+ * not in the timer interrupt, because that path is hand-tuned and
+ * compiled general-regs-only and a check inside it would be new
+ * instructions in the most delicate function in the kernel.
  *
- * raise() does the real default action, which for every signal named
- * here is to end the process. That is not a refusal; it is what a
- * correct implementation does when no handler is installed, and it is
- * exactly what raise(SIGABRT) means.
+ * Two consequences follow and neither is hidden:
  *
- * ---- who asked for it ----
+ *   **No call returns EINTR.** A system call that has begun runs to
+ *   completion and the handler runs after it. A program that loops on
+ *   EINTR will simply never take that branch, which is safe; a program
+ *   that *depends* on a signal cutting a long read short will wait.
  *
- * ICU's decContext.h includes <signal.h> "for traps" and uses nothing
- * from it -- decNumber's trap mechanism is compiled out. WebKit's
- * configure probes for SIGTRAP by name. Both are satisfied by the
- * constants alone.
+ *   A thread asleep in the kernel sees a caught signal when it next
+ *   wakes rather than at the instant it is sent. A signal that *kills*
+ *   does not wait — the process ends immediately — so what is delayed is
+ *   the case where the program asked to be told and is not in a hurry.
+ *
+ * And the mask is per-process rather than per-thread, which POSIX makes
+ * per-thread. Two threads of one program cannot have different masks
+ * here. That is written down in include/vls.h beside the structure that
+ * holds it rather than discovered.
  */
 
 #include <stddef.h>
@@ -94,6 +95,10 @@ typedef int sig_atomic_t;
 #define SIGPOLL   SIGIO
 #define SIGSYS    31
 
+/* One past the highest signal a program may name. The kernel carries
+ * sixty-four; thirty-two is what this header names and what the numbers
+ * above stop at, and a program that asks for 40 gets EINVAL rather than
+ * a silent nothing. */
 #define NSIG      32
 
 typedef void (*__sighandler_t)(int);
@@ -104,17 +109,128 @@ typedef __sighandler_t sig_t;
 #define SIG_ERR ((__sighandler_t)-1)
 
 /*
- * Always SIG_ERR, with errno set to ENOSYS. See the note above: this is
- * a refusal a caller can detect, and the alternative -- accepting the
- * handler and never calling it -- is a lie a caller cannot.
+ * A set of signals, as one word.
+ *
+ * glibc makes this a hundred and twenty-eight bytes so that the type
+ * would not have to change if the kernel ever grew past a thousand
+ * signals. This kernel carries sixty-four and says so, and the system
+ * call takes an eight-byte mask — so a word is the whole of it, and a
+ * structure whose first word was the only one ever read would be a
+ * hundred and twenty bytes of pretence.
+ */
+typedef unsigned long sigset_t;
+
+int sigemptyset(sigset_t *set);
+int sigfillset(sigset_t *set);
+int sigaddset(sigset_t *set, int sig);
+int sigdelset(sigset_t *set, int sig);
+int sigismember(const sigset_t *set, int sig);
+
+/* sa_flags. SA_RESTART is accepted and means nothing here, and that is
+ * the truthful outcome rather than a lie: no call returns EINTR, so
+ * there is never anything to restart. */
+#define SA_NOCLDSTOP 0x00000001
+#define SA_NOCLDWAIT 0x00000002
+#define SA_SIGINFO   0x00000004
+#define SA_ONSTACK   0x08000000
+#define SA_RESTART   0x10000000
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000
+#define SA_RESTORER  0x04000000
+
+/* sigprocmask's `how`. */
+#define SIG_BLOCK    0
+#define SIG_UNBLOCK  1
+#define SIG_SETMASK  2
+
+/* si_code, for the two that a handler here can actually be told apart
+ * by. A crash reporter prints "address not mapped" rather than
+ * "permissions" by reading this, and the page-fault error code already
+ * knew which it was. */
+#define SI_USER      0
+#define SI_KERNEL    0x80
+#define SEGV_MAPERR  1
+#define SEGV_ACCERR  2
+#define CLD_EXITED   1
+#define CLD_KILLED   2
+
+/*
+ * What a three-argument handler is given.
+ *
+ * A hundred and twenty-eight bytes with the fields where Linux puts
+ * them, because this is a structure a *program* reads by name and the
+ * names have to land on the offsets it was compiled against. Only three
+ * of them are ever filled — si_signo, si_code and si_addr — and the rest
+ * is zero, which is a truthful siginfo rather than a partial one: every
+ * field a program can read has the value it should have.
+ */
+typedef struct {
+    int           si_signo;
+    int           si_errno;
+    int           si_code;
+    int           __pad0;
+    /* For a fault, the address. For a SIGCHLD this is where Linux packs
+     * si_pid and si_uid; nothing here fills that, and it reads zero. */
+    void         *si_addr;
+    int           si_status;
+    int           __pad1;
+    unsigned char __pad2[96];
+} siginfo_t;
+
+/*
+ * The disposition of one signal.
+ *
+ * This is *not* the structure the system call takes, and the difference
+ * is the whole reason libc/process.c has a conversion in it rather than
+ * a cast. POSIX orders the members handler, mask, flags, restorer; the
+ * kernel's argument is handler, flags, restorer, mask. Both orders are
+ * correct for their own side and neither is free to change, so the
+ * wrapper moves four words.
+ */
+struct sigaction {
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
+    sigset_t sa_mask;
+    int      sa_flags;
+    void   (*sa_restorer)(void);
+};
+
+/*
+ * Install a handler, and run it when the signal arrives.
+ *
+ * SIGKILL and SIGSTOP are refused with EINVAL, which is the standard's
+ * answer and this kernel's: they are the two a program is not permitted
+ * to be between.
+ */
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
+
+/*
+ * The older, simpler form, and it is a real one now.
+ *
+ * Implemented over sigaction with no flags, which gives the System V
+ * semantics: the handler stays installed across deliveries and the
+ * signal is blocked for the duration of its own handler. That is what
+ * every program written since the eighties expects `signal` to mean.
  */
 __sighandler_t signal(int sig, __sighandler_t handler);
 
+int sigprocmask(int how, const sigset_t *set, sigset_t *old);
+
+/* Send one. `sig` of zero sends nothing and answers whether the process
+ * exists, which is what it has meant since the seventh edition. */
+int kill(int pid, int sig);
+
 /*
- * The default action for every signal above, which is to end the
- * process. Prints which signal it was first, because a program that
- * disappears without a word is the hardest kind to diagnose on a serial
- * console.
+ * Send one to this process.
+ *
+ * Over kill() now rather than straight to abort(). The difference is
+ * visible to any program that installs a handler: raise(SIGUSR1) used to
+ * end the process because there was nowhere for a handler to be, and now
+ * it calls the handler and returns. raise(SIGABRT) with no handler still
+ * ends the process, because that is the default action and not a
+ * refusal.
  */
 int raise(int sig);
 

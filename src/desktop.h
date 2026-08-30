@@ -11,6 +11,11 @@
 #include "pe.h"
 #include "registry.h"
 #include "sci.h"
+/* The Linux subset's seam: the signal state hung off an address space,
+ * the personality flag, and the router this file's system call switch
+ * hands a Linux-numbered call to. src/sched/vls_core.c is the other side
+ * and the two meet only here. */
+#include "vls.h"
 
 /*
  * Vextro 9 desktop.
@@ -1334,6 +1339,14 @@ static int sys_canvas_ok(uint64_t buf, int64_t bw, int64_t bh) {
 static uint64_t sys_sbrk(int64_t delta);
 
 /*
+ * And exec, for the same reason and with a longer reach: it needs the
+ * loader, the allow list, the scanner and the address-space builder,
+ * every one of which is defined further down this file than the system
+ * call switch that has to reach it.
+ */
+static int64_t sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp);
+
+/*
  * ===== 4b. THE ELEVATION GATEWAY =====
  *
  * Every process in this system starts restricted, and that sentence is
@@ -1691,9 +1704,25 @@ static void sys_net_describe(char *out, int cap, const uint8_t ip[4],
     str_append(out, nb, cap);
 }
 
-static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
-                                uint64_t a2, uint64_t a3, uint64_t a4,
-                                uint64_t a5) {
+/*
+ * ---- why this is no longer the function the entry stub calls ----
+ *
+ * It was, and the split happened when a second numbering arrived. A
+ * Linux program and a Vextro one both issue `syscall` and their numbers
+ * collide — 1 is SYS_PRINT here and `write` there — so something above
+ * this has to decide which of the two a given call is written in. That
+ * something is syscall_service at the bottom of this file.
+ *
+ * The reason this one had to be renamed rather than have the routing put
+ * at its top is exact and was worth an hour to see: the router
+ * *forwards* a translated call back into this switch. Linux `write`
+ * becomes native SYS_WRITE, which is 6, and 6 re-entering a router that
+ * routes by personality would be read as Linux `close`. One door in, one
+ * door below it, and nothing can go round twice.
+ */
+static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
+                               uint64_t a2, uint64_t a3, uint64_t a4,
+                               uint64_t a5) {
     /* a3 is a real argument now -- send and recv carry their flags
      * there -- so it is no longer in this list. a4 and a5 still have no
      * caller and are named here so that the compiler does not have to
@@ -1743,6 +1772,12 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
     }
 
     case SYS_EXIT:
+        /* The parent is told here rather than at the reap. The reaper
+         * runs on the compositor thread, which during a boot self-test
+         * is the thread blocked waiting for this program to finish — so
+         * a wait4 satisfied only by a reap would be satisfied only after
+         * the waiter returned. See addr_space_t.exit_reported. */
+        vls_report_exit(vmm_current, (int)a0, 0);
         sched_exit((int)a0);
         return 0;                       /* never reached */
 
@@ -1775,7 +1810,7 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         if (kind == FD_FREE)  return (uint64_t)(int64_t)-VXE_BADF;
         if (kind == FD_DIR)   return (uint64_t)(int64_t)-VXE_BADF;
 
-        if (kind == FD_FILE || kind == FD_SOCK) {
+        if (kind == FD_FILE || kind == FD_SOCK || kind == FD_DEV) {
             vfs_desc_t *d = vfs_get(as, (int64_t)a0);
             if (!d) return (uint64_t)(int64_t)-VXE_BADF;
 
@@ -1788,6 +1823,9 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                 app_refuse("write: unreadable buffer");
                 return (uint64_t)(int64_t)-VXE_FAULT;
             }
+            if (kind == FD_DEV)
+                return (uint64_t)dev_write(d, (const void *)(uintptr_t)a1,
+                                           (uint32_t)len);
             return (uint64_t)vfs_file_write(d, (const void *)(uintptr_t)a1,
                                             (uint32_t)len);
         }
@@ -1885,6 +1923,34 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
             return (uint64_t)-1;
         }
 
+        /*
+         * ---- and the two things a Linux program expects to survive ----
+         *
+         * The signal handlers, because POSIX says a child inherits its
+         * dispositions: a program that installs a SIGCHLD handler and
+         * then forks a worker expects the worker to have the same idea
+         * of what SIGPIPE means. Pending signals are *not* inherited and
+         * vls_sig_clone explains why — a signal addressed to the parent
+         * that was duplicated would be one signal delivered twice.
+         *
+         * And the personality, because a Linux binary that forks does
+         * not get a chance to set it again: the child resumes at the
+         * same instruction with the same numbering compiled into it. A
+         * child that came back native would make its next call into
+         * whatever this system's number happened to mean.
+         */
+        if (vls_sig_clone(child, vmm_current) != 0) {
+            app_surf_release(child->surface);
+            child->surface = 0;
+            if (child->files) { vfs_table_destroy(child->files);
+                                child->files = 0; }
+            vmm_destroy(child);
+            kfree(child);
+            app_refuse("fork: could not duplicate the signal handlers");
+            return (uint64_t)-1;
+        }
+        child->personality = vmm_current->personality;
+
         /* The child resumes at the same instruction with RAX zero. Its
          * frame is built from the parent's, which the syscall stub has
          * already saved. */
@@ -1892,10 +1958,25 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         if (!t) {
             app_surf_release(child->surface);
             child->surface = 0;
+            vls_sig_free(child);
             vmm_destroy(child);
             kfree(child);
             return (uint64_t)-1;
         }
+
+        /*
+         * ---- parentage, which this system did not have until now ----
+         *
+         * The child's process identity is the tid of the thread that
+         * carries it, exactly as at spawn; what is new is the second
+         * line. Nothing anywhere recorded who forked whom, because until
+         * wait4 and SIGCHLD existed there was nothing to be told and
+         * nobody to tell. Recorded once here and never updated: a child
+         * whose parent has ended keeps the number, and a wait4 that
+         * finds no such process is exactly the answer POSIX gives.
+         */
+        child->pid  = t->pid;
+        child->ppid = vmm_current->pid;
         return t->pid;
     }
 
@@ -2540,6 +2621,12 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
      * the new one below.
      */
     case SYS_THREAD_EXIT:
+        /* Only if this is the last thread standing in the space, since
+         * this call ends one thread and not the program. A worker
+         * finishing is not a process ending and its parent must not be
+         * told that it is. */
+        if (vmm_current && vmm_current->refs <= 1)
+            vls_report_exit(vmm_current, (int)a0, 0);
         sched_exit((int)a0);
         return 0;                       /* never reached */
 
@@ -2576,12 +2663,164 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
                 t->state     = T_ZOMBIE;
             }
         }
+        vls_report_exit(as, (int)a0, 0);
         sched_exit((int)a0);
         return 0;                       /* never reached */
     }
 
     case SYS_GETTID:
         return cur_thread ? cur_thread->pid : 0;
+
+    /*
+     * ===== THE FIVE CALLS A SECOND PROCESS NEEDS =====
+     *
+     * Native numbers rather than Linux-only ones, because each is
+     * something a program written for *this* system now wants and none
+     * of them is an emulation of anything: a Vextro program that forks
+     * has to be able to wait, and a shell written here has to be able to
+     * replace itself. The Linux table in src/sched/vls_core.c forwards
+     * to these rather than reimplementing them.
+     *
+     * The signal calls are deliberately *not* here. Those are Linux's
+     * shape — a sigaction structure, a sixty-four bit mask, a frame laid
+     * on the user stack — and giving them native numbers as well would
+     * be a second door into one room. They are reachable through the
+     * call bias, which is how the test suite for them is written.
+     */
+    case SYS_EXECVE:
+        return (uint64_t)sys_execve(a0, a1, a2);
+
+    case SYS_WAIT4:
+        return (uint64_t)vls_wait4(a0, a1, a2, a3);
+
+    /*
+     * ---- duplicating a descriptor, and what cannot be duplicated ----
+     *
+     * A descriptor here *is* the open file description: the offset, the
+     * write-back image and the socket handle all live in the same
+     * structure the number indexes. Unix keeps them separate, so two of
+     * its descriptors can share one position in a file; this system has
+     * nowhere to put a shared description, which src/vfs.h already says
+     * at the point a fork declines to duplicate a socket.
+     *
+     * That makes three cases rather than one:
+     *
+     *   A device node, a console stream, a directory or a file opened
+     *   for reading has no mutable state that two holders could
+     *   disagree about. Those duplicate exactly, and they are what
+     *   `dup2(fd, 1)` is nearly always used on — redirecting output to
+     *   /dev/null or to a log is the whole idiom.
+     *
+     *   A file opened for *writing* has a write-back image, and two
+     *   images of one file both flushed at close means whichever closed
+     *   last silently wins. Refused, by name.
+     *
+     *   A socket, for the reason vfs_clone_table gives at length: two
+     *   holders of one connection do not each get the response, they get
+     *   alternating halves of it.
+     */
+    case SYS_DUP:
+    case SYS_DUP2: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        const int kind = vfs_kind_of(as, (int64_t)a0);
+        if (kind == FD_FREE) return (uint64_t)(int64_t)-VXE_BADF;
+
+        if (num == SYS_DUP2 && (int64_t)a0 == (int64_t)a1) {
+            /* dup2 onto itself is defined to be a no-op that still
+             * checks the descriptor is open, which the line above did. */
+            return a1;
+        }
+
+        struct proc_files *f = vfs_files(as, 1);
+        if (!f) return (uint64_t)(int64_t)-VXE_NOMEM;
+
+        if (kind == FD_SOCK) {
+            app_refuse("dup: a connection cannot be held twice on this "
+                       "system");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+
+        vfs_desc_t *s = &f->d[a0 < FD_MAX ? a0 : 0];
+        if (kind == FD_FILE && s->writable) {
+            app_refuse("dup: a file open for writing has one write-back "
+                       "image and cannot be held twice");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+
+        int nfd;
+        if (num == SYS_DUP2) {
+            if ((int64_t)a1 < 0 || a1 >= FD_MAX)
+                return (uint64_t)(int64_t)-VXE_BADF;
+            nfd = (int)a1;
+            /* The target is closed first, and silently, which is what
+             * dup2 promises: it is how a program points its own output
+             * somewhere else without a window in which it has none. */
+            if (f->d[nfd].kind != FD_FREE && f->d[nfd].kind != FD_CONSOLE)
+                vfs_close_desc(&f->d[nfd]);
+        } else {
+            nfd = vfs_alloc(as);
+            if (nfd < 0) return (uint64_t)(int64_t)nfd;
+        }
+
+        vfs_desc_t *o = &f->d[nfd];
+        *o = *s;
+        o->wbuf = 0; o->wcap = 0; o->ents = 0; o->rx = 0; o->tx = 0;
+        o->busy = o->busy_rx = o->busy_tx = 0;
+        /* A duplicate is not close-on-exec however the original was
+         * marked, and that is POSIX rather than a simplification: the
+         * whole point of dup2 before an exec is to hand the new image a
+         * descriptor. */
+        o->cloexec = 0;
+
+        if (kind == FD_DIR && s->ents && s->nents) {
+            const uint64_t bytes = (uint64_t)s->nents * sizeof(vx_dirent_t);
+            o->ents = (vx_dirent_t *)kmalloc_pool(bytes, KPOOL_PAGED);
+            if (!o->ents) { vfs_desc_reset(o); return (uint64_t)(int64_t)-VXE_NOMEM; }
+            for (uint64_t k = 0; k < bytes; k++)
+                ((uint8_t *)o->ents)[k] = ((const uint8_t *)s->ents)[k];
+        }
+        return (uint64_t)nfd;
+    }
+
+    /*
+     * ---- which numbering this process speaks ----
+     *
+     * A one-way door, and the refusal to go back is the whole safety of
+     * it: a program that could return to the native numbering
+     * half-way through would have made some calls in one numbering and
+     * some in the other, and 1 means SYS_PRINT in one and `write` in the
+     * other. Returns the previous value, so a caller can tell that it
+     * took.
+     *
+     * A Linux binary loaded by a future loader will have this set for it
+     * before its first instruction. Until then it is set by a program
+     * about itself, which is what makes the subset testable from a
+     * program built in this tree.
+     */
+    case SYS_PERSONALITY: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        const uint64_t was = as->personality;
+        if (a0 == VLS_PERSONALITY_LINUX) {
+            if (!as->personality) {
+                serial_puts("[VLS] pid ");
+                serial_put_dec(as->pid);
+                serial_puts(" (");
+                serial_puts(cur_thread ? cur_thread->name : "?");
+                serial_puts(") now speaks the linux abi\n");
+            }
+            as->personality = VLS_PERSONALITY_LINUX;
+        } else if (a0 != VLS_PERSONALITY_NATIVE) {
+            return (uint64_t)(int64_t)-VXE_INVAL;
+        } else if (as->personality == VLS_PERSONALITY_LINUX) {
+            app_refuse("personality: a process cannot go back to the "
+                       "native numbering");
+            return (uint64_t)(int64_t)-VXE_PERM;
+        }
+        return was;
+    }
 
     /*
      * Where this thread's own variables are.
@@ -2694,13 +2933,39 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         const uint32_t acc = fl & VX_O_ACCMODE;
         const int wants_write = (acc == VX_O_WRONLY || acc == VX_O_RDWR);
 
+        /*
+         * ---- a device node is not a file, and none of the three
+         *      questions below is about it ----
+         *
+         * This has to be decided here rather than inside vfs_open,
+         * because all three gates are applied before vfs_open is
+         * reached and every one of them would give a wrong answer.
+         *
+         * The profile boundary is about another account's private tree,
+         * and /dev is in nobody's profile. The pagefile guard is about a
+         * run of raw sectors, and /dev has none. And the elevation
+         * gateway is about "the three ways a program can change this
+         * machine permanently" — rewriting NTFS metadata, rewriting the
+         * registry, writing raw sectors — of which writing to /dev/null
+         * is none. `open("/dev/null", O_RDWR)` is what a program does
+         * before it has decided to do anything at all, and it put a
+         * password prompt on the screen, which is precisely how somebody
+         * is trained to click yes.
+         *
+         * The render node is the interesting case and it comes out the
+         * same way: a write to it lands in this process's own window
+         * surface, which the process already has mapped at canvas_va and
+         * may write to freely without asking anyone.
+         */
+        const int is_dev = dev_claims(abs);
+
         /* The profile boundary first: it is not a question anybody gets
          * to answer, it is another account's private tree. */
-        if (!prof_may(abs, wants_write)) {
+        if (!is_dev && !prof_may(abs, wants_write)) {
             app_refuse("open: outside this account's profile");
             return (uint64_t)(int64_t)-VXE_ACCES;
         }
-        if (wants_write && swap_owns_path(abs)) {
+        if (!is_dev && wants_write && swap_owns_path(abs)) {
             app_refuse("open: the pagefile is in use");
             return (uint64_t)(int64_t)-VXE_BUSY;
         }
@@ -2718,7 +2983,7 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
          * reach the disk, including when that happens on the janitor's
          * thread after the process is gone.
          */
-        if (wants_write && !uac_guard("write a file", abs))
+        if (!is_dev && wants_write && !uac_guard("write a file", abs))
             return (uint64_t)(int64_t)-VXE_PERM;
 
         /*
@@ -2778,6 +3043,12 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
             app_refuse("read: unwritable buffer");
             return (uint64_t)(int64_t)-VXE_FAULT;
         }
+        /* A device node reads through src/devfs.h. The range check above
+         * is the same one the file path gets and is what makes it safe
+         * for either to write straight through the caller's pointer. */
+        if (kind == FD_DEV)
+            return (uint64_t)dev_read(d, (void *)(uintptr_t)a1,
+                                      (uint32_t)len);
         return (uint64_t)vfs_file_read(d, (void *)(uintptr_t)a1,
                                        (uint32_t)len);
     }
@@ -2840,6 +3111,23 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         char abs[FS_PATH_MAX];
         fs_abs(path, abs, sizeof(abs));
 
+        /*
+         * The device nodes answer here as well as at open, and that is
+         * not a duplication of effort — it is the more important of the
+         * two. A program almost never opens /dev/null blind: it stats it
+         * first, to find out whether this system has one, and decides
+         * from the answer whether to redirect or to fall back. A stat
+         * that said "no such file" for a node the open would have
+         * succeeded on is a system whose devices exist and cannot be
+         * found.
+         */
+        if (dev_claims(abs)) {
+            vx_stat_t *dst = (vx_stat_t *)(uintptr_t)a1;
+            const dev_node_t *n = dev_lookup(abs);
+            if (n) dev_stat(n, dst); else dev_stat_dir(dst);
+            return 0;
+        }
+
         uint64_t size = 0, ino = 0;
         int is_dir = 0;
         /* A path in another account's profile answers "no such file",
@@ -2877,6 +3165,12 @@ static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
         if (kind == FD_SOCK) {
             vfs_fill_stat(st, 0, 0, 0);
             st->mode = VX_S_IFSOCK;
+            return 0;
+        }
+        if (kind == FD_DEV) {
+            const dev_node_t *n = dev_lookup(d->path);
+            if (!n) return (uint64_t)(int64_t)-VXE_BADF;
+            dev_stat(n, st);
             return 0;
         }
         if (kind == FD_DIR) {
@@ -3839,6 +4133,140 @@ static int as_unistr(addr_space_t *as, uint64_t at, uint64_t buf,
  * other process — is either in the half of the address space its
  * descriptors forbid or is not mapped at all.
  */
+/*
+ * Everything a process is entitled to see, mapped into a space that has
+ * already been created.
+ *
+ * Split out of app_spawn because exec needs precisely this and nothing
+ * else around it. The two differ at both ends and agree completely in
+ * the middle: a spawn creates a thread afterwards and an exec re-points
+ * one, a spawn claims a window and an exec keeps the one the process
+ * already had. What neither may differ in is the *mapping* — the same
+ * four regions, the same W^X, the same guard page — because a second
+ * copy of that would be a second place for a protection bit to be
+ * wrong, and the one that was wrong would be the one nobody read.
+ *
+ * `keep` is the surface to reuse, or null to claim a fresh one. It is
+ * the whole of exec's difference here and it matters: releasing the
+ * window and claiming it again would put it back in the pool for the
+ * length of one call, which is long enough for another program's launch
+ * to take it.
+ *
+ * Returns 0 having filled in the stack pointer and the page count, or -1
+ * having left the space for the caller to destroy.
+ */
+static int app_map_image(addr_space_t *as, const char *name,
+                         uint64_t base_va, uint64_t span,
+                         const app_layout_t *lay, app_surface_t *keep,
+                         uint64_t *out_sp, uint64_t *out_pages) {
+    const uint64_t stack_top = lay->stack_top;
+    const uint64_t tramp_va  = lay->tramp_va;
+    const uint64_t canvas_va = lay->canvas_va;
+    as->brk = as->brk_top = lay->heap_base;
+
+    /*
+     * The token, and it is restricted whoever launched this.
+     *
+     * The account's administrator flag is recorded beside it rather than
+     * folded into it, because the two answer different questions: the
+     * flag says this session *may be asked* to elevate, the token says
+     * whether it has been. A program started by an administrator gets
+     * exactly the same privileges as one started by anybody else until
+     * somebody answers a prompt about it. See uac_guard.
+     */
+    as->sid       = (uint32_t)(user_current + 1);
+    as->sid_admin = (uint8_t)(user_is_admin(user_current) ? 1 : 0);
+    as->token     = UAC_TOKEN_RESTRICTED;
+
+    /* Now that this process's trampoline address is known, resolve the
+     * staged image's imports against it. Doing it here rather than in
+     * the loader is what lets the page move. */
+    kernel_exports_for(tramp_va);
+    vx_resolve_imports(app_memory, span);
+
+    /* The image, one page at a time, each with the protection its
+     * segment asked for. A page that no segment claimed is not mapped
+     * at all rather than mapped and empty. */
+    uint64_t pages = (span + 4095) / 4096;
+    for (uint64_t p = 0; p < pages; p++) {
+        uint8_t prot = app_page_prot[p];
+        if (!prot) prot = APROT_READ;              /* padding inside a span */
+        uint64_t flags = PTE_USER;
+        if (prot & APROT_WRITE) flags |= PTE_WRITE;
+        if (!(prot & APROT_EXEC)) flags |= PTE_NX;
+
+        uint64_t phys = pmm_alloc();
+        if (!phys) return -1;
+        if (vmm_map(as, base_va + p * 4096, phys, flags) != 0) {
+            pmm_free(phys);
+            return -1;
+        }
+        uint8_t *dst = (uint8_t *)(uintptr_t)phys_to_virt(phys);
+        for (int i = 0; i < 4096; i++) dst[i] = app_memory[p * 4096 + i];
+    }
+
+    /* Stack: writable, never executable. */
+    if (vmm_alloc_range(as, stack_top - USER_STACK_SIZE,
+                        USER_STACK_SIZE,
+                        PTE_USER | PTE_WRITE | PTE_NX) != USER_STACK_SIZE)
+        return -1;
+    /* One unmapped page below it, so an overflow is a fault at a known
+     * address rather than a write into the heap. */
+    {
+        uint64_t *g = vmm_walk(as, stack_top - USER_STACK_SIZE - PAGE_SIZE, 1);
+        if (g) *g = PTE_GUARD;
+    }
+
+    /* The trampolines: readable and executable, and writable by nobody.
+     * They are the same physical page in every process. */
+    if (vmm_map_shared(as, tramp_va, utramp_start,
+                       (uint64_t)(utramp_end - utramp_start),
+                       PTE_USER) != 0)
+        return -1;
+
+    /* The window's pixels, so a program can draw without a syscall per
+     * pixel. No-execute, because a canvas full of attacker-chosen bytes
+     * that the program can also jump to is the whole of the exploit.
+     *
+     * This process's own surface, not the shared canvas: two programs
+     * running at once each get their pages, and neither can read or
+     * write the other's. */
+    as->surface = keep ? keep : app_surf_claim(name);
+    if (as->surface) {
+        if (vmm_map_shared(as, canvas_va, as->surface->px, APP_SURF_BYTES,
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            return -1;
+    } else {
+        serial_puts("[compositor] no free surface; ");
+        serial_puts(name);
+        serial_puts(" shares the fallback canvas\n");
+        if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
+                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
+            return -1;
+    }
+    as->canvas_va = canvas_va;
+    as->tramp_va  = tramp_va;
+
+    /*
+     * The return address.
+     *
+     * Every app in this system is a `void _start(void)` that simply
+     * returns when it is done, which used to work because the kernel had
+     * called it. Nothing calls it now, so the value it returns *to* has
+     * to be put there by hand: the address of a stub that asks to exit.
+     * Placing it at STACK_TOP-8 also leaves the stack pointer where the
+     * ABI says it is at function entry — eight past a sixteen-byte
+     * boundary — which matters now that applications may use SSE.
+     */
+    const uint64_t sp = stack_top - 8;
+    if (as_poke64(as, sp, tramp_va + (uint64_t)(utramp_exit - utramp_start))
+        != 0) return -1;
+
+    *out_sp    = sp;
+    *out_pages = pages;
+    return 0;
+}
+
 static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
                            uint64_t entry_va, const app_layout_t *lay,
                            int verbose) {
@@ -3886,111 +4314,25 @@ static thread_t *app_spawn(const char *name, uint64_t base_va, uint64_t span,
      * processes relocations: an image has to land where it was linked.
      * That is the honest limit of this.
      */
-    const uint64_t stack_top = lay->stack_top;
-    const uint64_t tramp_va  = lay->tramp_va;
-    const uint64_t canvas_va = lay->canvas_va;
-    as->brk = as->brk_top = lay->heap_base;
-
-    /*
-     * The token, and it is restricted whoever launched this.
-     *
-     * The account's administrator flag is recorded beside it rather than
-     * folded into it, because the two answer different questions: the
-     * flag says this session *may be asked* to elevate, the token says
-     * whether it has been. A program started by an administrator gets
-     * exactly the same privileges as one started by anybody else until
-     * somebody answers a prompt about it. See uac_guard.
-     */
-    as->sid       = (uint32_t)(user_current + 1);
-    as->sid_admin = (uint8_t)(user_is_admin(user_current) ? 1 : 0);
-    as->token     = UAC_TOKEN_RESTRICTED;
-
-    /* Now that this process's trampoline address is known, resolve the
-     * staged image's imports against it. Doing it here rather than in
-     * the loader is what lets the page move. */
-    kernel_exports_for(tramp_va);
-    vx_resolve_imports(app_memory, span);
-
-    /* The image, one page at a time, each with the protection its
-     * segment asked for. A page that no segment claimed is not mapped
-     * at all rather than mapped and empty. */
-    uint64_t pages = (span + 4095) / 4096;
-    for (uint64_t p = 0; p < pages; p++) {
-        uint8_t prot = app_page_prot[p];
-        if (!prot) prot = APROT_READ;              /* padding inside a span */
-        uint64_t flags = PTE_USER;
-        if (prot & APROT_WRITE) flags |= PTE_WRITE;
-        if (!(prot & APROT_EXEC)) flags |= PTE_NX;
-
-        uint64_t phys = pmm_alloc();
-        if (!phys) goto fail;
-        if (vmm_map(as, base_va + p * 4096, phys, flags) != 0) {
-            pmm_free(phys);
-            goto fail;
-        }
-        uint8_t *dst = (uint8_t *)(uintptr_t)phys_to_virt(phys);
-        for (int i = 0; i < 4096; i++) dst[i] = app_memory[p * 4096 + i];
-    }
-
-    /* Stack: writable, never executable. */
-    if (vmm_alloc_range(as, stack_top - USER_STACK_SIZE,
-                        USER_STACK_SIZE,
-                        PTE_USER | PTE_WRITE | PTE_NX) != USER_STACK_SIZE)
+    uint64_t sp = 0, pages = 0;
+    if (app_map_image(as, name, base_va, span, lay, 0, &sp, &pages) != 0)
         goto fail;
-    /* One unmapped page below it, so an overflow is a fault at a known
-     * address rather than a write into the heap. */
-    {
-        uint64_t *g = vmm_walk(as, stack_top - USER_STACK_SIZE - PAGE_SIZE, 1);
-        if (g) *g = PTE_GUARD;
-    }
-
-    /* The trampolines: readable and executable, and writable by nobody.
-     * They are the same physical page in every process. */
-    if (vmm_map_shared(as, tramp_va, utramp_start,
-                       (uint64_t)(utramp_end - utramp_start),
-                       PTE_USER) != 0)
-        goto fail;
-
-    /* The window's pixels, so a program can draw without a syscall per
-     * pixel. No-execute, because a canvas full of attacker-chosen bytes
-     * that the program can also jump to is the whole of the exploit.
-     *
-     * This process's own surface, not the shared canvas: two programs
-     * running at once each get their pages, and neither can read or
-     * write the other's. */
-    as->surface = app_surf_claim(name);
-    if (as->surface) {
-        if (vmm_map_shared(as, canvas_va, as->surface->px, APP_SURF_BYTES,
-                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
-            goto fail;
-    } else {
-        serial_puts("[compositor] no free surface; ");
-        serial_puts(name);
-        serial_puts(" shares the fallback canvas\n");
-        if (vmm_map_shared(as, canvas_va, app_canvas, sizeof(app_canvas),
-                           PTE_USER | PTE_WRITE | PTE_NX) != 0)
-            goto fail;
-    }
-    as->canvas_va = canvas_va;
-    as->tramp_va  = tramp_va;
-
-    /*
-     * The return address.
-     *
-     * Every app in this system is a `void _start(void)` that simply
-     * returns when it is done, which used to work because the kernel had
-     * called it. Nothing calls it now, so the value it returns *to* has
-     * to be put there by hand: the address of a stub that asks to exit.
-     * Placing it at STACK_TOP-8 also leaves the stack pointer where the
-     * ABI says it is at function entry — eight past a sixteen-byte
-     * boundary — which matters now that applications may use SSE.
-     */
-    uint64_t sp = stack_top - 8;
-    if (as_poke64(as, sp, tramp_va + (uint64_t)(utramp_exit - utramp_start))
-        != 0) goto fail;
 
     thread_t *t = sched_spawn_user(as, entry_va, sp, name, PRIO_NORMAL);
     if (!t) goto fail;
+
+    /*
+     * Who this process is.
+     *
+     * The pid of the thread that created the space, fixed for the life of
+     * the space and unchanged by an exec — Linux's tgid, and this
+     * system's only process identity. Nothing had one until kill and
+     * wait4 existed, because until then nothing could ask about a
+     * process other than itself. No parent, because the desktop launched
+     * this rather than a program forking it; only SYS_FORK sets ppid.
+     */
+    as->pid  = t->pid;
+    as->ppid = 0;
 
     if (as->surface) {
         as->surface->pid = t->pid;
@@ -4233,6 +4575,12 @@ static thread_t *pe_spawn(const char *name, pe_image_t *img,
     thread_t *t = sched_spawn_user(as, img->entry, sp, name, PRIO_NORMAL);
     if (!t) goto fail;
 
+    /* A Windows process has a process identity for the same reason an
+     * ELF one does, and gets it the same way. It is what a forked child
+     * of it would record as its parent. */
+    as->pid  = t->pid;
+    as->ppid = 0;
+
     if (as->surface) {
         as->surface->pid = t->pid;
         app_surf_front   = as->surface;
@@ -4310,6 +4658,30 @@ static void app_reaped(thread_t *t) {
         struct proc_files *f = t->as->files;
         t->as->files = 0;
         vfs_retire_table(f);
+    }
+
+    /*
+     * ---- and telling this process's parent that it has ended ----
+     *
+     * Here rather than in sched_exit, and the window is narrow enough to
+     * be worth naming: sched_reap calls this hook and destroys the
+     * address space immediately afterwards, so this is the last moment
+     * at which the dying process's identity, its parent's number and the
+     * signal that killed it are all still readable. A moment later the
+     * status the parent is waiting for would be memory that had been
+     * freed.
+     *
+     * vls_child_exited records the status against the *parent's* signal
+     * state, posts a SIGCHLD, and wakes anything parked in wait4. It
+     * does nothing at all if the parent has already ended, which is what
+     * an orphan is.
+     */
+    if (t->as && t->as->refs <= 1) {
+        const int killed = t->as->sig ? (int)t->as->sig->killed_by : 0;
+        vls_report_exit(t->as, killed ? killed : t->exit_code, killed);
+        /* The handlers go with the process. Freed after the line above,
+         * because that line reads them. */
+        vls_sig_free(t->as);
     }
 
     /* A worker thread ending is not an event anybody wants told about;
@@ -4429,7 +4801,19 @@ static int execute_bin_full(const char *filepath, int verbose,
         pe_exports_for(lay.tramp_va);
 
         uint64_t pe_base = 0x0000000000400000ULL + aslr_offset(2048);
+        /*
+         * Zeroed before the loader sees it, and not as a formality: every
+         * early return in pe_load is a `return -1` taken before a single
+         * field of this structure is written, and the four lines below
+         * that print `img.sections`, `img.relocations`,
+         * `img.imports_resolved` and `img.pdata_size` are reached only
+         * when it returned zero. That is correct today and it is correct
+         * because of a property of a function in another file. A report
+         * built out of an uninitialised stack frame is the kind of wrong
+         * that reads as a plausible number.
+         */
         pe_image_t img;
+        for (uint64_t i = 0; i < sizeof(img); i++) ((uint8_t *)&img)[i] = 0;
         win_image_forget();
         int prc = pe_load(file, fsize, pe_base, &img);
         if (prc != 0) {
@@ -4556,6 +4940,592 @@ static int execute_bin_full(const char *filepath, int verbose,
 }
 
 /* Launch and return; the program runs as a thread from here on. */
+/* ============================================================
+ *  exec: the same process, a different program
+ * ============================================================
+ *
+ * The one operation a process can perform on itself that changes
+ * everything about it except which process it is, and the only reason
+ * this system has never had it is that nothing needed it: a program was
+ * started by the desktop and ran until it stopped. A browser is the
+ * program that needs it — WebKit's UI process launches its web process
+ * and its network process by forking and executing, and there was no
+ * second half to that pair here.
+ *
+ * ---- what is kept, and why each ----
+ *
+ *   The process identity. That is the definition of exec: `pid` and
+ *   `ppid` survive, so a parent that forked and is waiting still
+ *   recognises what comes back.
+ *
+ *   The window. Released and re-claimed would put it back in the pool
+ *   for the length of one call, which is long enough for another
+ *   launch to take it — and the program would come back to find its
+ *   window belonged to somebody else.
+ *
+ *   The descriptors, minus the ones marked close-on-exec. That flag has
+ *   been recorded on every descriptor since open() existed here and has
+ *   never been *read* by anything, because nothing could exec. This is
+ *   what it was for.
+ *
+ *   The blocked signal mask, and not the handlers. vls_sig_reset_for_exec
+ *   explains the asymmetry: a handler is an address in an image that no
+ *   longer exists, an ignore is a decision about the process.
+ *
+ * ---- and the two rules that make a failure safe ----
+ *
+ * Everything is built before anything is torn down, and the old address
+ * space is destroyed last. A failed exec must leave the process exactly
+ * as it was and return -1, which is only possible if the space it was
+ * running in is still there to go back to. Every early return below
+ * happens before the first irreversible step.
+ *
+ * And a multi-threaded process is refused rather than having its
+ * siblings killed. Linux kills them; doing that here would leave zombie
+ * threads still pointing at an address space this call had already
+ * destroyed, and the reaper decrementing a reference count on freed
+ * memory is a fault with no stack left to blame. The pattern that
+ * matters — fork, then exec in the child — is single-threaded in the
+ * child by construction, so this costs nothing that is actually done.
+ */
+#define EXEC_ARG_MAX    32
+#define EXEC_ARG_BYTES  2048
+
+typedef struct {
+    int      n;
+    uint32_t off[EXEC_ARG_MAX];       /* into `blob` */
+    uint32_t len;
+    char     blob[EXEC_ARG_BYTES];
+} exec_vec_t;
+
+/*
+ * A NULL-terminated array of user string pointers, taken whole into
+ * kernel memory.
+ *
+ * Before anything is torn down, because after the address space is gone
+ * so are the strings — and a program's own argv lives in the memory the
+ * exec is about to unmap. This is the piece that is easy to leave until
+ * the new stack is ready and impossible to do there.
+ */
+static int exec_take_vector(uint64_t uptr, exec_vec_t *v) {
+    v->n = 0;
+    v->len = 0;
+    v->blob[0] = '\0';
+    if (!uptr) return 0;
+
+    for (int i = 0; i < EXEC_ARG_MAX; i++) {
+        uint64_t sp = 0;
+        if (!user_range_mapped(vmm_current, uptr + (uint64_t)i * 8, 8, 0))
+            return -1;
+        sp = *(const uint64_t *)(uintptr_t)(uptr + (uint64_t)i * 8);
+        if (!sp) { v->n = i; return 0; }
+
+        char tmp[256];
+        const int got = sys_copy_string(sp, tmp, sizeof(tmp));
+        if (got < 0) return -1;
+        const uint32_t need = (uint32_t)got + 1;
+        if (v->len + need > EXEC_ARG_BYTES) return -1;
+
+        v->off[i] = v->len;
+        for (uint32_t k = 0; k < need; k++) v->blob[v->len + k] = tmp[k];
+        v->len += need;
+        v->n = i + 1;
+    }
+    /* More than thirty-two of them. Refused rather than truncated: a
+     * program handed half its arguments does the wrong thing quietly,
+     * where one told the exec failed does not do it at all. */
+    return -1;
+}
+
+/* Lay a vector out on the new stack, growing down, and answer where the
+ * pointer array ended up. The strings are already there — placed by the
+ * caller in one block — so this writes only the array of pointers into
+ * it, NULL-terminated as the ABI requires. */
+static int exec_place_vector(addr_space_t *as, const exec_vec_t *v,
+                             uint64_t strings_va, uint64_t *p,
+                             uint64_t *out_va) {
+    *p -= (uint64_t)(v->n + 1) * 8;
+    for (int i = 0; i < v->n; i++)
+        if (as_poke64(as, *p + (uint64_t)i * 8,
+                      strings_va + v->off[i]) != 0) return -1;
+    if (as_poke64(as, *p + (uint64_t)v->n * 8, 0) != 0) return -1;
+    *out_va = *p;
+    return 0;
+}
+
+static int64_t sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp) {
+    addr_space_t *old = vmm_current;
+    if (!old || !old->live || !cur_thread || !cur_thread->user)
+        return -VXE_PERM;
+    /* The frame is what gets rewritten to land in the new image, and
+     * only the SYSCALL door carries a return address this code can
+     * reach — `int 0x80` leaves it in the processor's own frame, above
+     * what syscall_frame_t covers. */
+    if (!cur_thread->sframe || !cur_thread->sfast) return -VXE_PERM;
+
+    if (old->refs > 1) {
+        app_refuse("execve: this process has more than one thread; "
+                   "exec from a single-threaded child instead");
+        return -VXE_AGAIN;
+    }
+
+    char path[FS_PATH_MAX];
+    if (sys_copy_string(upath, path, sizeof(path)) < 0) {
+        app_refuse("execve: unreadable path");
+        return -VXE_FAULT;
+    }
+
+    static exec_vec_t argv, envp;    /* static: 4 KB is too much stack */
+    if (exec_take_vector(uargv, &argv) != 0) {
+        app_refuse("execve: the argument vector is unreadable or too large");
+        return -VXE_FAULT;
+    }
+    if (exec_take_vector(uenvp, &envp) != 0) {
+        app_refuse("execve: the environment is unreadable or too large");
+        return -VXE_FAULT;
+    }
+
+    char abs[FS_PATH_MAX];
+    fs_abs(path, abs, sizeof(abs));
+    if (!prof_may(abs, 0)) {
+        app_refuse("execve: outside this account's profile");
+        return -VXE_ACCES;
+    }
+
+    uint64_t fsize = 0;
+    const void *fdata = fs_read_file(abs, &fsize);
+    if (!fdata || fsize < 8) return -VXE_NOENT;
+
+    /*
+     * The same two gates a launch from the desktop passes, and they are
+     * here rather than skipped because exec is otherwise a way around
+     * both: a program that could exec anything could run what the allow
+     * list forbids and what the scanner would have refused, by asking
+     * for it from inside a process that was already permitted.
+     */
+    char shortname[ALLOW_NAME];
+    policy_short_name(abs, shortname, sizeof(shortname));
+    if (!allow_permits(shortname)) {
+        serial_puts("[policy] execve blocked (not on the allow list): ");
+        serial_puts(shortname);
+        serial_putc('\n');
+        return -VXE_ACCES;
+    }
+    if (scanner_on) {
+        const int verdict = scan_buffer((const uint8_t *)fdata,
+                                        (uint32_t)fsize);
+        if (verdict != SCAN_CLEAN) {
+            serial_puts("[scan] execve refused ");
+            serial_puts(shortname);
+            serial_puts(": ");
+            serial_puts(scan_detail);
+            serial_putc('\n');
+            return -VXE_ACCES;
+        }
+    }
+
+    const uint8_t *file = (const uint8_t *)fdata;
+    uint64_t entry_va = 0, base_va = 0, span = 0;
+    int rc;
+    if (file[0] == (uint8_t)VX_MAGIC0 && file[1] == (uint8_t)VX_MAGIC1 &&
+        file[2] == (uint8_t)VX_MAGIC2 && file[3] == (uint8_t)VX_MAGIC3) {
+        rc = load_vx_image(file, fsize, 0, &entry_va, &base_va, &span);
+    } else if (file[0] == 0x7F && file[1] == 'E' && file[2] == 'L' &&
+               file[3] == 'F') {
+        rc = load_elf_image(file, fsize, 0, &entry_va, &base_va, &span);
+    } else {
+        /* ENOEXEC, which is the answer a shell turns into "try it as a
+         * script" and this system turns into a refusal it can print. */
+        return -8;
+    }
+    if (rc != 0) return -VXE_IO;
+    if (base_va < USER_MIN || base_va + span > USER_IMAGE_MAX)
+        return -VXE_NOMEM;
+
+    /* ---- from here the new space is built; nothing is torn down yet ---- */
+
+    addr_space_t *nas = (addr_space_t *)kmalloc(sizeof(addr_space_t));
+    if (!nas) return -VXE_NOMEM;
+    for (uint64_t i = 0; i < sizeof(addr_space_t); i++) ((uint8_t *)nas)[i] = 0;
+    if (vmm_create(nas) != 0) { kfree(nas); return -VXE_NOMEM; }
+    nas->refs = 1;
+
+    app_layout_t lay;
+    app_layout_pick(&lay);
+
+    uint64_t sp = 0, pages = 0;
+    if (app_map_image(nas, shortname, base_va, span, &lay,
+                      old->surface, &sp, &pages) != 0) {
+        /* The surface was the caller's and stays the caller's: it was
+         * passed in rather than claimed, so it is not this path's to
+         * release. Clearing the pointer first is what stops vmm_destroy
+         * from being handed a space that still claims one. */
+        nas->surface = 0;
+        vmm_destroy(nas);
+        kfree(nas);
+        return -VXE_NOMEM;
+    }
+
+    /*
+     * ---- the arguments, on the new stack ----
+     *
+     * Not the System V startup block, and the difference is deliberate.
+     * That convention puts argc at the stack pointer and expects _start
+     * to read it from there — but every program on this system is a
+     * `void _start(void)` that *returns*, with the address it returns to
+     * placed on the stack by the loader, and a block where that address
+     * has to be would break all of them.
+     *
+     * So the strings and the two pointer arrays go on the stack, and
+     * their addresses go in RDI, RSI and RDX: the ordinary C calling
+     * convention. A program written as `_start(void)` ignores three
+     * registers it was going to ignore anyway; one written as
+     * `_start(int argc, char **argv, char **envp)` gets its arguments
+     * without a word of assembly. Both work, which is the property that
+     * matters when the images being executed are the ones already on the
+     * volume.
+     */
+    uint64_t p = lay.stack_top;
+    uint64_t strings_va = 0, argv_va = 0, envp_va = 0;
+
+    const uint32_t sbytes = argv.len + envp.len;
+    p -= sbytes ? sbytes : 8u;
+    p &= ~15ull;
+    strings_va = p;
+    if (argv.len && as_write(nas, p, argv.blob, argv.len) != 0) goto exec_fail;
+    if (envp.len && as_write(nas, p + argv.len, envp.blob, envp.len) != 0)
+        goto exec_fail;
+    const uint64_t envp_strings_va = strings_va + argv.len;
+
+    p = strings_va;
+    if (exec_place_vector(nas, &argv, strings_va, &p, &argv_va) != 0)
+        goto exec_fail;
+    if (exec_place_vector(nas, &envp, envp_strings_va, &p, &envp_va) != 0)
+        goto exec_fail;
+
+    /* Sixteen-aligned, then one word for the address _start returns to —
+     * which leaves RSP eight past a boundary, exactly where the ABI says
+     * it is when a function is entered. */
+    p &= ~15ull;
+    p -= 8;
+    if (as_poke64(nas, p, lay.tramp_va +
+                          (uint64_t)(utramp_exit - utramp_start)) != 0)
+        goto exec_fail;
+    sp = p;
+
+    /* ---- the point of no return ---- */
+
+    nas->pid       = old->pid;
+    nas->ppid      = old->ppid;
+    nas->net_ok    = NET_UNASKED;   /* a new program, so a new question */
+    /*
+     * Back to the native numbering, and this is a decision rather than
+     * an oversight. The image that has just been loaded is one of this
+     * system's own — a .vx or an ELF built by this tree — because that
+     * is all the loader above can read. Its calls are written in native
+     * numbers. Carrying a Linux personality across into it would make
+     * its first `write` mean `close`. A day when this loader can read a
+     * foreign ELF is the day this line reads the image and decides.
+     */
+    nas->personality = VLS_PERSONALITY_NATIVE;
+
+    /* The descriptors move rather than being duplicated, and the ones
+     * marked close-on-exec are closed on the way. That flag has been
+     * recorded at every open since descriptors existed here and this is
+     * the first code that has ever read it. */
+    nas->files = old->files;
+    old->files = 0;
+    int closed = 0;
+    if (nas->files) {
+        for (int i = 0; i < FD_MAX; i++) {
+            vfs_desc_t *d = &nas->files->d[i];
+            if (d->kind == FD_FREE || d->kind == FD_CONSOLE) continue;
+            if (!d->cloexec) continue;
+            vfs_close_desc(d);
+            closed++;
+        }
+    }
+
+    /* The signal state moves too, and is reset for the new image. The
+     * blocked mask is what survives; see vls_sig_reset_for_exec. */
+    nas->sig = old->sig;
+    old->sig = 0;
+    vls_sig_reset_for_exec(nas);
+
+    /* The window is the process's, and the process is the same one. */
+    old->surface = 0;
+
+    sched_adopt_space(cur_thread, nas);
+
+    /*
+     * The frame the syscall will return along, rewritten to land in the
+     * new image. SYSRETQ takes RIP from RCX and RFLAGS from R11, which
+     * is why those two carry the entry point and the flags rather than
+     * fields named for them.
+     *
+     * Every other register is cleared. Not tidiness: they hold the old
+     * program's pointers, and a new image that read one would be reading
+     * an address in a space that no longer exists.
+     */
+    syscall_frame_t *f = cur_thread->sframe;
+    f->rcx      = entry_va;
+    f->r11      = 0x202;
+    f->user_rsp = sp;
+    f->rdi      = (uint64_t)argv.n;
+    f->rsi      = argv_va;
+    f->rdx      = envp_va;
+    f->rbx = f->rbp = 0;
+    f->r8 = f->r9 = f->r10 = f->r12 = f->r13 = f->r14 = f->r15 = 0;
+
+    /* Not before now. The space the caller was running in is only safe
+     * to destroy once nothing points at it, and CR3 held it until
+     * sched_adopt_space three lines ago. */
+    vmm_destroy(old);
+    kfree(old);
+
+    str_copy(cur_thread->name, shortname, SCHED_NAME_LEN);
+    if (nas->surface)
+        str_copy(nas->surface->name, shortname, SCHED_NAME_LEN);
+
+    serial_puts("[exec] execve ");
+    serial_puts(shortname);
+    serial_puts(" in pid ");
+    serial_put_dec(nas->pid);
+    serial_puts(", ");
+    serial_put_dec((uint32_t)pages);
+    serial_puts(" image pages, ");
+    serial_put_dec((uint32_t)argv.n);
+    serial_puts(" args, ");
+    serial_put_dec((uint32_t)closed);
+    serial_puts(" descriptors closed on exec\n");
+    return 0;
+
+exec_fail:
+    /* Nothing irreversible has happened: the caller is still running in
+     * `old`, still holds its own descriptors, and still owns the
+     * surface — which is why it is cleared here rather than released. */
+    nas->surface = 0;
+    vmm_destroy(nas);
+    kfree(nas);
+    return -VXE_NOMEM;
+}
+
+/* ============================================================
+ *  the router's side of the seam
+ * ============================================================
+ *
+ * Ten small functions and one assignment. src/sched/vls_core.c is a
+ * separate object and reaches everything here through the table below,
+ * for the reason the Makefile gives beside KERN_MODULES: a module that
+ * included this file would compile, link, and be given a private copy of
+ * the compositor's state. It is the same shape as sched_reap_hook, and
+ * the dependency points the same way — from the composition root into
+ * the module, never back.
+ */
+static uint64_t vlsh_native(uint64_t num, uint64_t a0, uint64_t a1,
+                            uint64_t a2, uint64_t a3, uint64_t a4,
+                            uint64_t a5) {
+    return syscall_native(num, a0, a1, a2, a3, a4, a5);
+}
+
+static int vlsh_range_ok(uint64_t va, uint64_t len) {
+    return user_range_ok(va, len);
+}
+
+static int vlsh_range_mapped(uint64_t va, uint64_t len, int write) {
+    if (!vmm_current) return 0;
+    return user_range_mapped(vmm_current, va, len, write);
+}
+
+static int vlsh_copy_in(uint64_t uptr, void *dst, uint64_t len) {
+    if (!vlsh_range_mapped(uptr, len, 0)) return -1;
+    const uint8_t *s = (const uint8_t *)(uintptr_t)uptr;
+    uint8_t *d = (uint8_t *)dst;
+    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    return 0;
+}
+
+static int vlsh_copy_out(uint64_t uptr, const void *src, uint64_t len) {
+    if (!vlsh_range_mapped(uptr, len, 1)) return -1;
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)(uintptr_t)uptr;
+    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    return 0;
+}
+
+static int vlsh_copy_string(uint64_t uptr, char *dst, int cap) {
+    return sys_copy_string(uptr, dst, cap);
+}
+
+static int64_t vlsh_execve(uint64_t path, uint64_t argv, uint64_t envp) {
+    return sys_execve(path, argv, envp);
+}
+
+/* Where the signal trampoline is in *this* process. One physical page in
+ * every address space, at an address the layout displaces per process —
+ * so the offset is fixed and the base is not. */
+static uint64_t vlsh_sigreturn_va(void) {
+    if (!vmm_current || !vmm_current->tramp_va) return 0;
+    return vmm_current->tramp_va +
+           (uint64_t)(utramp_sigreturn - utramp_start);
+}
+
+static void vlsh_refuse(const char *what) { app_refuse(what); }
+
+static uint32_t vlsh_pid(void)  { return vmm_current ? vmm_current->pid  : 0; }
+static uint32_t vlsh_ppid(void) { return vmm_current ? vmm_current->ppid : 0; }
+/*
+ * Never zero, and that is the whole of this function.
+ *
+ * `sid` is the account identifier and is user_current + 1, so a machine
+ * with nobody signed in — a boot self-test, or a machine sitting at its
+ * login screen — has user_current at -1 and a sid of zero. Handing that
+ * back as a uid says "root" to every ported library that asks, and a
+ * great deal of ported code reads uid zero as permission to skip a
+ * check, write to a system directory, or decline to drop privilege.
+ * None of that is true here: every process holds
+ * UAC_TOKEN_RESTRICTED whoever started it.
+ *
+ * So a process with no account behind it is nobody, which is the number
+ * Unix has used for exactly this for forty years, and is a truthful
+ * answer rather than a safe-looking one.
+ */
+#define VLS_UID_NOBODY 65534u
+
+static uint32_t vlsh_uid(void) {
+    if (!vmm_current || !vmm_current->sid) return VLS_UID_NOBODY;
+    return vmm_current->sid;
+}
+
+static void vls_install(void) {
+    vls_host.native        = vlsh_native;
+    vls_host.range_ok      = vlsh_range_ok;
+    vls_host.range_mapped  = vlsh_range_mapped;
+    vls_host.copy_in       = vlsh_copy_in;
+    vls_host.copy_out      = vlsh_copy_out;
+    vls_host.copy_string   = vlsh_copy_string;
+    vls_host.execve        = vlsh_execve;
+    vls_host.sigreturn_va  = vlsh_sigreturn_va;
+    vls_host.refuse        = vlsh_refuse;
+    vls_host.pid           = vlsh_pid;
+    vls_host.ppid          = vlsh_ppid;
+    vls_host.uid           = vlsh_uid;
+    vls_init();
+}
+
+/*
+ * ---- a signal, on the way out of a system call ----
+ *
+ * One of exactly two points where a caught signal can be delivered, and
+ * the reason there are two rather than one is that they are the only two
+ * places a thread returns to ring 3 with a complete register set in a
+ * frame that can be rewritten. The other is the fault path in
+ * src/trap.h.
+ *
+ * The timer interrupt is deliberately not a third. src/sched/scheduler.c
+ * says sched_on_tick is hand-tuned and compiled general-regs-only,
+ * moving extended state through registers the compiler has been told not
+ * to touch; a signal check in it would be new instructions in the most
+ * delicate function in this kernel, and the last thing added to it
+ * produced a #GP two instructions later.
+ *
+ * What that costs, stated rather than left to be discovered: a thread
+ * asleep in the kernel sees a caught signal when it next wakes rather
+ * than at the moment it is sent, and no system call returns EINTR. A
+ * signal that *kills* does not wait — vls_signal_post ends the target
+ * immediately — so the case this delays is the one where the program
+ * asked to be told and is not in a hurry.
+ */
+static uint64_t syscall_deliver_signals(uint64_t ret) {
+    addr_space_t *as = vmm_current;
+    if (!as || !as->sig || !as->sig->pending) return ret;
+    if (!cur_thread || !cur_thread->user) return ret;
+
+    /*
+     * The thread's own frame, not the global.
+     *
+     * This runs after wait4 may have parked for fifty milliseconds, and
+     * during that park the child being waited for entered the kernel and
+     * wrote syscall_cur_frame. Reading the global here delivered the
+     * signal into the child's saved registers. See the note in
+     * syscall_dispatch_frame.
+     */
+    syscall_frame_t *f = cur_thread->sframe;
+    /* The legacy gate keeps the return address in the processor's own
+     * interrupt frame, above what syscall_frame_t covers, so there is no
+     * RIP here to redirect. Every program that can install a handler
+     * reaches this kernel through SYSCALL. */
+    if (!f || !cur_thread->sfast) return ret;
+
+    vls_regs_t r;
+    for (uint64_t i = 0; i < sizeof(r); i++) ((uint8_t *)&r)[i] = 0;
+    /* The first fifteen words of the two structures are the same
+     * registers in the same order, which include/vls.h arranges on
+     * purpose so that this is a copy rather than fifteen assignments
+     * that could be mis-ordered. */
+    for (int i = 0; i < 15; i++)
+        ((uint64_t *)&r)[i] = ((const uint64_t *)f)[i];
+    r.rax    = ret;                 /* what the call was about to answer */
+    r.rip    = f->rcx;              /* SYSCALL left the return address   */
+    r.rsp    = f->user_rsp;
+    r.rflags = f->r11;
+
+    const int what = vls_signal_dispatch(as, &r);
+    if (what == VLS_DELIVER_HANDLER) {
+        for (int i = 0; i < 15; i++)
+            ((uint64_t *)f)[i] = ((const uint64_t *)&r)[i];
+        f->rcx      = r.rip;
+        f->user_rsp = r.rsp;
+        f->r11      = r.rflags;
+        return r.rax;
+    }
+    if (what == VLS_DELIVER_FATAL) {
+        const int sig = as->sig ? (int)as->sig->killed_by : 0;
+        serial_puts("[VLS] pid ");
+        serial_put_dec(as->pid);
+        serial_puts(" ended by signal ");
+        serial_put_dec((uint32_t)sig);
+        serial_puts("\n");
+        vls_report_exit(as, sig, 1);
+        /* Every thread of the process, the same way SYS_EXIT_GROUP does
+         * it and with the same argument for why marking is enough. */
+        for (int i = 0; i < SCHED_MAX_THREADS; i++) {
+            thread_t *t = threads[i];
+            if (!t || t == cur_thread) continue;
+            if (t->as != as || t->state == T_FREE) continue;
+            t->exit_code = 128 + sig;
+            t->state     = T_ZOMBIE;
+        }
+        sched_exit(128 + sig);
+    }
+    return ret;
+}
+
+/*
+ * ---- the one door, and which numbering is behind it ----
+ *
+ * Everything a ring-3 program asks for arrives here, from either entry
+ * stub, and leaves by exactly one of three paths. include/vls.h explains
+ * why there are two ways to be a Linux call and why both are needed; the
+ * short of it is that the bias works without state and the personality
+ * works without cooperation, and the signal trampoline on the shared
+ * page needs the first while an actual Linux binary needs the second.
+ */
+static uint64_t syscall_service(uint64_t num, uint64_t a0, uint64_t a1,
+                                uint64_t a2, uint64_t a3, uint64_t a4,
+                                uint64_t a5) {
+    uint64_t ret;
+    if (num >= VLS_CALL_BIAS) {
+        ret = vls_syscall(num - VLS_CALL_BIAS, a0, a1, a2, a3, a4, a5);
+    } else if (vmm_current &&
+               vmm_current->personality == VLS_PERSONALITY_LINUX) {
+        ret = vls_syscall(num, a0, a1, a2, a3, a4, a5);
+    } else {
+        ret = syscall_native(num, a0, a1, a2, a3, a4, a5);
+    }
+    return syscall_deliver_signals(ret);
+}
+
 static int execute_bin_internal(const char *filepath, int verbose) {
     return execute_bin_full(filepath, verbose, 0);
 }

@@ -36,12 +36,14 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**125,142 lines of C written here**, across 257 files, built as four kernel
+**132,897 lines of C written here**, across 271 files, built as five kernel
 objects plus one for inference, over a user-space C library of its own —
 and, since ring 3 got file descriptors and sockets, a freestanding C++
 runtime to go with it, down to the Itanium ABI's run-time type
-information. 3.7 million host checks across 17 suites on every build, and
-ten more on the machine itself.
+information. A ring-3 program can now fork, exec, signal, and wait for its
+children, in Linux's numbering as well as this system's. 3.7 million host
+checks across 17 suites on every build, and thirteen more on the machine
+itself.
 
 ---
 
@@ -91,7 +93,7 @@ rebuilds; `make clean` does not touch it and `make cleandisk` resets it.
 
 # Architecture
 
-## The kernel is four objects
+## The kernel is five objects
 
 For most of this system's life the kernel was one translation unit: ninety-odd
 headers of `static` functions, 69,000 lines seen by the compiler at once. That
@@ -101,20 +103,27 @@ link time. It is also what makes naive splitting dangerous: compile two objects
 that both include `kheap.h` and each gets **its own free list**. It compiles,
 it links, it boots, and it is wrong.
 
-So the split is measured rather than assumed. Three modules had interfaces
+So the split is measured rather than assumed. Four modules had interfaces
 narrow enough to write down:
 
 | source | exports | imports | what the object is |
 |---|---:|---:|---|
 | `src/core/main.c` | — | — | composition root: boot, drivers, desktop, render loop |
-| `src/sched/scheduler.c` | 28 | 14 | threads, the 1 kHz timer ISR, the context switch |
+| `src/sched/scheduler.c` | 30 | 14 | threads, the 1 kHz timer ISR, the context switch |
+| `src/sched/vls_core.c` | 15 | 11 | the Linux ABI: router, signals, wait |
 | `src/fs/ntfs/ntfs_ops.c` | 8 | 9 | NTFS, read and write |
 | `src/security/anti_virus.c` | 14 | 5 | allowlist, signature automaton, UAC policy |
 
 Everything crossing those boundaries is declared in
 **`include/kernel_shared.h`**, and the rule that keeps it honest is that the
-three module sources include only that header and their own. Around **60
-symbols** lost their `static` to make this work — not 2,979. That ratio is the
+four module sources include only that header and their own. `vls_core.c` is
+the one that could not have kept the rule unaided: the services it forwards a
+translated call to live in `src/desktop.h`, so it reaches them through a table
+of function pointers filled in once at boot — the same shape as
+`sched_reap_hook` and for the same reason. A module that included that header
+would compile, link, and be handed a private copy of the compositor's state.
+
+Around **60 symbols** lost their `static` to make this work — not 2,979. That ratio is the
 evidence the seam is real: a de-static'd symbol defined twice fails at link,
 where a `static` one defined twice succeeds and hands each object a private
 copy.
@@ -372,6 +381,93 @@ the option that looks gentlest and is the dangerous one: code compiled
 against a throwing `new` does not check, so null is not an error path,
 it is a fault inside the constructor reported as the wrong thing
 entirely.
+
+## A Linux subset, so that a program can start a program
+
+`include/vls.h` and `src/sched/vls_core.c`. Until now a ring-3 program on
+this system could ask for things *about itself* and nothing else. It could
+fork — that has existed since system call 23 — and the fork was half of a
+pair with no other half: the child could only run the code its parent was
+already running, and when it stopped, nobody could be told.
+
+A browser is the program that makes that insufficient. WebKit is not one
+process; it is a UI process that forks a web process and a network process,
+hands them descriptors, and expects a signal when one dies. So five calls
+arrived together, native rather than emulated — `execve`, `wait4`, `dup`,
+`dup2` and `personality` — and beside them a translation layer for programs
+that were compiled against Linux's numbering rather than this one's.
+
+**The renumbering itself turned out to be nearly free**, and that is worth
+saying because it was the part expected to be the work. This system's own
+descriptor calls were written against Linux's constants deliberately —
+`O_CREAT` is `0100` in `src/syscall.h` because that is what the code being
+ported says — so thirty of the sixty-seven rows in the table are a change of
+call number and nothing else. What was actually hard was the four places
+Linux has a *concept* this system did not:
+
+| | what had to be built |
+|---|---|
+| **Signals** | The only way a program here can be told anything it did not ask for; everything else in this kernel is call-and-answer. A caught signal lays a frame on the interrupted thread's own stack — `siginfo_t` and a `ucontext_t` at the offsets a handler expects — and `rt_sigreturn` restores from the *ucontext*, so a handler that assigns `gregs[REG_RIP]` and returns lands where it asked. That is the one thing a JIT actually does with a `SIGSEGV` handler. |
+| **`exec`** | The only operation that changes what a process *is* without changing which process it is. The whole new address space is built before anything is torn down, because a failed exec must leave the process runnable. It is also the first code here to *read* the close-on-exec flag, which every `open` has recorded since descriptors existed. |
+| **`wait`** | Requires a process to have a parent, which requires a process to have an *identity*. There was none: `thread_t.pid` names a thread, so two threads of one program had two of them and neither was the program's. `addr_space_t` now carries Linux's `tgid` distinction. |
+| **`clone(CLONE_VM)`** | Whose child returns from a call it never made. Native `SYS_CLONE` takes an entry point and cannot express it, so the table does not pretend: the flags are inspected, a combination outside the subset is refused by name, and `sched_clone_thread` copies the parent's register file the way a fork does with the address space left shared. |
+
+Two doors lead to the same room, and both are needed. A call number at or
+above `0x40000000` is a Linux number with a bias added — unambiguous, needs
+no state, and works from a program that is otherwise native. A **personality**
+flag on the address space says every *unbiased* number from that process is a
+Linux number, which is what an actual Linux ELF will need, since its calls
+were compiled long before they got here. The signal trampoline is the proof
+that both are necessary: it lives on the shared trampoline page, is the same
+bytes in every process, and issues the *biased* number — so one stub serves a
+native process that caught a signal and a Linux one that did.
+
+`/dev` is answered before the volume is consulted, which is the semantics
+rather than an optimisation: a file called `\dev\null` on the disk must not
+be able to shadow the device. Eight nodes — `null`, `zero`, `full`, `random`,
+`urandom`, `tty`, `dri/card0`, `dri/renderD128` — and none of them passes
+through the elevation gateway, because that gateway guards the three ways a
+program can change the machine permanently and writing to `/dev/null` is none
+of them. A write to the render node lands in the calling process's own window
+surface. What that is *not* is a DRM device: real DRI is almost entirely
+`ioctl`, this kernel has none, and the table answers `ENOTTY` — which is what
+a program reads as "not the device I hoped for" rather than "this system is
+broken".
+
+An unmapped call is `ENOSYS` and one `[VLS]` line on the serial port naming
+itself, with all six argument registers. Never a halt. That line is how the
+list of what to build next gets written by the programs that need it rather
+than guessed at in advance.
+
+`apps/vlstest.c` runs **111 checks** on the machine, including a child that
+sets the personality and from that instant speaks nothing but raw Linux system
+calls, and one that takes a real page fault and reports the address its
+handler was given.
+
+## Ports, and what each one cost
+
+Seven libraries are built from upstream sources, unpatched, and run in
+ring 3. Each is fetched by checksum (`make libs-fetch`) and gitignored,
+and each is checked on the machine rather than assumed:
+
+| | version | in ring 3 | what it actually needed |
+|---|---|---|---|
+| SQLite | 3.45.1 | 32 checks | `SQLITE_OS_OTHER=1` and a VFS, so the VFS *is* the OS |
+| FreeType | 2.13.2 | 35 checks | four modules and the stock ANSI `ftsystem.c` over our FILE streams |
+| HarfBuzz | 8.5.0 | 32 checks | three C++ headers and `__popcountdi2` from libgcc |
+| ICU | 74.2 | 54 checks | the Itanium ABI's RTTI, and a wall clock — its data ships prebuilt |
+| libjpeg-turbo | 3.0.4 | 20 checks | two hand-written config headers; built at three precisions, no SIMD |
+| libepoxy | 1.5.10 | 19 checks | `dlopen`/`dlsym` over a table, because there is no dynamic linker |
+| WPE | 1.16.2 | 40 checks | the backend seam in `third_party/wpe-port/` |
+
+The last two are the ones that say something about the shape of this
+system rather than about the libraries. libjpeg-turbo is compiled three
+times over — at 8, 12 and 16 bits per sample — because version 3 selects
+precision at run time and skipping the other two passes leaves the
+dispatch calling functions that are not in the archive. And libepoxy is
+a *dispatcher*: it resolves two thousand OpenGL entry points by name
+through `dlsym`, which is why `libc/dlfcn.c` exists and why it is a name
+table rather than a loader. Nine of those two thousand resolve here.
 
 ## The interface, from utility classes
 
@@ -880,8 +976,8 @@ because a repository that blurs it is not worth reading.
 
 | | Why not |
 |---|---|
-| **Hardware-rasterised 3D** | There *is* a 3D API with a real shader compiler. What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work. Solid reports which backend is live. |
-| **Signals, `exec`, pipes, `dup`** | There is no way to start a program from a program, so a pipe would have nobody at the other end. `dup` is absent for a sharper reason: here a descriptor *is* the open file description, so a second name for one could only be a copy — two offsets, two write-back images, two closes of a socket — and each is wrong in a way a program would meet as data loss. |
+| **Hardware-rasterised 3D, and OpenGL** | There *is* a 3D API with a real shader compiler. What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work. **libepoxy is ported** and WebKit's configure finds it — it is a function-pointer dispatcher, so it builds without an OpenGL underneath — and nine entry points resolve to the framebuffer at `/dev/dri/renderD128`: clear, viewport, read pixels, and the strings a stack reads to find out what it is talking to. Everything with a pipeline behind it is absent from the table, so `glDrawArrays` prints its own name and aborts rather than drawing nothing. A software GL over the existing rasteriser is the rung that changes that. |
+| **Pipes** | Signals, `exec` and `dup` are here now — see the Linux subset above — and a pipe is the one of the four that did not come with them. It needs a descriptor kind that is a *buffer with two ends*, which is the one thing `src/vfs.h` has no shape for, and a `pipe2` is answered with `ENOSYS` and a `[VLS]` line rather than a half-built one. `dup` arrived with its limits stated instead of hidden: here a descriptor *is* the open file description, so a file open for writing or a connected socket cannot be duplicated — two write-back images or two closes of one connection are each wrong in a way a program meets as data loss — and both are refused by name rather than approximated. |
 | **Full-disk encryption** | Individual directories seal into encrypted containers; the volume itself is not encrypted, so filenames and free space are in the clear. |
 | **Sandboxing beyond ring 3** | Hardware isolation is real now — a program cannot read the kernel or another process. What is still only *policy* is which programs may start: the allowlist and scanner decide that, and nothing constrains what a program does within its own address space. |
 | **VPN, branch caching, SMB Direct** | Not written. Kerberos also holds tickets encrypted on disk rather than in a kernel keyring. |
@@ -1068,6 +1164,7 @@ src/
   core/main.c       Entry point, boot, hardware init, render loop, login
   sched/            scheduler.c  threads, the 1 kHz ISR, the switch
                     sched.h      thread_t, priorities, the inline hot path
+                    vls_core.c   the Linux ABI: router, signals, wait4
   fs/ntfs/          ntfs_ops.c   NTFS read + write, $MFT, journal
   security/         anti_virus.c Aho-Corasick scanner, allowlist, UAC
   net/              wifi.c  ieee80211.h  wpa2.h   802.11 + WPA2 supplicant
@@ -1078,6 +1175,7 @@ src/
   pmm.h  vmm.h  kheap.h  swap.h    frames, page tables, heap, pagefile
   gdt.h  idt.h  apic.h  trap.h     descriptors, vectors, the local APIC
   syscall.h  winproc.h  pe.h       two ABIs, PE loading, SEH
+  vls.h (include/)  devfs.h        the Linux subset, and /dev
 
   --- storage and filesystems ---
   blk.h  nvme.h  ahci.h  ata.h  usbmsc.h   one sector view, four buses

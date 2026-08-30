@@ -33,6 +33,16 @@
 #include "kernel_shared.h"
 #include "gdt.h"
 #include "vmm.h"
+/* For cur_thread, which the two dispatchers below now record the frame
+ * on as well as in the global — see the long note in
+ * syscall_dispatch_frame about what a service routine that blocks does
+ * to a single-word answer. */
+#include "sched/sched.h"
+/* The Linux subset. Needed here for two things and only two: the call
+ * bias, which the signal trampoline at the bottom of this file issues,
+ * and the VXN_* copy of the numbers below, which the static assertions
+ * beside them prove equal to the originals. */
+#include "vls.h"
 
 /* ---- numbers ----
  *
@@ -299,6 +309,105 @@
 #define SYS_WALLCLOCK       59
 
 /*
+ * ===== 60-64: a second process =====
+ *
+ * Everything below this line existed because a program could ask about
+ * itself. These are the first calls that let one ask about, or become,
+ * something else — and they arrived together because a browser needs
+ * them together: WebKit's UI process forks a web process, executes an
+ * image in it, hands it descriptors, and waits for it to end.
+ *
+ * SYS_FORK has been here since number 23 and was half a pair with no
+ * other half. A forked child could only run the same code its parent
+ * was running, and when it stopped nobody could be told.
+ *
+ *   EXECVE      replace this process's image, keeping its identity, its
+ *               window and every descriptor not marked close-on-exec.
+ *               The first code in this system to *read* that flag,
+ *               which has been recorded at every open since open
+ *               existed.
+ *   WAIT4       collect a child's status. Needs a process to have a
+ *               parent, which needs a process to have an identity —
+ *               see addr_space_t.pid, which is also new.
+ *   DUP, DUP2   a second number for one descriptor, within the limits
+ *               a system whose descriptor *is* its open file description
+ *               can offer. The service routine says which three cases
+ *               those are and refuses the other two by name.
+ *   PERSONALITY which numbering this process's calls are written in.
+ *               A one-way door; include/vls.h explains both mechanisms
+ *               and why there are two.
+ *
+ * The signal calls are not here on purpose. rt_sigaction, rt_sigprocmask,
+ * rt_sigreturn, kill and tgkill are Linux's shape down to the layout of
+ * the structures they take, and giving them native numbers as well would
+ * be a second door into one room. They are reachable through the call
+ * bias, which is also how the trampoline below reaches sigreturn.
+ */
+#define SYS_EXECVE          60
+#define SYS_WAIT4           61
+#define SYS_DUP             62
+#define SYS_DUP2            63
+#define SYS_PERSONALITY     64
+
+/*
+ * ---- and the proof that the module agrees about all of them ----
+ *
+ * src/sched/vls_core.c forwards Linux calls to these numbers and cannot
+ * include this file — it defines variables, emits the two entry stubs
+ * below, and forward-declares a static function, so a second translation
+ * unit that included it would not link. So include/vls.h carries its own
+ * copy under VXN_*, and this is where the two are made to agree.
+ *
+ * Two lists proved equal at compile time is a different thing from two
+ * lists. A number changed in one place and not the other stops the build
+ * at the line that was changed, rather than becoming a call that quietly
+ * does something else — which is the failure this would otherwise have,
+ * and it would present as a ported program doing an operation nobody
+ * asked for.
+ */
+_Static_assert(VXN_PRINT        == SYS_PRINT,        "VLS: PRINT");
+_Static_assert(VXN_EXIT         == SYS_EXIT,         "VLS: EXIT");
+_Static_assert(VXN_SBRK         == SYS_SBRK,         "VLS: SBRK");
+_Static_assert(VXN_WRITE        == SYS_WRITE,        "VLS: WRITE");
+_Static_assert(VXN_YIELD        == SYS_YIELD,        "VLS: YIELD");
+_Static_assert(VXN_TICKS        == SYS_TICKS,        "VLS: TICKS");
+_Static_assert(VXN_FORK         == SYS_FORK,         "VLS: FORK");
+_Static_assert(VXN_RANDOM       == SYS_RANDOM,       "VLS: RANDOM");
+_Static_assert(VXN_FUTEX        == SYS_FUTEX,        "VLS: FUTEX");
+_Static_assert(VXN_MMAP         == SYS_MMAP,         "VLS: MMAP");
+_Static_assert(VXN_MUNMAP       == SYS_MUNMAP,       "VLS: MUNMAP");
+_Static_assert(VXN_MPROTECT     == SYS_MPROTECT,     "VLS: MPROTECT");
+_Static_assert(VXN_THREAD_EXIT  == SYS_THREAD_EXIT,  "VLS: THREAD_EXIT");
+_Static_assert(VXN_GETTID       == SYS_GETTID,       "VLS: GETTID");
+_Static_assert(VXN_SET_FSBASE   == SYS_SET_FSBASE,   "VLS: SET_FSBASE");
+_Static_assert(VXN_CLOCK        == SYS_CLOCK,        "VLS: CLOCK");
+_Static_assert(VXN_EXIT_GROUP   == SYS_EXIT_GROUP,   "VLS: EXIT_GROUP");
+_Static_assert(VXN_NANOSLEEP    == SYS_NANOSLEEP,    "VLS: NANOSLEEP");
+_Static_assert(VXN_OPEN         == SYS_OPEN,         "VLS: OPEN");
+_Static_assert(VXN_READ         == SYS_READ,         "VLS: READ");
+_Static_assert(VXN_CLOSE        == SYS_CLOSE,        "VLS: CLOSE");
+_Static_assert(VXN_LSEEK        == SYS_LSEEK,        "VLS: LSEEK");
+_Static_assert(VXN_STAT         == SYS_STAT,         "VLS: STAT");
+_Static_assert(VXN_FSTAT        == SYS_FSTAT,        "VLS: FSTAT");
+_Static_assert(VXN_GETDENTS     == SYS_GETDENTS,     "VLS: GETDENTS");
+_Static_assert(VXN_UNLINK       == SYS_UNLINK,       "VLS: UNLINK");
+_Static_assert(VXN_MKDIR        == SYS_MKDIR,        "VLS: MKDIR");
+_Static_assert(VXN_FSYNC        == SYS_FSYNC,        "VLS: FSYNC");
+_Static_assert(VXN_FTRUNCATE    == SYS_FTRUNCATE,    "VLS: FTRUNCATE");
+_Static_assert(VXN_SOCKET       == SYS_SOCKET,       "VLS: SOCKET");
+_Static_assert(VXN_CONNECT      == SYS_CONNECT,      "VLS: CONNECT");
+_Static_assert(VXN_SEND         == SYS_SEND,         "VLS: SEND");
+_Static_assert(VXN_RECV         == SYS_RECV,         "VLS: RECV");
+_Static_assert(VXN_SOCKOPT      == SYS_SOCKOPT,      "VLS: SOCKOPT");
+_Static_assert(VXN_SHUTDOWN     == SYS_SHUTDOWN,     "VLS: SHUTDOWN");
+_Static_assert(VXN_WALLCLOCK    == SYS_WALLCLOCK,    "VLS: WALLCLOCK");
+_Static_assert(VXN_EXECVE       == SYS_EXECVE,       "VLS: EXECVE");
+_Static_assert(VXN_WAIT4        == SYS_WAIT4,        "VLS: WAIT4");
+_Static_assert(VXN_DUP          == SYS_DUP,          "VLS: DUP");
+_Static_assert(VXN_DUP2         == SYS_DUP2,         "VLS: DUP2");
+_Static_assert(VXN_PERSONALITY  == SYS_PERSONALITY,  "VLS: PERSONALITY");
+
+/*
  * ---- open flags ----
  *
  * Linux's numbers, and octal as Linux writes them, because ported code
@@ -536,9 +645,33 @@ void syscall_dispatch_frame(syscall_frame_t *f);
 void syscall_dispatch_frame(syscall_frame_t *f) {
     syscall_cur_frame = f;
     syscall_via_fast  = 1;
+    /*
+     * ---- and the same thing where it survives a block ----
+     *
+     * The globals above are correct for exactly as long as their own
+     * justification holds: interrupts are masked for the whole of a
+     * system call, so there is never more than one in progress. A
+     * service routine that *parks* breaks that, because the thread it
+     * is waiting for then enters the kernel and writes its own frame
+     * into the same word.
+     *
+     * The futex has parked since it was written and never noticed,
+     * because it touches nothing afterwards. wait4 parks and then needs
+     * the frame again — to deliver the SIGCHLD it was woken by — and the
+     * frame it found was the child's. It presented as a wait4 that wrote
+     * the right status through its pointer and returned zero, which
+     * looks like anything except a shared global.
+     *
+     * So the answer lives on the thread as well, and everything that
+     * reads it after a possible block reads it from there. The globals
+     * stay because the assembly above names them and has no thread
+     * pointer to hand.
+     */
+    if (cur_thread) { cur_thread->sframe = f; cur_thread->sfast = 1; }
     f->rax = syscall_service(f->rax, f->rdi, f->rsi, f->rdx,
                              f->r10, f->r8, f->r9);
     syscall_cur_frame = 0;
+    if (cur_thread) cur_thread->sframe = 0;
 }
 
 /*
@@ -565,9 +698,11 @@ void syscall_dispatch_legacy(syscall_frame_t *f);
 void syscall_dispatch_legacy(syscall_frame_t *f) {
     syscall_cur_frame = f;
     syscall_via_fast  = 0;
+    if (cur_thread) { cur_thread->sframe = f; cur_thread->sfast = 0; }
     (void)syscall_service(f->rax, f->rdi, f->rsi, f->rdx,
                           f->r10, f->r8, f->r9);
     syscall_cur_frame = 0;
+    if (cur_thread) cur_thread->sframe = 0;
 }
 
 /*
@@ -801,6 +936,51 @@ __asm__(
     "  jmp 1b\n"
 
     /*
+     * ---- and where a program lands when it returns from a signal
+     *      handler ----
+     *
+     * The same idea as the stub above and a harder problem, because on
+     * x86-64 there is no hardware assistance at all: a handler is
+     * entered by an ordinary jump with a return address on the stack,
+     * and the only way back to the interrupted code is for that return
+     * address to point at something that asks the kernel to restore
+     * twenty-three registers. Linux has no such stub of its own — it
+     * makes libc supply one and pass it in sa_restorer. This system
+     * provides one, because a program that catches SIGSEGV should not
+     * have to carry four instructions of assembly to do it.
+     *
+     * At entry, RSP points exactly at the frame vls_build_frame laid
+     * down, because the handler's `ret` popped the eight bytes above it.
+     * So the frame's address is RSP, and it goes in RDI.
+     *
+     * The number is the *biased* one, and that is the concrete reason
+     * include/vls.h keeps the bias as well as the personality: this page
+     * is one physical page mapped into every address space, so these
+     * instructions are the same bytes for a native process that caught a
+     * signal and for a Linux one that did. A personality-relative number
+     * would have to be two different stubs, or one that read per-process
+     * state it has no register to hold.
+     *
+     * Nothing follows the syscall on the successful path — the kernel
+     * has rewritten the frame and SYSRETQ goes to the restored RIP. The
+     * three instructions after it are for the path where the frame was
+     * rejected, and they end the process with the status a shell reports
+     * for a program killed by a segmentation fault. A `ret` there would
+     * return into the frame itself.
+     */
+    ".align 16\n"
+    ".globl utramp_sigreturn\n"
+    "utramp_sigreturn:\n"
+    "  movq %rsp, %rdi\n"
+    "  movl $0x4000000F, %eax\n"     /* VLS_CALL_BIAS | 15 (rt_sigreturn) */
+    "  syscall\n"
+    "  movl $139, %edi\n"            /* 128 + SIGSEGV */
+    "  movl $38, %eax\n"             /* SYS_EXIT_GROUP */
+    "  syscall\n"
+    "2:\n"
+    "  jmp 2b\n"
+
+    /*
      * ---- the Microsoft calling convention ----
      *
      * A PE image is compiled for a different ABI: its first four
@@ -1031,7 +1211,7 @@ extern uint8_t petramp_print[], petramp_exit[], petramp_pixel[],
 
 extern uint8_t utramp_start[], utramp_end[];
 extern uint8_t utramp_ttf_text_width[], utramp_ttf_draw_string[],
-               utramp_gfx_rect[], utramp_exit[];
+               utramp_gfx_rect[], utramp_exit[], utramp_sigreturn[];
 
 /* Where a stub ends up once the page is mapped into a process. */
 static inline uint64_t utramp_user_addr(const uint8_t *stub) {

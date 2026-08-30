@@ -32,6 +32,9 @@
 #include <stdint.h>
 #include "gdt.h"
 #include "sched/sched.h"
+/* A ring-3 fault is the second of the two places a caught signal can be
+ * delivered, and the only place a *synchronous* one can be. */
+#include "vls.h"
 
 typedef struct {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -305,6 +308,87 @@ void exception_handle(exc_frame_t *f) {
         serial_puts("\n[trap] halted\n");
         __asm__ volatile("cli");
         for (;;) __asm__ volatile("hlt");
+    }
+
+    /*
+     * ---- did the program ask to be told about this? ----
+     *
+     * Before the report and before the kill, and the placement is the
+     * whole of it. A JIT plants faults on purpose — a guard page it
+     * expects to hit, a write to a page it protected to detect a store —
+     * and catches SIGSEGV to deal with them. Printing eleven lines of
+     * register dump for each one would bury every genuine fault in a
+     * scroll of intentional ones, exactly as an unfiltered copy-on-write
+     * fault would.
+     *
+     * This is the second of the two places a caught signal can be
+     * delivered; the other is on the way out of a system call. Both are
+     * points where the thread is about to return to ring 3 with a full
+     * register set in a frame that can be rewritten, and the timer
+     * interrupt is deliberately not a third — see the note beside
+     * syscall_deliver_signals.
+     *
+     * Only for a process that has already installed a handler:
+     * vls_signal_fault answers zero for one that has not, and the
+     * existing path below — print everything, end the thread — is the
+     * right answer for that program and has not changed.
+     */
+    if (from_user && cur_thread && cur_thread->user && vmm_current &&
+        vmm_current->sig) {
+        int sig = 0;
+        switch (f->vector) {
+        case 0:  case 16: case 19: sig = VLS_SIGFPE;  break;  /* #DE, x87, SIMD */
+        case 1:  case 3:           sig = VLS_SIGTRAP; break;  /* #DB, #BP      */
+        case 6:                    sig = VLS_SIGILL;  break;  /* #UD           */
+        case 17:                   sig = VLS_SIGBUS;  break;  /* #AC           */
+        case 4:  case 5:  case 13: sig = VLS_SIGSEGV; break;  /* #OF, #BR, #GP */
+        case 14:                   sig = VLS_SIGSEGV; break;  /* #PF           */
+        default: break;
+        }
+        if (sig) {
+            /* The page-fault error code already says which of the two
+             * si_code values applies, and a crash reporter that prints
+             * "address not mapped" rather than "permissions" is reading
+             * exactly this bit. */
+            const uint32_t code = (f->vector == 14 && !(f->error & 1))
+                                  ? VLS_SEGV_MAPERR
+                                  : (f->vector == 14 ? VLS_SEGV_ACCERR
+                                                     : VLS_SI_KERNEL);
+            if (vls_signal_fault(vmm_current, sig, cr2, code,
+                                 f->vector, f->error)) {
+                vls_regs_t r;
+                for (uint64_t i = 0; i < sizeof(r); i++)
+                    ((uint8_t *)&r)[i] = 0;
+                /* exc_frame_t and vls_regs_t open with the same fifteen
+                 * registers in the same order, which include/vls.h
+                 * arranges so that this is a copy rather than fifteen
+                 * assignments that could be mis-ordered. */
+                for (int i = 0; i < 15; i++)
+                    ((uint64_t *)&r)[i] = ((const uint64_t *)f)[i];
+                r.rip        = f->rip;
+                r.rsp        = f->rsp;
+                r.rflags     = f->rflags;
+                r.fault_addr = cr2;
+                r.trapno     = f->vector;
+                r.err        = f->error;
+
+                if (vls_signal_dispatch(vmm_current, &r) ==
+                    VLS_DELIVER_HANDLER) {
+                    for (int i = 0; i < 15; i++)
+                        ((uint64_t *)f)[i] = ((const uint64_t *)&r)[i];
+                    f->rip    = r.rip;
+                    f->rsp    = r.rsp;
+                    f->rflags = r.rflags;
+                    serial_puts("[VLS] ");
+                    serial_puts(exc_name(f->vector));
+                    serial_puts(" delivered to the program's handler\n");
+                    return;
+                }
+                /* Not delivered. Falls through to the report below,
+                 * which is where a fault that nobody could catch has
+                 * always gone. */
+            }
+        }
     }
 
     serial_puts("\n[trap] ");

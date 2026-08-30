@@ -108,6 +108,30 @@ typedef struct thread {
      * it would share every variable it exists to keep apart.
      */
     uint64_t       fsbase;
+    /*
+     * ---- the system call this thread is inside, if any ----
+     *
+     * There is a global that answers the same question — syscall_cur_frame
+     * in include/kernel_shared.h — and it was correct for as long as its
+     * own justification held: "interrupts are masked for the whole of a
+     * system call, so there is never more than one in progress".
+     *
+     * That stops being true the moment a service routine *blocks*. The
+     * futex has blocked since it was written and got away with it,
+     * because it touches nothing after it parks. wait4 is the first call
+     * that parks and then needs the frame again, and in between a
+     * different thread — the very child being waited for — enters the
+     * kernel and overwrites the global. The parent then wakes and reads
+     * its child's registers as its own.
+     *
+     * The symptom was a wait4 that returned zero while writing the
+     * correct status through its pointer, which is a long way from
+     * looking like a shared global. So the frame is per-thread, which is
+     * what it always described, and the global is kept beside it for the
+     * assembly stubs that have no thread pointer to hand.
+     */
+    struct syscall_frame *sframe;
+    int            sfast;               /* which of the two doors        */
     char           name[SCHED_NAME_LEN];
     /* 512 bytes, sixteen-aligned, exactly as FXSAVE64 wants them. The
      * attribute is on the member rather than the struct because the
@@ -201,6 +225,32 @@ thread_t *sched_fork_thread(thread_t *parent, addr_space_t *child_as);
 thread_t *sched_spawn_thread(addr_space_t *as, uint64_t entry,
                              uint64_t user_stack, uint64_t arg,
                              uint64_t fsbase, const char *name);
+
+/*
+ * A second thread that resumes where the caller is, rather than at a
+ * function.
+ *
+ * The one above cannot serve Linux's clone(CLONE_VM), which is what a
+ * pthread_create compiles to: its child returns from a call it never
+ * made, at the parent's next instruction, with a stack of its own. That
+ * needs the parent's whole register file copied out of the frame it
+ * entered the kernel through — the same thing a fork does — with the
+ * address space left shared instead of duplicated. See the long note at
+ * the definition.
+ */
+thread_t *sched_clone_thread(thread_t *parent, uint64_t user_stack,
+                             uint64_t fsbase);
+
+/*
+ * Move a running thread into an address space that has just been built,
+ * loading CR3 if it is the current one. What exec needs, and the only
+ * operation in this file that creates nothing: the process keeps its
+ * identity and changes everything else about itself.
+ *
+ * The old space is left for the caller to destroy, because only the
+ * caller knows whether the exec succeeded.
+ */
+void      sched_adopt_space(thread_t *t, addr_space_t *as);
 void      sched_exit(int code);
 int       sched_join(thread_t *t, uint32_t timeout_ms);
 void      sched_reap(void);

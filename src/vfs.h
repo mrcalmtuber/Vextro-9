@@ -208,7 +208,13 @@ enum {
     FD_CONSOLE,
     FD_FILE,
     FD_DIR,
-    FD_SOCK
+    FD_SOCK,
+    /* A node under /dev. Its own kind rather than a file with a flag,
+     * because every operation differs: it is opened without consulting
+     * the volume, read and written by src/devfs.h, never written back,
+     * and duplicated across a fork by copying eight bytes. See the note
+     * at the top of that file for which eight nodes exist and why. */
+    FD_DEV
 };
 
 typedef struct {
@@ -222,6 +228,7 @@ typedef struct {
     uint8_t  busy;          /* a call is parked in this descriptor       */
     uint8_t  busy_rx;
     uint8_t  busy_tx;
+    uint8_t  devid;         /* FD_DEV: which node, DEV_* in devfs.h     */
     uint32_t oflags;
 
     uint64_t pos;           /* file byte offset, or directory index      */
@@ -635,6 +642,16 @@ static int vfs_host_is_loopback(const char *host, uint8_t out[4]) {
  * ============================================================ */
 
 /*
+ * The nodes under /dev, which are not on the volume and must answer
+ * before it is consulted. Included here rather than beside vfs.h in
+ * src/desktop.h because it needs vfs_desc_t and vfs_desc_reset above and
+ * has to be complete before vfs_open below — a device node is a name the
+ * filesystem has never heard of, so the lookup is short-circuited rather
+ * than having its failure patched up afterwards.
+ */
+#include "devfs.h"
+
+/*
  * The listing, taken whole.
  *
  * A directory here is an NTFS B-tree and enumerating it is a walk with
@@ -792,6 +809,27 @@ static int vfs_open_reg(vfs_desc_t *d, const char *abs, uint32_t oflags,
  * Returns 0, or a negated error number.
  */
 static int vfs_open(vfs_desc_t *d, const char *abs, uint32_t oflags) {
+    /*
+     * The device nodes first, and *before* fs_stat rather than after it
+     * fails.
+     *
+     * Order is the whole of the semantics here. Asking the volume first
+     * and falling back would mean a file called \dev\null on the disk
+     * shadowed the device — which is a way for a program to be handed a
+     * file where it asked for a sink, and a way for anything that can
+     * create a file to change what another program's redirection does.
+     * /dev is a name this system reserves, and reserving it means
+     * answering for it first.
+     */
+    if (dev_claims(abs)) {
+        if (dev_is_dir(abs)) {
+            if (oflags & (VX_O_CREAT | VX_O_TRUNC)) return -VXE_ISDIR;
+            return dev_open_dir(d, abs, oflags);
+        }
+        if (oflags & VX_O_DIRECTORY) return -VXE_NOTDIR;
+        return dev_open(d, abs, oflags);
+    }
+
     uint64_t size = 0;
     int is_dir = 0;
     const int exists = fs_stat(abs, &size, &is_dir);
@@ -891,7 +929,12 @@ static int64_t vfs_seek(vfs_desc_t *d, int64_t off, int whence) {
     if (d->kind == FD_SOCK || d->kind == FD_CONSOLE) return -VXE_SPIPE;
 
     int64_t end;
-    if (d->kind == FD_DIR)                 end = (int64_t)d->nents;
+    /* A device node's end is as long as the window for the two graphics
+     * nodes and zero for the rest — which is what makes SEEK_END on
+     * /dev/zero answer zero, exactly as it does on Linux, rather than
+     * reading a file size out of a union nothing filled in. */
+    if (d->kind == FD_DEV)                 end = (int64_t)dev_length(d->devid);
+    else if (d->kind == FD_DIR)            end = (int64_t)d->nents;
     else if (d->writable && d->wbuf)       end = (int64_t)d->wlen;
     else                                   end = (int64_t)d->file.size;
 

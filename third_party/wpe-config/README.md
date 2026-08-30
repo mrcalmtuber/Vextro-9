@@ -181,20 +181,22 @@ conditionals:
     LibSoup  GLIB  Cairo  Fontconfig  Freetype  LibXslt  ...
 
 Ported, built, and staged into the sysroot: **SQLite**, **FreeType**,
-**WPE**, **HarfBuzz** and **ICU 74.2**.
+**WPE**, **HarfBuzz**, **ICU 74.2**, **libjpeg-turbo 3.0.4** and
+**libepoxy 1.5.10**.
 
-Two of those five have actually been *found by a configure run*:
-HarfBuzz, with the `harfbuzz-icu` archive that satisfies
-`find_package(HarfBuzz COMPONENTS ICU)`, and ICU, with the
-`data i18n uc` components WebKit names. The other three sit further
-down `OptionsWPE.cmake` than configure has yet reached — behind JPEG on
-line 10 — so nothing has exercised `FindSQLite3`, `FindWPE` or CMake's
-own `FindFreetype` against the layout they are staged in. Staged and
-findable are not the same fact until a run says so.
+Four of those seven have actually been *found by a configure run*, which
+is the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
+that satisfies `find_package(HarfBuzz COMPONENTS ICU)`, ICU with the
+`data i18n uc` components, JPEG at version 62, and Epoxy at 1.5.10. The
+other three sit further down `OptionsWPE.cmake` than configure has
+reached — behind LibGcrypt on line 12 — so nothing has exercised
+`FindSQLite3`, `FindWPE` or CMake's own `FindFreetype` against the layout
+they are staged in. Staged and findable are not the same fact until a run
+says so.
 
 Not done, and each its own project: GLIB, LibSoup, Cairo, Fontconfig,
-libxml2, zlib, libpng, libjpeg, WebP, libgcrypt, libtasn1, libxkbcommon,
-Epoxy.
+libxml2, zlib, libpng, WebP, libgcrypt, libtasn1, libxkbcommon,
+Unifdef.
 
 ### ICU was easier than this file used to claim
 
@@ -323,7 +325,7 @@ not installed to run them.
 
 ## Where it stops today
 
-`make webkit` reaches `OptionsWPE.cmake:10` — the *third* dependency
+`make webkit` reaches `OptionsWPE.cmake:12` — the *fifth* dependency
 check of twenty-two — and stops:
 
     -- Found HarfBuzz: .../build/webkit-sysroot/include/harfbuzz
@@ -331,8 +333,24 @@ check of twenty-two — and stops:
     -- Found ICU: .../build/webkit-sysroot/include
        (found suitable version "74.2", minimum required is "61.2")
        found components: data i18n uc
-    CMake Error: Could NOT find JPEG
-      (missing: JPEG_LIBRARY JPEG_INCLUDE_DIR)
+    -- Found JPEG: .../build/webkit-sysroot/lib/libjpeg.a
+       (found version "62")
+    -- Found Epoxy: .../build/webkit-sysroot/lib/libepoxy.a
+       (Required is at least version "1.5.4")
+    CMake Error: Could NOT find LibGcrypt
+      (missing: LibGcrypt_LIBRARY LibGcrypt_INCLUDE_DIR)
+
+Two of those four lines are new, and the second of them needed something
+this file did not have before: a **pkg-config module**.
+FindEpoxy.cmake sets `Epoxy_VERSION` from pkg-config and from nowhere
+else — find_path and find_library recover the headers and the archive
+and leave the version empty — so the sysroot's own layout got as far as
+`Required version (1.5.4) is higher than found version ()` about an
+archive that was sitting in it. That is the identical failure HarfBuzz
+produced before it was found. `make webkit-sysroot` now writes `.pc`
+files beside the archives and the toolchain file points
+`PKG_CONFIG_LIBDIR` at that directory *and nowhere else*, so pkg-config
+can describe this system's libraries and cannot describe the host's.
 
 Both of the first two lines were errors before this. HarfBuzz was
 rejected for not being built against ICU — `find_package(HarfBuzz 1.4.2
@@ -350,18 +368,38 @@ archive `icutest` exercised, and FreeType's two redirected config
 headers are copied over upstream's so the headers in it describe the
 archive beside them.
 
-So the frontier is now JPEG, and there are sixteen behind it.
+So the frontier is now LibGcrypt, and there are thirteen behind it.
 
 ## The exit code
 
 Non-zero, and this is the honest reading of it.
 
 Clearing the OS gate moved the wall from *before* the dependency list to
-*inside* it; porting ICU moved it two entries further along that list.
-Both were worth doing and neither is a browser: sixteen unported
-REQUIRED libraries stand behind the current error, one of them
-(**Epoxy**) an OpenGL function loader for a machine whose graphics
-driver deliberately implements the blitter and not the 3D pipeline.
+*inside* it; ICU moved it two entries along, and JPEG and Epoxy two
+more. None of that is a browser: thirteen unported REQUIRED libraries
+stand behind the current error.
+
+**Epoxy is the one worth being precise about**, because it is the entry
+that changed character rather than merely being ticked off. It is an
+OpenGL function *loader* — a dispatcher that resolves two thousand entry
+points by name at run time — so it builds perfectly well on a machine
+with no OpenGL, and `find_package(Epoxy 1.5.4)` is satisfied honestly by
+an archive generated from Khronos's own registry. What decides the
+outcome is what `dlsym` finds, and on this machine it finds nine: the
+provider in `third_party/libepoxy-port/vxgl.c` binds glClear,
+glClearColor, glViewport, glGetString, glGetIntegerv, glGetError,
+glFlush, glFinish and glReadPixels to the framebuffer at
+`/dev/dri/renderD128`, and everything with a pipeline behind it is
+absent from the table. `apps/gltest.c` checks the whole chain — dispatch
+stub, dlopen, dlsym, provider, render node, window — and its last section
+forks a child that calls `glDrawArrays`, which prints
+
+    glDrawArrays() not found: this system does not have that symbol
+
+and aborts. That is libepoxy's own code path, unpatched, naming the call
+it could not serve. A stub that returned quietly would have produced a
+black window and no explanation. The rung that changes it is a software
+GL over `src/g3d.h`'s rasteriser, which is a separate project.
 
 The arithmetic is worth stating plainly, because "two down, sixteen to
 go" reads more encouraging than it is. The two done here are the two
@@ -373,12 +411,28 @@ second runtime with its own main loop, type system and TLS stack, and
 kernel deliberately does not provide.
 
 There is also a second gate further along that no build-system work
-reaches. `WTF_OS_UNIX` gets the files chosen; the code in them still
-assumes a POSIX process model in places this system has no answer for
-yet — signals, `fork`/`exec`, descriptors passed between processes,
-`mmap` with a file behind it. A genuine `WTF_OS_VEXTRO` inside WebKit
-is what settles those, and it is upstream porting work of a different
-kind from anything below it on this ladder.
+reaches, and it has moved. `WTF_OS_UNIX` gets the files chosen; the code
+in them assumes a POSIX process model, and this system now has one for
+most of what they assume.
+
+**What was built for it (30 Aug 2026):** `include/vls.h` and
+`src/sched/vls_core.c`, the Vextro Linux Subset — sixty-seven Linux
+system calls translated, POSIX signals with a real frame on the user
+stack and an `rt_sigreturn` that restores from the `ucontext`, `execve`,
+`wait4`, `dup`/`dup2`, `clone(CLONE_VM)`, process identity and
+parentage on `addr_space_t`, and eight `/dev` nodes. 111 checks in ring
+3, `apps/vlstest.c`. It does not move the `make webkit` line and was
+never going to: that line is a missing *library*, and this is the rung
+after the libraries.
+
+**What it still does not settle:** descriptor passing between processes
+(no `SCM_RIGHTS`, and no Unix domain sockets to carry it), pipes — the
+one of the four that did not come with the others, because a pipe needs
+a descriptor kind that is a buffer with two ends and `src/vfs.h` has no
+shape for one — and `mmap` with a file behind it. A genuine
+`WTF_OS_VEXTRO` inside WebKit is still what settles the last of it, and
+it is upstream porting work of a different kind from anything below it
+on this ladder. What has changed is how much of it is left.
 
 ## The order
 
@@ -394,15 +448,22 @@ kind from anything below it on this ladder.
 8. ~~ICU~~ — done, 74.2, with `libharfbuzz-icu` beside it. Its data
    archive ships prebuilt; what it actually cost was RTTI and a
    calendar, both of which are now in.
-9. **JPEG**, where configure stops today, and then the rest of the
-   sixteen. Most are small; `GLib`/`LibSoup` and `Epoxy` are not, and
-   the second of those needs a GL implementation before it needs a port.
+9. ~~JPEG~~ — done, libjpeg-turbo 3.0.4, no SIMD, 8/12/16-bit, 20
+   checks in ring 3 against a bitstream macOS encoded.
+   ~~Epoxy~~ — done, 1.5.10, found at version 1.5.4+, nine entry points
+   bound to the framebuffer and the rest refused by name. **LibGcrypt**
+   is where configure stops today, and there are twelve behind it. Most
+   are small — zlib, libpng, libtasn1, WebP, Unifdef — and
+   `GLib`/`LibSoup` is not.
 10. The `libc/` gaps WebKit's own configure named: `langinfo.h`,
     `strnstr`, `regexec`, `statx`, `malloc_trim`. `sys/time.h`,
     `localtime_r`, `timegm`, `SIGTRAP`, `tm_gmtoff` and `tm_zone` were
     on this list and are now written — ICU needed them first.
-11. A real `WTF_OS_VEXTRO` inside WebKit, for the places `OS(UNIX)`
-    assumes a process model this system does not have
+11. ~~A process model for the places `OS(UNIX)` assumes one~~ — mostly
+    done, as **VLS**: signals, `execve`, `wait4`, `dup`, `clone`, and
+    `/dev`. What is left of it is descriptor passing between processes,
+    pipes, and file-backed `mmap`; a real `WTF_OS_VEXTRO` inside WebKit
+    is what settles those three.
 12. WPE WebKit, with this configuration
 13. The browser application, over `third_party/wpe-port/` and the skin
     in `assets/ui/`
@@ -417,4 +478,7 @@ ignoring.
 
 What remains is breadth for most of it and depth for three items: a GL
 implementation, a GLib-shaped second runtime, and a WTF platform port.
-None of those is reachable by configuring anything.
+None of those is reachable by configuring anything. Step 11 was the one
+that could be done out of order — it needs no library and no configure
+run, only a kernel — and it was, which is why it is struck through above
+while step 9 is not.

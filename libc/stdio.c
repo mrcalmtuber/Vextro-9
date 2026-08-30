@@ -273,13 +273,17 @@ int printf(const char *fmt, ...) {
     return n;
 }
 
-int fputs(const char *s, int fd) {
-    size_t n = strlen(s);
-    return write(fd, s, n) < 0 ? EOF : (int)n;
-}
-
+/*
+ * puts writes straight to the descriptor rather than through the stream
+ * layer, which is what it has always done here and is why it is up at
+ * this end of the file with printf rather than down with fwrite. fputs
+ * moved to the stream half when it was given its standard signature —
+ * see the note in stdio.h — and the two no longer share an
+ * implementation.
+ */
 int puts(const char *s) {
-    if (fputs(s, STDOUT_FILENO) == EOF) return EOF;
+    size_t n = strlen(s);
+    if (write(STDOUT_FILENO, s, n) < 0) return EOF;
     return write(STDOUT_FILENO, "\n", 1) < 0 ? EOF : 1;
 }
 
@@ -564,11 +568,16 @@ int fputc(int c, FILE *f) {
 
 int putc(int c, FILE *f) { return fputc(c, f); }
 
-int fputs_stream(const char *s, FILE *f) {
+int fputs(const char *s, FILE *f) {
     if (!s || !f) { errno = EINVAL; return EOF; }
     size_t n = strlen(s);
     return fwrite(s, 1, n, f) == n ? 0 : EOF;
 }
+
+/* The name this function had while a descriptor-taking `fputs` sat
+ * beside it. Kept because libcxx/ and tools/cxx_hostshim.h call it, and
+ * renaming those would be churn with nothing behind it. */
+int fputs_stream(const char *s, FILE *f) { return fputs(s, f); }
 
 size_t fwrite(const void *buf, size_t size, size_t count, FILE *f) {
     if (!buf || !size || !count || !f) return 0;

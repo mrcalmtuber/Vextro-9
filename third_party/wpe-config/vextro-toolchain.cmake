@@ -244,3 +244,44 @@ set(CMAKE_FIND_ROOT_PATH "${VX_ROOT}/build/webkit-sysroot")
 # finding one from the host if any path ever leaks in.
 set(CMAKE_FIND_LIBRARY_PREFIXES "lib")
 set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+
+# ---- and pkg-config, pointed at the sysroot and nowhere else ----
+#
+# This file used to say, correctly, that the find modules "look with
+# pkg-config (absent here) and then in the layout a Unix installation
+# has". The second half of that is a fallback, and for several modules it
+# is not an equivalent one.
+#
+# FindEpoxy.cmake is the case that forces the issue. It sets
+# Epoxy_VERSION *only* from the pkg-config module — find_path and
+# find_library recover the headers and the archive and leave the version
+# empty — and OptionsWPE.cmake asks for 1.5.4. So the fallback path ends
+# at find_package_handle_standard_args reporting
+#
+#     Required version (1.5.4) is higher than found version ()
+#
+# about a library that is sitting in the sysroot. That is the identical
+# failure HarfBuzz produced before it was found, and meeting it a second
+# time by hand is a worse use of a build than describing the packages
+# once.
+#
+# So `make webkit-sysroot` writes .pc files beside the archives, and
+# these two variables make pkg-config read *only* those:
+#
+#   PKG_CONFIG_LIBDIR      replaces the default search path outright,
+#                          rather than prepending to it. Without it,
+#                          /opt/homebrew/lib/pkgconfig is still on the
+#                          list and a host libjpeg would be described to
+#                          a cross build — headers and an archive for
+#                          the wrong operating system, found and linked.
+#   PKG_CONFIG_SYSROOT_DIR is empty on purpose. The .pc files carry an
+#                          absolute prefix already, and a sysroot dir
+#                          would be prepended to it a second time.
+#
+# They are set as environment variables because that is the only channel
+# pkg-config has; CMake's PKG_CONFIG_* cache entries do not reach it.
+if(EXISTS "${VX_ROOT}/build/webkit-sysroot/lib/pkgconfig")
+    set(ENV{PKG_CONFIG_LIBDIR}
+        "${VX_ROOT}/build/webkit-sysroot/lib/pkgconfig")
+    set(ENV{PKG_CONFIG_SYSROOT_DIR} "")
+endif()

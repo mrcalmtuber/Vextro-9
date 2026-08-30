@@ -80,4 +80,6 @@ third_party/sqlite/
 third_party/freetype/
 third_party/harfbuzz/
 third_party/icu/
+third_party/libjpeg/
+third_party/libepoxy/
 build/icu4c-*-src.tgz

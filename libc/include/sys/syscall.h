@@ -161,6 +161,45 @@ extern "C" {
  */
 #define SYS_WALLCLOCK       59
 
+/*
+ * ===== 60-64: a second process =====
+ *
+ * SYS_FORK has been number 23 since ring 3 existed and was half of a
+ * pair with no other half — a child could only run the code its parent
+ * was already running, and when it stopped nobody could be told. These
+ * are the other half. libc/process.c is what a program calls instead.
+ */
+#define SYS_EXECVE          60
+#define SYS_WAIT4           61
+#define SYS_DUP             62
+#define SYS_DUP2            63
+#define SYS_PERSONALITY     64
+
+/*
+ * ===== and the calls that only exist in Linux's numbering =====
+ *
+ * Signals are Linux's shape down to the layout of the structures they
+ * take, so the kernel gives them Linux numbers and no native ones — a
+ * second door into one room would be two things to keep in step. A
+ * program reaches them by adding the bias, which is what the kernel
+ * reads as "this number is written in Linux's numbering", and which
+ * works from a process that has not given up the native numbers.
+ * include/vls.h is the kernel's side and explains why there are two
+ * mechanisms rather than one.
+ *
+ * The bias is a bit rather than an offset so the arithmetic is exact in
+ * both directions and a Linux number can never be mistaken for a native
+ * one by an off-by-one.
+ */
+#define VLS_CALL_BIAS       0x40000000L
+
+#define VLS_rt_sigaction    13
+#define VLS_rt_sigprocmask  14
+#define VLS_kill            62
+#define VLS_wait4           61
+#define VLS_tgkill         234
+#define VLS_getppid        110
+
 /* futex operations. See <vxmutex.h> for what to build on them. */
 #define FUTEX_WAIT          0
 #define FUTEX_WAKE          1

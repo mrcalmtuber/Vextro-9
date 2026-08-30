@@ -78,7 +78,6 @@ int  vsnprintf(char *out, size_t cap, const char *fmt, va_list ap);
 
 int  puts(const char *s);
 int  putchar(int c);
-int  fputs(const char *s, int fd);
 
 /* ===== streams ===== */
 
@@ -107,13 +106,32 @@ int    fputc(int c, FILE *f);
 int    putc(int c, FILE *f);
 
 /*
- * fputs(const char *, int) has taken a *descriptor* in this library
- * since before there were streams, and existing code passes 1 and 2 to
- * it. Renaming it now would break that code silently, since both a
- * descriptor and a pointer are integers to a compiler that has been
- * given no prototype. So the stream form keeps the name it was given
- * when the two had to coexist.
+ * ---- fputs used to take a descriptor, and no longer does ----
+ *
+ * It was `int fputs(const char *, int fd)` in this library from before
+ * there were streams, with the stream form under the name fputs_stream
+ * beside it. The note that used to be here defended that: renaming it
+ * "would break that code silently, since both a descriptor and a
+ * pointer are integers to a compiler that has been given no prototype".
+ *
+ * That defence was measured and does not hold. There is always a
+ * prototype — this header is the only way to reach the function — and
+ * GCC 14 and later make int-from-pointer a hard **error**, not a
+ * warning. Passing a descriptor to the standard form does not compile,
+ * which is the opposite of silent.
+ *
+ * What the old signature did cost was every port that calls the
+ * standard one. libepoxy is where it was found: `fputs(msg, stderr)` in
+ * its dispatcher, which is plain C89, and which failed to compile
+ * against a library claiming to provide fputs. That is a failure mode
+ * with no bottom — it would recur for each of the remaining
+ * dependencies, one port at a time.
+ *
+ * So fputs is the standard function now. fputs_stream is kept as an
+ * alias of it because libcxx/ and tools/cxx_hostshim.h call it by that
+ * name, and a rename there would be churn with nothing behind it.
  */
+int    fputs(const char *s, FILE *f);
 int    fputs_stream(const char *s, FILE *f);
 
 int    fseek(FILE *f, long off, int whence);
