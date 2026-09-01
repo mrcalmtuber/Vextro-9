@@ -72,6 +72,10 @@ AT_INDEX_ALLOCATION = 0xA0
 AT_BITMAP = 0xB0
 AT_END = 0xFFFFFFFF
 
+# The root directory: MFT record 5, sequence 5. Hoisted out of main()
+# because dir_index_capacity() needs it to size a $FILE_NAME attribute.
+ROOT_REF = 5 | (5 << 48)
+
 FILE_RECORD_IN_USE = 0x0001
 FILE_RECORD_IS_DIRECTORY = 0x0002
 
@@ -218,8 +222,46 @@ def file_name_attr(parent_ref, name, is_dir, real_size=0, alloc_size=0):
 
 # ------------------------------------------------------- index entries
 
-def index_entry(mft_ref, name, is_dir, real_size, alloc_size):
-    """One $FILE_NAME entry inside a directory index."""
+IE_HAS_CHILD = 0x01
+IE_LAST      = 0x02
+IX_LARGE     = 0x01           # this node has children
+
+# One index block, and the unit $INDEX_ALLOCATION is divided into. Equal
+# to the cluster size, which makes "clusters per index block" 1 -- the
+# value written into the $INDEX_ROOT header below and the divisor
+# ix_block_read() uses to turn a VCN into a cluster.
+INDX_SIZE = CLUSTER
+
+
+def collation_key(name):
+    """
+    Order two names the way ntfs_name_cmp() in src/fs/ntfs/ntfs_ops.c
+    orders them, which is the order a reader that binary-searches
+    depends on.
+
+    That function upcases only a-z and then compares code unit by code
+    unit, with the shorter name first when one is a prefix of the other.
+    `str.upper()` agrees for ASCII and does not in general -- it maps
+    'i' differently under some locales' rules and expands 'ss' -- so the
+    fold is written out rather than borrowed. Every name on this volume
+    is ASCII today; the point is that the sort does not quietly stop
+    matching the kernel if one is not.
+    """
+    return [ord(c) - 32 if 'a' <= c <= 'z' else ord(c) for c in name]
+
+
+def index_entry(mft_ref, name, is_dir, real_size, alloc_size,
+                child_vcn=None):
+    """
+    One $FILE_NAME entry inside a directory index.
+
+    With child_vcn, the entry also carries a downlink: the IE_HAS_CHILD
+    flag and eight more bytes at the *end* of the entry holding the VCN
+    of the subtree whose names all sort before this one. The VCN goes
+    last, after the $FILE_NAME value and its padding, which is why it is
+    appended rather than packed -- writing it immediately after the
+    header would put it inside the name.
+    """
     fn = struct.pack("<Q", 5 | (5 << 48))      # parent: root, seq 5
     fn += struct.pack("<QQQQ", FIXED_TIME, FIXED_TIME, FIXED_TIME, FIXED_TIME)
     fn += struct.pack("<QQ", alloc_size, real_size)
@@ -228,36 +270,247 @@ def index_entry(mft_ref, name, is_dir, real_size, alloc_size):
     fn += utf16(name)
 
     entry_len = align(0x10 + len(fn), 8)
-    e = struct.pack("<QHHI", mft_ref, entry_len, len(fn), 0)
+    flags = 0
+    if child_vcn is not None:
+        entry_len += 8
+        flags = IE_HAS_CHILD
+
+    e = struct.pack("<QHHI", mft_ref, entry_len, len(fn), flags)
     e += fn
-    e += b"\x00" * (entry_len - len(e))
+    if child_vcn is not None:
+        e += b"\x00" * (entry_len - 8 - len(e))
+        e += struct.pack("<Q", child_vcn)
+    else:
+        e += b"\x00" * (entry_len - len(e))
     return e
 
 
-def index_end_entry():
-    # The terminator: no name, flag 0x02 = last entry in the node.
-    return struct.pack("<QHHI", 0, 0x10, 0, 0x02)
-
-
-def index_root(entries):
+def index_end_entry(child_vcn=None):
     """
-    A resident $INDEX_ROOT holding every entry.
+    The terminator: no name, IE_LAST.
 
-    Real NTFS spills into $INDEX_ALLOCATION once the root exceeds what
-    fits in an MFT record. This formatter keeps every directory small
-    enough that it does not have to -- the kernel's writer in
-    ntfs_ops.c is the half that has to cope with growth, and it
-    reports rather than corrupts when a root fills.
+    It carries a downlink like any other entry when the node has
+    children, and that downlink is the subtree holding every name after
+    the last separator. Omitting it is the mistake ntfs_ops.c warns
+    about at length -- it loses the rightmost subtree of every node, so
+    the directory reads correctly right up to its last few names.
     """
-    body = b"".join(entries) + index_end_entry()
-    header = struct.pack("<IIII", AT_FILE_NAME, 1, 4096, 1)   # collation 1
-    node = struct.pack("<IIII", 0x10, 0x10 + len(body), 0x10 + len(body), 0)
+    if child_vcn is None:
+        return struct.pack("<QHHI", 0, 0x10, 0, IE_LAST)
+    return (struct.pack("<QHHI", 0, 0x18, 0, IE_LAST | IE_HAS_CHILD)
+            + struct.pack("<Q", child_vcn))
+
+
+def index_root(entries, last_child=None):
+    """
+    The resident $INDEX_ROOT: either the whole directory, or the root
+    node of a tree whose other nodes live in $INDEX_ALLOCATION.
+
+    This formatter used to only ever produce the first of those, and
+    said so here -- the note read that it "keeps every directory small
+    enough that it does not have to" spill. That stopped being true the
+    first time a directory had two hundred names in it: xkeyboard-config
+    stages 195 files into /etc/xkb/symbols and the record overflowed at
+    12984 bytes against a 4096-byte ceiling. The kernel had read and
+    written B-trees since directories became B-trees; the formatter was
+    the half that could not make one.
+    """
+    body = b"".join(entries) + index_end_entry(last_child)
+    flags = IX_LARGE if last_child is not None else 0
+    # type, collation 1 (upcased $FILE_NAME), bytes per index block,
+    # clusters per index block.
+    header = struct.pack("<IIII", AT_FILE_NAME, 1, INDX_SIZE,
+                         INDX_SIZE // CLUSTER)
+    node = struct.pack("<IIII", 0x10, 0x10 + len(body), 0x10 + len(body),
+                       flags)
     return header + node + body
+
+
+def indx_block(vcn, entries, last_child=None):
+    """
+    One "INDX" block of $INDEX_ALLOCATION.
+
+    The layout, and the trap in it, are documented in ntfs_ops.c: the
+    index header sits at 0x18 and every offset inside it is relative to
+    *that*, not to the block; the update sequence array is at 0x28; and
+    entries begin at 0x40, after the array rather than on top of it.
+    """
+    body = b"".join(entries) + index_end_entry(last_child)
+    used = 0x28 + len(body)               # relative to the header at 0x18
+    if 0x18 + used > INDX_SIZE:
+        raise SystemExit("index block overflow -- a node was packed too full")
+
+    blk = bytearray(INDX_SIZE)
+    blk[0:4] = b"INDX"
+    struct.pack_into("<HH", blk, 0x04, 0x28, INDX_SIZE // SECTOR + 1)
+    struct.pack_into("<Q", blk, 0x08, 0)                  # $LogFile LSN
+    struct.pack_into("<Q", blk, 0x10, vcn)
+    struct.pack_into("<IIII", blk, 0x18,
+                     0x28,                                 # entries offset
+                     used,
+                     INDX_SIZE - 0x18,                     # allocated
+                     IX_LARGE if last_child is not None else 0)
+    blk[0x40:0x40 + len(body)] = body
+    return apply_fixups(bytes(blk), INDX_SIZE, usa_off=0x28)
+
+
+def with_child(entry, child_vcn):
+    """
+    Return `entry` carrying a downlink to `child_vcn`, or unchanged when
+    there is none.
+
+    The $FILE_NAME value is copied across untouched; only the length
+    grows by eight and IE_HAS_CHILD goes on. Rebuilding the entry from
+    its fields instead would mean carrying every field -- reference,
+    sizes, flags -- through the tree builder for no reason.
+    """
+    if child_vcn is None:
+        return entry
+    ref, length, keylen, flags = struct.unpack_from("<QHHI", entry, 0)
+    body = entry[0x10:length - 8] if (flags & IE_HAS_CHILD) else entry[0x10:length]
+    new_len = align(0x10 + len(body), 8) + 8
+    e = struct.pack("<QHHI", ref, new_len, keylen, flags | IE_HAS_CHILD)
+    e += body
+    e += b"\x00" * (new_len - 8 - len(e))
+    e += struct.pack("<Q", child_vcn)
+    return e
+
+
+# Fill a node to a little under the block's capacity. The slack is not
+# superstition: the kernel splits a node on the way down whenever it has
+# less than one maximum-sized entry free, so a node packed here to the
+# last byte would be split by the first name anyone added to that
+# directory at run time. Leaving room means the volume this produces
+# behaves like one the kernel grew itself.
+INDX_CAPACITY = INDX_SIZE - 0x40 - 512
+
+
+def build_index(entries, root_capacity):
+    """
+    Turn a directory's entries, already in collation order, into a root
+    node plus a list of index blocks.
+
+    Returns (root_entries, root_last_child, blocks), where blocks is
+    indexed by VCN and each element is (entries, last_child).
+
+    ---- the shape ----
+
+    An ordinary B-tree, built bottom-up. At each level the items are
+    pairs (entry, child) where `child` is the subtree holding every name
+    that sorts *before* that entry -- which is exactly how NTFS stores a
+    downlink, and why the downlink lives on the entry after it rather
+    than before.
+
+    Entries are packed into a node until one does not fit. That entry
+    becomes a **separator**: it is promoted to the level above and does
+    not appear in any node below, because this is a B-tree rather than a
+    B+tree and a name appears exactly once. The node just closed holds
+    everything before the separator, so the separator's downlink is that
+    node -- and the node's own rightmost child is whatever child the
+    separator brought with it.
+
+    The loop stops when what is left fits in the MFT record, which is a
+    smaller budget than a block and is why root_capacity is a parameter
+    rather than INDX_CAPACITY.
+    """
+    blocks = []
+
+    def emit(node_entries, last_child):
+        blocks.append((node_entries, last_child))
+        return len(blocks) - 1
+
+    def pack(items, trailing):
+        """Split one level into nodes. Returns (nodes, separators)."""
+        nodes, seps, cur, cur_len = [], [], [], 0
+        for e, child in items:
+            packed = with_child(e, child)
+            if cur and cur_len + len(packed) > INDX_CAPACITY:
+                # `e` is promoted; the node just closed ends before it,
+                # so that node's rightmost child is `e`'s own child.
+                nodes.append((cur, child))
+                seps.append(e)
+                cur, cur_len = [], 0
+                continue
+            cur.append(packed)
+            cur_len += len(packed)
+        nodes.append((cur, trailing))
+        return nodes, seps
+
+    items = [(e, None) for e in entries]
+    trailing = None
+
+    while True:
+        root = [with_child(e, c) for e, c in items]
+        # 0x10 of node header, plus the terminator: 0x10 bare, 0x18 with
+        # a downlink.
+        size = sum(len(e) for e in root) + 0x10 + (0x18 if trailing is not None else 0x10)
+        if size <= root_capacity:
+            return root, trailing, blocks
+
+        nodes, seps = pack(items, trailing)
+        if len(nodes) < 2:
+            raise SystemExit(
+                "a directory entry is too large for an index block")
+
+        items = []
+        for i in range(len(nodes) - 1):
+            items.append((seps[i], emit(nodes[i][0], nodes[i][1])))
+        trailing = emit(nodes[-1][0], nodes[-1][1])
+
+
+
+# The room a directory record has for its $INDEX_ROOT *value*, and what
+# else has to fit beside it.
+#
+# A directory record carries $STANDARD_INFORMATION, one $FILE_NAME and
+# $INDEX_ROOT; when the index spills it also carries $INDEX_ALLOCATION
+# and $BITMAP. Those two are sized here with a generous runlist because
+# the run is not encoded until the clusters are allocated, and being
+# wrong in this direction only means splitting one entry earlier than
+# strictly necessary. mft_record() is still the thing that refuses an
+# overflowing record -- this only decides where to aim.
+IX_ATTR_SLACK = align(0x40 + 8 + 32, 8) + align(0x18 + 8 + 8, 8)
+
+
+def dir_index_capacity(name, with_tree):
+    attr_off = align(0x38 + 2 * (MFT_REC // SECTOR + 1), 8)
+    fixed = (len(standard_information())
+             + len(file_name_attr(ROOT_REF, name, True))
+             + 8)                                  # the END marker
+    ir_header = 0x20                               # attr header + "$I30"
+    return (MFT_REC - attr_off - fixed - ir_header
+            - (IX_ATTR_SLACK if with_tree else 0))
+
+
+def plan_index(node):
+    """
+    Decide how one directory's index is stored, and record the answer on
+    the node: ix_root/ix_last_child/ix_blocks.
+
+    Small directories stay entirely resident, which is what every
+    directory on this volume did before xkeyboard-config arrived. Large
+    ones get a B-tree, and their blocks are allocated by the caller.
+    """
+    entries = []
+    for c in sorted(node.children.values(),
+                    key=lambda n: collation_key(n.name)):
+        ref = c.record | (1 << 48)
+        entries.append(index_entry(ref, c.name, c.is_dir, c.size,
+                                   c.clusters * CLUSTER))
+
+    name = "." if node.name == "" else node.name
+    flat = sum(len(e) for e in entries) + 0x10 + 0x10
+    if flat <= dir_index_capacity(name, False):
+        node.ix_root, node.ix_last_child, node.ix_blocks = entries, None, []
+        return
+
+    node.ix_root, node.ix_last_child, node.ix_blocks = build_index(
+        entries, dir_index_capacity(name, True))
 
 
 # ----------------------------------------------------------- records
 
-def apply_fixups(rec, size):
+def apply_fixups(rec, size, usa_off=0x30):
     """
     Install the update sequence.
 
@@ -270,7 +523,10 @@ def apply_fixups(rec, size):
     rec = bytearray(rec)
     count = size // SECTOR + 1
     usn = 1
-    off = 0x30                      # fixup array, past the fixed header
+    # Past the fixed header: 0x30 in an MFT record, 0x28 in an INDX
+    # block. The kernel reads the offset out of the header rather than
+    # assuming either, so the two only have to be self-consistent.
+    off = usa_off
     struct.pack_into("<HH", rec, 0x04, off, count)
     struct.pack_into("<H", rec, off, usn)
     for i in range(1, count):
@@ -334,6 +590,13 @@ class Node:
         self.lcn = 0                # first cluster of the data
         self.clusters = 0
         self.size = 0
+        # A directory's index, decided by plan_index(). ix_blocks is
+        # empty for every directory small enough to stay resident, which
+        # is all but a handful of them.
+        self.ix_root = []           # entries of the resident root node
+        self.ix_last_child = None   # VCN under the root's terminator
+        self.ix_blocks = []         # [(entries, last_child)], by VCN
+        self.ix_lcn = 0             # first cluster of $INDEX_ALLOCATION
 
     @property
     def is_dir(self):
@@ -461,6 +724,21 @@ def main():
         n.clusters = max(1, align(n.size, CLUSTER) // CLUSTER)
         n.lcn = lcn
         lcn += n.clusters
+
+    # --- directory indexes, and the ones that need a B-tree ---
+    #
+    # This has to happen after the loop above, because an index entry
+    # quotes its child's allocated size and that is only known once
+    # clusters are handed out. Every directory gets its entries built
+    # and sorted here; the ones whose entries do not fit in an MFT
+    # record get index blocks, and those blocks are clusters like any
+    # other file's.
+    for n in [root] + dirs:
+        plan_index(n)
+        if n.ix_blocks:
+            n.ix_lcn = lcn
+            lcn += len(n.ix_blocks)
+
     volume_end = lcn
 
     if volume_end >= total_clusters:
@@ -480,7 +758,6 @@ def main():
 
     # --- MFT records ---
     records = {}
-    ROOT_REF = 5 | (5 << 48)
 
     def sysrec(number, name, attrs, is_dir=False):
         return mft_record(number, 1,
@@ -505,20 +782,32 @@ def main():
     records[4] = sysrec(4, "$AttrDef", [attr_resident(AT_DATA, b"")])
 
     # 5: the root directory, whose index lists its own children
-    def index_for(node):
-        entries = []
-        for c in sorted(node.children.values(),
-                        key=lambda n: n.name.upper()):
-            ref = c.record | (1 << 48)
-            entries.append(index_entry(ref, c.name, c.is_dir, c.size,
-                                       c.clusters * CLUSTER))
-        return index_root(entries)
+    def index_attrs(node):
+        """$INDEX_ROOT, and the two attributes that only exist when the
+        directory needed a tree."""
+        attrs = [attr_resident(AT_INDEX_ROOT,
+                               index_root(node.ix_root, node.ix_last_child),
+                               name="$I30")]
+        if node.ix_blocks:
+            nblk = len(node.ix_blocks)
+            span = nblk * INDX_SIZE
+            attrs.append(attr_nonresident(AT_INDEX_ALLOCATION,
+                                          [(node.ix_lcn, nblk)],
+                                          span, span, name="$I30"))
+            # $BITMAP: one bit per index block, all of them in use. The
+            # kernel reads this to find a free block when it splits a
+            # node, so a volume that claimed none were used would hand
+            # out a block that already holds a subtree.
+            bits = bytearray(align(max(8, align(nblk, 8) // 8), 8))
+            for i in range(nblk):
+                bits[i // 8] |= 1 << (i % 8)
+            attrs.append(attr_resident(AT_BITMAP, bytes(bits), name="$I30"))
+        return attrs
 
     records[5] = mft_record(5, 5, [
         standard_information(),
         file_name_attr(ROOT_REF, ".", True),
-        attr_resident(AT_INDEX_ROOT, index_for(root), name="$I30"),
-    ], is_dir=True, link_count=1)
+    ] + index_attrs(root), is_dir=True, link_count=1)
 
     records[6] = sysrec(6, "$Bitmap", [
         attr_nonresident(AT_DATA, [(bitmap_lcn, bitmap_clusters)],
@@ -552,8 +841,7 @@ def main():
             records[n.record] = mft_record(n.record, 1, [
                 standard_information(),
                 file_name_attr(pref, n.name, True),
-                attr_resident(AT_INDEX_ROOT, index_for(n), name="$I30"),
-            ], is_dir=True)
+            ] + index_attrs(n), is_dir=True)
         else:
             records[n.record] = mft_record(n.record, 1, [
                 standard_information(),
@@ -610,6 +898,16 @@ def main():
         f.seek(mftmirr_lcn * CLUSTER)
         for n in range(4):
             f.write(records[n])
+
+        # The index blocks, before the file data purely for tidiness --
+        # they are ordinary clusters and were allocated from the same
+        # bump pointer.
+        for n in [root] + dirs:
+            if not n.ix_blocks:
+                continue
+            for vcn, (node_entries, last_child) in enumerate(n.ix_blocks):
+                f.seek((n.ix_lcn + vcn) * CLUSTER)
+                f.write(indx_block(vcn, node_entries, last_child))
 
         for n in files:
             if n.is_pagefile:

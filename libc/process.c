@@ -38,6 +38,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 
 /* ============================================================
@@ -301,3 +302,109 @@ int dup(int fd) {
 int dup2(int oldfd, int newfd) {
     return (int)__syscall_ret(__syscall2(SYS_DUP2, oldfd, newfd));
 }
+
+/* ============================================================
+ *  a channel, and asking whether it is ready
+ * ============================================================
+ *
+ * unistd.h listed pipe among the things this system did not have, with
+ * the reason that "there is no way to start a program from a program
+ * here ... so a pipe would have nobody at the other end". fork has
+ * existed since ring 3 did and exec and wait are in this file, so the
+ * reason expired.
+ */
+int pipe2(int fds[2], int flags) {
+    return (int)__syscall_ret(__syscall2(SYS_PIPE2, (long)(void *)fds,
+                                         (long)flags));
+}
+
+int pipe(int fds[2]) {
+    return pipe2(fds, 0);
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    return (int)__syscall_ret(__syscall3(SYS_POLL, (long)(void *)fds,
+                                         (long)nfds, (long)timeout));
+}
+
+/*
+ * A connected pair that never leaves the machine.
+ *
+ * The same object a pipe is with both directions filled in, which is why
+ * it lives beside pipe() rather than beside socket(): nothing here
+ * reaches lwIP, no address is bound, and nothing is sent anywhere.
+ * AF_UNIX and SOCK_STREAM only, refused at the call otherwise.
+ */
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+    return (int)__syscall_ret(__syscall4(SYS_SOCKETPAIR, (long)domain,
+                                         (long)type, (long)protocol,
+                                         (long)(void *)sv));
+}
+
+/*
+ * ---- who this process is running as ----
+ *
+ * Never zero, and that is the substance rather than a detail. A great
+ * deal of ported code reads uid zero as permission to skip a check, and
+ * none of it is true here: every process holds UAC_TOKEN_RESTRICTED
+ * whoever started it, and what decides access is the account identifier
+ * and the profile boundary. With nobody signed in the answer is 65534 —
+ * nobody — which the kernel chooses; see the note beside vlsh_uid.
+ *
+ * There is no separate effective identifier because there is no setuid:
+ * nothing on this system changes the account a running program belongs
+ * to, so the real and effective answers are the same by construction.
+ */
+uid_t getuid(void)  { return (uid_t)__syscall0(VLS_CALL_BIAS + 102); }
+uid_t geteuid(void) { return getuid(); }
+gid_t getgid(void)  { return (gid_t)__syscall0(VLS_CALL_BIAS + 104); }
+gid_t getegid(void) { return getgid(); }
+
+/*
+ * A new session, which this system does not have.
+ *
+ * Sessions and process groups are how Unix decides which processes a
+ * terminal signal reaches. There is one console here, it belongs to the
+ * compositor's window rather than to any process, and kill() already
+ * refuses the negative pids that name a group — so there is no structure
+ * for a session to be a partition of.
+ *
+ * ENOSYS rather than a pretended success: a program calls setsid() to
+ * detach from a terminal it will then stop receiving signals from, and
+ * one told it had succeeded would believe something about its own
+ * lifetime that is not true.
+ */
+pid_t setsid(void) {
+    errno = ENOSYS;
+    return (pid_t)-1;
+}
+
+/*
+ * ---- the environment, which is empty and is not null ----
+ *
+ * POSIX says `environ` points at a NULL-terminated array of "NAME=value"
+ * strings. This system has no environment: nothing sets a variable,
+ * nothing inherits one, and execve's third argument is built by whoever
+ * calls it rather than taken from anywhere.
+ *
+ * So the honest value is a vector with nothing in it, and *not* a null
+ * pointer. The difference is the whole reason this has a comment: code
+ * that walks the environment writes `for (p = environ; *p; p++)`, which
+ * on a null pointer is a fault and on an empty vector is a loop that
+ * runs zero times. libgpg-error's spawn-posix.c passes environ straight
+ * to execv, where a null would become the child's argv terminator.
+ */
+static char *vx_environ_empty[1] = { NULL };
+char **environ = vx_environ_empty;
+
+/*
+ * Becoming another account, which a running program does not get to do.
+ *
+ * EPERM rather than ENOSYS: the operation is understood and refused.
+ * There is one way to be another account here and it is to sign in as
+ * one — the account is fixed at spawn from the session (see
+ * app_map_image, which sets as->sid from user_current) and nothing
+ * reachable from ring 3 moves it.
+ */
+int setuid(uid_t uid) { (void)uid; errno = EPERM; return -1; }
+int setgid(gid_t gid) { (void)gid; errno = EPERM; return -1; }

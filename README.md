@@ -36,14 +36,14 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**132,897 lines of C written here**, across 271 files, built as five kernel
+**136,527 lines of C written here**, across 280 files, built as five kernel
 objects plus one for inference, over a user-space C library of its own —
 and, since ring 3 got file descriptors and sockets, a freestanding C++
 runtime to go with it, down to the Itanium ABI's run-time type
 information. A ring-3 program can now fork, exec, signal, and wait for its
-children, in Linux's numbering as well as this system's. 3.7 million host
-checks across 17 suites on every build, and thirteen more on the machine
-itself.
+children, in Linux's numbering as well as this system's — over pipes, with
+signals, waiting on poll. 3.7 million host checks across 17 suites on
+every build, and seventeen more on the machine itself.
 
 ---
 
@@ -279,10 +279,13 @@ that asserts `UNIX`, which selects the generic-Unix branch rather than
 the Linux one, and the toolchain adds `-D__unix__` because WTF reads
 predefined macros rather than CMake variables. Configure now runs
 WebKit's whole feature-detection pass against this C library and stops
-at `OptionsWPE.cmake:10` — the third of twenty-two required packages.
-HarfBuzz and ICU are now *found*, at 8.5.0 and 74.2, with the components
-WebKit asks for; JPEG is where it stops. Sixteen more stand behind that,
-one of them an OpenGL loader for a machine with no GL.
+at `OptionsWPE.cmake:16` — the ninth of twenty-two required packages.
+Eight are now *found* by a real configure run: HarfBuzz 8.5.0 with the
+components WebKit asks for, ICU 74.2 with `data i18n uc`, JPEG 62,
+Epoxy 1.5.10, LibGcrypt 1.10.3, Libtasn1 4.19.0, Libxkbcommon 1.7.0 and
+LibXml2 2.12.6. PNG is where it stops, and nine stand behind that —
+though PNG's own probe fails on zlib first, so the next one is really
+two.
 
 **The three things that were blocking before this no longer are.** There was no `libstdc++` for
 `x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;
@@ -439,14 +442,14 @@ itself, with all six argument registers. Never a halt. That line is how the
 list of what to build next gets written by the programs that need it rather
 than guessed at in advance.
 
-`apps/vlstest.c` runs **111 checks** on the machine, including a child that
+`apps/vlstest.c` runs **164 checks** on the machine, including a child that
 sets the personality and from that instant speaks nothing but raw Linux system
 calls, and one that takes a real page fault and reports the address its
 handler was given.
 
 ## Ports, and what each one cost
 
-Seven libraries are built from upstream sources, unpatched, and run in
+Twelve libraries are built from upstream sources, unpatched, and run in
 ring 3. Each is fetched by checksum (`make libs-fetch`) and gitignored,
 and each is checked on the machine rather than assumed:
 
@@ -458,9 +461,14 @@ and each is checked on the machine rather than assumed:
 | ICU | 74.2 | 54 checks | the Itanium ABI's RTTI, and a wall clock — its data ships prebuilt |
 | libjpeg-turbo | 3.0.4 | 20 checks | two hand-written config headers; built at three precisions, no SIMD |
 | libepoxy | 1.5.10 | 19 checks | `dlopen`/`dlsym` over a table, because there is no dynamic linker |
+| libgpg-error | 1.50 | — | four generated headers, two host tools, and an errno table that had to be preprocessed by the *cross* compiler |
+| libgcrypt | 1.10.3 | 33 checks | pipes, `poll` and `socketpair`, which it needed before it would link |
+| libtasn1 | 4.19.0 | 94 checks | `WORD_BIT` in `<limits.h>`, and gnulib's `strverscmp` — this C library had neither |
+| libxkbcommon | 1.7.0 | 67 checks | 2.7 MB of xkeyboard-config on the volume, and a formatter that can write a directory of 138 names |
+| libxml2 | 2.12.6 | 66 checks | nothing — the first port that needed no new interface at all |
 | WPE | 1.16.2 | 40 checks | the backend seam in `third_party/wpe-port/` |
 
-The last two are the ones that say something about the shape of this
+The last three are the ones that say something about the shape of this
 system rather than about the libraries. libjpeg-turbo is compiled three
 times over — at 8, 12 and 16 bits per sample — because version 3 selects
 precision at run time and skipping the other two passes leaves the
@@ -468,6 +476,25 @@ dispatch calling functions that are not in the archive. And libepoxy is
 a *dispatcher*: it resolves two thousand OpenGL entry points by name
 through `dlsym`, which is why `libc/dlfcn.c` exists and why it is a name
 table rather than a loader. Nine of those two thousand resolve here.
+
+And libgcrypt is the one that could not be made to link at all until the
+kernel grew something. Its error library's `visibility.c` defines every
+public `gpgrt_` name in one file, including the process-spawning ones, so
+the locks libgcrypt actually wants drag in a module that calls `pipe()`
+and `socketpair()` — neither of which existed. Both do now, along with
+`poll()`, and `src/vfs.h` has a descriptor kind that is a buffer with two
+ends. That was the last of the four things `libc/include/unistd.h` used
+to list as absent.
+
+libtasn1 is the smallest of the ten and the one whose test is the most
+specific: the ASN.1 module it compiles is a verbatim copy of the one WPE
+WebKit carries in `pal/crypto/tasn1/Utilities.cpp`, and every structure
+it decodes came out of the build machine's OpenSSL. Neither is
+incidental. A module written to be easy to parse would not have shown
+whether WebKit's builds, and a structure encoded here and decoded here
+would agree with itself even if both halves shared a wrong idea of how
+an OBJECT IDENTIFIER is packed — the same reason `jpegtest` reads a
+bitstream macOS encoded.
 
 ## The interface, from utility classes
 
@@ -977,7 +1004,7 @@ because a repository that blurs it is not worth reading.
 | | Why not |
 |---|---|
 | **Hardware-rasterised 3D, and OpenGL** | There *is* a 3D API with a real shader compiler. What no hardware here can do is run it: the Gen9 driver is a blitter by design and QEMU's display has no 3D engine, so geometry and fragment stages are CPU work. **libepoxy is ported** and WebKit's configure finds it — it is a function-pointer dispatcher, so it builds without an OpenGL underneath — and nine entry points resolve to the framebuffer at `/dev/dri/renderD128`: clear, viewport, read pixels, and the strings a stack reads to find out what it is talking to. Everything with a pipeline behind it is absent from the table, so `glDrawArrays` prints its own name and aborts rather than drawing nothing. A software GL over the existing rasteriser is the rung that changes that. |
-| **Pipes** | Signals, `exec` and `dup` are here now — see the Linux subset above — and a pipe is the one of the four that did not come with them. It needs a descriptor kind that is a *buffer with two ends*, which is the one thing `src/vfs.h` has no shape for, and a `pipe2` is answered with `ENOSYS` and a `[VLS]` line rather than a half-built one. `dup` arrived with its limits stated instead of hidden: here a descriptor *is* the open file description, so a file open for writing or a connected socket cannot be duplicated — two write-back images or two closes of one connection are each wrong in a way a program meets as data loss — and both are refused by name rather than approximated. |
+| **Terminals, sessions, process groups** | All four of the things this table used to list — signals, `exec`, `dup`, pipes — are built. What is still absent is the layer above them: there is one console, it belongs to the compositor's window rather than to any process, and `setsid` answers ENOSYS because there is no structure for a session to partition. `kill` refuses the negative pids that name a group for the same reason. `dup` also arrived with its limits stated instead of hidden: here a descriptor *is* the open file description, so a file open for writing or a connected socket cannot be duplicated — two write-back images or two closes of one connection are each wrong in a way a program meets as data loss — and both are refused by name. |
 | **Full-disk encryption** | Individual directories seal into encrypted containers; the volume itself is not encrypted, so filenames and free space are in the clear. |
 | **Sandboxing beyond ring 3** | Hardware isolation is real now — a program cannot read the kernel or another process. What is still only *policy* is which programs may start: the allowlist and scanner decide that, and nothing constrains what a program does within its own address space. |
 | **VPN, branch caching, SMB Direct** | Not written. Kerberos also holds tickets encrypted on disk rather than in a kernel keyring. |

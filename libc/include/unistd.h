@@ -33,11 +33,6 @@ extern "C" {
  *
  * ---- what is still absent, and why ----
  *
- *   pipe. The one of the four that did not arrive with the others: a
- *   pipe needs a descriptor kind that is a *buffer with two ends*, and
- *   src/vfs.h has no shape for one. Asked for through the Linux
- *   numbering it answers ENOSYS and names itself on the wire.
- *
  *   symlink, readlink, link. There are no links on this volume.
  *
  *   chown, getuid, setuid. There are accounts and there is a boundary
@@ -178,6 +173,69 @@ int execvp(const char *file, char *const argv[]);
  */
 int dup(int fd);
 int dup2(int oldfd, int newfd);
+
+/*
+ * A channel between two processes: fds[0] reads, fds[1] writes.
+ *
+ * The last of the four things this header used to list as absent, and it
+ * was absent for a reason that expired rather than a reason that was
+ * wrong — "a pipe would have nobody at the other end" was true until
+ * fork had an exec and a wait to pair with.
+ *
+ * A read blocks while the buffer is empty and a writer still holds the
+ * other end, and answers zero when the last writer has closed. A write
+ * blocks while the buffer is full and answers EPIPE when the last reader
+ * has closed. The buffer is one page, which is what Unix has used since
+ * the seventh edition.
+ *
+ * pipe2's only honoured flag is O_CLOEXEC. O_NONBLOCK is refused rather
+ * than accepted: there is no non-blocking read behind these descriptors,
+ * and a program told its pipe would not block would find it blocking on
+ * the first full buffer.
+ */
+int pipe(int fds[2]);
+int pipe2(int fds[2], int flags);
+
+/*
+ * Which account this process belongs to. Never zero — see the note at
+ * the definition, and the one beside vlsh_uid in src/desktop.h. There is
+ * no setuid on this system, so the real and effective answers are the
+ * same by construction rather than by coincidence.
+ */
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+
+/* A new session, which this system has no structure for. Always -1 with
+ * ENOSYS; see the definition for why a pretended success would be worse
+ * than a refusal. */
+pid_t setsid(void);
+
+/*
+ * The environment, which is empty here and is not null: a vector with
+ * nothing in it, so that `for (p = environ; *p; p++)` runs zero times
+ * rather than faulting. Nothing on this system sets a variable and
+ * nothing inherits one — execve's third argument is built by its caller.
+ */
+extern char **environ;
+
+/*
+ * ---- changing which account a program runs as, which does not happen
+ *      here ----
+ *
+ * Declared because ports call them inside branches that are dead on this
+ * system — libgcrypt's secure-memory setup drops setuid privileges if it
+ * finds it has any, which it never does, because geteuid() and getuid()
+ * are the same function here and nothing has ever changed either.
+ *
+ * They answer -1 with EPERM rather than ENOSYS, and the difference is
+ * the point: the operation is understood and refused. There is exactly
+ * one way to become another account on this machine and it is to sign in
+ * as one; a running program does not get to change the answer.
+ */
+int setuid(uid_t uid);
+int setgid(gid_t gid);
 
 void  _exit(int status) __attribute__((noreturn));
 

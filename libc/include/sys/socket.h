@@ -83,6 +83,18 @@ extern "C" {
 #include <sys/types.h>
 
 #define AF_UNSPEC   0
+/*
+ * A socket in the filesystem, which this system does not have.
+ *
+ * Named here for the same reason AF_INET6 is: a program that mentions
+ * the constant in a branch it does not take should compile, and one that
+ * passes it to socket() should be refused *at the call*, by name, rather
+ * than fail to build against a constant that every other Unix defines.
+ * The kernel answers EAFNOSUPPORT — see the note at the top of this file
+ * and struct sockaddr_un in <sys/un.h>.
+ */
+#define AF_UNIX     1
+#define AF_LOCAL    AF_UNIX
 #define AF_INET     2
 #define AF_INET6   10
 #define PF_INET     AF_INET
@@ -162,5 +174,14 @@ int vx_connect_host(int fd, const char *host, unsigned short port);
 #ifdef __cplusplus
 }
 #endif
+
+/*
+ * A connected pair that never leaves the machine — two descriptors over
+ * two rings, which is what a socketpair is and all anything here uses
+ * one for. Declared beside the network calls because that is where a
+ * program looks for it; implemented beside pipe() in libc/process.c
+ * because that is what it is.
+ */
+int socketpair(int domain, int type, int protocol, int sv[2]);
 
 #endif /* _SYS_SOCKET_H */

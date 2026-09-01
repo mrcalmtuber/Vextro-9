@@ -134,6 +134,29 @@ int    putc(int c, FILE *f);
 int    fputs(const char *s, FILE *f);
 int    fputs_stream(const char *s, FILE *f);
 
+/*
+ * ---- a temporary file, which this system cannot make ----
+ *
+ * Declared because it is C89 and ports include <stdio.h> expecting it to
+ * be there; defined because a declaration without one moves the failure
+ * to a link error in whichever port called it first.
+ *
+ * It always returns NULL, with errno set, and that is a conforming
+ * outcome rather than a stub: the standard defines tmpfile as able to
+ * fail, every caller is written to check — libgpg-error's estream.c does
+ * `fp = tmpfile(); if (!fp) goto out;` — and a caller that checks learns
+ * the truth and takes its other path.
+ *
+ * What it would take to do properly is worth writing down, because it is
+ * not much and it is not nothing: a directory that may be written
+ * without a person answering a prompt, and unlink-on-close, which means
+ * a flag on vfs_desc_t and an unlink after the write-back in
+ * vfs_close_desc. The reason it has not been built is that nothing has
+ * needed it — every port so far either uses an in-memory stream or does
+ * without.
+ */
+FILE  *tmpfile(void);
+
 int    fseek(FILE *f, long off, int whence);
 long   ftell(FILE *f);
 int    fseeko(FILE *f, off_t off, int whence);

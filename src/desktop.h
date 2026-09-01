@@ -1810,7 +1810,8 @@ static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
         if (kind == FD_FREE)  return (uint64_t)(int64_t)-VXE_BADF;
         if (kind == FD_DIR)   return (uint64_t)(int64_t)-VXE_BADF;
 
-        if (kind == FD_FILE || kind == FD_SOCK || kind == FD_DEV) {
+        if (kind == FD_FILE || kind == FD_SOCK || kind == FD_DEV ||
+            kind == FD_PIPE) {
             vfs_desc_t *d = vfs_get(as, (int64_t)a0);
             if (!d) return (uint64_t)(int64_t)-VXE_BADF;
 
@@ -1826,6 +1827,10 @@ static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
             if (kind == FD_DEV)
                 return (uint64_t)dev_write(d, (const void *)(uintptr_t)a1,
                                            (uint32_t)len);
+            if (kind == FD_PIPE)
+                return (uint64_t)vfs_pipe_write(d,
+                                                (const void *)(uintptr_t)a1,
+                                                (uint32_t)len);
             return (uint64_t)vfs_file_write(d, (const void *)(uintptr_t)a1,
                                             (uint32_t)len);
         }
@@ -2785,6 +2790,163 @@ static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
     }
 
     /*
+     * ---- a channel between two processes ----
+     *
+     * Two descriptors over one buffer. libc/include/unistd.h listed pipe
+     * among the things this system did not have, with the reason that
+     * "there is no way to start a program from a program here ... so a
+     * pipe would have nobody at the other end". fork has existed since
+     * ring 3 did and exec and wait arrived with the Linux subset, so the
+     * reason expired and this is what replaced it.
+     *
+     * a0 is where the two numbers go, a1 is O_CLOEXEC or nothing.
+     * O_NONBLOCK is refused rather than accepted: there is no
+     * non-blocking read behind these descriptors, and a program told its
+     * pipe would not block would find it blocking on the first full
+     * buffer.
+     */
+    case SYS_PIPE2: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        if (!user_range_mapped(as, a0, 8, 1)) {
+            app_refuse("pipe: unwritable descriptor pair");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        if (a1 & ~(uint64_t)VX_O_CLOEXEC) {
+            app_refuse("pipe: only O_CLOEXEC is available on this system's "
+                       "pipes");
+            return (uint64_t)(int64_t)-VXE_INVAL;
+        }
+        int fds[2] = { -1, -1 };
+        const int rc = vfs_pipe_create(as, fds, (uint32_t)a1, 0);
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+
+        int32_t *out = (int32_t *)(uintptr_t)a0;
+        out[0] = fds[0];
+        out[1] = fds[1];
+        return 0;
+    }
+
+    /*
+     * ---- the same object with both directions filled in ----
+     *
+     * a0 domain, a1 type, a2 protocol, a3 where the pair goes. AF_UNIX
+     * and SOCK_STREAM, and nothing else, for the same reason SYS_SOCKET
+     * accepts only AF_INET: a family that cannot be served is refused at
+     * the call rather than accepted and made to fail later.
+     *
+     * It shares no code with the network stack and never reaches lwIP.
+     * What a program gets is two descriptors over two rings, crossed —
+     * which is what a socketpair is for, and the only thing anything
+     * here uses one for.
+     */
+    case SYS_SOCKETPAIR: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+        if (a0 != VX_AF_UNIX) {
+            app_refuse("socketpair: only AF_UNIX pairs exist on this system");
+            return (uint64_t)(int64_t)-VXE_AFNOSUPPORT;
+        }
+        if ((a1 & 0xFF) != VX_SOCK_STREAM) {
+            app_refuse("socketpair: only stream pairs exist on this system");
+            return (uint64_t)(int64_t)-VXE_OPNOTSUPP;
+        }
+        if (a2 != 0) return (uint64_t)(int64_t)-VXE_INVAL;
+        if (!user_range_mapped(as, a3, 8, 1)) {
+            app_refuse("socketpair: unwritable descriptor pair");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+        int fds[2] = { -1, -1 };
+        const int rc = vfs_pipe_create(as, fds, (uint32_t)(a1 & ~0xFFu), 1);
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+        int32_t *out = (int32_t *)(uintptr_t)a3;
+        out[0] = fds[0];
+        out[1] = fds[1];
+        return 0;
+    }
+
+    /*
+     * ---- and a way to ask whether one is ready ----
+     *
+     * poll rather than select, for the reason src/syscall.h gives beside
+     * the number: select describes its descriptors as a bitmap indexed
+     * by number and makes the caller clear three of them per call, where
+     * poll takes an array of the ones it cares about.
+     *
+     * a0 is an array of `struct pollfd` — fd, events, revents, eight
+     * bytes each — a1 is how many, a2 is a timeout in milliseconds with
+     * the usual -1 for "wait indefinitely" and 0 for "look and return".
+     *
+     * The indefinite wait is bounded here at a minute, and that is worth
+     * saying rather than hiding: this kernel has no way to be certain a
+     * wake will arrive for every kind of descriptor — a socket's
+     * readiness is not exposed by lwIP through vxnet — so an unbounded
+     * park would be a thread that could never be reaped. A caller that
+     * asked to wait forever and got a timeout after sixty seconds loops
+     * and asks again, which is what every correct poll caller already
+     * does.
+     */
+    case SYS_POLL: {
+        addr_space_t *as = vmm_current;
+        if (!as || !as->live) return (uint64_t)(int64_t)-VXE_PERM;
+
+        const uint64_t n = a1;
+        if (n > FD_MAX) return (uint64_t)(int64_t)-VXE_INVAL;
+        if (!n) {
+            /* No descriptors is a sleep, which is what a program uses
+             * poll(NULL, 0, ms) for. */
+            if ((int64_t)a2 > 0) sched_sleep_ms(a2);
+            return 0;
+        }
+        const uint64_t bytes = n * 8;
+        if (!user_range_mapped(as, a0, bytes, 1)) {
+            app_refuse("poll: unreadable or unwritable descriptor array");
+            return (uint64_t)(int64_t)-VXE_FAULT;
+        }
+
+        const int64_t want_ms = (int64_t)a2;
+        const uint64_t deadline = want_ms < 0 ? sched_ticks + 60000
+                                              : sched_ticks + (uint64_t)want_ms;
+        for (;;) {
+            int ready = 0;
+            for (uint64_t i = 0; i < n; i++) {
+                int32_t *fdp   = (int32_t *)(uintptr_t)(a0 + i * 8);
+                int16_t *evp   = (int16_t *)(uintptr_t)(a0 + i * 8 + 4);
+                int16_t *revp  = (int16_t *)(uintptr_t)(a0 + i * 8 + 6);
+                *revp = 0;
+                /* A negative descriptor is skipped and answers zero,
+                 * which is how a caller disables one entry of a set it
+                 * keeps across calls. */
+                if (*fdp < 0) continue;
+
+                const int st = vfs_ready(as, *fdp);
+                if (st < 0) { *revp = VX_POLLNVAL; ready++; continue; }
+                if ((st & VFS_READY_READ)  && (*evp & VX_POLLIN))  *revp |= VX_POLLIN;
+                if ((st & VFS_READY_WRITE) && (*evp & VX_POLLOUT)) *revp |= VX_POLLOUT;
+                /* HUP and NVAL are reported whether or not they were
+                 * asked for, which POSIX requires: a caller cannot
+                 * subscribe to them and must not miss them. */
+                if (st & VFS_READY_HUP) *revp |= VX_POLLHUP;
+                if (*revp) ready++;
+            }
+            if (ready) return (uint64_t)ready;
+            if (want_ms == 0) return 0;
+            if (sched_ticks >= deadline) return 0;
+
+            /*
+             * Nothing ready. A short sleep rather than a park on a
+             * channel, because the descriptors in one call can be of
+             * several kinds and there is no single address they all
+             * wake on. Ten milliseconds is a hundred wakeups a second
+             * for a program that is waiting, which is invisible beside
+             * the frame clock and is what keeps this honest: it is a
+             * poll in the older sense of the word.
+             */
+            sched_sleep_ms(10);
+        }
+    }
+
+    /*
      * ---- which numbering this process speaks ----
      *
      * A one-way door, and the refusal to go back is the whole safety of
@@ -3049,6 +3211,13 @@ static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
         if (kind == FD_DEV)
             return (uint64_t)dev_read(d, (void *)(uintptr_t)a1,
                                       (uint32_t)len);
+        /* A pipe blocks when it is empty, which is the one read on this
+         * system that waits for another *process* rather than for a
+         * disk. See vfs_pipe_read for why an empty ring with no writer
+         * is end-of-file rather than a wait. */
+        if (kind == FD_PIPE)
+            return (uint64_t)vfs_pipe_read(d, (void *)(uintptr_t)a1,
+                                           (uint32_t)len);
         return (uint64_t)vfs_file_read(d, (void *)(uintptr_t)a1,
                                        (uint32_t)len);
     }
@@ -3165,6 +3334,17 @@ static uint64_t syscall_native(uint64_t num, uint64_t a0, uint64_t a1,
         if (kind == FD_SOCK) {
             vfs_fill_stat(st, 0, 0, 0);
             st->mode = VX_S_IFSOCK;
+            return 0;
+        }
+        if (kind == FD_PIPE) {
+            /* S_IFIFO, which is the kind a program checks for when it
+             * wants to know whether its input is a terminal, a file or
+             * something it should stream. There is no size: a pipe holds
+             * whatever has not been read yet, and reporting that as a
+             * file length would be a number that changes between the
+             * stat and the read. */
+            vfs_fill_stat(st, 0, 0, 0);
+            st->mode = VX_S_IFIFO;
             return 0;
         }
         if (kind == FD_DEV) {
@@ -5532,8 +5712,30 @@ static int execute_bin_internal(const char *filepath, int verbose) {
 
 /* Launch and wait. Only for callers that have nothing to draw while they
  * wait — the boot self-test — because it stops the compositor thread. */
+/*
+ * Run a program and wait for it, then collect what it left behind.
+ *
+ * The reap is the part worth explaining. sched_reap normally runs on the
+ * compositor thread, once a frame — but a caller of *this* function is
+ * blocked inside it, and during the boot self-tests the thread that is
+ * blocked is the compositor thread itself. So nothing is collected for
+ * as long as the tests run, and a suite that forks leaves every child
+ * holding an address space and a claim on the six-entry window surface
+ * pool until the render loop finally starts.
+ *
+ * That was found rather than predicted: apps/vlstest.c forks eight
+ * children, and the two suites after it could not map their own images.
+ * The message was "could not map gcrypttest into its address space",
+ * which says nothing about a test three programs earlier.
+ *
+ * Reaping here is correct and not merely convenient — a blocking launch
+ * has by definition a finished process to collect, and this thread is
+ * not one of the threads being freed.
+ */
 static int execute_bin_blocking(const char *filepath, int verbose) {
-    return execute_bin_full(filepath, verbose, 1);
+    const int rc = execute_bin_full(filepath, verbose, 1);
+    sched_reap();
+    return rc;
 }
 
 static int execute_bin(const char *filepath) {

@@ -118,6 +118,7 @@
 #define LNX_nanosleep        35
 #define LNX_getpid           39
 #define LNX_socket           41
+#define LNX_socketpair       53
 #define LNX_connect          42
 #define LNX_sendto           44
 #define LNX_recvfrom         45
@@ -161,7 +162,10 @@
 #define LNX_openat          257
 #define LNX_newfstatat      262
 #define LNX_unlinkat        263
+#define LNX_pipe             22
+#define LNX_poll              7
 #define LNX_pipe2           293
+#define LNX_ppoll           271
 #define LNX_getrandom       318
 
 /* arch_prctl subfunctions. Only the two that touch FS, because that is
@@ -264,6 +268,9 @@
 #define VXN_DUP         62
 #define VXN_DUP2        63
 #define VXN_PERSONALITY 64
+#define VXN_PIPE2       65
+#define VXN_POLL        66
+#define VXN_SOCKETPAIR  67
 
 /* The error numbers used here, which are Linux's, which are the ones
  * src/syscall.h calls VXE_* and libc/include/errno.h calls E*. Three

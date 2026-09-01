@@ -62,8 +62,10 @@ with no assembler backend.
 | ICU 74.2, and the data archive read off the volume | `apps/icutest.cpp` |
 | run-time type information, so a library may use `dynamic_cast` | `libcxx/src/typeinfo.cpp` |
 | a calendar, so that a date formatter has a real "now" | `SYS_WALLCLOCK`, `libc/calendar.c` |
+| libjpeg-turbo, libepoxy, libgcrypt, libtasn1, libxkbcommon and libxml2 in ring 3 | `apps/jpegtest.c`, `gltest.c`, `gcrypttest.c`, `tasn1test.c`, `xkbtest.c`, `xmltest.c` |
+| the keymap data a browser needs, on the volume | `/etc/xkb`, 250 files from xkeyboard-config |
 | WebKit's OS detection, passed without patching it | `vextro-project-inject.cmake` |
-| a sysroot the find modules can see all five ported libraries in | `make webkit-sysroot` |
+| a sysroot the find modules can see all twelve ported libraries in | `make webkit-sysroot` |
 
 `apps/wpetest.c` runs all of that in ring 3 on every `APP_SELFTEST` boot.
 
@@ -171,7 +173,7 @@ smaller than expected each time, and is now in: `<inttypes.h>` and
 `<cinttypes>` and `is_standard_layout` for ICU. None of the five needed
 a patch to its own source.
 
-**7. The dependency set — five done, and the count is still worse than
+**7. The dependency set — eight found, and the count is still worse than
 "a few more".** `Source/cmake/OptionsWPE.cmake` opens with **twenty-two
 unconditional `find_package(... REQUIRED)`** and has more behind
 conditionals:
@@ -181,22 +183,24 @@ conditionals:
     LibSoup  GLIB  Cairo  Fontconfig  Freetype  LibXslt  ...
 
 Ported, built, and staged into the sysroot: **SQLite**, **FreeType**,
-**WPE**, **HarfBuzz**, **ICU 74.2**, **libjpeg-turbo 3.0.4** and
-**libepoxy 1.5.10**.
+**WPE**, **HarfBuzz**, **ICU 74.2**, **libjpeg-turbo 3.0.4**,
+**libepoxy 1.5.10**, **libgpg-error 1.50 + libgcrypt 1.10.3**,
+**libtasn1 4.19.0**, **libxkbcommon 1.7.0** and **libxml2 2.12.6**.
 
-Four of those seven have actually been *found by a configure run*, which
-is the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
+Eight of those have actually been *found by a configure run*, which is
+the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
 that satisfies `find_package(HarfBuzz COMPONENTS ICU)`, ICU with the
-`data i18n uc` components, JPEG at version 62, and Epoxy at 1.5.10. The
+`data i18n uc` components, JPEG at version 62, Epoxy at 1.5.10,
+LibGcrypt at 1.10.3, Libtasn1 at 4.19.0, Libxkbcommon at 1.7.0 and
+LibXml2 at 2.12.6. The
 other three sit further down `OptionsWPE.cmake` than configure has
-reached — behind LibGcrypt on line 12 — so nothing has exercised
-`FindSQLite3`, `FindWPE` or CMake's own `FindFreetype` against the layout
-they are staged in. Staged and findable are not the same fact until a run
-says so.
+reached — behind PNG on line 16 — so nothing has exercised
+`FindSQLite3`, `FindWPE` or CMake's own `FindFreetype` against the
+layout they are staged in. Staged and findable are not the same fact
+until a run says so.
 
 Not done, and each its own project: GLIB, LibSoup, Cairo, Fontconfig,
-libxml2, zlib, libpng, WebP, libgcrypt, libtasn1, libxkbcommon,
-Unifdef.
+zlib, libpng, WebP, Unifdef.
 
 ### ICU was easier than this file used to claim
 
@@ -325,7 +329,7 @@ not installed to run them.
 
 ## Where it stops today
 
-`make webkit` reaches `OptionsWPE.cmake:12` — the *fifth* dependency
+`make webkit` reaches `OptionsWPE.cmake:16` — the *ninth* dependency
 check of twenty-two — and stops:
 
     -- Found HarfBuzz: .../build/webkit-sysroot/include/harfbuzz
@@ -337,20 +341,53 @@ check of twenty-two — and stops:
        (found version "62")
     -- Found Epoxy: .../build/webkit-sysroot/lib/libepoxy.a
        (Required is at least version "1.5.4")
-    CMake Error: Could NOT find LibGcrypt
-      (missing: LibGcrypt_LIBRARY LibGcrypt_INCLUDE_DIR)
+    -- Found LibGcrypt: .../build/webkit-sysroot/lib/libgcrypt.a
+       (found suitable version "1.10.3", minimum required is "1.7.0")
+    -- Found Libtasn1: .../build/webkit-sysroot/lib/libtasn1.a
+    --   Found xkbcommon, version 1.7.0
+    -- Found Libxkbcommon: TRUE (Required is at least version "0.4.0")
+    -- Found LibXml2: .../build/webkit-sysroot/lib/libxml2.a
+       (found suitable version "2.12.6", minimum required is "2.8.0")
+    -- Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)
+    CMake Error: Could NOT find PNG
+      (missing: PNG_LIBRARY PNG_PNG_INCLUDE_DIR)
 
-Two of those four lines are new, and the second of them needed something
-this file did not have before: a **pkg-config module**.
-FindEpoxy.cmake sets `Epoxy_VERSION` from pkg-config and from nowhere
-else — find_path and find_library recover the headers and the archive
-and leave the version empty — so the sysroot's own layout got as far as
+Libtasn1 prints no version, and that is `FindLibtasn1.cmake` rather than
+a gap: it hands `find_package_handle_standard_args` a single
+`REQUIRED_VARS LIBTASN1_LIBRARIES` and no `VERSION_VAR`, and
+`OptionsWPE.cmake:13` asks for no minimum. It is the only one of the
+seven written with nothing to compare.
+
+**A correction, because this section used to say otherwise.** It read
+that Epoxy could not be found without a **pkg-config module** — that
+`FindEpoxy.cmake` takes `Epoxy_VERSION` from pkg-config and nowhere
+else, and that the sysroot therefore got as far as
 `Required version (1.5.4) is higher than found version ()` about an
-archive that was sitting in it. That is the identical failure HarfBuzz
-produced before it was found. `make webkit-sysroot` now writes `.pc`
-files beside the archives and the toolchain file points
-`PKG_CONFIG_LIBDIR` at that directory *and nowhere else*, so pkg-config
-can describe this system's libraries and cannot describe the host's.
+archive sitting in it. The first half is true and the conclusion is not.
+`FindEpoxy.cmake:70-77` guards that `FATAL_ERROR` with
+`if (Epoxy_VERSION)`, so an **empty** version takes the other branch and
+prints a warning instead:
+
+    CMake Warning at Source/cmake/FindEpoxy.cmake:77 (message):
+      Cannot determine Epoxy version withouit pkg-config
+
+— upstream's typo included — and configure carries on.
+`find_package_handle_standard_args` does not reject a package for an
+unset `VERSION_VAR`. The quoted error was **HarfBuzz's**, whose find
+module computes a version out of the headers, and it was generalised to
+Epoxy without being reproduced.
+
+This is measurable rather than arguable: pkg-config is **not installed
+on this machine**, `build/webkit/CMakeCache.txt` records
+`PKG_CONFIG_EXECUTABLE-NOTFOUND`, every find module has been taking its
+`find_path`/`find_library` fallback all along, and all six that have
+been reached still succeed. The `.pc` files `make webkit-sysroot` writes
+are inert today.
+
+They are written and kept anyway. Installing pkg-config is one command,
+and on a machine that has it the toolchain's `PKG_CONFIG_LIBDIR` points
+at that directory *and nowhere else* — which is what would stop the
+host's own libraries from answering a query about this system's.
 
 Both of the first two lines were errors before this. HarfBuzz was
 rejected for not being built against ICU — `find_package(HarfBuzz 1.4.2
@@ -368,7 +405,10 @@ archive `icutest` exercised, and FreeType's two redirected config
 headers are copied over upstream's so the headers in it describe the
 archive beside them.
 
-So the frontier is now LibGcrypt, and there are thirteen behind it.
+So the frontier is now PNG, and there are nine behind it — but note the
+ZLIB line above it. `FindPNG` looks for zlib first and does not find it
+either, so the next entry is really **two** ports, and zlib is the one
+that has to come first.
 
 ## The exit code
 
@@ -425,11 +465,15 @@ parentage on `addr_space_t`, and eight `/dev` nodes. 111 checks in ring
 never going to: that line is a missing *library*, and this is the rung
 after the libraries.
 
+**Pipes, `poll` and `socketpair` arrived with libgcrypt** (30 Aug 2026),
+because its error library's `visibility.c` defines every public name in
+one file and the locks came with the spawn module. `src/vfs.h` has an
+`FD_PIPE` kind now — a ring with separately counted ends, shared rather
+than duplicated across a fork — and `SYS_POLL` is the readiness
+interface GLib's main loop is built on.
+
 **What it still does not settle:** descriptor passing between processes
-(no `SCM_RIGHTS`, and no Unix domain sockets to carry it), pipes — the
-one of the four that did not come with the others, because a pipe needs
-a descriptor kind that is a buffer with two ends and `src/vfs.h` has no
-shape for one — and `mmap` with a file behind it. A genuine
+(no `SCM_RIGHTS`), and `mmap` with a file behind it. A genuine
 `WTF_OS_VEXTRO` inside WebKit is still what settles the last of it, and
 it is upstream porting work of a different kind from anything below it
 on this ladder. What has changed is how much of it is left.
@@ -448,22 +492,37 @@ on this ladder. What has changed is how much of it is left.
 8. ~~ICU~~ — done, 74.2, with `libharfbuzz-icu` beside it. Its data
    archive ships prebuilt; what it actually cost was RTTI and a
    calendar, both of which are now in.
-9. ~~JPEG~~ — done, libjpeg-turbo 3.0.4, no SIMD, 8/12/16-bit, 20
-   checks in ring 3 against a bitstream macOS encoded.
-   ~~Epoxy~~ — done, 1.5.10, found at version 1.5.4+, nine entry points
-   bound to the framebuffer and the rest refused by name. **LibGcrypt**
-   is where configure stops today, and there are twelve behind it. Most
-   are small — zlib, libpng, libtasn1, WebP, Unifdef — and
-   `GLib`/`LibSoup` is not.
+9. ~~JPEG~~, ~~Epoxy~~, ~~LibGcrypt~~, ~~Libtasn1~~, ~~Libxkbcommon~~,
+   ~~LibXml2~~ — done.
+   libjpeg-turbo 3.0.4 (no SIMD, 8/12/16-bit, 20 checks in ring 3
+   against a bitstream macOS encoded); libepoxy 1.5.10 (nine entry
+   points bound to the framebuffer, the rest refused by name);
+   libgcrypt 1.10.3 with libgpg-error 1.50 (33 checks against FIPS 197,
+   RFC 4231, RFC 6070 and NIST, on the portable C paths); libtasn1
+   4.19.0 (94 checks against DER the build machine's OpenSSL wrote,
+   through the ASN.1 module WebKit itself compiles); libxkbcommon 1.7.0
+   with 2.7 MB of xkeyboard-config staged at `/etc/xkb`, compiling the
+   `evdev/pc105/us` keymap WebKit asks for by name (67 checks against
+   Linux keycodes and X11 keysyms); libxml2 2.12.6 with zlib, iconv,
+   ICU, modules, FTP and HTTP all compiled out (66 checks, driven the
+   way `XMLDocumentParserLibxml2.cpp` drives it). **PNG** is where
+   configure stops today, and there are nine behind it — but `FindPNG`
+   wants zlib first, so that entry is two ports and zlib leads. The
+   rest are small — WebP, Unifdef — and `GLib`/`LibSoup` is not.
 10. The `libc/` gaps WebKit's own configure named: `langinfo.h`,
     `strnstr`, `regexec`, `statx`, `malloc_trim`. `sys/time.h`,
     `localtime_r`, `timegm`, `SIGTRAP`, `tm_gmtoff` and `tm_zone` were
     on this list and are now written — ICU needed them first.
 11. ~~A process model for the places `OS(UNIX)` assumes one~~ — mostly
     done, as **VLS**: signals, `execve`, `wait4`, `dup`, `clone`, and
-    `/dev`. What is left of it is descriptor passing between processes,
-    pipes, and file-backed `mmap`; a real `WTF_OS_VEXTRO` inside WebKit
-    is what settles those three.
+    `/dev`. ~~Pipes~~ are done too, built because libgcrypt would not
+    link without them — `pipe`, `pipe2`, `poll` and `socketpair`. What
+    is left is descriptor passing *between* processes and **file-backed
+    `mmap`**; the second of those is now a named cost rather than an
+    abstract gap, since it is why `libxkbcommon-port/config.h` leaves
+    HAVE_MMAP undefined and reads every keymap file through upstream's
+    fread fallback. A real `WTF_OS_VEXTRO` inside WebKit is what settles
+    the first.
 12. WPE WebKit, with this configuration
 13. The browser application, over `third_party/wpe-port/` and the skin
     in `assets/ui/`

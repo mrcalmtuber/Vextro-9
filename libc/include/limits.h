@@ -47,6 +47,25 @@ extern "C" {
 #define LLONG_MAX   9223372036854775807LL
 #define ULLONG_MAX  18446744073709551615ULL
 
+/*
+ * ---- the same widths again, counted in bits ----
+ *
+ * WORD_BIT and LONG_BIT are the number of bits in an `int` and in a
+ * `long`. They say nothing the three blocks above do not already say —
+ * they are the same facts in a form that can be used as a shift count,
+ * which is what makes them worth having: a hash that rotates a value
+ * wants `h >> (WORD_BIT - 9)`, and computing that from INT_MAX is not
+ * something a preprocessor can do.
+ *
+ * POSIX puts them in <limits.h> under the XSI option; glibc hides them
+ * behind __USE_XOPEN and musl defines them unconditionally, which is
+ * what this does. Added for libtasn1, whose parser_aux.c includes this
+ * header with the comment `/`* WORD_BIT *`/` beside it and hashes every
+ * node name that way.
+ */
+#define WORD_BIT    32
+#define LONG_BIT    64
+
 #define SSIZE_MAX   LONG_MAX
 #define PATH_MAX    256
 #define NAME_MAX    255

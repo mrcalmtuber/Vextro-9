@@ -350,6 +350,44 @@
 #define SYS_PERSONALITY     64
 
 /*
+ * ===== 65-66: a channel, and a way to ask whether it is ready =====
+ *
+ * The last two of the four things libc/include/unistd.h listed as
+ * absent, and they arrived together because they are one capability:
+ * a pipe is only useful if a program can find out whether reading it
+ * would block, and a readiness call is only interesting if there is
+ * something whose readiness changes.
+ *
+ * Both were forced by a port rather than chosen. libgpg-error's
+ * spawn-posix.c calls pipe() unconditionally, and its estream.c needs
+ * either <poll.h> or <sys/select.h> to compile at all — and the file
+ * that defines every public gpgrt_ name references both modules, so
+ * libgcrypt could not be linked without them.
+ *
+ * POLL is the one of the two readiness interfaces that was worth
+ * writing. select() describes a set of descriptors as a bitmap indexed
+ * by number, which fixes a maximum descriptor at compile time and makes
+ * the caller clear three of them per call; poll() takes an array of the
+ * descriptors it actually cares about. There are sixty-four descriptors
+ * per process here, so neither would have been slow — poll is simply the
+ * better interface, and it is the one GLib's main loop is built on.
+ */
+#define SYS_PIPE2           65
+#define SYS_POLL            66
+/*
+ * A socketpair, which on this system is the same object a pipe is with
+ * both directions filled in — two rings crossed, so each end reads what
+ * the other writes. Its own number rather than a flag on SYS_PIPE2
+ * because the two answer different questions and a caller reading the
+ * number should not have to know that one is the other with a bit set.
+ *
+ * AF_UNIX and SOCK_STREAM only. It shares nothing with SYS_SOCKET, which
+ * is lwIP and the network; this never leaves the machine and never
+ * touches the stack.
+ */
+#define SYS_SOCKETPAIR      67
+
+/*
  * ---- and the proof that the module agrees about all of them ----
  *
  * src/sched/vls_core.c forwards Linux calls to these numbers and cannot
@@ -406,6 +444,9 @@ _Static_assert(VXN_WAIT4        == SYS_WAIT4,        "VLS: WAIT4");
 _Static_assert(VXN_DUP          == SYS_DUP,          "VLS: DUP");
 _Static_assert(VXN_DUP2         == SYS_DUP2,         "VLS: DUP2");
 _Static_assert(VXN_PERSONALITY  == SYS_PERSONALITY,  "VLS: PERSONALITY");
+_Static_assert(VXN_PIPE2        == SYS_PIPE2,        "VLS: PIPE2");
+_Static_assert(VXN_POLL         == SYS_POLL,         "VLS: POLL");
+_Static_assert(VXN_SOCKETPAIR   == SYS_SOCKETPAIR,   "VLS: SOCKETPAIR");
 
 /*
  * ---- open flags ----
@@ -455,6 +496,25 @@ _Static_assert(sizeof(vx_stat_t) == 32, "vx_stat_t crosses the boundary");
 #define VX_S_IFDIR  0040000
 #define VX_S_IFCHR  0020000     /* the console streams */
 #define VX_S_IFSOCK 0140000
+/* A pipe. Reported by fstat on either end, which is how a program finds
+ * out that its input is a stream it cannot seek rather than a file. */
+#define VX_S_IFIFO  0010000
+
+/*
+ * ---- what poll asks about, and what it answers ----
+ *
+ * Linux's numbers, for the reason every other constant in this file uses
+ * Linux's numbers: a port writes POLLIN and would otherwise assemble a
+ * set from a different one. POLLERR, POLLHUP and POLLNVAL are output
+ * only — a caller cannot subscribe to them and must not miss them, so
+ * the service routine reports them whether or not they were asked for.
+ */
+#define VX_POLLIN    0x001
+#define VX_POLLPRI   0x002
+#define VX_POLLOUT   0x004
+#define VX_POLLERR   0x008
+#define VX_POLLHUP   0x010
+#define VX_POLLNVAL  0x020
 
 /* One entry from SYS_GETDENTS. Fixed-length rather than the packed,
  * self-describing records Linux uses: a variable record means the
@@ -497,6 +557,10 @@ _Static_assert(sizeof(vx_dirent_t) == 272, "vx_dirent_t crosses the boundary");
  * That stops somebody listening and does not stop somebody in the
  * middle.
  */
+/* A pair of connected descriptors that never leave the machine. Named
+ * beside AF_INET because socketpair takes it, and refused by SYS_SOCKET
+ * because there is no address behind it to connect to. */
+#define VX_AF_UNIX       1
 #define VX_AF_INET       2
 #define VX_SOCK_STREAM   1
 #define VX_SOCK_DGRAM    2

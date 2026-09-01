@@ -1893,11 +1893,83 @@ void kmain(void) {
     serial_puts("[vextro] icu selftest: done\n");
 
     /*
+     * And libgcrypt, the dependency after Epoxy and the largest port
+     * here after ICU — two libraries, since its error type, its locks and
+     * its in-memory streams all belong to libgpg-error.
+     *
+     * Every algorithm is checked against a number printed in a standard
+     * rather than against itself, which matters more here than usual:
+     * this build runs the portable C implementations, because every
+     * extension assembly path is off, and a distribution build does not.
+     * It also carries the one check that can catch a wrongly generated
+     * errno table — see the note in apps/gcrypttest.c.
+     */
+    serial_puts("[vextro] gcrypt selftest: running /gcrypttest\n");
+    execute_bin_blocking("/gcrypttest", 0);
+    serial_puts("[vextro] gcrypt selftest: done\n");
+
+    /*
+     * And libtasn1, the dependency after libgcrypt and the smallest port
+     * in the tree — a DER encoder and decoder, eleven objects, no
+     * generated headers at all.
+     *
+     * It reads bytes the build machine's OpenSSL wrote, for the reason
+     * jpegtest reads a bitstream macOS encoded: this library is both the
+     * encoder and the decoder, so a structure written here and read back
+     * here would agree with itself even if both halves shared a wrong
+     * idea of how an OBJECT IDENTIFIER is packed. The ASN.1 module it
+     * compiles is WebKit's own, copied out of Utilities.cpp, so "the
+     * definitions WebKit uses build here" is something this test
+     * establishes rather than assumes.
+     */
+    serial_puts("[vextro] tasn1 selftest: running /tasn1test\n");
+    execute_bin_blocking("/tasn1test", 0);
+    serial_puts("[vextro] tasn1 selftest: done\n");
+
+    /*
+     * And libxkbcommon, which is the only one of these whose subject is
+     * half data. The archive can be perfect and this can still fail: a
+     * keymap is a program written in a language that lives in /etc/xkb,
+     * and compiling one means reading a rules file, a keycodes file, a
+     * types file, a compat file and a chain of symbols files off NTFS
+     * while the compiler resolves includes between them.
+     *
+     * It makes WebKit's own call — evdev, pc105, us, with the two empty
+     * strings WPEKeymapXKB.cpp passes — and then checks the result
+     * against Linux's keycode numbering and X11's keysym numbers rather
+     * than against itself.
+     */
+    serial_puts("[vextro] xkb selftest: running /xkbtest\n");
+    execute_bin_blocking("/xkbtest", 0);
+    serial_puts("[vextro] xkb selftest: done\n");
+
+    /*
+     * And libxml2, the largest port here after ICU. It runs after the
+     * others because it is the one that exercises the most of this
+     * system at once: pthread keys for its global state, the C library's
+     * allocator under a parser that allocates per node, and — in the
+     * section that matters most — the external entity loader hook, which
+     * is what stops a document from turning an entity declaration into a
+     * file read. WebKit installs its own loader for exactly that reason,
+     * and apps/xmltest.c proves the hook is under the caller's control
+     * on this build.
+     */
+    serial_puts("[vextro] xml selftest: running /xmltest\n");
+    execute_bin_blocking("/xmltest", 0);
+    serial_puts("[vextro] xml selftest: done\n");
+
+    /*
      * And the Linux subset, which is last because it is the only one
-     * that makes *other* processes: it forks five children, kills one,
-     * faults another, and executes a third. Everything before it runs in
-     * a single process and would be harder to attribute a failure in if
-     * a stray child were still running.
+     * that makes *other* processes: it forks eight children, kills one,
+     * faults another, executes a third, and leaves each of them
+     * unreaped — the reaper runs on the compositor thread, and during a
+     * boot self-test the compositor thread is the one blocked here.
+     *
+     * That is why it goes at the end rather than merely why it is
+     * tidier there. Every child holds an address space and a claim on
+     * the window surface pool until the render loop starts, so a suite
+     * that ran after it would find six surfaces gone and its own image
+     * harder to map. gcrypttest above discovered exactly that.
      *
      * It is also the only self-test whose failures are visible on the
      * serial line before it reports them — an unmapped Linux call prints

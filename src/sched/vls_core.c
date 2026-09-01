@@ -1504,6 +1504,22 @@ static uint64_t l_fcntl(const uint64_t a[6]) {
 
 /* ---- process ---- */
 
+static uint64_t l_socketpair(const uint64_t a[6]) {
+    return vn(VXN_SOCKETPAIR, a[0], a[1], a[2], a[3], 0, 0);
+}
+
+static uint64_t l_pipe(const uint64_t a[6]) {
+    /* Linux has a one-argument pipe and a two-argument pipe2; this
+     * system has only the second, because O_CLOEXEC is the one flag it
+     * can honour and a call unable to express it would have to be
+     * followed by an fcntl to be useful. */
+    return vn(VXN_PIPE2, a[0], 0, 0, 0, 0, 0);
+}
+
+static uint64_t l_pipe2(const uint64_t a[6]) {
+    return vn(VXN_PIPE2, a[0], a[1], 0, 0, 0, 0);
+}
+
 static uint64_t l_getpid(const uint64_t a[6]) {
     (void)a; return vls_host.pid ? vls_host.pid() : 0;
 }
@@ -1781,6 +1797,7 @@ static const vls_call_t vls_table[] = {
 { LNX_stat,          VK_LOCAL,  0,             MNONE, 0, l_stat,   "stat" },
 { LNX_fstat,         VK_LOCAL,  0,             MNONE, 0, l_fstat,  "fstat" },
 { LNX_lstat,         VK_LOCAL,  0,             MNONE, 0, l_stat,   "lstat" },
+{ LNX_poll,          VK_NATIVE, VXN_POLL,      M(0,1,2,-1,-1,-1), 0, 0, "poll" },
 { LNX_lseek,         VK_NATIVE, VXN_LSEEK,     M(0,1,2,-1,-1,-1), 0, 0, "lseek" },
 { LNX_mmap,          VK_LOCAL,  0,             MNONE, 0, l_mmap,   "mmap" },
 { LNX_mprotect,      VK_NATIVE, VXN_MPROTECT,  M(0,1,2,-1,-1,-1), 0, 0, "mprotect" },
@@ -1799,6 +1816,7 @@ static const vls_call_t vls_table[] = {
 { LNX_readv,         VK_LOCAL,  0,             MNONE, 0, l_readv,  "readv" },
 { LNX_writev,        VK_LOCAL,  0,             MNONE, 0, l_writev, "writev" },
 { LNX_access,        VK_LOCAL,  0,             MNONE, 0, l_access, "access" },
+{ LNX_pipe,          VK_LOCAL,  0,             MNONE, 0, l_pipe,   "pipe" },
 { LNX_sched_yield,   VK_NATIVE, VXN_YIELD,     MNONE, 0, 0, "sched_yield" },
 { LNX_dup,           VK_NATIVE, VXN_DUP,       M(0,-1,-1,-1,-1,-1), 0, 0, "dup" },
 { LNX_dup2,          VK_NATIVE, VXN_DUP2,      M(0,1,-1,-1,-1,-1), 0, 0, "dup2" },
@@ -1809,6 +1827,7 @@ static const vls_call_t vls_table[] = {
 { LNX_sendto,        VK_LOCAL,  0,             MNONE, 0, l_sendto, "sendto" },
 { LNX_recvfrom,      VK_LOCAL,  0,             MNONE, 0, l_recvfrom, "recvfrom" },
 { LNX_shutdown,      VK_NATIVE, VXN_SHUTDOWN,  M(0,1,-1,-1,-1,-1), 0, 0, "shutdown" },
+{ LNX_socketpair,    VK_LOCAL,  0,             MNONE, 0, l_socketpair, "socketpair" },
 { LNX_setsockopt,    VK_LOCAL,  0,             MNONE, 0, l_setsockopt, "setsockopt" },
 { LNX_clone,         VK_LOCAL,  0,             MNONE, 0, l_clone,  "clone" },
 { LNX_fork,          VK_NATIVE, VXN_FORK,      MNONE, 0, 0, "fork" },
@@ -1856,6 +1875,7 @@ static const vls_call_t vls_table[] = {
 { LNX_openat,        VK_LOCAL,  0,             MNONE, 0, l_openat, "openat" },
 { LNX_newfstatat,    VK_LOCAL,  0,             MNONE, 0, l_newfstatat, "newfstatat" },
 { LNX_unlinkat,      VK_LOCAL,  0,             MNONE, 0, l_unlinkat, "unlinkat" },
+{ LNX_pipe2,         VK_LOCAL,  0,             MNONE, 0, l_pipe2,  "pipe2" },
 { LNX_getrandom,     VK_NATIVE, VXN_RANDOM,    M(0,1,-1,-1,-1,-1), 0, 0, "getrandom" },
 };
 

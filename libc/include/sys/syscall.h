@@ -174,6 +174,9 @@ extern "C" {
 #define SYS_DUP             62
 #define SYS_DUP2            63
 #define SYS_PERSONALITY     64
+#define SYS_PIPE2           65
+#define SYS_POLL            66
+#define SYS_SOCKETPAIR      67
 
 /*
  * ===== and the calls that only exist in Linux's numbering =====

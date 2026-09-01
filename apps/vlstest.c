@@ -61,6 +61,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1071,6 +1072,133 @@ static void t_libc(void) {
 }
 
 /* ============================================================
+ *  15. a channel between two processes
+ * ============================================================
+ *
+ * Pipes are the newest thing in this kernel and the one that had no test
+ * until now, so these checks are chosen for the ways a ring buffer with
+ * two counted ends actually goes wrong:
+ *
+ *   The empty ring answering the wrong question. A reader that finds
+ *   nothing must be able to tell "wait, somebody may still write" from
+ *   "stop, nobody ever will", and a single reference count cannot
+ *   express that. The end-of-file check below is the one that fails if
+ *   readers and writers are counted together.
+ *
+ *   The fork *sharing* rather than duplicating. A child with a private
+ *   copy of the ring is not at the other end of anything — the program
+ *   runs, the write succeeds, the parent reads nothing, and the failure
+ *   looks like a lost message rather than a wrong reference count.
+ *
+ *   Blocking, which is the substance of the thing. The parent's read
+ *   below happens before the child has written, so it must park and be
+ *   woken rather than answer zero.
+ */
+static void t_pipe(void) {
+    int fds[2] = { -1, -1 };
+    check_eq("pipe() answers", pipe(fds), 0);
+    check("and gives two different descriptors",
+          fds[0] >= 0 && fds[1] >= 0 && fds[0] != fds[1]);
+
+    /* Within one process first, which needs no scheduling at all. */
+    char buf[32];
+    check_eq("a write goes in", (long)write(fds[1], "hello", 5), 5L);
+    check_eq("and comes back out", (long)read(fds[0], buf, sizeof(buf)), 5L);
+    check("with the same bytes", memcmp(buf, "hello", 5) == 0);
+
+    /* fstat says what kind of thing it is, which is how a program
+     * decides whether its input can be seeked. */
+    struct lstat st;
+    check_eq("fstat on a pipe", LX2(L_fstat, fds[0], &st), 0);
+    check("says it is a FIFO", (st.st_mode & S_IFMT) == 0010000u);
+
+    /*
+     * Readiness. The ring is empty and the write end is open, so the
+     * read end is *not* ready and poll must say so rather than
+     * optimistically claiming everything is always ready.
+     */
+    struct { int fd; short events; short revents; } pf[2];
+    pf[0].fd = fds[0]; pf[0].events = POLLIN;  pf[0].revents = 0;
+    pf[1].fd = fds[1]; pf[1].events = POLLOUT; pf[1].revents = 0;
+    check_eq("poll with a timeout of zero returns immediately",
+             poll((struct pollfd *)pf, 2, 0), 1);
+    check("the empty read end is not readable", !(pf[0].revents & POLLIN));
+    check("the write end is writable", (pf[1].revents & POLLOUT) != 0);
+
+    write(fds[1], "x", 1);
+    pf[0].revents = pf[1].revents = 0;
+    check_eq("after a write, two ends are ready",
+             poll((struct pollfd *)pf, 2, 0), 2);
+    check("and the read end is one of them", (pf[0].revents & POLLIN) != 0);
+    read(fds[0], buf, 1);
+
+    /*
+     * The end-of-file rule. With the write end closed and the ring
+     * empty, a read must answer zero rather than wait — and this is the
+     * check that fails if the two counts were folded into one.
+     */
+    close(fds[1]);
+    check_eq("reading a pipe whose writer has gone is end of file",
+             (long)read(fds[0], buf, sizeof(buf)), 0L);
+    pf[0].revents = 0;
+    pf[0].fd = fds[0]; pf[0].events = POLLIN;
+    poll((struct pollfd *)pf, 1, 0);
+    check("and poll reports the hangup", (pf[0].revents & POLLHUP) != 0);
+    close(fds[0]);
+
+    /* ---- and now across a fork, which is what it is for ---- */
+    check_eq("a second pipe", pipe(fds), 0);
+    const pid_t kid = fork();
+    if (kid == 0) {
+        close(fds[0]);
+        /* Slept first on purpose, so the parent's read below is reached
+         * with the ring still empty and has to block. A read that
+         * answered zero here would pass a test written the other way
+         * round. */
+        lsleep_ns(60000000L);
+        write(fds[1], "from the child", 14);
+        close(fds[1]);
+        _exit(0);
+    }
+    close(fds[1]);
+    char got[32];
+    memset(got, 0, sizeof(got));
+    const long n = read(fds[0], got, sizeof(got));
+    check_eq("the parent's blocking read returns the child's bytes", n, 14L);
+    check("and they are the right bytes",
+          memcmp(got, "from the child", 14) == 0);
+    /* The child closed its end, so this must now be end of file rather
+     * than a second wait. */
+    check_eq("then end of file", (long)read(fds[0], got, sizeof(got)), 0L);
+    close(fds[0]);
+    int st2 = 0;
+    waitpid(kid, &st2, 0);
+    check_eq("and the child exited cleanly", WEXITSTATUS(st2), 0);
+
+    /*
+     * A socketpair, which is the same object with both directions
+     * filled in. The check that matters is that it is *bidirectional* —
+     * a pipe pretending to be one would pass the first write and fail
+     * the reply.
+     */
+    int sv[2] = { -1, -1 };
+    check_eq("socketpair() answers", socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    check_eq("one end writes", (long)write(sv[0], "ping", 4), 4L);
+    check_eq("the other reads", (long)read(sv[1], buf, 4), 4L);
+    check("the right bytes", memcmp(buf, "ping", 4) == 0);
+    check_eq("and the reply goes the other way",
+             (long)write(sv[1], "pong", 4), 4L);
+    check_eq("and arrives", (long)read(sv[0], buf, 4), 4L);
+    check("intact", memcmp(buf, "pong", 4) == 0);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* A family this system does not have is refused at the call. */
+    check_eq("an AF_INET socketpair is refused",
+             socketpair(AF_INET, SOCK_STREAM, 0, sv), -1);
+}
+
+/* ============================================================
  *  the program
  * ============================================================ */
 
@@ -1111,6 +1239,7 @@ void _start(int argc, char **argv, char **envp) {
     t_personality();
     t_clone();
     t_libc();
+    t_pipe();
 
     printf("vlstest: %d checks, %d failures\n", checks, failures);
 }

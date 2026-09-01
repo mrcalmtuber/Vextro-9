@@ -83,3 +83,9 @@ third_party/icu/
 third_party/libjpeg/
 third_party/libepoxy/
 build/icu4c-*-src.tgz
+third_party/libgpg-error/
+third_party/libgcrypt/
+third_party/libtasn1/
+third_party/libxkbcommon/
+third_party/xkeyboard-config/
+third_party/libxml2/

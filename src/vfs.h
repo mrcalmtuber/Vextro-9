@@ -214,7 +214,65 @@ enum {
      * the volume, read and written by src/devfs.h, never written back,
      * and duplicated across a fork by copying eight bytes. See the note
      * at the top of that file for which eight nodes exist and why. */
-    FD_DEV
+    FD_DEV,
+    /*
+     * One end of a pipe. The kind that finally made this system's
+     * descriptor table look like a Unix one, and the last of the four
+     * things libc/include/unistd.h listed as absent.
+     *
+     * Its own kind for the reason FD_DEV is: every operation differs.
+     * There is no file behind it and no volume, the two ends share one
+     * buffer and are counted separately, a read blocks when it is empty
+     * and a write blocks when it is full, and a fork *shares* it rather
+     * than duplicating it — which is the whole point, since a pipe with
+     * a private copy on each side of a fork is two pipes and no channel.
+     */
+    FD_PIPE
+};
+
+/*
+ * ============================================================
+ *  a buffer with two ends
+ * ============================================================
+ *
+ * ---- why this did not exist until now ----
+ *
+ * Because nothing could be at the other end of it. src/vfs.h and
+ * libc/include/unistd.h both said so for as long as there was no way to
+ * start a program from a program: "a pipe would have nobody at the other
+ * end". fork has existed since ring 3 did, and exec and wait arrived
+ * with the Linux subset, so the sentence stopped being true and this is
+ * the consequence.
+ *
+ * What actually forced it was a port. libgpg-error's spawn-posix.c calls
+ * pipe() unconditionally, and visibility.c — the one file that defines
+ * every public gpgrt_ name, including the locks libgcrypt needs —
+ * references the spawn module, so the pipe comes with the lock whether
+ * or not anything spawns. There was no way to link libgcrypt without it.
+ *
+ * ---- the shape ----
+ *
+ * One ring, two descriptors, and two counts rather than one. A reader
+ * seeing an empty ring must be able to tell "wait, somebody may still
+ * write" from "stop, nobody ever will", and a single reference count
+ * cannot express that. So writers and readers are counted apart: an
+ * empty ring with no writers is end-of-file, and a full ring with no
+ * readers is EPIPE.
+ *
+ * The buffer is one page from the paged pool. That is Unix's own
+ * historical size and it is enough that a program which writes a line
+ * and then reads the answer never blocks; a program that streams
+ * megabytes through it blocks and unblocks, which is what a pipe is for.
+ */
+#define VFS_PIPE_SIZE 4096
+
+struct vfs_pipe {
+    uint8_t *buf;
+    uint32_t head;          /* where the next byte is written  */
+    uint32_t tail;          /* where the next byte is read     */
+    uint32_t len;           /* how many bytes are in it        */
+    uint16_t readers;
+    uint16_t writers;
 };
 
 typedef struct {
@@ -229,6 +287,7 @@ typedef struct {
     uint8_t  busy_rx;
     uint8_t  busy_tx;
     uint8_t  devid;         /* FD_DEV: which node, DEV_* in devfs.h     */
+    uint8_t  pipe_w;        /* FD_PIPE: this is the writing end          */
     uint32_t oflags;
 
     uint64_t pos;           /* file byte offset, or directory index      */
@@ -242,6 +301,18 @@ typedef struct {
     /* FD_DIR: the whole listing, taken at open. */
     vx_dirent_t *ents;
     uint32_t     nents;
+
+    /*
+     * FD_PIPE: the rings this end reads from and writes to.
+     *
+     * Two pointers rather than one, because a socketpair is the same
+     * object with both filled in. A pipe's read end has only `prd`, its
+     * write end has only `pwr`, and each end of a socketpair has both —
+     * crossed, so that what one writes the other reads. Owned by neither
+     * descriptor and freed by whichever holder is the last to let go.
+     */
+    struct vfs_pipe *prd;
+    struct vfs_pipe *pwr;
 
     /* FD_SOCK: the lwIP descriptor or the vxsec slot, and the staging. */
     int      sock;
@@ -309,6 +380,35 @@ static void vfs_close_desc(vfs_desc_t *d) {
         if (d->wbuf) kfree(d->wbuf);
     } else if (d->kind == FD_DIR) {
         if (d->ents) kfree(d->ents);
+    } else if (d->kind == FD_PIPE) {
+        /*
+         * One end goes back, not the pipe.
+         *
+         * Which end matters: a reader closing is what turns a later
+         * write into EPIPE, and a writer closing is what turns a later
+         * read into end-of-file rather than an indefinite wait. So the
+         * counts are decremented separately and the waiters on the other
+         * side are woken either way — a reader parked on an empty ring
+         * has to find out that no writer is left, and it can only find
+         * out by being woken and looking.
+         */
+        struct vfs_pipe *ends[2] = { d->prd, d->pwr };
+        for (int e = 0; e < 2; e++) {
+            struct vfs_pipe *p = ends[e];
+            if (!p) continue;
+            if (e == 0) { if (p->readers) p->readers--; }
+            else        { if (p->writers) p->writers--; }
+            sched_wake_chan(p, 1);
+            if (!p->readers && !p->writers) {
+                if (p->buf) kfree(p->buf);
+                kfree(p);
+                /* A socketpair holds the same ring twice only if both
+                 * of its ends are this descriptor, which cannot happen;
+                 * but the second slot must not be freed twice if a
+                 * future caller ever aliases them. */
+                if (ends[1 - e] == p) ends[1 - e] = 0;
+            }
+        }
     } else if (d->kind == FD_SOCK) {
         if (d->sock >= 0) {
             if (d->tls) vxsec_close(d->sock);
@@ -484,6 +584,23 @@ static int vfs_clone_table(addr_space_t *child, addr_space_t *parent) {
          */
         if (s->kind == FD_SOCK) continue;
 
+        /*
+         * A pipe is *shared* across a fork, and this is the one kind
+         * where that is the whole point rather than a convenience. A
+         * child with a private copy of the ring is not at the other end
+         * of anything; the classic use — parent reads, child writes — is
+         * exactly two processes holding two ends of one buffer.
+         *
+         * So the pointer is copied and the count on this end is raised,
+         * before the general copy below, which would otherwise leave
+         * both descriptors pointing at a ring that thinks it has one
+         * holder.
+         */
+        if (s->kind == FD_PIPE) {
+            if (s->prd) s->prd->readers++;
+            if (s->pwr) s->pwr->writers++;
+        }
+
         *o = *s;
         o->wbuf = 0; o->ents = 0; o->rx = 0; o->tx = 0;
         o->wcap = 0;
@@ -640,6 +757,254 @@ static int vfs_host_is_loopback(const char *host, uint8_t out[4]) {
 /* ============================================================
  *  opening
  * ============================================================ */
+
+/* ============================================================
+ *  reading and writing a pipe
+ * ============================================================
+ *
+ * Both block, and blocking is the substance of the thing rather than an
+ * implementation detail: a pipe is how one program waits for another
+ * without either of them polling. The park is the same bounded one the
+ * futex and wait4 use — sched_block_on with a timeout, re-entered by the
+ * caller's own loop — so a missed wake costs a few milliseconds instead
+ * of becoming a thread this kernel can never reap.
+ *
+ * Interrupts are masked for the whole of a system call, and these are
+ * called from inside one, so the ring cannot change underneath the
+ * arithmetic between two statements. What *can* happen is that the
+ * thread parks, at which point another thread runs and may fill or drain
+ * it — which is why every field is re-read after every park rather than
+ * kept in a local across one.
+ */
+static int64_t vfs_pipe_read(vfs_desc_t *d, void *buf, uint32_t len) {
+    struct vfs_pipe *p = d->prd;
+    if (!d->readable || !p) return -VXE_BADF;
+    if (!len) return 0;
+
+    for (;;) {
+        if (p->len) break;
+        /*
+         * Empty. Whether that is "wait" or "stop" is the one question a
+         * single reference count could not have answered: with no writer
+         * left, nothing will ever arrive, and answering zero is
+         * end-of-file exactly as it is on a file that has been read to
+         * its end. With a writer still holding the other end, this
+         * thread waits.
+         */
+        if (!p->writers) return 0;
+        sched_block_on(p, 50);
+    }
+
+    uint32_t n = len;
+    if (n > p->len) n = p->len;
+    uint8_t *out = (uint8_t *)buf;
+    for (uint32_t i = 0; i < n; i++) {
+        out[i] = p->buf[p->tail];
+        p->tail = (p->tail + 1) % VFS_PIPE_SIZE;
+    }
+    p->len -= n;
+
+    /* A writer parked on a full ring now has room. Woken whether or not
+     * one is actually waiting, because finding out would cost more than
+     * the call it saves. */
+    sched_wake_chan(p, 1);
+    return (int64_t)n;
+}
+
+static int64_t vfs_pipe_write(vfs_desc_t *d, const void *buf, uint32_t len) {
+    struct vfs_pipe *p = d->pwr;
+    if (!d->writable || !p) return -VXE_BADF;
+    if (!len) return 0;
+
+    const uint8_t *in = (const uint8_t *)buf;
+    uint32_t done = 0;
+
+    while (done < len) {
+        /*
+         * Nobody to read it. EPIPE rather than a wait, because a wait
+         * would be forever — and on a system with signals this is also
+         * where SIGPIPE would be raised. It is not raised here, and that
+         * is a decision rather than an omission: the signal's default
+         * action is to kill the process, which for a program that
+         * checks its return value would turn a handled error into a
+         * death. A program that wants the signal can ask for the
+         * behaviour by checking for EPIPE, which it has to do anyway.
+         */
+        if (!p->readers) return done ? (int64_t)done : -32 /* EPIPE */;
+
+        if (p->len == VFS_PIPE_SIZE) {
+            /*
+             * Full. A short write is legal once anything has been
+             * transferred — POSIX only promises atomicity below PIPE_BUF
+             * — but blocking is what a caller expects and what makes the
+             * common "write a line, read the answer" pattern work
+             * without a loop on their side.
+             */
+            sched_block_on(p, 50);
+            continue;
+        }
+
+        uint32_t room = VFS_PIPE_SIZE - p->len;
+        uint32_t n = len - done;
+        if (n > room) n = room;
+        for (uint32_t i = 0; i < n; i++) {
+            p->buf[p->head] = in[done + i];
+            p->head = (p->head + 1) % VFS_PIPE_SIZE;
+        }
+        p->len += n;
+        done += n;
+        sched_wake_chan(p, 1);
+    }
+    return (int64_t)done;
+}
+
+/*
+ * Both ends at once.
+ *
+ * The two descriptors are taken before either is filled in, because
+ * vfs_alloc hands back the lowest free number and taking the second
+ * after the first is initialised would be fine — but taking both first
+ * makes the failure path one branch instead of two. `flags` carries
+ * O_CLOEXEC, which is the only one pipe2 has that this system can
+ * honour: O_NONBLOCK would need a non-blocking read, and there is no
+ * readiness interface behind these descriptors to build one on.
+ */
+static struct vfs_pipe *vfs_ring_new(void) {
+    struct vfs_pipe *p = (struct vfs_pipe *)kmalloc(sizeof(struct vfs_pipe));
+    if (!p) return 0;
+    for (uint64_t i = 0; i < sizeof(*p); i++) ((uint8_t *)p)[i] = 0;
+    p->buf = (uint8_t *)kmalloc_pool(VFS_PIPE_SIZE, KPOOL_PAGED);
+    if (!p->buf) { kfree(p); return 0; }
+    return p;
+}
+
+static void vfs_ring_free(struct vfs_pipe *p) {
+    if (!p) return;
+    if (p->buf) kfree(p->buf);
+    kfree(p);
+}
+
+/*
+ * Both ends at once, for a pipe and for a socketpair.
+ *
+ * `two_way` is the whole difference. A pipe is one ring: the first
+ * descriptor reads it and the second writes it, and each end can do only
+ * its own half. A socketpair is two rings crossed: each descriptor reads
+ * one and writes the other, so both ends can do both — which is what
+ * makes it a *pair of sockets* rather than a pipe, and is the only thing
+ * a program uses one for.
+ *
+ * The two descriptors are taken before either is filled in, so the
+ * failure path is one branch rather than two. `flags` carries O_CLOEXEC,
+ * which is the only one this system can honour: O_NONBLOCK would need a
+ * non-blocking read, and blocking is what these descriptors are for.
+ */
+static int vfs_pipe_create(addr_space_t *as, int fds[2], uint32_t flags,
+                           int two_way) {
+    if (!as) return -VXE_PERM;
+
+    const int afd = vfs_alloc(as);
+    if (afd < 0) return afd;
+    /* Claimed so the second allocation cannot hand back the same number;
+     * filled in properly below. */
+    as->files->d[afd].kind = FD_PIPE;
+
+    const int bfd = vfs_alloc(as);
+    if (bfd < 0) { vfs_desc_reset(&as->files->d[afd]); return bfd; }
+
+    struct vfs_pipe *ab = vfs_ring_new();          /* a writes, b reads */
+    struct vfs_pipe *ba = two_way ? vfs_ring_new() : 0;
+    if (!ab || (two_way && !ba)) {
+        vfs_ring_free(ab);
+        vfs_ring_free(ba);
+        vfs_desc_reset(&as->files->d[afd]);
+        vfs_desc_reset(&as->files->d[bfd]);
+        return -VXE_NOMEM;
+    }
+
+    const uint8_t ce = (flags & VX_O_CLOEXEC) ? 1 : 0;
+
+    vfs_desc_t *a = &as->files->d[afd];
+    vfs_desc_reset(a);
+    a->kind = FD_PIPE; a->cloexec = ce; a->sock = -1;
+    vfs_desc_t *b = &as->files->d[bfd];
+    vfs_desc_reset(b);
+    b->kind = FD_PIPE; b->cloexec = ce; b->sock = -1;
+
+    if (two_way) {
+        a->prd = ba; a->pwr = ab;
+        b->prd = ab; b->pwr = ba;
+        a->readable = a->writable = 1;
+        b->readable = b->writable = 1;
+        ab->writers = 1; ab->readers = 1;
+        ba->writers = 1; ba->readers = 1;
+        str_copy(a->path, "socketpair:0", sizeof(a->path));
+        str_copy(b->path, "socketpair:1", sizeof(b->path));
+    } else {
+        /* fds[0] reads and fds[1] writes, which is the order pipe(2) has
+         * had since the seventh edition and which every caller assumes
+         * without checking. */
+        a->prd = ab; a->readable = 1;
+        b->pwr = ab; b->writable = 1; b->pipe_w = 1;
+        ab->readers = 1; ab->writers = 1;
+        str_copy(a->path, "pipe:read", sizeof(a->path));
+        str_copy(b->path, "pipe:write", sizeof(b->path));
+    }
+
+    fds[0] = afd;
+    fds[1] = bfd;
+    return 0;
+}
+
+/*
+ * Is this descriptor ready?
+ *
+ * The whole of the readiness interface this system has, and it is
+ * deliberately answered per-kind rather than by asking a driver, because
+ * for four of the six kinds the answer is a constant that is *true*
+ * rather than a convenient lie: a file, a directory and a device node
+ * are always ready — a read from them completes without waiting on
+ * anything but the disk — and the console has no input at all, so it is
+ * writable and never readable.
+ *
+ * A pipe is the interesting one and the reason this exists. A socket is
+ * reported ready and that is the honest limit of it: lwIP's readiness is
+ * not exposed through vxnet, so a poll on a socket says "try", and the
+ * recv that follows blocks. Said here rather than discovered.
+ */
+#define VFS_READY_READ  1
+#define VFS_READY_WRITE 2
+#define VFS_READY_HUP   4
+
+static int vfs_ready(addr_space_t *as, int fd) {
+    const int kind = vfs_kind_of(as, fd);
+    if (kind == FD_FREE) return -1;
+    if (kind == FD_CONSOLE) return VFS_READY_WRITE;
+
+    vfs_desc_t *d = vfs_get(as, fd);
+    if (!d) return -1;
+
+    if (kind == FD_PIPE) {
+        int r = 0;
+        if (d->prd) {
+            /* Data, or no writer left — and the second is readable in
+             * the sense that matters: a read returns immediately, with
+             * zero, which is what the caller needs to be told. */
+            if (d->prd->len) r |= VFS_READY_READ;
+            if (!d->prd->writers) r |= (VFS_READY_READ | VFS_READY_HUP);
+        }
+        if (d->pwr) {
+            if (d->pwr->len < VFS_PIPE_SIZE) r |= VFS_READY_WRITE;
+            if (!d->pwr->readers) r |= VFS_READY_HUP;
+        }
+        if (!d->prd && !d->pwr) r = VFS_READY_HUP;
+        return r;
+    }
+
+    int r = VFS_READY_WRITE;
+    if (d->readable) r |= VFS_READY_READ;
+    return r;
+}
 
 /*
  * The nodes under /dev, which are not on the volume and must answer

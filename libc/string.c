@@ -170,3 +170,28 @@ char *strtok(char *s, const char *sep) {
     else      save = 0;
     return tok;
 }
+
+/*
+ * ---- stpcpy and stpncpy ----
+ *
+ * The difference from strcpy is the return value and it is the whole
+ * point: the end rather than the beginning, so that a second append does
+ * not have to walk the first string again. See the note in string.h.
+ *
+ * stpncpy keeps strncpy's padding rule, which is the surprising half:
+ * if the source is shorter than n, the remainder of the destination is
+ * filled with NULs, and the pointer returned is to the *first* of them
+ * rather than to the end of the buffer.
+ */
+char *stpcpy(char *dst, const char *src) {
+    while ((*dst = *src) != '\0') { dst++; src++; }
+    return dst;
+}
+
+char *stpncpy(char *dst, const char *src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i] != '\0'; i++) dst[i] = src[i];
+    char *end = dst + i;
+    for (; i < n; i++) dst[i] = '\0';
+    return end;
+}

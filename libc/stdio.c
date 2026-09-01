@@ -1289,3 +1289,13 @@ int scanf(const char *fmt, ...) {
     va_end(ap);
     return n;
 }
+
+/*
+ * A temporary file, which this system cannot make. See the long note in
+ * stdio.h: NULL with errno is what the standard says a failure looks
+ * like, and it is what every caller already handles.
+ */
+FILE *tmpfile(void) {
+    errno = ENOSYS;
+    return NULL;
+}

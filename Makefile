@@ -49,11 +49,31 @@ ifeq ($(filter clean cleandisk,$(MAKECMDGOALS)),)
 NEED    := $(CC) $(LD) $(HOSTCC) python3 xorriso
 MISSING := $(strip $(foreach t,$(NEED), \
              $(if $(shell command -v $(t) 2>/dev/null),,$(t))))
+
+# bison is checked by *version*, not by name, and it is the one tool
+# here where that matters. libxkbcommon's parser is the only generated
+# source in the tree that no tarball ships pre-made, and its very first
+# directive -- `%define api.pure` -- is bison 2.3b syntax. macOS ships
+# 2.3, which is on the PATH, answers `command -v`, and then stops with
+# "syntax error, unexpected identifier, expecting string". Homebrew's
+# bison is keg-only and deliberately does *not* shadow it, so BISON in
+# the libxkbcommon section looks in the cellar first; this probe asks
+# whichever one that resolves to what version it is.
+BISON_OK := $(shell b=/opt/homebrew/opt/bison/bin/bison; \
+              [ -x $$b ] || b=/usr/local/opt/bison/bin/bison; \
+              [ -x $$b ] || b=`command -v bison 2>/dev/null`; \
+              [ -n "$$b" ] && "$$b" --version 2>/dev/null | head -1 | \
+                awk '{ split($$NF, v, "."); \
+                       if (v[1] > 2 || (v[1] == 2 && v[2] >= 4)) print "y" }')
+ifneq ($(BISON_OK),y)
+MISSING := $(MISSING) bison>=2.4
+endif
+
 ifneq ($(MISSING),)
 $(info )
 $(info   Cannot build. Missing: $(MISSING))
 $(info )
-$(info   macOS:  brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu)
+$(info   macOS:  brew install x86_64-elf-gcc x86_64-elf-binutils xorriso qemu bison)
 $(info )
 $(info   Linux:  xorriso and qemu-system-x86 are packaged; an x86_64-elf)
 $(info           cross toolchain generally is not. Build one -- the OSDev)
@@ -294,20 +314,53 @@ test: build/wikidoc_test build/profile_test build/ttfhint_test build/crypto_test
 	@./build/wifi_test
 	@./build/media_test
 	@./build/rdp_test
-	@mkdir -p build/scratch
+	@mkdir -p build/scratch build/scratch/many
 	@printf "vextro ntfs scratch\\n" > build/scratch/a.txt
 	@printf "hello from a subdirectory\\n" > build/scratch/b.txt
 	@head -c 300000 /dev/urandom > build/scratch/big.bin
 	@rm -f build/scratch/ntfs.img build/scratch/tree.img
 	@python3 tools/mkntfs.py build/scratch/ntfs.img 16 \
 	         build/scratch/a.txt > /dev/null
+	@# 400 names in one directory, which is past what a single index
+	@# block holds at any name length -- so /many is a B-tree of at
+	@# least two levels whose root node is separators rather than
+	@# entries, and it is built by the *formatter*.
+	@#
+	@# That is a different code path from the one the kernel takes when
+	@# it grows a directory, and only the kernel's had a test.
+	@# tools/mkntfs.py wrote a single resident $$INDEX_ROOT and said in a
+	@# comment that it "keeps every directory small enough that it does
+	@# not have to" spill -- which stopped being true the first time a
+	@# directory had two hundred names in it, and presented as
+	@# `MFT record 104 overflows (12984 > 4096)` with no volume written.
+	@i=0; while [ $$i -lt 400 ]; do \
+	    printf 'entry %d\n' $$i > build/scratch/many/file-$$i.txt; \
+	    i=$$((i + 1)); \
+	done
 	@python3 tools/mkntfs.py build/scratch/tree.img 2048 \
 	         build/scratch/a.txt \
 	         build/scratch/b.txt:docs/readme.txt \
-	         build/scratch/big.bin:store/pkg/big.bin > /dev/null
+	         build/scratch/big.bin:store/pkg/big.bin \
+	         $$(for f in build/scratch/many/*.txt; do \
+	                echo "$$f:many/$${f##*/}"; done) > /dev/null
 	@./build/ntfs_test build/scratch/ntfs.img build/scratch/tree.img
 	@python3 tools/ntfsdir.py build/scratch/tree.img /big > /dev/null && \
 	 echo "  ok   an independent reader agrees about the B-tree"
+	@# The same independent reader on the formatter's tree. It parses the
+	@# image itself, so it is the half that would notice a tree only this
+	@# formatter can read -- and it checks the order, because a
+	@# mis-sorted B-tree is not a tree that loses names, it is one whose
+	@# binary search walks past them.
+	@n=`python3 tools/ntfsdir.py build/scratch/tree.img /many | \
+	    sed -n 's/^.*: \([0-9]*\) entries.*/\1/p'`; \
+	 o=`python3 tools/ntfsdir.py build/scratch/tree.img /many | \
+	    grep -c ascending`; \
+	 if [ "$$n" = "400" ] && [ "$$o" = "1" ]; then \
+	     echo "  ok   a formatter-built B-tree: 400 names, in order"; \
+	 else \
+	     echo "  FAIL a formatter-built directory lost names ($$n of 400)"; \
+	     exit 1; \
+	 fi
 	@./build/vmx_test
 	@./build/av_test
 	@./build/mbedtls_test $(TLS_HOST) $(TLS_PORT)
@@ -662,6 +715,15 @@ ASSET_FILES := assets/wiki.zim assets/qwen2.gguf assets/explain.gguf
 # its contents change, and .gitignore covers it.
 ASSET_LIST  := .assets.list
 
+# The keymap data's staging directory, hoisted here from the
+# libxkbcommon block far below because `disk.img` names it as a
+# *prerequisite*, and make expands a prerequisite list immediately --
+# a variable defined later in the file is empty at that point, and the
+# symptom is a rule that asks for `/.stamp`. Everything else about
+# libxkbcommon stays together down there; only this one name has to be
+# in scope before line 750.
+XKBCONF_STAGE := build/xkbdata
+
 .PHONY: assets
 assets:
 	@python3 tools/fetch_assets.py --dest assets --ask-again \
@@ -745,12 +807,24 @@ build/ca-bundle.crt:
 # at boot and cannot use a fragmented one; and it allocates every file
 # sequentially, because without $ATTRIBUTE_LIST a fragmented 937 MB
 # archive's run list would not fit in its own MFT record.
-disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt
+# The keymap data is listed by *walking* build/xkbdata rather than by
+# naming its files here: it is xkeyboard-config's tree, 251 files under
+# four directories, and its shape is not this Makefile's to know. The
+# walk is a shell loop for the same reason $big below is one -- the
+# directory is produced by a download, so it does not exist when make
+# parses this file and a $(wildcard) would quietly expand to nothing.
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest build/gcrypttest build/tasn1test build/xkbtest build/xmltest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt $(XKBCONF_STAGE)/.stamp
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
 	    if [ -f "$$f" ]; then big="$$big $$f"; fi; \
 	done; \
+	xkb=""; \
+	if [ -d $(XKBCONF_STAGE) ]; then \
+	    for f in `cd $(XKBCONF_STAGE) && find . -type f ! -name .stamp | sed 's|^\./||'`; do \
+	        xkb="$$xkb $(XKBCONF_STAGE)/$$f:etc/xkb/$$f"; \
+	    done; \
+	fi; \
 	cmd="python3 tools/mkntfs.py disk.img $(DISK_MB) \
 		apps/about.txt apps/notes.txt build/hello build/faulter \
 		build/mutextest \
@@ -766,6 +840,10 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		build/vlstest \
 		build/jpegtest \
 		build/gltest \
+		build/gcrypttest \
+		build/tasn1test \
+		build/xkbtest \
+		build/xmltest \
 		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
 		$(ICU_DATA):icudt74l.dat \
 		build/sqlseed.db:sqlseed.db \
@@ -773,12 +851,13 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		apps/welcome.txt:docs/welcome.txt \
 		build/ca-bundle.crt:etc/ca-bundle.crt \
 		$$big \
+		$$xkb \
 		$(foreach a,$(STORE_APPS),build/store/$(a).vx:store/pkg/$(a).vx) \
 		$(foreach p,$(PIC_NAMES),build/pics/$(p).sci:pics/$(p).sci) \
 		$(foreach t,$(MUSIC_NAMES),build/music/$(t).wav:music/$(t).wav) \
 		$$(test -f build/music/bell.flac && \
 		   echo build/music/bell.flac:music/bell.flac)"; \
-	echo "$$cmd"; \
+	echo "python3 tools/mkntfs.py disk.img $(DISK_MB) ... `echo $$xkb | wc -w | tr -d ' '` files under etc/xkb"; \
 	$$cmd
 
 cleandisk:
@@ -1554,10 +1633,774 @@ $(EPOXY_DIR)/src/dispatch_common.c:
 	@tar -C $(EPOXY_DIR) --strip-components=1 -xzf build/$(EPOXY_TARBALL)
 	@echo "  EPOXY    $(EPOXY_DIR) ($(EPOXY_VERSION))"
 
+# --- libgpg-error 1.50 and libgcrypt 1.10.3 ---
+#
+# `OptionsWPE.cmake:12`, and two libraries rather than one: libgcrypt's
+# error type, its locks and its in-memory streams are all libgpg-error's,
+# so there is no way to have the second without the first.
+#
+# ---- what is different about these two ----
+#
+# Every port before them shipped either a hand-editable configuration
+# (FreeType, libjpeg) or a generator that runs standalone (libepoxy's
+# Python). These are autotools, and autotools does not merely *write* a
+# config.h — it writes several headers by running programs it has just
+# compiled. libgpg-error needs four generated headers and two host tools
+# to make them, and libgcrypt needs three more.
+#
+# All of it is reproduced below rather than checked in, because the
+# inputs are in the tarballs and the outputs are derived. The one that
+# matters is the errno table:
+#
+#   mkerrcodes.h is produced with the **cross** preprocessor, against
+#   libc/include/errno.h, because the table maps this system's errno
+#   values onto GPG_ERR_* names. Generated with the host's preprocessor
+#   instead it would carry macOS's numbers — EOPNOTSUPP is 102 there and
+#   95 here — and every gpg_error_from_errno would be quietly wrong. The
+#   tool that consumes it is then compiled *for the host*, because it has
+#   to run; its data is the cross compiler's.
+#
+# ---- and the arch flag that is not an extension ----
+#
+# libgcrypt is built with no CPU-extension assembly at all — no AES-NI,
+# no AVX, no SHA-EXT — because those are selected at run time from CPUID
+# through a hwfeatures layer whose .S files upstream's own build
+# assembles. HAVE_CPU_ARCH_X86 *is* set, and the long note in
+# third_party/libgcrypt-port/config.h explains why that is not a
+# contradiction: it selects base `addq`/`adcq` in the bignum inline
+# helpers, and without it a 64-bit build silently takes ec-inline.h's
+# 32-bit limb path and fails to assemble four files away.
+GPGERROR_VERSION := 1.50
+GPGERROR_TARBALL := libgpg-error-$(GPGERROR_VERSION).tar.bz2
+GPGERROR_URL     := https://gnupg.org/ftp/gcrypt/libgpg-error/$(GPGERROR_TARBALL)
+GPGERROR_SHA256  := 69405349e0a633e444a28c5b35ce8f14484684518a508dc48a089992fe93e20a
+GPGERROR_DIR     := third_party/libgpg-error
+GPGERROR_PORT    := third_party/libgpg-error-port
+GPGERROR_GEN     := build/gpgerror
+
+GCRYPT_VERSION := 1.10.3
+GCRYPT_TARBALL := libgcrypt-$(GCRYPT_VERSION).tar.bz2
+GCRYPT_URL     := https://gnupg.org/ftp/gcrypt/libgcrypt/$(GCRYPT_TARBALL)
+GCRYPT_SHA256  := 8b0870897ac5ac67ded568dcfadf45969cfa8a6beb0fd60af2a9eadc2a3272aa
+GCRYPT_DIR     := third_party/libgcrypt
+GCRYPT_PORT    := third_party/libgcrypt-port
+GCRYPT_GEN     := build/gcrypt
+
+# --- libgpg-error's generated headers ---
+#
+# err-codes.h and err-sources.h ship pre-generated in the tarball; these
+# four do not.
+$(GPGERROR_GEN)/code-to-errno.h: $(GPGERROR_DIR)/src/errnos.in \
+                                 $(GPGERROR_DIR)/src/mkerrnos.awk
+	@mkdir -p $(GPGERROR_GEN)
+	@awk -f $(GPGERROR_DIR)/src/mkerrnos.awk $< > $@
+
+# The one that has to see *our* errno.h. See the note above.
+$(GPGERROR_GEN)/mkerrcodes.h: $(GPGERROR_DIR)/src/errnos.in \
+                              libc/include/errno.h
+	@mkdir -p $(GPGERROR_GEN)
+	@awk -f $(GPGERROR_DIR)/src/mkerrcodes1.awk $< > $(GPGERROR_GEN)/_mkerrcodes.h
+	@$(CC) -E -P -Ilibc/include $(GPGERROR_GEN)/_mkerrcodes.h 2>/dev/null \
+	  | grep GPG_ERR_ \
+	  | awk -f $(GPGERROR_DIR)/src/mkerrcodes.awk > $@
+	@rm -f $(GPGERROR_GEN)/_mkerrcodes.h
+
+# Compiled for the *host* because it has to run; fed the table above,
+# which the cross compiler produced.
+$(GPGERROR_GEN)/code-from-errno.h: $(GPGERROR_GEN)/mkerrcodes.h
+	@cc -O1 -I$(GPGERROR_GEN) -I$(GPGERROR_DIR)/src \
+	    -o $(GPGERROR_GEN)/mkerrcodes $(GPGERROR_DIR)/src/mkerrcodes.c
+	@$(GPGERROR_GEN)/mkerrcodes \
+	  | awk -f $(GPGERROR_DIR)/src/mkerrcodes2.awk > $@
+
+# The public header, assembled by upstream's own mkheader from six
+# inputs. `--cross x86_64-unknown-linux-gnu` picks the shipped
+# lock-obj-pub for that triplet, whose forty reserved bytes comfortably
+# hold this system's sixteen-byte pthread_mutex_t; nothing else in the
+# header keys on the name.
+$(GPGERROR_GEN)/gpg-error.h: $(GPGERROR_PORT)/config.h \
+                             $(GPGERROR_DIR)/src/gpg-error.h.in \
+                             $(GPGERROR_GEN)/code-from-errno.h \
+                             $(GPGERROR_GEN)/code-to-errno.h
+	@mkdir -p $(GPGERROR_GEN)
+	@cp $(GPGERROR_PORT)/config.h $(GPGERROR_GEN)/config.h
+	@cc -O1 -I$(GPGERROR_GEN) -I$(GPGERROR_DIR)/src \
+	    -o $(GPGERROR_GEN)/mkheader $(GPGERROR_DIR)/src/mkheader.c
+	@# Every path quoted, because this checkout lives in a directory with
+	@# a space in its name and mkheader is run from another directory —
+	@# the same hazard vextro-toolchain.cmake documents at length, in the
+	@# one build step that has to cd.
+	@cd $(GPGERROR_DIR)/src && "$(CURDIR)/$(GPGERROR_GEN)/mkheader" \
+	    --cross x86_64-unknown-linux-gnu gpg-error.h.in \
+	    "$(CURDIR)/$(GPGERROR_GEN)/config.h" 1.50 0x013200 \
+	    > "$(CURDIR)/$@"
+	@cp $@ $(GPGERROR_GEN)/gpgrt.h
+	@echo "  GEN    $(GPGERROR_GEN)/gpg-error.h (errno table from libc/include/errno.h)"
+
+GPGERROR_NAMES := posix-lock posix-thread spawn-posix init version estream \
+                  estream-printf strsource strerror code-to-errno \
+                  code-from-errno visibility sysutils stringutils \
+                  syscall-clamp logging b64dec b64enc argparse
+GPGERROR_OBJ := $(addprefix $(GPGERROR_GEN)/obj/,$(addsuffix .o,$(GPGERROR_NAMES)))
+
+GPGERROR_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w -DHAVE_CONFIG_H \
+                   -I$(GPGERROR_GEN) -I$(GPGERROR_DIR)/src -I$(GPGERROR_DIR) \
+                   -Ilibc/include
+
+$(GPGERROR_GEN)/obj/%.o: $(GPGERROR_DIR)/src/%.c $(GPGERROR_GEN)/gpg-error.h
+	@mkdir -p $(GPGERROR_GEN)/obj
+	$(CC) $(GPGERROR_CFLAGS) -c $< -o $@
+
+build/libgpg-error.a: $(GPGERROR_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  GPGERR build/libgpg-error.a ($(GPGERROR_VERSION))"
+
+# --- libgcrypt's generated headers ---
+#
+# gcrypt.h from the .in by substitution; gost-sb.h from a host tool that
+# emits the GOST substitution boxes; mod-source-info.h names which bignum
+# sources were used, which for this build is the portable C.
+$(GCRYPT_GEN)/gost-sb.h: $(GCRYPT_DIR)/cipher/gost-s-box.c
+	@mkdir -p $(GCRYPT_GEN)
+	@cc -O1 -o $(GCRYPT_GEN)/gost-s-box $<
+	@cd "$(GCRYPT_GEN)" && ./gost-s-box gost-sb.h
+
+$(GCRYPT_GEN)/mod-source-info.h:
+	@mkdir -p $(GCRYPT_GEN)
+	@printf '/* Generated: this build uses the portable C bignum. */\nstatic char mod_source_info[] = "\\n * generic C (no assembly modules)";\n' > $@
+
+# mpi.h says #include "../mpi/mpi-asm-defs.h", which upstream's configure
+# creates by linking an architecture directory into place. Resolved here
+# through the include path instead — -I$(GCRYPT_GEN) makes
+# `../mpi/mpi-asm-defs.h` land on build/mpi/ — so nothing in the vendored
+# tree is written to.
+build/mpi/mpi-asm-defs.h: $(GCRYPT_DIR)/mpi/generic/mpi-asm-defs.h
+	@mkdir -p build/mpi
+	@cp $< $@
+
+$(GCRYPT_GEN)/gcrypt.h: $(GCRYPT_PORT)/gcrypt.h
+	@mkdir -p $(GCRYPT_GEN)
+	@cp $< $@
+
+GCRYPT_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+                 -D_GCRYPT_IN_LIBGCRYPT -DHAVE_CONFIG_H \
+                 -I$(GCRYPT_GEN) -I$(GCRYPT_DIR)/src -I$(GCRYPT_DIR)/mpi \
+                 -I$(GCRYPT_DIR)/mpi/generic -I$(GCRYPT_DIR) -Ilibc/include
+
+# Every .c in cipher/ that is not written for a particular instruction
+# set. The exclusions are by name because upstream's own file naming is
+# the only marker: rijndael-aesni.c, sha256-avx2-bmi2-amd64.S and so on.
+GCRYPT_CIPHER_SRC := $(shell ls $(GCRYPT_DIR)/cipher/*.c 2>/dev/null | \
+    grep -vE '(armv|aarch64|-ppc|s390x|intel|amd64|avx|sse|ssse3|-x86|-arm|neon|aesni|padlock|riscv|-p10|vpmsum|vaes|gfni|-c-|ppc8)')
+GCRYPT_MPI_NAMES := mpi-add mpi-bit mpi-cmp mpi-div mpi-gcd mpi-inline \
+                    mpi-inv mpi-mul mpi-mod mpi-pow mpi-mpow mpi-scan \
+                    mpicoder mpih-div mpih-mul mpih-const-time mpiutil \
+                    ec ec-ed25519 ec-nist
+GCRYPT_GEN_NAMES := mpih-add1 mpih-lshift mpih-mul1 mpih-mul2 mpih-mul3 \
+                    mpih-rshift mpih-sub1 udiv-w-sdiv
+GCRYPT_SRC_NAMES := visibility misc global sexp hwfeatures hwf-x86 stdmem \
+                    secmem missing-string fips context const-time
+GCRYPT_RND_NAMES := random random-csprng random-drbg random-system \
+                    rndgetentropy rndhw rndjent
+
+GCRYPT_OBJ := $(patsubst $(GCRYPT_DIR)/cipher/%.c,$(GCRYPT_GEN)/obj/c_%.o,$(GCRYPT_CIPHER_SRC)) \
+              $(addprefix $(GCRYPT_GEN)/obj/m_,$(addsuffix .o,$(GCRYPT_MPI_NAMES))) \
+              $(addprefix $(GCRYPT_GEN)/obj/g_,$(addsuffix .o,$(GCRYPT_GEN_NAMES))) \
+              $(addprefix $(GCRYPT_GEN)/obj/s_,$(addsuffix .o,$(GCRYPT_SRC_NAMES))) \
+              $(addprefix $(GCRYPT_GEN)/obj/r_,$(addsuffix .o,$(GCRYPT_RND_NAMES))) \
+              $(GCRYPT_GEN)/obj/z_compat.o
+
+GCRYPT_DEPS := $(GCRYPT_GEN)/config.h $(GCRYPT_GEN)/gcrypt.h \
+               $(GCRYPT_GEN)/gost-sb.h $(GCRYPT_GEN)/mod-source-info.h \
+               build/mpi/mpi-asm-defs.h $(GCRYPT_GEN)/gpg-error.h
+
+# libgcrypt includes <gpg-error.h>, so the generated header is copied
+# beside its own rather than reached with a second -I: the two libraries
+# are staged into one include directory in the sysroot too, and a build
+# that found it only through an extra flag would not match what a
+# consumer sees.
+$(GCRYPT_GEN)/gpg-error.h: $(GPGERROR_GEN)/gpg-error.h
+	@mkdir -p $(GCRYPT_GEN)
+	@cp $(GPGERROR_GEN)/gpg-error.h $@
+	@cp $(GPGERROR_GEN)/gpgrt.h $(GCRYPT_GEN)/gpgrt.h
+
+$(GCRYPT_GEN)/config.h: $(GCRYPT_PORT)/config.h
+	@mkdir -p $(GCRYPT_GEN)
+	@cp $< $@
+
+$(GCRYPT_GEN)/obj/c_%.o: $(GCRYPT_DIR)/cipher/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+$(GCRYPT_GEN)/obj/m_%.o: $(GCRYPT_DIR)/mpi/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+$(GCRYPT_GEN)/obj/g_%.o: $(GCRYPT_DIR)/mpi/generic/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+$(GCRYPT_GEN)/obj/s_%.o: $(GCRYPT_DIR)/src/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+$(GCRYPT_GEN)/obj/r_%.o: $(GCRYPT_DIR)/random/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+$(GCRYPT_GEN)/obj/z_%.o: $(GCRYPT_DIR)/compat/%.c $(GCRYPT_DEPS)
+	@mkdir -p $(GCRYPT_GEN)/obj
+	$(CC) $(GCRYPT_CFLAGS) -c $< -o $@
+
+build/libgcrypt.a: $(GCRYPT_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  GCRYPT build/libgcrypt.a ($(GCRYPT_VERSION), portable C, no extension asm)"
+
+.PHONY: gcrypt
+gcrypt: build/libgcrypt.a build/libgpg-error.a
+
+$(GPGERROR_DIR)/src/gpg-error.h.in:
+	@echo "  fetching $(GPGERROR_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(GPGERROR_TARBALL) $(GPGERROR_URL)
+	@printf '%s  build/%s\n' "$(GPGERROR_SHA256)" "$(GPGERROR_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(GPGERROR_TARBALL) does not match its checksum."; \
+		     rm -f build/$(GPGERROR_TARBALL); exit 1; }
+	@rm -rf $(GPGERROR_DIR)
+	@mkdir -p $(GPGERROR_DIR)
+	@tar -C $(GPGERROR_DIR) --strip-components=1 -xjf build/$(GPGERROR_TARBALL)
+
+$(GCRYPT_DIR)/src/gcrypt.h.in:
+	@echo "  fetching $(GCRYPT_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(GCRYPT_TARBALL) $(GCRYPT_URL)
+	@printf '%s  build/%s\n' "$(GCRYPT_SHA256)" "$(GCRYPT_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(GCRYPT_TARBALL) does not match its checksum."; \
+		     rm -f build/$(GCRYPT_TARBALL); exit 1; }
+	@rm -rf $(GCRYPT_DIR)
+	@mkdir -p $(GCRYPT_DIR)
+	@tar -C $(GCRYPT_DIR) --strip-components=1 -xjf build/$(GCRYPT_TARBALL)
+
+# --- libtasn1 4.19.0 ---
+#
+# `OptionsWPE.cmake:13`, and the smallest port in this file.
+#
+# libtasn1 is a DER encoder and decoder: it reads an ASN.1 module
+# definition, builds a tree from it, and then encodes and decodes byte
+# strings against that tree. WebKit uses it in exactly one place --
+# Source/WebCore/PAL/pal/crypto/tasn1/Utilities.cpp -- to take WebCrypto
+# keys apart and put them back together, through eight functions:
+# asn1_array2tree, asn1_create_element, asn1_der_decoding2,
+# asn1_read_value, asn1_read_value_type, asn1_der_coding,
+# asn1_write_value and asn1_delete_structure. apps/tasn1test.c exercises
+# those eight and nothing else, because that is the interface that has
+# to work.
+#
+# ---- why this one is short ----
+#
+# Autotools again, and this time almost none of it matters. libgpg-error
+# needed two host tools and four generated headers; libtasn1 needs
+# neither. The bison parser is *shipped pre-generated* in the tarball as
+# lib/ASN1.c, so there is no bison dependency, and the public header is
+# shipped with its version numbers already substituted, so there is no
+# mkheader step. What is left is a config.h, which is hand-written in
+# third_party/libtasn1-port/ and explains itself.
+#
+# ---- the eleven objects, and the two that look optional ----
+#
+# Nine are upstream's lib_LTLIBRARIES sources. The other two come from
+# lib/gl/, which is a three-module gnulib slice:
+#
+#   c-ctype.c      is not dead weight. Under the _GL_INLINE block that
+#                  config.h reproduces, this compiler gives c-ctype.h's
+#                  functions C99 `inline` semantics, which emit *no*
+#                  out-of-line definition -- and c-ctype.c is the one
+#                  translation unit that does, via _GL_EXTERN_INLINE. At
+#                  -O2 every call inlines and the omission is invisible;
+#                  it would surface later as an undefined c_isdigit from
+#                  an -O0 build or a taken address. `nm` on the object
+#                  shows fifteen T symbols, which is the check.
+#   strverscmp.c   is the function this C library does not have, called
+#                  by asn1_check_version. gnulib's implementation rather
+#                  than one written here: it is upstream's own, it is
+#                  already proven against this libc, and it keeps the
+#                  LGPL code inside the vendored boundary.
+#
+# gl/unistd.c is the one gnulib source deliberately left out. It exists
+# to house the inline functions of gnulib's *replacement* <unistd.h>,
+# which this build does not use -- our own is on the include path -- so
+# it would compile to `typedef int dummy;` and nothing else.
+#
+# ---- and the header this needed from libc ----
+#
+# parser_aux.c includes <limits.h> with the comment `/`* WORD_BIT *`/`
+# beside it and hashes every node name with `h >> (WORD_BIT - 9)`.
+# WORD_BIT was not in libc/include/limits.h; it is now, beside LONG_BIT,
+# which is where POSIX and musl both put them.
+TASN1_VERSION := 4.19.0
+TASN1_TARBALL := libtasn1-$(TASN1_VERSION).tar.gz
+TASN1_URL     := https://ftp.gnu.org/gnu/libtasn1/$(TASN1_TARBALL)
+TASN1_SHA256  := 1613f0ac1cf484d6ec0ce3b8c06d56263cc7242f1c23b30d82d23de345a63f7a
+TASN1_DIR     := third_party/libtasn1
+TASN1_PORT    := third_party/libtasn1-port
+TASN1_GEN     := build/tasn1
+
+TASN1_LIB_NAMES := ASN1 coding decoding element errors gstr parser_aux \
+                   structure version
+TASN1_GL_NAMES  := c-ctype strverscmp
+
+TASN1_OBJ := $(addprefix $(TASN1_GEN)/obj/l_,$(addsuffix .o,$(TASN1_LIB_NAMES))) \
+             $(addprefix $(TASN1_GEN)/obj/g_,$(addsuffix .o,$(TASN1_GL_NAMES)))
+
+# -DASN1_BUILDING is upstream's own AM_CPPFLAGS. With HAVE_VISIBILITY
+# left undefined it does not change what ASN1_API expands to -- both
+# arms reach the empty spelling, which is the right one for a static
+# archive -- but it is what includes/libtasn1.h keys on to know it is
+# being read by the library rather than by a consumer, and a port that
+# passed only the flags that happen to matter today would be one more
+# thing to rediscover.
+TASN1_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+                -DHAVE_CONFIG_H -DASN1_BUILDING \
+                -I$(TASN1_GEN) -I$(TASN1_DIR)/lib \
+                -I$(TASN1_DIR)/lib/includes -I$(TASN1_DIR)/lib/gl \
+                -Ilibc/include
+
+$(TASN1_GEN)/config.h: $(TASN1_PORT)/config.h
+	@mkdir -p $(TASN1_GEN)
+	@cp $< $@
+
+$(TASN1_GEN)/obj/l_%.o: $(TASN1_DIR)/lib/%.c $(TASN1_GEN)/config.h
+	@mkdir -p $(TASN1_GEN)/obj
+	$(CC) $(TASN1_CFLAGS) -c $< -o $@
+$(TASN1_GEN)/obj/g_%.o: $(TASN1_DIR)/lib/gl/%.c $(TASN1_GEN)/config.h
+	@mkdir -p $(TASN1_GEN)/obj
+	$(CC) $(TASN1_CFLAGS) -c $< -o $@
+
+build/libtasn1.a: $(TASN1_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  TASN1  build/libtasn1.a ($(TASN1_VERSION))"
+
+.PHONY: tasn1
+tasn1: build/libtasn1.a
+
+$(TASN1_DIR)/lib/includes/libtasn1.h:
+	@echo "  fetching $(TASN1_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(TASN1_TARBALL) $(TASN1_URL)
+	@printf '%s  build/%s\n' "$(TASN1_SHA256)" "$(TASN1_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(TASN1_TARBALL) does not match its checksum."; \
+		     rm -f build/$(TASN1_TARBALL); exit 1; }
+	@rm -rf $(TASN1_DIR)
+	@mkdir -p $(TASN1_DIR)
+	@tar -C $(TASN1_DIR) --strip-components=1 -xzf build/$(TASN1_TARBALL)
+
+# --- libxkbcommon 1.7.0, and the keymap data it reads ---
+#
+# `OptionsWPE.cmake:14`, and the first port here that is a library *and*
+# a body of data. Both halves are needed and the second is the larger:
+# libxkbcommon does not contain a keyboard layout, it contains a compiler
+# for the files that describe one, and those files are xkeyboard-config's.
+#
+# ---- what WebKit does with it ----
+#
+# One call, in Source/WebKit/WPEPlatform/wpe/WPEKeymapXKB.cpp:180:
+#
+#     struct xkb_rule_names names = { "evdev", "pc105", "us", "", "" };
+#     xkb_keymap_new_from_names(context, &names, ...)
+#
+# Those five strings are Rules, Model, Layout, Variant and Options, and
+# resolving them means *reading files*: rules/evdev is a table that maps
+# the five onto a keycodes file, a types file, a compat file and a
+# symbols expression, each of which is then found by name under the
+# config root. So a build that staged only the archive would produce a
+# browser whose keymap is NULL. apps/xkbtest.c makes that exact call.
+#
+# ---- three host tools, and one of them is not on the PATH ----
+#
+# **bison.** src/xkbcomp/parser.y is the one generated source that does
+# *not* ship pre-made in this tarball (ks_tables.h and keywords.c both
+# do), so the parser is generated at build time. macOS's own bison is
+# 2.3 and libxkbcommon wants >= 2.3a, which is not a formality: the very
+# first directive, `%define api.pure`, is 2.3b syntax and 2.3 stops on it
+# with "syntax error, unexpected identifier, expecting string". Homebrew's
+# bison 3.8.2 is keg-only -- installing it does **not** change what
+# `bison` means on the PATH -- so BISON below looks in the cellar first
+# and falls back to the PATH, and the toolchain check at the top of this
+# file tests the version rather than the name. Getting that wrong builds
+# here and fails on the next clean machine with the error above.
+#
+# **python3**, already required by tools/mkntfs.py, to run
+# xkeyboard-config's own merge.py and map-variants.py.
+#
+# **pkg-config**, which is new and belongs to the `webkit` target rather
+# than to this one. FindLibxkbcommon.cmake is four lines long and has no
+# find_path/find_library fallback at all -- `pkg_check_modules(
+# LIBXKBCOMMON xkbcommon)` is the whole module -- so unlike every
+# package found so far, this one genuinely cannot be discovered without
+# it. The .pc file must be named xkbcommon.pc, after the module name in
+# that call, not after the library.
+XKB_VERSION := 1.7.0
+XKB_TARBALL := libxkbcommon-$(XKB_VERSION).tar.xz
+XKB_URL     := https://xkbcommon.org/download/$(XKB_TARBALL)
+XKB_SHA256  := 65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247
+XKB_DIR     := third_party/libxkbcommon
+XKB_PORT    := third_party/libxkbcommon-port
+XKB_GEN     := build/xkb
+
+XKBCONF_VERSION := 2.41
+XKBCONF_TARBALL := xkeyboard-config-$(XKBCONF_VERSION).tar.xz
+XKBCONF_URL     := https://www.x.org/archive/individual/data/xkeyboard-config/$(XKBCONF_TARBALL)
+XKBCONF_SHA256  := f02cd6b957295e0d50236a3db15825256c92f67ef1f73bf1c77a4b179edf728f
+XKBCONF_DIR     := third_party/xkeyboard-config
+# XKBCONF_STAGE is defined near ASSET_LIST; see the note there.
+
+# Homebrew's bison is keg-only by design -- macOS ships its own and brew
+# refuses to shadow it -- so the cellar path is tried first. See the note
+# above for what happens with the 2.3 that would otherwise answer.
+BISON := $(shell if [ -x /opt/homebrew/opt/bison/bin/bison ]; then \
+                     echo /opt/homebrew/opt/bison/bin/bison; \
+                 elif [ -x /usr/local/opt/bison/bin/bison ]; then \
+                     echo /usr/local/opt/bison/bin/bison; \
+                 else echo bison; fi)
+
+# The parser, generated into build/ rather than committed: it is derived
+# from parser.y in the vendored tree, which is the same rule libepoxy's
+# gl_generated.h is under.
+#
+# `-p _xkbcommon_` is upstream's (meson.build:163) and is load-bearing
+# rather than cosmetic. It renames every yy* symbol bison emits, so
+# yyparse becomes _xkbcommon_parse and yylex becomes _xkbcommon_lex --
+# which are the names src/xkbcomp/parser-priv.h *declares* and the names
+# scanner.c and parser.y themselves define. Generated without it, the
+# parser compiles against nothing: `implicit declaration of yylex`,
+# `implicit declaration of yyerror`, and a library that would have
+# exported a generic `yyparse` into every program that linked it.
+#
+# `-d` writes parser.h beside it, which parser-priv.h includes by plain
+# name and reaches through -I$(XKB_GEN).
+$(XKB_GEN)/parser.c: $(XKB_DIR)/src/xkbcomp/parser.y
+	@mkdir -p $(XKB_GEN)
+	@$(BISON) -p _xkbcommon_ -d -o $@ $<
+	@echo "  GEN    $(XKB_GEN)/parser.c ($$($(BISON) --version | head -1))"
+
+$(XKB_GEN)/config.h: $(XKB_PORT)/config.h
+	@mkdir -p $(XKB_GEN)
+	@cp $< $@
+
+# Upstream's meson libxkbcommon_sources, minus the headers. Split by
+# directory because there are two keymap.c and two parser.c in it --
+# src/keymap.c and src/xkbcomp/keymap.c are different files with
+# different jobs, and one object directory with no prefixes would have
+# silently kept whichever was compiled last.
+#
+# Not included, and deliberately: src/registry.c and src/util-list.c are
+# libxkbregistry, a separate library for *listing* available layouts that
+# needs libxml2 and that WebKit does not link; src/x11/ needs xcb.
+XKB_SRC_NAMES     := atom context context-priv keysym keysym-utf keymap \
+                     keymap-priv state text utf8 utils
+XKB_COMP_NAMES    := action ast-build compat expr include keycodes keymap \
+                     keymap-dump keywords rules scanner symbols types vmod \
+                     xkbcomp
+XKB_COMPOSE_NAMES := parser paths state table
+
+XKB_OBJ := $(addprefix $(XKB_GEN)/obj/s_,$(addsuffix .o,$(XKB_SRC_NAMES))) \
+           $(addprefix $(XKB_GEN)/obj/c_,$(addsuffix .o,$(XKB_COMP_NAMES))) \
+           $(addprefix $(XKB_GEN)/obj/p_,$(addsuffix .o,$(XKB_COMPOSE_NAMES))) \
+           $(XKB_GEN)/obj/y_parser.o
+
+XKB_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+              -DHAVE_CONFIG_H -I$(XKB_GEN) -I$(XKB_DIR)/src \
+              -I$(XKB_DIR)/include -I$(XKB_DIR) -Ilibc/include
+
+XKB_DEPS := $(XKB_GEN)/config.h $(XKB_GEN)/parser.c
+
+$(XKB_GEN)/obj/s_%.o: $(XKB_DIR)/src/%.c $(XKB_DEPS)
+	@mkdir -p $(XKB_GEN)/obj
+	$(CC) $(XKB_CFLAGS) -c $< -o $@
+$(XKB_GEN)/obj/c_%.o: $(XKB_DIR)/src/xkbcomp/%.c $(XKB_DEPS)
+	@mkdir -p $(XKB_GEN)/obj
+	$(CC) $(XKB_CFLAGS) -c $< -o $@
+$(XKB_GEN)/obj/p_%.o: $(XKB_DIR)/src/compose/%.c $(XKB_DEPS)
+	@mkdir -p $(XKB_GEN)/obj
+	$(CC) $(XKB_CFLAGS) -c $< -o $@
+# The generated parser is compiled from build/, and needs the vendored
+# xkbcomp directory on the include path because it includes its own
+# parser-priv.h and ast-build.h by relative name.
+$(XKB_GEN)/obj/y_parser.o: $(XKB_GEN)/parser.c $(XKB_GEN)/config.h
+	@mkdir -p $(XKB_GEN)/obj
+	$(CC) $(XKB_CFLAGS) -I$(XKB_DIR)/src/xkbcomp -c $< -o $@
+
+build/libxkbcommon.a: $(XKB_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  XKB    build/libxkbcommon.a ($(XKB_VERSION), no mmap, no x11)"
+
+.PHONY: xkbcommon
+xkbcommon: build/libxkbcommon.a
+
+# --- the keymap data, assembled the way xkeyboard-config assembles it ---
+#
+# rules/evdev does not ship. It is *merged* at build time from 44 parts:
+# 28 numbered fragments, 6 legacy-compatibility fragments, and 10 more
+# generated by compat/map-variants.py out of two mapping tables. The
+# order is by filename, which is why every fragment is numbered, and
+# merge.py additionally groups them under their `! model layout = ...`
+# section headers and emits each header once.
+#
+# All of that is upstream's, run here rather than reimplemented: the two
+# scripts are python3 and are in the tarball. Reproducing the merge by
+# hand would be a second implementation of a file format whose only
+# consumer is the library being ported.
+#
+# The legacy-compatibility parts are included -- meson's `compat-rules`
+# option, which defaults to true -- because the symbols tree that ships
+# beside them is the complete one. A rules file without them next to 195
+# symbols files is an inconsistent volume: the old layout names would
+# resolve to nothing and the failure would look like a broken keymap
+# rather than a missing table.
+XKBCONF_PARTS := 0000-hdr.part 0001-lists.part 0002-RS.lists.part \
+                 0004-RS.m_k.part 0005-l1_k.part 0006-l_k.part \
+                 0007-o_k.part 0008-ml_g.part 0009-m_g.part \
+                 0011-mlv_s.part 0013-ml_s.part 0015-ml1_s.part \
+                 0018-ml2_s.part 0020-ml3_s.part 0022-ml4_s.part \
+                 0026-RS.m_s.part 0027-RS.ml_s1.part 0033-ml_c.part \
+                 0034-ml1_c.part 0035-m_t.part 0036-lo_s.part \
+                 0037-l1o_s.part 0038-l2o_s.part 0039-l3o_s.part \
+                 0040-l4o_s.part 0042-o_s.part 0043-o_c.part \
+                 0044-o_t.part compat/0028-lv_c.part \
+                 compat/0029-l1v1_c.part compat/0030-l2v2_c.part \
+                 compat/0031-l3v3_c.part compat/0032-l4v4_c.part \
+                 compat/0041-o_s.part
+
+# level : the ml_s part it generates : the mlv_s part it generates
+XKBCONF_GEN := 0:0012-ml_s.part:0010-mlv_s.part \
+               1:0014-ml1_s.part:0016-ml1v1_s.part \
+               2:0017-ml2_s.part:0023-ml2v2_s.part \
+               3:0019-ml3_s.part:0024-ml3v3_s.part \
+               4:0021-ml4_s.part:0025-ml4v4_s.part
+
+$(XKBCONF_STAGE)/.stamp: $(XKBCONF_DIR)/rules/merge.py
+	@rm -rf $(XKBCONF_STAGE)
+	@mkdir -p $(XKBCONF_STAGE)/rules
+	@set -e; \
+	R="$(CURDIR)/$(XKBCONF_DIR)/rules"; \
+	O="$(CURDIR)/$(XKBCONF_STAGE)"; \
+	for ruleset in base evdev; do \
+	    P="$$O/parts-$$ruleset"; \
+	    mkdir -p "$$P"; \
+	    for part in $(XKBCONF_PARTS); do \
+	        src=`echo "$$part" | sed "s/RS/$$ruleset/"`; \
+	        cp "$$R/$$src" "$$P/`basename $$src`.$$ruleset"; \
+	    done; \
+	    for spec in $(XKBCONF_GEN); do \
+	        n=`echo $$spec | cut -d: -f1`; \
+	        a=`echo $$spec | cut -d: -f2`; \
+	        b=`echo $$spec | cut -d: -f3`; \
+	        (cd "$$R" && python3 compat/map-variants.py --want=mls \
+	            --number=$$n "$$P/$$a" compat/layoutsMapping.lst \
+	            compat/variantsMapping.lst); \
+	        (cd "$$R" && python3 compat/map-variants.py --want=mlvs \
+	            --number=$$n "$$P/$$b" compat/variantsMapping.lst); \
+	    done; \
+	    (cd "$$R" && python3 merge.py "$$P"/*) > "$$O/rules/$$ruleset"; \
+	    rm -rf "$$P"; \
+	done
+	@# The four directories that ship as-is. geometry/ is not among them
+	@# and is not an oversight: libxkbcommon parses geometry sections and
+	@# then discards them -- it has no notion of where a key physically
+	@# is -- so the 1.4 MB would be read and thrown away. The .xml files
+	@# are skipped for the same kind of reason: they describe the layout
+	@# list for a settings UI and are read only by libxkbregistry, which
+	@# is not built here.
+	@for d in keycodes types compat symbols; do \
+	    mkdir -p $(XKBCONF_STAGE)/$$d; \
+	    (cd $(XKBCONF_DIR)/$$d && find . -type f ! -name '*.xml' \
+	        ! -name 'meson.build' -print) | while read f; do \
+	        mkdir -p "$(XKBCONF_STAGE)/$$d/`dirname $$f`"; \
+	        cp "$(XKBCONF_DIR)/$$d/$$f" "$(XKBCONF_STAGE)/$$d/$$f"; \
+	    done; \
+	done
+	@touch $@
+	@echo "  XKBDATA $(XKBCONF_STAGE) ($(XKBCONF_VERSION), `find $(XKBCONF_STAGE) -type f | wc -l | tr -d ' '` files, rules merged from 44 parts)"
+
+.PHONY: xkbdata
+xkbdata: $(XKBCONF_STAGE)/.stamp
+
+$(XKB_DIR)/src/xkbcomp/parser.y:
+	@echo "  fetching $(XKB_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(XKB_TARBALL) $(XKB_URL)
+	@printf '%s  build/%s\n' "$(XKB_SHA256)" "$(XKB_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(XKB_TARBALL) does not match its checksum."; \
+		     rm -f build/$(XKB_TARBALL); exit 1; }
+	@rm -rf $(XKB_DIR)
+	@mkdir -p $(XKB_DIR)
+	@tar -C $(XKB_DIR) --strip-components=1 -xJf build/$(XKB_TARBALL)
+
+$(XKBCONF_DIR)/rules/merge.py:
+	@echo "  fetching $(XKBCONF_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(XKBCONF_TARBALL) $(XKBCONF_URL)
+	@printf '%s  build/%s\n' "$(XKBCONF_SHA256)" "$(XKBCONF_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(XKBCONF_TARBALL) does not match its checksum."; \
+		     rm -f build/$(XKBCONF_TARBALL); exit 1; }
+	@rm -rf $(XKBCONF_DIR)
+	@mkdir -p $(XKBCONF_DIR)
+	@tar -C $(XKBCONF_DIR) --strip-components=1 -xJf build/$(XKBCONF_TARBALL)
+
+# --- libxml2 2.12.6 ---
+#
+# `OptionsWPE.cmake:15`, and found by **CMake's own FindLibXml2** rather
+# than by a module WebKit ships -- the first package here in that
+# position. It matters in one place: that module's REQUIRED_VARS are
+# LIBXML2_LIBRARY and LIBXML2_INCLUDE_DIR, and it takes the version by
+# regex out of `libxml/xmlversion.h`, so the header staged into the
+# sysroot is what answers `find_package(LibXml2 2.8.0 REQUIRED)`.
+#
+# ---- one library, two configuration files ----
+#
+# Almost nothing about what libxml2 *does* is decided in a config.h.
+# Every one of the 47 sources is compiled unconditionally and the
+# feature set is applied from inside, through macros in
+# `include/libxml/xmlversion.h` -- a generated header, and the reason
+# this section is longer than libtasn1's whole port.
+#
+# So there are two halves. `third_party/libxml2-port/config.h` answers
+# what the C files ask the *platform*, and is hand-written like every
+# other port's. The list below answers what they ask the *build*, and is
+# substituted into upstream's own `xmlversion.h.in` -- 37 tokens, each
+# of which lands in a `#if @WITH_X@` that either defines a
+# LIBXML_X_ENABLED or does not.
+#
+# Substituting rather than hand-writing the header is deliberate:
+# xmlversion.h is 500 lines of interlocking `#if`s -- XPointer requires
+# XPath, the writer requires output, the reader requires push -- and a
+# hand-written copy would be a second implementation of upstream's
+# dependency rules that stops matching at the next release.
+XML2_VERSION := 2.12.6
+XML2_VERNUM  := 21206
+XML2_TARBALL := libxml2-$(XML2_VERSION).tar.xz
+XML2_URL     := https://download.gnome.org/sources/libxml2/2.12/$(XML2_TARBALL)
+XML2_SHA256  := 889c593a881a3db5fdd96cc9318c87df34eb648edfc458272ad46fd607353fbb
+XML2_DIR     := third_party/libxml2
+XML2_PORT    := third_party/libxml2-port
+XML2_GEN     := build/xml2
+
+# The feature set, as sed expressions over xmlversion.h.in.
+#
+# On, and upstream's defaults: the parser and tree APIs, push, SAX1 and
+# SAX2, XPath, XPointer, XInclude, the reader and writer, pattern,
+# regexps, RelaxNG/Schemas, Schematron, C14N, catalog, HTML, valid,
+# output, debug, threads, ISO8859X.
+#
+# Off, in three groups, and the long note in
+# third_party/libxml2-port/config.h says which is which:
+#   absent here    ZLIB LZMA MODULES ICONV
+#   present and    ICU -- ported, staged, and deliberately not wired,
+#   not wired      because WebKit converts before the parser sees a byte
+#   unreachable    FTP HTTP -- WebKit installs its own entity loader so
+#                  libxml2 can never fetch, which is the XXE defence
+# plus the ones upstream itself defaults off: LEGACY, MEM_DEBUG,
+# THREAD_ALLOC, TRIO, XPTR_LOCS.
+XML2_SUBST := \
+  -e 's/@VERSION@/$(XML2_VERSION)/g' \
+  -e 's/@LIBXML_VERSION_NUMBER@/$(XML2_VERNUM)/g' \
+  -e 's/@LIBXML_VERSION_EXTRA@//g' \
+  -e 's/@MODULE_EXTENSION@/.so/g' \
+  -e 's/@WITH_TREE@/1/g'      -e 's/@WITH_OUTPUT@/1/g' \
+  -e 's/@WITH_PUSH@/1/g'      -e 's/@WITH_READER@/1/g' \
+  -e 's/@WITH_WRITER@/1/g'    -e 's/@WITH_PATTERN@/1/g' \
+  -e 's/@WITH_SAX1@/1/g'      -e 's/@WITH_VALID@/1/g' \
+  -e 's/@WITH_HTML@/1/g'      -e 's/@WITH_CATALOG@/1/g' \
+  -e 's/@WITH_XPATH@/1/g'     -e 's/@WITH_XPTR@/1/g' \
+  -e 's/@WITH_XINCLUDE@/1/g'  -e 's/@WITH_C14N@/1/g' \
+  -e 's/@WITH_REGEXPS@/1/g'   -e 's/@WITH_SCHEMAS@/1/g' \
+  -e 's/@WITH_SCHEMATRON@/1/g' -e 's/@WITH_DEBUG@/1/g' \
+  -e 's/@WITH_THREADS@/1/g'   -e 's/@WITH_ISO8859X@/1/g' \
+  -e 's/@WITH_FTP@/0/g'       -e 's/@WITH_HTTP@/0/g' \
+  -e 's/@WITH_ICONV@/0/g'     -e 's/@WITH_ICU@/0/g' \
+  -e 's/@WITH_ZLIB@/0/g'      -e 's/@WITH_LZMA@/0/g' \
+  -e 's/@WITH_MODULES@/0/g'   -e 's/@WITH_LEGACY@/0/g' \
+  -e 's/@WITH_MEM_DEBUG@/0/g' -e 's/@WITH_THREAD_ALLOC@/0/g' \
+  -e 's/@WITH_TRIO@/0/g'      -e 's/@WITH_XPTR_LOCS@/0/g'
+
+# Generated into the layout a consumer sees rather than into a flat
+# directory: every public header includes <libxml/xmlversion.h>, so the
+# generated one has to sit beside the shipped ones under a `libxml/`
+# component. build/xml2/include is that root, and it is also what gets
+# copied into the sysroot -- so the headers the library is compiled
+# against and the headers WebKit will be compiled against are the same
+# files.
+$(XML2_GEN)/include/libxml/xmlversion.h: $(XML2_DIR)/include/libxml/xmlversion.h.in
+	@mkdir -p $(XML2_GEN)/include/libxml
+	@sed $(XML2_SUBST) $< > $@
+	@echo "  GEN    $@ ($(XML2_VERSION), no icu/iconv/zlib/http)"
+
+$(XML2_GEN)/config.h: $(XML2_PORT)/config.h
+	@mkdir -p $(XML2_GEN)
+	@cp $< $@
+
+# All 47, exactly as upstream's LIBXML2_SRCS lists them. The ones whose
+# feature is off -- nanoftp, nanohttp, xmlmodule, xzlib -- compile to
+# empty objects rather than being dropped, because the list is
+# upstream's and a build that curated it would have to be re-curated
+# every release.
+XML2_NAMES := buf c14n catalog chvalid debugXML dict encoding entities \
+              error globals hash HTMLparser HTMLtree legacy list \
+              nanoftp nanohttp parser parserInternals pattern relaxng \
+              SAX SAX2 schematron threads tree uri valid xinclude xlink \
+              xmlIO xmlmemory xmlmodule xmlreader xmlregexp xmlsave \
+              xmlschemas xmlschemastypes xmlstring xmlunicode xmlwriter \
+              xpath xpointer xzlib
+
+XML2_OBJ := $(addprefix $(XML2_GEN)/obj/,$(addsuffix .o,$(XML2_NAMES)))
+
+# -I$(XML2_GEN)/include comes *before* the vendored include directory so
+# that the generated xmlversion.h is the one found; the vendored tree
+# has only the .in beside it, so this is belt and braces rather than a
+# shadowing trick.
+XML2_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+               -DHAVE_CONFIG_H -D_REENTRANT -DSYSCONFDIR='"/etc"' \
+               -I$(XML2_GEN) -I$(XML2_GEN)/include \
+               -I$(XML2_DIR)/include -I$(XML2_DIR) -Ilibc/include
+
+XML2_DEPS := $(XML2_GEN)/config.h $(XML2_GEN)/include/libxml/xmlversion.h
+
+$(XML2_GEN)/obj/%.o: $(XML2_DIR)/%.c $(XML2_DEPS)
+	@mkdir -p $(XML2_GEN)/obj
+	$(CC) $(XML2_CFLAGS) -c $< -o $@
+
+build/libxml2.a: $(XML2_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  XML2   build/libxml2.a ($(XML2_VERSION))"
+
+.PHONY: xml2
+xml2: build/libxml2.a
+
+$(XML2_DIR)/include/libxml/xmlversion.h.in:
+	@echo "  fetching $(XML2_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(XML2_TARBALL) $(XML2_URL)
+	@printf '%s  build/%s\n' "$(XML2_SHA256)" "$(XML2_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(XML2_TARBALL) does not match its checksum."; \
+		     rm -f build/$(XML2_TARBALL); exit 1; }
+	@rm -rf $(XML2_DIR)
+	@mkdir -p $(XML2_DIR)
+	@tar -C $(XML2_DIR) --strip-components=1 -xJf build/$(XML2_TARBALL)
+
 .PHONY: libs-fetch
 libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc \
             $(ICU_DIR)/common/unicode/utypes.h $(JPEG_DIR)/jpeglib.h \
-            $(EPOXY_DIR)/src/dispatch_common.c
+            $(EPOXY_DIR)/src/dispatch_common.c \
+            $(GPGERROR_DIR)/src/gpg-error.h.in $(GCRYPT_DIR)/src/gcrypt.h.in \
+            $(TASN1_DIR)/lib/includes/libtasn1.h \
+            $(XKB_DIR)/src/xkbcomp/parser.y $(XKBCONF_DIR)/rules/merge.py \
+            $(XML2_DIR)/include/libxml/xmlversion.h.in
 
 # --- Fetching WPE WebKit itself ---
 #
@@ -1649,7 +2492,9 @@ webkit-sysroot: $(WEBKIT_SYSROOT)/.stamp
 
 $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
                           $(ICU_LIBS) $(LIBHBICU) build/libjpeg.a \
-                          build/libepoxy.a \
+                          build/libepoxy.a build/libgcrypt.a \
+                          build/libgpg-error.a build/libtasn1.a \
+                          build/libxkbcommon.a build/libxml2.a \
                           $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h \
                           $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
 	@rm -rf $(WEBKIT_SYSROOT)
@@ -1698,34 +2543,153 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	@cp $(EPOXY_GEN)/include/epoxy/gl_generated.h \
 	                                       $(WEBKIT_SYSROOT)/include/epoxy/
 	@cp build/libepoxy.a $(WEBKIT_SYSROOT)/lib/libepoxy.a
-	@# ---- and the .pc files, which are not decoration ----
+	@# libgcrypt and libgpg-error, staged together because
+	@# FindLibGcrypt.cmake looks for both and says why in its own
+	@# comment: "the libgcrypt.pc file does not list gpg-error as a
+	@# dependency, resulting in linking errors". gcrypt.h and
+	@# gpg-error.h are the two headers it find_path's for, and
+	@# gcrypt.h's GCRYPT_VERSION line is its version fallback when
+	@# pkg-config is not consulted.
+	@cp $(GCRYPT_GEN)/gcrypt.h            $(WEBKIT_SYSROOT)/include/
+	@cp $(GPGERROR_GEN)/gpg-error.h $(GPGERROR_GEN)/gpgrt.h \
+	                                      $(WEBKIT_SYSROOT)/include/
+	@cp build/libgcrypt.a     $(WEBKIT_SYSROOT)/lib/libgcrypt.a
+	@cp build/libgpg-error.a  $(WEBKIT_SYSROOT)/lib/libgpg-error.a
+	@# libtasn1: one public header and one archive, and the header is
+	@# the one *shipped* in the tarball rather than lib/includes/
+	@# libtasn1.h.in beside it. The .in is a substitution template with
+	@# @ASN1_VERSION_MAJOR@ where the numbers go, and upstream's dist
+	@# ships the finished header next to it; staging the template would
+	@# put an unsubstituted ASN1_VERSION into every consumer.
+	@cp $(TASN1_DIR)/lib/includes/libtasn1.h $(WEBKIT_SYSROOT)/include/
+	@cp build/libtasn1.a      $(WEBKIT_SYSROOT)/lib/libtasn1.a
+	@# libxkbcommon. Five of the seven public headers: xkbcommon.h and
+	@# the four it includes or that consumers include beside it.
+	@# xkbcommon-x11.h and xkbregistry.h are left out on purpose --
+	@# they declare the two libraries this build does not produce
+	@# (libxkbcommon-x11 needs xcb, libxkbregistry needs libxml2), and
+	@# a header in this directory with no archive behind it is exactly
+	@# the mismatch the FreeType and JPEG staging notes are about.
+	@mkdir -p $(WEBKIT_SYSROOT)/include/xkbcommon
+	@cp $(XKB_DIR)/include/xkbcommon/xkbcommon.h \
+	    $(XKB_DIR)/include/xkbcommon/xkbcommon-compat.h \
+	    $(XKB_DIR)/include/xkbcommon/xkbcommon-compose.h \
+	    $(XKB_DIR)/include/xkbcommon/xkbcommon-keysyms.h \
+	    $(XKB_DIR)/include/xkbcommon/xkbcommon-names.h \
+	                                      $(WEBKIT_SYSROOT)/include/xkbcommon/
+	@cp build/libxkbcommon.a  $(WEBKIT_SYSROOT)/lib/libxkbcommon.a
+	@# libxml2, and the one port whose *include layout* is load-bearing.
 	@#
-	@# Several of WebKit's find modules ask pkg-config *first* and use
-	@# find_path/find_library only as a fallback -- and the fallback
-	@# does not recover everything. FindEpoxy.cmake sets Epoxy_VERSION
-	@# only from the pkg-config module, so a sysroot without one gives
-	@# FPHSA an empty version and it reports "Required version (1.5.4)
-	@# is higher than found version ()" about a library that is right
-	@# there. That is the exact failure HarfBuzz produced before it was
-	@# found, and it is worth pre-empting rather than meeting again.
+	@# CMake's own FindLibXml2 -- not a module WebKit ships -- does
+	@# `find_path(NAMES libxml/xpath.h PATH_SUFFIXES libxml2)`, so the
+	@# headers have to sit at include/libxml2/libxml/ and not at
+	@# include/libxml/. That extra component is why an installed libxml2
+	@# is reached as `-I/usr/include/libxml2` and included as
+	@# <libxml/parser.h>, and it is what the .pc's Cflags says below.
 	@#
-	@# The toolchain file points PKG_CONFIG_LIBDIR at this directory, so
-	@# these are the only modules pkg-config can see: nothing from the
-	@# host can leak in and be linked against by mistake.
+	@# The generated xmlversion.h is copied *after* the shipped headers
+	@# and into the same directory, because every public header includes
+	@# <libxml/xmlversion.h> and would otherwise find nothing -- the
+	@# vendored tree has only the .in. It is also the file CMake reads
+	@# LIBXML2_VERSION_STRING out of by regex, which is what answers
+	@# `find_package(LibXml2 2.8.0 REQUIRED)`.
+	@mkdir -p $(WEBKIT_SYSROOT)/include/libxml2/libxml
+	@cp $(XML2_DIR)/include/libxml/*.h \
+	                                      $(WEBKIT_SYSROOT)/include/libxml2/libxml/
+	@cp $(XML2_GEN)/include/libxml/xmlversion.h \
+	                                      $(WEBKIT_SYSROOT)/include/libxml2/libxml/
+	@cp build/libxml2.a       $(WEBKIT_SYSROOT)/lib/libxml2.a
+	@# ---- and the .pc files ----
+	@#
+	@# Several of WebKit's find modules ask pkg-config first and use
+	@# find_path/find_library only as a fallback, so these describe every
+	@# archive here the way an installed library would be described.
+	@#
+	@# **They did nothing at all until libxkbcommon**, and the history is
+	@# worth keeping because it corrects a claim this comment used to
+	@# make twice over.
+	@#
+	@# It first said Epoxy could not be found without its .pc, because
+	@# FindEpoxy takes Epoxy_VERSION from pkg-config and FPHSA would
+	@# refuse version "" against a required 1.5.4. That is wrong.
+	@# FindEpoxy.cmake:70-77 guards its FATAL_ERROR with
+	@# `if (Epoxy_VERSION)`, so an *empty* version takes the other branch
+	@# and prints a warning -- "Cannot determine Epoxy version withouit
+	@# pkg-config", upstream's typo included -- and configure carries on.
+	@# FPHSA does not reject a package for an unset VERSION_VAR. The
+	@# error quoted was HarfBuzz's, whose find module derives a version
+	@# from the headers, generalised to Epoxy without being reproduced.
+	@#
+	@# It then said, correctly at the time, that the files were inert:
+	@# pkg-config was not installed, build/webkit/CMakeCache.txt read
+	@# PKG_CONFIG_EXECUTABLE-NOTFOUND, and all six packages found so far
+	@# had been found by find_path/find_library alone.
+	@#
+	@# **Libxkbcommon is the one that cannot be.** Its find module is
+	@# `pkg_check_modules(LIBXKBCOMMON xkbcommon)` and nothing else --
+	@# no find_path, no find_library, no fallback. So pkg-config is now
+	@# a build requirement, checked by the `webkit` target, and every
+	@# file written here is live. Two things changed the moment it was
+	@# installed: xkbcommon is found, and Epoxy stopped warning and
+	@# started reporting 1.5.10 -- from this directory, because the
+	@# toolchain file points PKG_CONFIG_LIBDIR here and nowhere else, so
+	@# the host's own libraries cannot answer a query about this
+	@# system's.
 	@mkdir -p $(WEBKIT_SYSROOT)/lib/pkgconfig
 	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libjpeg\nDescription: libjpeg-turbo, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -ljpeg\nCflags: -I$${includedir}\n' \
 	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(JPEG_VERSION)" \
 	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libjpeg.pc
-	@# Epoxy's is the one that is load-bearing rather than tidy:
-	@# FindEpoxy.cmake takes Epoxy_VERSION from pkg-config and from
-	@# nowhere else, so without this file find_path and find_library
-	@# both succeed and FPHSA still refuses the package for being
-	@# version "" against a required 1.5.4.
+	@# Epoxy's is where the effect is visible: FindEpoxy.cmake takes
+	@# Epoxy_VERSION from pkg-config and from nowhere else, so this file
+	@# is the only thing that can answer its version check. Before
+	@# pkg-config was installed the package was found anyway and
+	@# configure warned; now it reports 1.5.10 and does not.
 	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: epoxy\nDescription: libepoxy GL dispatch, Vextro framebuffer provider\nVersion: %s\nLibs: -L$${libdir} -lepoxy\nCflags: -I$${includedir}\n' \
 	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(EPOXY_VERSION)" \
 	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/epoxy.pc
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libgcrypt\nDescription: libgcrypt, built for Vextro ring 3\nVersion: %s\nRequires.private: gpg-error\nLibs: -L$${libdir} -lgcrypt\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(GCRYPT_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libgcrypt.pc
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: gpg-error\nDescription: libgpg-error, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lgpg-error\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(GPGERROR_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/gpg-error.pc
+	@# libtasn1's is the opposite case to Epoxy's, and is written anyway.
+	@# FindLibtasn1.cmake consults pkg-config only for *hints* and then
+	@# hands FPHSA a single REQUIRED_VAR with no VERSION_VAR, so
+	@# find_library alone would satisfy it and OptionsWPE asks for no
+	@# minimum version. It is here so that every archive in this
+	@# directory is described the same way rather than only the ones
+	@# that would otherwise fail -- the next find module to be reached
+	@# may well be one that reads Version.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libtasn1\nDescription: GNU Libtasn1, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -ltasn1\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(TASN1_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libtasn1.pc
+	@# xkbcommon's is the first .pc here that is genuinely required, and
+	@# the file name is part of that. FindLibxkbcommon.cmake is four
+	@# lines of substance --
+	@#
+	@#     find_package(PkgConfig QUIET)
+	@#     pkg_check_modules(LIBXKBCOMMON xkbcommon)
+	@#     find_package_handle_standard_args(Libxkbcommon
+	@#         REQUIRED_VARS LIBXKBCOMMON_FOUND FOUND_VAR LIBXKBCOMMON_FOUND)
+	@#
+	@# -- with no find_path and no find_library to fall back on. Every
+	@# package found before this one was found by that fallback. This one
+	@# can only be found by pkg-config, and pkg-config finds a module by
+	@# the name in the call: **xkbcommon.pc**, not libxkbcommon.pc.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\nxkb_base=/etc/xkb\n\nName: xkbcommon\nDescription: XKB keymap compiler, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lxkbcommon\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(XKB_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/xkbcommon.pc
+	@# libxml-2.0 is the module name pkg-config has always known this
+	@# library by, and the Cflags carries the extra path component the
+	@# headers are staged under. CMake's FindLibXml2 consults it for
+	@# hints before falling back to find_path, so it is the faster of
+	@# the two routes rather than the only one.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libXML\nDescription: libXML2, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lxml2\nCflags: -I$${includedir}/libxml2\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(XML2_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libxml-2.0.pc
 	@touch $@
-	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy)"
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy, gcrypt, tasn1, xkbcommon, xml2)"
 
 # --- Building it ---
 #
@@ -1741,8 +2705,9 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 # third_party/wpe-config/ answers that, and configure now runs through
 # WebKit's feature detection and reaches its dependency list. What
 # stands here now is the dependency list itself -- 22 REQUIRED packages,
-# of which this system has four. third_party/wpe-config/README.md has
-# the current frontier and the exact error.
+# seven of which a configure run has actually found.
+# third_party/wpe-config/README.md has the current frontier and the exact
+# error.
 .PHONY: webkit
 webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
         $(WEBKIT_SYSROOT)/.stamp
@@ -1751,6 +2716,7 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	command -v ninja >/dev/null || missing="$$missing ninja"; \
 	command -v ruby  >/dev/null || missing="$$missing ruby"; \
 	command -v gperf >/dev/null || missing="$$missing gperf"; \
+	command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	command -v $(CXX) >/dev/null || missing="$$missing $(CXX)"; \
 	if [ -n "$$missing" ]; then \
 	    echo ""; \
@@ -1763,14 +2729,19 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	    echo "    descriptors in ring 3 done  src/vfs.h, 19 system calls"; \
 	    echo "    sockets in ring 3     done  over src/vxnet.h"; \
 	    echo "    the OS gate           done  third_party/wpe-config/"; \
-	    echo "    sqlite, freetype, harfbuzz"; \
+	    echo "    eleven upstream libraries"; \
 	    echo "                          done  ported, and green in ring 3"; \
 	    echo ""; \
+	    echo "  pkg-config is not optional here, unlike the rest:"; \
+	    echo "  FindLibxkbcommon.cmake has no find_path fallback at all,"; \
+	    echo "  so xkbcommon can only be discovered through it."; \
+	    echo ""; \
 	    echo "  What remains after installing the above is the dependency"; \
-	    echo "  list: 22 packages WebKit marks REQUIRED, of which this"; \
-	    echo "  system has four. ICU is the first of the eighteen, and"; \
-	    echo "  each is a port onto interfaces that now exist and are"; \
-	    echo "  tested, rather than an interface to be invented."; \
+	    echo "  list: 22 packages WebKit marks REQUIRED, seven of which a"; \
+	    echo "  configure run has found. LibXml2 is where it stops and"; \
+	    echo "  ten stand behind it -- each a port onto interfaces that"; \
+	    echo "  now exist and are tested, rather than an interface to be"; \
+	    echo "  invented."; \
 	    echo ""; \
 	    echo "  third_party/wpe-config/README.md has the full order."; \
 	    echo ""; \
@@ -1931,6 +2902,90 @@ build/gltest.o: apps/gltest.c apps/vextro.h $(EPOXY_PORT)/config.h \
 build/gltest: build/gltest.o build/libepoxy.a apps/app.ld $(LIBC) $(LIBC_CRT0)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		$(LIBC_CRT0) build/gltest.o build/libepoxy.a $(LIBC) -o $@
+
+# --- User app: gcrypttest ---
+#
+# libgcrypt in ring 3, against the vectors printed in FIPS 197, RFC 4231,
+# RFC 6070 and NIST's SHA examples rather than against itself. The
+# portable C implementations are the ones running here — every extension
+# assembly path is off — so "the same answer as a distribution build" is
+# a claim this test has to make rather than assume.
+build/gcrypttest.o: apps/gcrypttest.c apps/vextro.h $(GCRYPT_GEN)/gcrypt.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(GCRYPT_GEN) -I$(GPGERROR_GEN) -c $< -o $@
+
+build/gcrypttest: build/gcrypttest.o build/libgcrypt.a build/libgpg-error.a \
+                  apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/gcrypttest.o build/libgcrypt.a \
+		build/libgpg-error.a $(LIBC) -o $@
+
+# --- User app: tasn1test ---
+#
+# libtasn1 in ring 3, against DER the build machine's OpenSSL produced —
+# apps/tasn1_ref.h has the commands — and against the ASN.1 module WPE
+# WebKit itself compiles in, copied verbatim from
+# Source/WebCore/PAL/pal/crypto/tasn1/Utilities.cpp. Both of those are
+# deliberate: an encoder checked against its own decoder agrees with
+# itself while both are wrong, and a module written to be easy would not
+# have shown whether WebKit's builds.
+#
+# The public header comes from the vendored tree rather than from the
+# sysroot, which is the same arrangement every other test here uses: the
+# sysroot is what WebKit's configure looks at, and a test that read from
+# it would be checking the staging step rather than the library.
+build/tasn1test.o: apps/tasn1test.c apps/tasn1_ref.h apps/vextro.h \
+                   $(TASN1_DIR)/lib/includes/libtasn1.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(TASN1_DIR)/lib/includes -c $< -o $@
+
+build/tasn1test: build/tasn1test.o build/libtasn1.a \
+                 apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/tasn1test.o build/libtasn1.a \
+		$(LIBC) -o $@
+
+# --- User app: xkbtest ---
+#
+# libxkbcommon in ring 3, compiling the keymap WebKit asks for out of the
+# xkeyboard-config data on the volume. It is the only test here whose
+# subject is half data: the archive can be perfect and the suite still
+# fail, because a keymap is a program in a language that lives in
+# /etc/xkb and has to be read off NTFS at run time.
+#
+# Expected values come from Linux's input-event-codes.h (keycode = kernel
+# code + 8), X11's keysymdef.h and Unicode — three sources outside this
+# system — for the reason apps/jpeg_ref.h and apps/tasn1_ref.h exist.
+build/xkbtest.o: apps/xkbtest.c apps/vextro.h \
+                 $(XKB_DIR)/include/xkbcommon/xkbcommon.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(XKB_DIR)/include -c $< -o $@
+
+build/xkbtest: build/xkbtest.o build/libxkbcommon.a \
+               apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/xkbtest.o build/libxkbcommon.a \
+		$(LIBC) -o $@
+
+# --- User app: xmltest ---
+#
+# libxml2 in ring 3, driven the way WebKit drives it: a push parser with
+# XML_PARSE_NOENT | XML_PARSE_HUGE, an external entity loader that
+# refuses, and errors read through xmlSetStructuredErrorFunc. It also
+# asserts the four features this build compiles *out* -- zlib, iconv,
+# modules, http -- because each is an absence the port chose rather than
+# one it stumbled into.
+build/xmltest.o: apps/xmltest.c apps/vextro.h \
+                 $(XML2_GEN)/include/libxml/xmlversion.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(XML2_GEN)/include -I$(XML2_DIR)/include \
+		-c $< -o $@
+
+build/xmltest: build/xmltest.o build/libxml2.a \
+               apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/xmltest.o build/libxml2.a \
+		$(LIBC) -o $@
 
 # --- User app: icutest ---
 #
