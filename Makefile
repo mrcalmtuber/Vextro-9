@@ -813,7 +813,7 @@ build/ca-bundle.crt:
 # walk is a shell loop for the same reason $big below is one -- the
 # directory is produced by a download, so it does not exist when make
 # parses this file and a $(wildcard) would quietly expand to nothing.
-disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest build/gcrypttest build/tasn1test build/xkbtest build/xmltest $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt $(XKBCONF_STAGE)/.stamp
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest build/gcrypttest build/tasn1test build/xkbtest build/xmltest build/zlibtest build/pngtest build/zlibref.gz build/zlibbad.gz $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt $(XKBCONF_STAGE)/.stamp
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -844,6 +844,10 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		build/tasn1test \
 		build/xkbtest \
 		build/xmltest \
+		build/zlibtest \
+		build/pngtest \
+		build/zlibref.gz:zlibref.gz \
+		build/zlibbad.gz:zlibbad.gz \
 		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
 		$(ICU_DATA):icudt74l.dat \
 		build/sqlseed.db:sqlseed.db \
@@ -1425,7 +1429,8 @@ $(ICU_DIR)/common/unicode/utypes.h:
 # --- libjpeg-turbo 3.0.4 ---
 #
 # The library that is literally next. `OptionsWPE.cmake:10` is
-# `find_package(JPEG REQUIRED)` — the third of twenty-two — and it is
+# `find_package(JPEG REQUIRED)` — the third of the fifteen that file
+# opens with — and it is
 # where every configure run has stopped since ICU and HarfBuzz started
 # being found.
 #
@@ -2393,6 +2398,222 @@ $(XML2_DIR)/include/libxml/xmlversion.h.in:
 	@mkdir -p $(XML2_DIR)
 	@tar -C $(XML2_DIR) --strip-components=1 -xJf build/$(XML2_TARBALL)
 
+# --- zlib 1.3.1 ---
+#
+# `OptionsWPE.cmake:23` in its own right, and `OptionsWPE.cmake:16`
+# before that: CMake's FindPNG opens with `find_package(ZLIB)` and does
+# nothing else if that fails, so the PNG line reports two missing
+# packages and this is the first of them.
+#
+# Found by CMake's own FindZLIB, which is the *only* find module reached
+# so far that never consults pkg-config at all: it wants `zlib.h` on the
+# include path and a library called `z`, and it takes the version by
+# regex from `#define ZLIB_VERSION` in the staged header.
+#
+# ---- the one configuration decision, and where it has to be made ----
+#
+# zlib has no config.h. What it has is two `#ifdef`s at the top of
+# zconf.h -- HAVE_UNISTD_H and HAVE_STDARG_H, each with the comment "may
+# be set to #if 1 by ./configure" -- and between them they decide whether
+# <unistd.h> is included and whether z_off_t is off_t or long.
+#
+# Both are true here. What is awkward is that they have to be answered
+# *twice*, in two different ways, because of how zlib includes its own
+# header:
+#
+#   For the archive, on the command line. zlib.h says `#include
+#   "zconf.h"`, and a quoted include is resolved from the includer's own
+#   directory first -- so a generated zconf.h anywhere else is silently
+#   ignored while zlib's own sources are compiled, whatever -I says.
+#   -DHAVE_UNISTD_H -DHAVE_STDARG_H reaches the vendored header instead.
+#
+#   For the consumer, by generating an edited copy. WebKit will include
+#   <zlib.h> from the sysroot with neither define on its command line, so
+#   the *staged* zconf.h has to carry the answers itself or it would
+#   describe a different library from the archive beside it -- the same
+#   hazard the FreeType and JPEG staging notes are about. The two sed
+#   expressions below are upstream's own, lifted from configure:568-601,
+#   so the generated file is the file ./configure would have written.
+#
+# The two routes are equivalent by construction: `#ifdef HAVE_UNISTD_H`
+# with -D on the command line and `#if 1` in the header both end at
+# `#define Z_HAVE_UNISTD_H`, which is the only thing either one does.
+ZLIB_VERSION := 1.3.1
+ZLIB_TARBALL := zlib-$(ZLIB_VERSION).tar.gz
+ZLIB_URL     := https://zlib.net/fossils/$(ZLIB_TARBALL)
+ZLIB_SHA256  := 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+ZLIB_DIR     := third_party/zlib
+ZLIB_GEN     := build/zlib
+
+# The generated pair, in the layout a consumer sees. libpng below is
+# compiled with -I$(ZLIB_GEN)/include for exactly this reason: it must
+# see the same zconf.h WebKit will, not the unedited one in the vendored
+# tree, or png.h's `#include "zlib.h"` would reach a header describing a
+# zlib that was never built.
+$(ZLIB_GEN)/include/zconf.h: $(ZLIB_DIR)/zconf.h
+	@mkdir -p $(ZLIB_GEN)/include
+	@sed -e '/^#ifdef HAVE_UNISTD_H.* may be/s/def HAVE_UNISTD_H\(.*\) may be/ 1\1 was/' \
+	     -e '/^#ifdef HAVE_STDARG_H.* may be/s/def HAVE_STDARG_H\(.*\) may be/ 1\1 was/' \
+	     $< > $@
+	@echo "  GEN    $@ (unistd, stdarg)"
+
+$(ZLIB_GEN)/include/zlib.h: $(ZLIB_DIR)/zlib.h $(ZLIB_GEN)/include/zconf.h
+	@mkdir -p $(ZLIB_GEN)/include
+	@cp $< $@
+
+# All fifteen, which is the whole library. Nothing here is optional and
+# nothing is a platform variant: zlib ships one implementation and the
+# only thing a build chooses is the two defines above.
+ZLIB_NAMES := adler32 compress crc32 deflate gzclose gzlib gzread gzwrite \
+              infback inffast inflate inftrees trees uncompr zutil
+
+ZLIB_OBJ := $(addprefix $(ZLIB_GEN)/obj/,$(addsuffix .o,$(ZLIB_NAMES)))
+
+ZLIB_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+               -DHAVE_UNISTD_H -DHAVE_STDARG_H \
+               -I$(ZLIB_DIR) -Ilibc/include
+
+$(ZLIB_GEN)/obj/%.o: $(ZLIB_DIR)/%.c $(ZLIB_DIR)/zlib.h
+	@mkdir -p $(ZLIB_GEN)/obj
+	$(CC) $(ZLIB_CFLAGS) -c $< -o $@
+
+build/libz.a: $(ZLIB_OBJ) $(ZLIB_GEN)/include/zlib.h
+	@rm -f $@
+	$(AR) rcs $@ $(ZLIB_OBJ)
+	@echo "  ZLIB   build/libz.a ($(ZLIB_VERSION))"
+
+.PHONY: zlib
+zlib: build/libz.a
+
+# Two gzip files for the volume, extracted from apps/zlib_ref.h rather
+# than compressed here.
+#
+# zlib's gz* layer is the only part of the library that touches the
+# operating system -- open with a mode argument, read, write, lseek,
+# close, snprintf, strerror -- and it deserves to be driven against real
+# NTFS. But a boot self-test runs with nobody signed in, and creating a
+# file in that state is refused at open() by the elevation gateway, which
+# is the security property `apps/fdtest.c` asserts rather than works
+# around. So the read half needs a gzip file that is already there.
+#
+# Extracting them from the header keeps one copy of the data: the array
+# apps/zlibtest.c compares against and the bytes on the disk are the same
+# bytes by construction. /zlibbad.gz carries the original text's CRC-32
+# over a flipped payload, so it reads back 431 plausible bytes and then
+# fails -- which is the only way a read-only test reaches gz_error().
+build/zlibref.gz: apps/zlib_ref.h tools/carray.py
+	@mkdir -p build
+	@python3 tools/carray.py --from apps/zlib_ref.h \
+		--name zref_text_gzip_named --out $@
+
+build/zlibbad.gz: apps/zlib_ref.h tools/carray.py
+	@mkdir -p build
+	@python3 tools/carray.py --from apps/zlib_ref.h \
+		--name zref_text_gzip_corrupt --out $@
+
+$(ZLIB_DIR)/zlib.h:
+	@echo "  fetching $(ZLIB_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(ZLIB_TARBALL) $(ZLIB_URL)
+	@printf '%s  build/%s\n' "$(ZLIB_SHA256)" "$(ZLIB_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(ZLIB_TARBALL) does not match its checksum."; \
+		     rm -f build/$(ZLIB_TARBALL); exit 1; }
+	@rm -rf $(ZLIB_DIR)
+	@mkdir -p $(ZLIB_DIR)
+	@tar -C $(ZLIB_DIR) --strip-components=1 -xzf build/$(ZLIB_TARBALL)
+
+# --- libpng 1.6.58 ---
+#
+# `OptionsWPE.cmake:16`, behind zlib, and found by CMake's own FindPNG --
+# which is why the section above exists: that module's first statement is
+# `find_package(ZLIB)` and its whole body is inside `if (ZLIB_FOUND)`.
+#
+# ---- pnglibconf.h, and why nothing here is hand-written ----
+#
+# libpng's configuration is one generated header, `pnglibconf.h`, and
+# upstream ships the standard one as `scripts/pnglibconf.h.prebuilt` for
+# builds that are not running its awk pipeline. It is copied here
+# verbatim, unedited, and that is a claim worth making rather than a
+# shortcut: every option in it is supportable on this machine, so there
+# was nothing to turn off.
+#
+# The two that would have been in question are both answered:
+#
+#   PNG_SETJMP_SUPPORTED     libpng's error handling is setjmp/longjmp
+#                            and there is no other mode worth having.
+#                            libc/setjmp.S is real, and this is the first
+#                            code in ring 3 to depend on it -- which is
+#                            why apps/pngtest.c goes out of its way to
+#                            make libpng longjmp out of a decode.
+#
+#   PNG_FLOATING_POINT_      pow, floor, ceil, exp, log and modf, for
+#   SUPPORTED                gamma. All six are in libc/math.c, and the
+#                            no-FPU rule that would once have made this
+#                            impossible was repealed when the model
+#                            needed floating point.
+#
+# PNG_INTEL_SSE_ + the other SIMD options stay undefined, and that is
+# upstream's default rather than a decision here: unlike ARM's NEON,
+# which libpng enables by detection, the x86 intrinsics are explicit
+# opt-in. So the fourteen sources below are the complete library, and
+# -msse2 in APP_CFLAGS does not quietly change that.
+#
+# ---- and the include layout it needs ----
+#
+# png.h includes "pnglibconf.h" and "zlib.h", neither of which is in
+# libpng's own directory, so both are found through -I: the generated
+# config from build/png, and zlib's *edited* zconf.h pair from
+# build/zlib/include. That second one matters -- compiling libpng against
+# the unedited zconf.h would build it against a zlib whose z_off_t is
+# long rather than off_t, which is the same size here and would be a
+# genuine mismatch on a machine where it is not.
+PNG_VERSION := 1.6.58
+PNG_TARBALL := libpng-$(PNG_VERSION).tar.xz
+PNG_URL     := https://download.sourceforge.net/libpng/$(PNG_TARBALL)
+PNG_SHA256  := 28eb403f51f0f7405249132cecfe82ea5c0ef97f1b32c5a65828814ae0d34775
+PNG_DIR     := third_party/libpng
+PNG_GEN     := build/png
+
+$(PNG_GEN)/pnglibconf.h: $(PNG_DIR)/scripts/pnglibconf.h.prebuilt
+	@mkdir -p $(PNG_GEN)
+	@cp $< $@
+	@echo "  GEN    $@ ($(PNG_VERSION), upstream prebuilt, unedited)"
+
+PNG_NAMES := png pngerror pngget pngmem pngpread pngread pngrio pngrtran \
+             pngrutil pngset pngtrans pngwio pngwrite pngwtran pngwutil
+
+PNG_OBJ := $(addprefix $(PNG_GEN)/obj/,$(addsuffix .o,$(PNG_NAMES)))
+
+PNG_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+              -I$(PNG_GEN) -I$(PNG_DIR) -I$(ZLIB_GEN)/include -Ilibc/include
+
+PNG_DEPS := $(PNG_GEN)/pnglibconf.h $(ZLIB_GEN)/include/zlib.h
+
+$(PNG_GEN)/obj/%.o: $(PNG_DIR)/%.c $(PNG_DEPS)
+	@mkdir -p $(PNG_GEN)/obj
+	$(CC) $(PNG_CFLAGS) -c $< -o $@
+
+build/libpng.a: $(PNG_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  PNG    build/libpng.a ($(PNG_VERSION))"
+
+.PHONY: png
+png: build/libpng.a
+
+$(PNG_DIR)/scripts/pnglibconf.h.prebuilt:
+	@echo "  fetching $(PNG_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(PNG_TARBALL) $(PNG_URL)
+	@printf '%s  build/%s\n' "$(PNG_SHA256)" "$(PNG_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(PNG_TARBALL) does not match its checksum."; \
+		     rm -f build/$(PNG_TARBALL); exit 1; }
+	@rm -rf $(PNG_DIR)
+	@mkdir -p $(PNG_DIR)
+	@tar -C $(PNG_DIR) --strip-components=1 -xJf build/$(PNG_TARBALL)
+
 .PHONY: libs-fetch
 libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc \
             $(ICU_DIR)/common/unicode/utypes.h $(JPEG_DIR)/jpeglib.h \
@@ -2400,7 +2621,8 @@ libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/h
             $(GPGERROR_DIR)/src/gpg-error.h.in $(GCRYPT_DIR)/src/gcrypt.h.in \
             $(TASN1_DIR)/lib/includes/libtasn1.h \
             $(XKB_DIR)/src/xkbcomp/parser.y $(XKBCONF_DIR)/rules/merge.py \
-            $(XML2_DIR)/include/libxml/xmlversion.h.in
+            $(XML2_DIR)/include/libxml/xmlversion.h.in \
+            $(ZLIB_DIR)/zlib.h $(PNG_DIR)/scripts/pnglibconf.h.prebuilt
 
 # --- Fetching WPE WebKit itself ---
 #
@@ -2495,6 +2717,7 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
                           build/libepoxy.a build/libgcrypt.a \
                           build/libgpg-error.a build/libtasn1.a \
                           build/libxkbcommon.a build/libxml2.a \
+                          build/libz.a build/libpng.a \
                           $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h \
                           $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
 	@rm -rf $(WEBKIT_SYSROOT)
@@ -2599,6 +2822,45 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	@cp $(XML2_GEN)/include/libxml/xmlversion.h \
 	                                      $(WEBKIT_SYSROOT)/include/libxml2/libxml/
 	@cp build/libxml2.a       $(WEBKIT_SYSROOT)/lib/libxml2.a
+	@# zlib. The archive is staged as libz.a rather than under the name
+	@# this Makefile builds it with, because FindZLIB's search list is
+	@# `z zlib zdll zlib1 ...` and `z` is first.
+	@#
+	@# The header pair is the *generated* one from build/zlib/include and
+	@# not the vendored tree's, and that is the whole point of generating
+	@# it: zlib's configuration is two `#ifdef`s in zconf.h which this
+	@# build answers with -D on the command line, and a consumer
+	@# compiling with neither define would otherwise get a zconf.h that
+	@# describes a different library from the archive next to it. Same
+	@# hazard as FreeType's redirected headers, same fix.
+	@#
+	@# zlib.h is also where FindZLIB reads the version from, by regex on
+	@# `#define ZLIB_VERSION`. There is no .pc route: FindZLIB is the one
+	@# find module reached so far that never consults pkg-config at all.
+	@cp $(ZLIB_GEN)/include/zlib.h $(ZLIB_GEN)/include/zconf.h \
+	                                      $(WEBKIT_SYSROOT)/include/
+	@cp build/libz.a          $(WEBKIT_SYSROOT)/lib/libz.a
+	@# libpng. Three headers flat in include/ -- FindPNG's find_path
+	@# tries the no-suffix directory before include/libpng16 and friends,
+	@# so this is the shorter of two correct layouts and matches how
+	@# jpeglib.h is staged above.
+	@#
+	@# pnglibconf.h is the generated one, and it is staged for the same
+	@# reason zconf.h is: png.h includes it unconditionally, every
+	@# structure layout in the library depends on what it says, and a
+	@# consumer that found a different one would compile against a
+	@# libpng that was never built. It is copied from build/png rather
+	@# than from the tarball because the tarball does not contain it --
+	@# only scripts/pnglibconf.h.prebuilt, which is what build/png holds
+	@# a verbatim copy of.
+	@#
+	@# png.h is where FindPNG reads PNG_LIBPNG_VER_STRING from, and the
+	@# archive is libpng.a because `png` comes before the version-suffixed
+	@# names in that module's search list.
+	@cp $(PNG_DIR)/png.h $(PNG_DIR)/pngconf.h \
+	                                      $(WEBKIT_SYSROOT)/include/
+	@cp $(PNG_GEN)/pnglibconf.h           $(WEBKIT_SYSROOT)/include/
+	@cp build/libpng.a        $(WEBKIT_SYSROOT)/lib/libpng.a
 	@# ---- and the .pc files ----
 	@#
 	@# Several of WebKit's find modules ask pkg-config first and use
@@ -2688,8 +2950,26 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libXML\nDescription: libXML2, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lxml2\nCflags: -I$${includedir}/libxml2\n' \
 	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(XML2_VERSION)" \
 	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libxml-2.0.pc
+	@# zlib and libpng are both found by CMake's own modules, and neither
+	@# of those consults pkg-config at all -- FindZLIB reads the version
+	@# out of zlib.h by regex and FindPNG out of png.h. These files are
+	@# written for the same reason libtasn1's is: every archive in this
+	@# directory is described the same way, and the next find module to
+	@# be reached may well be one that asks.
+	@#
+	@# libpng gets two names because an installed libpng has two: the
+	@# real libpng16.pc and libpng.pc beside it, which is a symlink
+	@# upstream and a copy here. A consumer may ask for either.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: zlib\nDescription: zlib compression library, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lz\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(ZLIB_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/zlib.pc
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libpng\nDescription: libpng, built for Vextro ring 3\nVersion: %s\nRequires: zlib\nLibs: -L$${libdir} -lpng\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(PNG_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng16.pc
+	@cp $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng16.pc \
+	   $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng.pc
 	@touch $@
-	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy, gcrypt, tasn1, xkbcommon, xml2)"
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy, gcrypt, tasn1, xkbcommon, xml2, zlib, png)"
 
 # --- Building it ---
 #
@@ -2704,8 +2984,9 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 # for a target without an operating system; the injection layer in
 # third_party/wpe-config/ answers that, and configure now runs through
 # WebKit's feature detection and reaches its dependency list. What
-# stands here now is the dependency list itself -- 22 REQUIRED packages,
-# seven of which a configure run has actually found.
+# stands here now is the dependency list itself -- 15 unconditional
+# REQUIRED packages at the head of OptionsWPE.cmake and two more further
+# down, thirteen of which a configure run has actually found.
 # third_party/wpe-config/README.md has the current frontier and the exact
 # error.
 .PHONY: webkit
@@ -2729,7 +3010,7 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	    echo "    descriptors in ring 3 done  src/vfs.h, 19 system calls"; \
 	    echo "    sockets in ring 3     done  over src/vxnet.h"; \
 	    echo "    the OS gate           done  third_party/wpe-config/"; \
-	    echo "    eleven upstream libraries"; \
+	    echo "    fourteen upstream libraries"; \
 	    echo "                          done  ported, and green in ring 3"; \
 	    echo ""; \
 	    echo "  pkg-config is not optional here, unlike the rest:"; \
@@ -2737,11 +3018,11 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	    echo "  so xkbcommon can only be discovered through it."; \
 	    echo ""; \
 	    echo "  What remains after installing the above is the dependency"; \
-	    echo "  list: 22 packages WebKit marks REQUIRED, seven of which a"; \
-	    echo "  configure run has found. LibXml2 is where it stops and"; \
-	    echo "  ten stand behind it -- each a port onto interfaces that"; \
-	    echo "  now exist and are tested, rather than an interface to be"; \
-	    echo "  invented."; \
+	    echo "  list: 17 packages WebKit marks REQUIRED without a"; \
+	    echo "  condition, thirteen of which a configure run has found."; \
+	    echo "  WebP is where it stops; behind it are WPE (already ported"; \
+	    echo "  and simply never reached) and GLib with LibSoup, which is"; \
+	    echo "  a second runtime rather than a port."; \
 	    echo ""; \
 	    echo "  third_party/wpe-config/README.md has the full order."; \
 	    echo ""; \
@@ -2985,6 +3266,52 @@ build/xmltest: build/xmltest.o build/libxml2.a \
                apps/app.ld $(LIBC) $(LIBC_CRT0)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		$(LIBC_CRT0) build/xmltest.o build/libxml2.a \
+		$(LIBC) -o $@
+
+# --- User app: zlibtest ---
+#
+# Compiled against build/zlib/include and *nothing else* -- not the
+# vendored tree, and without -DHAVE_UNISTD_H or -DHAVE_STDARG_H, which
+# the archive itself is built with. That is deliberate and it is section
+# 1 of the test: this file sees exactly what WebKit will see when it
+# includes <zlib.h> out of the sysroot, so if the generated zconf.h ever
+# stops answering those two questions the same way the command line
+# does, it fails here as a wrong type size rather than five libraries
+# later as a link error.
+build/zlibtest.o: apps/zlibtest.c apps/zlib_ref.h apps/vextro.h \
+                  $(ZLIB_GEN)/include/zlib.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(ZLIB_GEN)/include -c $< -o $@
+
+build/zlibtest: build/zlibtest.o build/libz.a \
+                apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/zlibtest.o build/libz.a \
+		$(LIBC) -o $@
+
+# --- User app: pngtest ---
+#
+# The include path is the same three directories libpng itself is built
+# with, in the same order, because png.h includes "pnglibconf.h" and
+# "zlib.h" and both come from generated directories rather than from the
+# vendored tree. It has to be the generated pnglibconf.h in particular:
+# every structure layout in the library depends on it, and a test
+# compiled against a different one would be reading png_struct at the
+# wrong offsets.
+#
+# libpng.a comes before libz.a on the link line and both before libc,
+# because ld resolves an archive once, in order: libpng calls deflate,
+# zlib calls malloc, and nothing calls back.
+build/pngtest.o: apps/pngtest.c apps/png_ref.h apps/vextro.h \
+                 $(PNG_GEN)/pnglibconf.h $(ZLIB_GEN)/include/zlib.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(PNG_GEN) -I$(PNG_DIR) -I$(ZLIB_GEN)/include \
+		-c $< -o $@
+
+build/pngtest: build/pngtest.o build/libpng.a build/libz.a \
+               apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/pngtest.o build/libpng.a build/libz.a \
 		$(LIBC) -o $@
 
 # --- User app: icutest ---

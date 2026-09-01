@@ -89,3 +89,5 @@ third_party/libtasn1/
 third_party/libxkbcommon/
 third_party/xkeyboard-config/
 third_party/libxml2/
+third_party/zlib/
+third_party/libpng/

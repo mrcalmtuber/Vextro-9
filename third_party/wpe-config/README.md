@@ -65,7 +65,7 @@ with no assembler backend.
 | libjpeg-turbo, libepoxy, libgcrypt, libtasn1, libxkbcommon and libxml2 in ring 3 | `apps/jpegtest.c`, `gltest.c`, `gcrypttest.c`, `tasn1test.c`, `xkbtest.c`, `xmltest.c` |
 | the keymap data a browser needs, on the volume | `/etc/xkb`, 250 files from xkeyboard-config |
 | WebKit's OS detection, passed without patching it | `vextro-project-inject.cmake` |
-| a sysroot the find modules can see all twelve ported libraries in | `make webkit-sysroot` |
+| a sysroot the find modules can see all fourteen ported libraries in | `make webkit-sysroot` |
 
 `apps/wpetest.c` runs all of that in ring 3 on every `APP_SELFTEST` boot.
 
@@ -173,10 +173,15 @@ smaller than expected each time, and is now in: `<inttypes.h>` and
 `<cinttypes>` and `is_standard_layout` for ICU. None of the five needed
 a patch to its own source.
 
-**7. The dependency set — eight found, and the count is still worse than
-"a few more".** `Source/cmake/OptionsWPE.cmake` opens with **twenty-two
-unconditional `find_package(... REQUIRED)`** and has more behind
-conditionals:
+**7. The dependency set — thirteen found, and the count was wrong.**
+This section said for months that `Source/cmake/OptionsWPE.cmake` opens
+with **twenty-two** unconditional `find_package(... REQUIRED)`. Counted
+rather than remembered, it opens with **fifteen**, on lines 8-22, and
+carries two more at top level further down (LibSoup at 172, GLIB at
+185) — **seventeen** unconditional REQUIRED in all. There are 44
+`find_package` calls in the file, most of them conditional or optional,
+which is the likeliest source of the wrong number. The list itself was
+always right; only the total was not:
 
     HarfBuzz  ICU  JPEG  Epoxy  LibGcrypt  Libtasn1  Libxkbcommon
     LibXml2  PNG  SQLite3  Threads  Unifdef  WebP  WPE  ZLIB
@@ -185,22 +190,30 @@ conditionals:
 Ported, built, and staged into the sysroot: **SQLite**, **FreeType**,
 **WPE**, **HarfBuzz**, **ICU 74.2**, **libjpeg-turbo 3.0.4**,
 **libepoxy 1.5.10**, **libgpg-error 1.50 + libgcrypt 1.10.3**,
-**libtasn1 4.19.0**, **libxkbcommon 1.7.0** and **libxml2 2.12.6**.
+**libtasn1 4.19.0**, **libxkbcommon 1.7.0**, **libxml2 2.12.6**,
+**zlib 1.3.1** and **libpng 1.6.58**.
 
-Eight of those have actually been *found by a configure run*, which is
-the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
+Thirteen packages have actually been *found by a configure run*, which
+is the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
 that satisfies `find_package(HarfBuzz COMPONENTS ICU)`, ICU with the
 `data i18n uc` components, JPEG at version 62, Epoxy at 1.5.10,
-LibGcrypt at 1.10.3, Libtasn1 at 4.19.0, Libxkbcommon at 1.7.0 and
-LibXml2 at 2.12.6. The
-other three sit further down `OptionsWPE.cmake` than configure has
-reached — behind PNG on line 16 — so nothing has exercised
-`FindSQLite3`, `FindWPE` or CMake's own `FindFreetype` against the
-layout they are staged in. Staged and findable are not the same fact
-until a run says so.
+LibGcrypt at 1.10.3, Libtasn1 at 4.19.0, Libxkbcommon at 1.7.0, LibXml2
+at 2.12.6, ZLIB at 1.3.1, PNG at 1.6.58, SQLite3 at 3.45.1, Threads, and
+Unifdef at `/usr/bin/unifdef`.
 
-Not done, and each its own project: GLIB, LibSoup, Cairo, Fontconfig,
-zlib, libpng, WebP, Unifdef.
+Five of those cleared in one run, and the reason is worth keeping. This
+section used to say that SQLite3, WPE and FreeType were staged but not
+exercised, because nothing had reached them — "staged and findable are
+not the same fact until a run says so". Porting zlib moved the frontier
+past line 16 and the claim was settled at once: **SQLite3 was found**, on
+the layout it had been staged in for months, and so were Threads and
+Unifdef, which need nothing from this tree at all. **WPE and FreeType
+are still unproven** — WPE is line 21 and configure now stops at 20, and
+CMake's own `FindFreetype` is behind a conditional further down.
+
+Not done, and each its own project: WebP, then GLIB with LibSoup — the
+last two unconditional REQUIRED entries in the file — and Cairo and
+Fontconfig behind conditionals.
 
 ### ICU was easier than this file used to claim
 
@@ -329,8 +342,8 @@ not installed to run them.
 
 ## Where it stops today
 
-`make webkit` reaches `OptionsWPE.cmake:16` — the *ninth* dependency
-check of twenty-two — and stops:
+`make webkit` reaches `OptionsWPE.cmake:20` — the *thirteenth* of the
+fifteen checks that file opens with — and stops:
 
     -- Found HarfBuzz: .../build/webkit-sysroot/include/harfbuzz
        (found suitable version "8.5.0", minimum required is "1.4.2")
@@ -348,15 +361,34 @@ check of twenty-two — and stops:
     -- Found Libxkbcommon: TRUE (Required is at least version "0.4.0")
     -- Found LibXml2: .../build/webkit-sysroot/lib/libxml2.a
        (found suitable version "2.12.6", minimum required is "2.8.0")
-    -- Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)
-    CMake Error: Could NOT find PNG
-      (missing: PNG_LIBRARY PNG_PNG_INCLUDE_DIR)
+    -- Found ZLIB: .../build/webkit-sysroot/lib/libz.a
+       (found version "1.3.1")
+    -- Found PNG: .../build/webkit-sysroot/lib/libpng.a
+       (found version "1.6.58")
+    -- Found SQLite3: .../build/webkit-sysroot/lib/libsqlite3.a
+       (found version "3.45.1")
+    -- Found Threads: TRUE
+    -- Found Unifdef: /usr/bin/unifdef
+    -- The following WebP libraries were not found:
+    --  WebP (required)
+    --  demux (required)
+    CMake Error: Could NOT find WebP
+      (missing: WebP_INCLUDE_DIR WebP_LIBRARY _WebP_REQUIRED_LIBS_FOUND)
 
 Libtasn1 prints no version, and that is `FindLibtasn1.cmake` rather than
 a gap: it hands `find_package_handle_standard_args` a single
 `REQUIRED_VARS LIBTASN1_LIBRARIES` and no `VERSION_VAR`, and
-`OptionsWPE.cmake:13` asks for no minimum. It is the only one of the
-seven written with nothing to compare.
+`OptionsWPE.cmake:13` asks for no minimum. It is the only one written
+with nothing to compare.
+
+**Five lines cleared for the price of one port.** zlib was ported
+because `FindPNG` begins with `find_package(ZLIB)` and its whole body is
+inside `if (ZLIB_FOUND)` — so the PNG line had been reporting two
+missing packages, not one. Once those two went green, three checks that
+had never run turned out to need nothing: `FindSQLite3` found the
+archive staged months earlier, and Threads and Unifdef are satisfied by
+the host toolchain and `/usr/bin/unifdef`. That is the difference
+between *staged* and *found*, settled in one run.
 
 **A correction, because this section used to say otherwise.** It read
 that Epoxy could not be found without a **pkg-config module** — that
@@ -377,17 +409,28 @@ unset `VERSION_VAR`. The quoted error was **HarfBuzz's**, whose find
 module computes a version out of the headers, and it was generalised to
 Epoxy without being reproduced.
 
-This is measurable rather than arguable: pkg-config is **not installed
-on this machine**, `build/webkit/CMakeCache.txt` records
-`PKG_CONFIG_EXECUTABLE-NOTFOUND`, every find module has been taking its
-`find_path`/`find_library` fallback all along, and all six that have
-been reached still succeed. The `.pc` files `make webkit-sysroot` writes
-are inert today.
+That was measurable rather than arguable at the time: pkg-config was not
+installed, `build/webkit/CMakeCache.txt` recorded
+`PKG_CONFIG_EXECUTABLE-NOTFOUND`, and every find module reached so far
+had been taking its `find_path`/`find_library` fallback. The `.pc` files
+`make webkit-sysroot` writes were inert.
 
-They are written and kept anyway. Installing pkg-config is one command,
-and on a machine that has it the toolchain's `PKG_CONFIG_LIBDIR` points
-at that directory *and nowhere else* — which is what would stop the
-host's own libraries from answering a query about this system's.
+**Libxkbcommon changed that, and it is now a build requirement.**
+`FindLibxkbcommon.cmake` is `pkg_check_modules(LIBXKBCOMMON xkbcommon)`
+and nothing else — no `find_path`, no `find_library`, no fallback — so
+that package can only be found by pkg-config, and the module name in the
+call is what the file has to be called: **`xkbcommon.pc`**. Two things
+changed the moment pkg-config was installed: xkbcommon is found, and
+Epoxy stopped warning and started reporting 1.5.10. The toolchain points
+`PKG_CONFIG_LIBDIR` at the sysroot *and nowhere else*, which is what
+stops the host's own libraries from answering a query about this
+system's.
+
+The two newest `.pc` files are back to being inert, and deliberately so:
+CMake's own `FindZLIB` and `FindPNG` never consult pkg-config at all —
+they read the version out of `zlib.h` and `png.h` by regex — so
+`zlib.pc` and `libpng16.pc` are written for consistency rather than
+because anything reads them yet.
 
 Both of the first two lines were errors before this. HarfBuzz was
 rejected for not being built against ICU — `find_package(HarfBuzz 1.4.2
@@ -405,10 +448,11 @@ archive `icutest` exercised, and FreeType's two redirected config
 headers are copied over upstream's so the headers in it describe the
 archive beside them.
 
-So the frontier is now PNG, and there are nine behind it — but note the
-ZLIB line above it. `FindPNG` looks for zlib first and does not find it
-either, so the next entry is really **two** ports, and zlib is the one
-that has to come first.
+So the frontier is now **WebP**, with `COMPONENTS demux`, and there are
+five REQUIRED entries behind it — one of which, WPE, is already ported
+and staged and has simply never been reached. `FindWebP.cmake` is
+WebKit's own and wants `libwebp` plus a separate `libwebpdemux`, so that
+entry is one tarball and two archives.
 
 ## The exit code
 
@@ -416,8 +460,10 @@ Non-zero, and this is the honest reading of it.
 
 Clearing the OS gate moved the wall from *before* the dependency list to
 *inside* it; ICU moved it two entries along, and JPEG and Epoxy two
-more. None of that is a browser: thirteen unported REQUIRED libraries
-stand behind the current error.
+more, and zlib took four lines with it. None of that is a browser: four
+unconditional REQUIRED entries stand behind the current error — WebP,
+WPE, LibSoup and GLIB — and WPE is already ported and staged and has
+simply never been reached.
 
 **Epoxy is the one worth being precise about**, because it is the entry
 that changed character rather than merely being ticked off. It is an
@@ -441,14 +487,15 @@ it could not serve. A stub that returned quietly would have produced a
 black window and no explanation. The rung that changes it is a software
 GL over `src/g3d.h`'s rasteriser, which is a separate project.
 
-The arithmetic is worth stating plainly, because "two down, sixteen to
-go" reads more encouraging than it is. The two done here are the two
-that had no substitute — nothing else supplies the Unicode tables, and
-nothing else supplies shaping. Several of the sixteen are small (zlib,
-libpng, libjpeg, libtasn1). Two are not: **GLib** with **LibSoup** is a
-second runtime with its own main loop, type system and TLS stack, and
-**Epoxy** wants a GL implementation this machine does not have and this
-kernel deliberately does not provide.
+The arithmetic is worth stating plainly, because the count coming down
+reads more encouraging than it is. Most of what has been cleared was
+small in the way a library can be small: zlib, libpng, libjpeg and
+libtasn1 each cost a configuration file and a test, and none of them
+needed the system to grow. What is left is not shaped like that. **GLib**
+with **LibSoup** is a second runtime with its own main loop, type system
+and TLS stack, and **Epoxy** is found but wants a GL implementation this
+machine does not have and this kernel deliberately does not provide — an
+entry that is ticked and not therefore done.
 
 There is also a second gate further along that no build-system work
 reaches, and it has moved. `WTF_OS_UNIX` gets the files chosen; the code
@@ -505,10 +552,15 @@ on this ladder. What has changed is how much of it is left.
    `evdev/pc105/us` keymap WebKit asks for by name (67 checks against
    Linux keycodes and X11 keysyms); libxml2 2.12.6 with zlib, iconv,
    ICU, modules, FTP and HTTP all compiled out (66 checks, driven the
-   way `XMLDocumentParserLibxml2.cpp` drives it). **PNG** is where
-   configure stops today, and there are nine behind it — but `FindPNG`
-   wants zlib first, so that entry is two ports and zlib leads. The
-   rest are small — WebP, Unifdef — and `GLib`/`LibSoup` is not.
+   way `XMLDocumentParserLibxml2.cpp` drives it); zlib 1.3.1 (138
+   checks, decoding DEFLATE Apple's libcompression produced); libpng
+   1.6.58 (73 checks against PNGs written from the specification and by
+   macOS's ImageIO, driven progressively the way `PNGImageDecoder.cpp`
+   drives it). Those last two cleared five lines between them: PNG's own
+   probe wanted zlib first, and SQLite3, Threads and Unifdef were
+   waiting behind them needing nothing. **WebP** is where configure
+   stops today, with four behind it — and `GLib`/`LibSoup` is the one
+   that is not small.
 10. The `libc/` gaps WebKit's own configure named: `langinfo.h`,
     `strnstr`, `regexec`, `statx`, `malloc_trim`. `sys/time.h`,
     `localtime_r`, `timegm`, `SIGTRAP`, `tm_gmtoff` and `tm_zone` were

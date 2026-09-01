@@ -36,14 +36,14 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**136,527 lines of C written here**, across 280 files, built as five kernel
+**139,229 lines of C written here**, across 284 files, built as five kernel
 objects plus one for inference, over a user-space C library of its own —
 and, since ring 3 got file descriptors and sockets, a freestanding C++
 runtime to go with it, down to the Itanium ABI's run-time type
 information. A ring-3 program can now fork, exec, signal, and wait for its
 children, in Linux's numbering as well as this system's — over pipes, with
 signals, waiting on poll. 3.7 million host checks across 17 suites on
-every build, and seventeen more on the machine itself.
+every build, and nineteen more on the machine itself.
 
 ---
 
@@ -279,21 +279,37 @@ that asserts `UNIX`, which selects the generic-Unix branch rather than
 the Linux one, and the toolchain adds `-D__unix__` because WTF reads
 predefined macros rather than CMake variables. Configure now runs
 WebKit's whole feature-detection pass against this C library and stops
-at `OptionsWPE.cmake:16` — the ninth of twenty-two required packages.
-Eight are now *found* by a real configure run: HarfBuzz 8.5.0 with the
-components WebKit asks for, ICU 74.2 with `data i18n uc`, JPEG 62,
-Epoxy 1.5.10, LibGcrypt 1.10.3, Libtasn1 4.19.0, Libxkbcommon 1.7.0 and
-LibXml2 2.12.6. PNG is where it stops, and nine stand behind that —
-though PNG's own probe fails on zlib first, so the next one is really
-two.
+at `OptionsWPE.cmake:20` — the thirteenth of the fifteen required
+packages that file opens with. **Thirteen are now *found* by a real
+configure run**: HarfBuzz
+8.5.0 with the components WebKit asks for, ICU 74.2 with `data i18n uc`,
+JPEG 62, Epoxy 1.5.10, LibGcrypt 1.10.3, Libtasn1 4.19.0, Libxkbcommon
+1.7.0, LibXml2 2.12.6, ZLIB 1.3.1, PNG 1.6.58, SQLite3 3.45.1, Threads
+and Unifdef. WebP is where it stops.
+
+Five of those cleared at once, which is worth knowing before guessing
+what the next port costs: `FindPNG` opens with `find_package(ZLIB)` and
+does nothing else if that fails, so zlib unblocked two lines rather than
+one — and SQLite3, Threads and Unifdef had been satisfiable for some
+time behind them, waiting for the lines above to stop erroring.
+
+(This paragraph used to say *twenty-two* required packages, and that
+number was wrong every time it was repeated. `OptionsWPE.cmake` opens
+with **fifteen** unconditional `find_package(... REQUIRED)` on lines
+8-22, and carries two more further down — LibSoup and GLIB — for
+seventeen in all. Forty-four `find_package` calls appear in the file
+altogether, most of them conditional or optional, and that is probably
+where twenty-two came from.)
 
 **The three things that were blocking before this no longer are.** There was no `libstdc++` for
 `x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;
-there are now a freestanding C++ runtime (`libcxx/`), nineteen
+there are now a freestanding C++ runtime (`libcxx/`), twenty-four
 descriptor and socket system calls (`src/vfs.h`), and the POSIX layer
-over them in `libc/`. What remains is mostly breadth — eighteen
-dependency ports, and the specific `libc` gaps WebKit's own configure
-named (`sys/time.h`, `langinfo.h`, `localtime_r`, `timegm`, `regexec`).
+over them in `libc/`. What remains of the required list is short and
+uneven: **WebP**, which is one tarball and two archives, and **GLib with
+LibSoup**, which is not a port but a second runtime — plus the specific
+`libc` gaps WebKit's own configure named (`langinfo.h`, `strnstr`,
+`regexec`).
 Two items are depth rather than breadth: an OpenGL implementation, and a
 real `WTF_OS_VEXTRO` for the places WTF assumes a process model this
 system has no answer for. `third_party/wpe-config/README.md` sets it out
@@ -449,8 +465,8 @@ handler was given.
 
 ## Ports, and what each one cost
 
-Twelve libraries are built from upstream sources, unpatched, and run in
-ring 3. Each is fetched by checksum (`make libs-fetch`) and gitignored,
+Fourteen libraries are built from upstream sources, unpatched, and run
+in ring 3. Each is fetched by checksum (`make libs-fetch`) and gitignored,
 and each is checked on the machine rather than assumed:
 
 | | version | in ring 3 | what it actually needed |
@@ -466,10 +482,12 @@ and each is checked on the machine rather than assumed:
 | libtasn1 | 4.19.0 | 94 checks | `WORD_BIT` in `<limits.h>`, and gnulib's `strverscmp` — this C library had neither |
 | libxkbcommon | 1.7.0 | 67 checks | 2.7 MB of xkeyboard-config on the volume, and a formatter that can write a directory of 138 names |
 | libxml2 | 2.12.6 | 66 checks | nothing — the first port that needed no new interface at all |
+| zlib | 1.3.1 | 138 checks | nothing either; its configuration is two `#ifdef`s answered twice over |
+| libpng | 1.6.58 | 73 checks | `setjmp`, which had been in `libc/` for years with nothing in ring 3 using it |
 | WPE | 1.16.2 | 40 checks | the backend seam in `third_party/wpe-port/` |
 
-The last three are the ones that say something about the shape of this
-system rather than about the libraries. libjpeg-turbo is compiled three
+Three of them say something about the shape of this system rather than
+about the libraries. libjpeg-turbo is compiled three
 times over — at 8, 12 and 16 bits per sample — because version 3 selects
 precision at run time and skipping the other two passes leaves the
 dispatch calling functions that are not in the archive. And libepoxy is
@@ -486,7 +504,7 @@ and `socketpair()` — neither of which existed. Both do now, along with
 ends. That was the last of the four things `libc/include/unistd.h` used
 to list as absent.
 
-libtasn1 is the smallest of the ten and the one whose test is the most
+libtasn1 is the smallest of the fourteen and the one whose test is the most
 specific: the ASN.1 module it compiles is a verbatim copy of the one WPE
 WebKit carries in `pal/crypto/tasn1/Utilities.cpp`, and every structure
 it decodes came out of the build machine's OpenSSL. Neither is
@@ -495,6 +513,25 @@ whether WebKit's builds, and a structure encoded here and decoded here
 would agree with itself even if both halves shared a wrong idea of how
 an OBJECT IDENTIFIER is packed — the same reason `jpegtest` reads a
 bitstream macOS encoded.
+
+zlib and libpng arrived together because they had to: CMake's `FindPNG`
+begins with `find_package(ZLIB)` and its whole body is inside
+`if (ZLIB_FOUND)`, so the PNG line was reporting two missing packages.
+Neither needed a new interface — every call they make, down to `pow` and
+`setjmp`, was already in `libc/` — but libpng is the first thing in ring
+3 to *use* `setjmp`, because it does not return error codes: `png_error`
+calls the caller's handler, which must not return, and the way it does
+not return is a `longjmp`. `libc/setjmp.S` had been sitting there for
+years with nothing above it to notice if it saved the wrong registers.
+
+Their tests are built the same way as `jpegtest`'s and for the same
+reason. `apps/zlib_ref.h` holds DEFLATE produced by **Apple's
+libcompression**, with the RFC 1950 and RFC 1952 wrappers written from
+the specifications rather than by zlib's own writer. `apps/png_ref.h`
+holds six PNGs built from the specification by `tools/mkpngref.py` and
+one re-encoded by macOS's ImageIO — and one of the six uses a different
+row filter on *every row*, which no real encoder would produce and which
+is the only way to know the Average and Paeth reconstructions are right.
 
 ## The interface, from utility classes
 

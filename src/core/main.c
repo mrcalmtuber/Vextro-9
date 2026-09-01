@@ -1959,6 +1959,54 @@ void kmain(void) {
     serial_puts("[vextro] xml selftest: done\n");
 
     /*
+     * And zlib, which is two questions rather than one.
+     *
+     * The first is whether inflate is right, and that cannot be settled
+     * by this library alone: compressing and decompressing with the same
+     * code agrees with itself whatever either half believes. So the
+     * streams apps/zlibtest.c decodes were produced by Apple's
+     * libcompression on the build machine, and the wrappers round them
+     * were written from RFC 1950 and RFC 1952 rather than by zlib's own
+     * writer.
+     *
+     * The second is whether the gz* layer can reach the disk, and that
+     * is a question about this system and not about zlib at all. gzopen
+     * calls open with a mode argument, gzread calls read and lseek,
+     * gzclose calls close — and the NTFS writer here keeps a write-back
+     * image until the descriptor is closed, so a gzclose that did not
+     * really close would leave a file that reads back empty. The test
+     * writes a gzip file to the volume, checks the magic with the raw
+     * descriptor calls, and only then reads it back through zlib.
+     */
+    serial_puts("[vextro] zlib selftest: running /zlibtest\n");
+    execute_bin_blocking("/zlibtest", 0);
+    serial_puts("[vextro] zlib selftest: done\n");
+
+    /*
+     * And libpng, which runs straight after zlib because it is built on
+     * it — every IDAT chunk is a zlib stream, so a libpng failure here
+     * with zlib green above narrows to libpng in one step.
+     *
+     * It is also the first code in ring 3 that depends on setjmp. libpng
+     * does not return error codes: png_error() calls the caller's
+     * handler, which must not return, and the way it does not return is
+     * longjmp to a buffer set with setjmp(png_jmpbuf(png)). libc/setjmp.S
+     * has been in this tree since long before there was anything in ring
+     * 3 to use it, and section 9 of apps/pngtest.c is the first thing
+     * that would notice if it saved the wrong registers — which it would
+     * notice as a jump into nowhere rather than as a wrong answer.
+     *
+     * The images it decodes were written by tools/mkpngref.py from the
+     * specification and by macOS's ImageIO, never by libpng, for the
+     * reason apps/jpeg_ref.h exists. One of them uses a different row
+     * filter on every row, which a real encoder choosing filters to
+     * compress well would never produce.
+     */
+    serial_puts("[vextro] png selftest: running /pngtest\n");
+    execute_bin_blocking("/pngtest", 0);
+    serial_puts("[vextro] png selftest: done\n");
+
+    /*
      * And the Linux subset, which is last because it is the only one
      * that makes *other* processes: it forks eight children, kills one,
      * faults another, executes a third, and leaves each of them
