@@ -2007,6 +2007,116 @@ void kmain(void) {
     serial_puts("[vextro] png selftest: done\n");
 
     /*
+     * And WebP, which is two libraries and the first port here that is.
+     * `find_package(WebP REQUIRED COMPONENTS demux)` asks for libwebp and
+     * libwebpdemux by name, and the second does not decode a pixel: it
+     * walks a RIFF container and hands out fragments.
+     *
+     * Two things in apps/webptest.c are worth knowing about from here.
+     *
+     * There is no second implementation of VP8 on this machine — macOS
+     * reads .webp through ImageIO and ImageIO bundles libwebp — so the
+     * bitstreams it decodes were encoded by these same sources compiled
+     * for the *host*, and the header says so rather than implying
+     * otherwise. What is genuinely independent is the animation's
+     * container, which tools/mkwebpref.py assembles from the WebP
+     * specification, and the demuxer is exactly what that tests.
+     *
+     * And section 8 swaps libwebp's own CPU-detection hook for one that
+     * reports a processor with no SIMD, decodes again, and requires the
+     * two results to be identical. This port compiles the SSE2, SSE4.1
+     * and AVX2 kernels in rather than turning them off, and that check is
+     * the reason it is allowed to: an optimisation nobody can test is a
+     * liability. Which of the three the processor actually permits is
+     * printed rather than required — AVX2 needs the operating system to
+     * enable the YMM state, and this kernel does not.
+     */
+    serial_puts("[vextro] webp selftest: running /webptest\n");
+    execute_bin_blocking("/webptest", 0);
+    serial_puts("[vextro] webp selftest: done\n");
+
+    /*
+     * And PCRE2, which is the first library here that WebKit's configure
+     * will never ask for. It is not on OptionsWPE.cmake's list at any
+     * line — it is on GLib's, whose meson.build makes libpcre2-8 a
+     * required dependency because GRegex *is* PCRE2 since GLib stopped
+     * bundling a copy. So this is a prerequisite of a prerequisite, and
+     * it runs here for the same reason everything else does: an archive
+     * that has not been run on the machine is a claim rather than a
+     * fact.
+     *
+     * Two things in apps/pcre2test.c are worth knowing from here. The
+     * Unicode assertions are written as facts from the Unicode Character
+     * Database rather than as observations of this library — U+0391 is
+     * Lu because the UCD says so — because Unicode support is the thing
+     * this port had to turn on by hand and GLib passes PCRE2_UCP on
+     * every pattern it compiles. And the JIT is deliberately absent:
+     * PCRE2's JIT writes machine code into a page and jumps to it, which
+     * is a question about this kernel rather than about PCRE2, and
+     * nothing in ring 3 has ever asked for an executable mapping. GLib
+     * has an explicit branch for that answer, so the test takes it.
+     */
+    serial_puts("[vextro] pcre2 selftest: running /pcre2test\n");
+    execute_bin_blocking("/pcre2test", 0);
+    serial_puts("[vextro] pcre2 selftest: done\n");
+
+    /*
+     * And libffi, the other half of what GLib needs before it can be
+     * attempted — and the port that ran into this kernel's own security
+     * policy rather than into anything about the library.
+     *
+     * libffi does two things. ffi_call marshals arguments into registers
+     * and stack slots and calls code that is already executable; that
+     * half is built, and everything apps/ffitest.c does exercises it,
+     * down to the SysV classification of structures that travel half in
+     * an integer register and half in an SSE one.
+     *
+     * Closures are the other half: they manufacture a function pointer,
+     * which means writing machine code into memory and jumping to it.
+     * src/desktop.h:2449 refuses PROT_WRITE|PROT_EXEC by name, and
+     * libc/include/sys/mman.h says why — every page of every program is
+     * writable or executable and never both. So src/closures.c is not
+     * compiled and ffi_closure_alloc is absent from the archive, which
+     * makes a program that wants one fail at link naming the symbol
+     * rather than fault later inside a heap buffer.
+     *
+     * GLib does not want one. gobject/gclosure.c uses ffi_prep_cif,
+     * ffi_call and the ffi_type_ descriptors and nothing else, so the
+     * half this system can build is the half that is needed.
+     */
+    serial_puts("[vextro] ffi selftest: running /ffitest\n");
+    execute_bin_blocking("/ffitest", 0);
+    serial_puts("[vextro] ffi selftest: done\n");
+
+    /*
+     * And GNU libiconv, which closes a gap this tree had been writing
+     * down rather than fixing: third_party/libxml2-port/config.h has
+     * said since it was written that there is no iconv in this C
+     * library, and GLib's meson.build makes one required. They were the
+     * same absence.
+     *
+     * It is the one port here whose expectations need no second
+     * implementation at all, because the mappings *are* the standard:
+     * ISO-8859-15 puts a euro sign at 0xA4 because ISO/IEC 8859-15 says
+     * so, and Shift_JIS encodes U+3042 as 0x82 0xA0 because JIS X 0208
+     * says so. Every table in apps/iconvtest.c is written as the
+     * standard's fact rather than as something this library happens to
+     * do — and two sections are chosen to *discriminate*, since 0xA4 is
+     * a currency sign in Latin-1 and a euro in Latin-9, which is the
+     * confusion a table-driven converter actually makes.
+     *
+     * The other half of it is the three errno values that are iconv's
+     * whole streaming contract. EILSEQ means the input is wrong and
+     * will still be wrong later; EINVAL means it is merely incomplete;
+     * E2BIG means nothing is wrong with the input at all and the output
+     * ran out. A caller fed by a socket meets all three and has to do
+     * something different each time.
+     */
+    serial_puts("[vextro] iconv selftest: running /iconvtest\n");
+    execute_bin_blocking("/iconvtest", 0);
+    serial_puts("[vextro] iconv selftest: done\n");
+
+    /*
      * And the Linux subset, which is last because it is the only one
      * that makes *other* processes: it forks eight children, kills one,
      * faults another, executes a third, and leaves each of them

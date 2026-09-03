@@ -91,3 +91,7 @@ third_party/xkeyboard-config/
 third_party/libxml2/
 third_party/zlib/
 third_party/libpng/
+third_party/libwebp/
+third_party/pcre2/
+third_party/libffi/
+third_party/libiconv/

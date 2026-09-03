@@ -813,7 +813,7 @@ build/ca-bundle.crt:
 # walk is a shell loop for the same reason $big below is one -- the
 # directory is produced by a download, so it does not exist when make
 # parses this file and a $(wildcard) would quietly expand to nothing.
-disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest build/gcrypttest build/tasn1test build/xkbtest build/xmltest build/zlibtest build/pngtest build/zlibref.gz build/zlibbad.gz $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt $(XKBCONF_STAGE)/.stamp
+disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutextest build/threadtest build/wpetest build/fdprobe build/fdtest build/cxxtest build/sqltest build/fttest build/hbtest build/icutest build/vlstest build/jpegtest build/gltest build/gcrypttest build/tasn1test build/xkbtest build/xmltest build/zlibtest build/pngtest build/webptest build/pcre2test build/ffitest build/iconvtest build/zlibref.gz build/zlibbad.gz $(WINAPPS) $(STORE_BINS) $(PIC_SCI) $(MUSIC_WAV) $(MUSIC_FLAC) build/ca-bundle.crt $(XKBCONF_STAGE)/.stamp
 	@set -e; \
 	big=""; \
 	for f in $(ASSET_FILES); do \
@@ -846,6 +846,10 @@ disk.img: $(ASSET_LIST) build/sqlseed.db | build/hello build/faulter build/mutex
 		build/xmltest \
 		build/zlibtest \
 		build/pngtest \
+		build/webptest \
+		build/pcre2test \
+		build/ffitest \
+		build/iconvtest \
 		build/zlibref.gz:zlibref.gz \
 		build/zlibbad.gz:zlibbad.gz \
 		assets/ComicNeue-Regular.ttf:ComicNeue-Regular.ttf \
@@ -2614,6 +2618,527 @@ $(PNG_DIR)/scripts/pnglibconf.h.prebuilt:
 	@mkdir -p $(PNG_DIR)
 	@tar -C $(PNG_DIR) --strip-components=1 -xJf build/$(PNG_TARBALL)
 
+# --- libwebp 1.6.0 ---
+#
+# `OptionsWPE.cmake:20`, and the last unproven entry in the fifteen that
+# file opens with. `find_package(WebP REQUIRED COMPONENTS demux)` wants
+# two archives, not one, which is why this section builds two.
+#
+# ---- what FindWebP.cmake actually asks for ----
+#
+# WebKit ships its own module, and it wants three things: `webp/decode.h`
+# somewhere on the include path, a library called `webp`, and — because
+# of `COMPONENTS demux` — a second one called `webpdemux`. There is a
+# `mux` component too and OptionsWPE does not request it, so
+# libwebpmux.a is deliberately not built: nothing in
+# `Source/WebCore` names WebPMux, and an archive in the sysroot that
+# nothing has ever run is exactly the mismatch the libxkbcommon staging
+# note is about.
+#
+# **A bug in that module, named rather than fixed**, in the tradition of
+# FindEpoxy's "withouit" typo. Line 68 reads
+#
+#     set(WebP_VERSION ${PC_WEBP_CFLAGS_VERSION})
+#
+# and `pkg_check_modules` sets `PC_WEBP_VERSION`, never
+# `PC_WEBP_CFLAGS_VERSION`. So `WebP_VERSION` is empty whether or not
+# pkg-config is installed and whether or not the .pc file below exists —
+# which is harmless here only because OptionsWPE asks for no minimum, so
+# the `VERSION_GREATER` comparison is "" against "" and takes neither
+# branch. The .pc files are written anyway, for the reason libtasn1's is.
+#
+# ---- config.h, and the one decision in it that matters ----
+#
+# See the long note in third_party/libwebp-port/config.h. In short:
+# libwebp's SIMD has two macro families, and the moment HAVE_CONFIG_H is
+# defined the config file becomes responsible for the answer —
+# WEBP_HAVE_SSE2 is what lets the dispatcher call VP8DspInitSSE2 at all.
+# Each WEBP_HAVE_ here is paired with a compiler flag below, because the
+# two must agree in both directions: a -m without the define compiles
+# the kernels and never calls them, and a define without the -m calls an
+# Init function that is not in the archive.
+#
+# ---- the tarball ----
+#
+# From Google's own release host over HTTPS, checksum recorded here.
+# There is a detached signature beside it, `libwebp-1.6.0.tar.gz.asc`,
+# and it is **not** verified: gpg is not installed on this machine and
+# installing it was not part of the work. Recorded as a gap rather than
+# quietly skipped — the checksum below was taken from the download, so
+# it pins the bytes against later tampering and vouches for nothing
+# about the first fetch.
+WEBP_VERSION := 1.6.0
+WEBP_TARBALL := libwebp-$(WEBP_VERSION).tar.gz
+WEBP_URL     := https://storage.googleapis.com/downloads.webmproject.org/releases/webp/$(WEBP_TARBALL)
+WEBP_SHA256  := e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+WEBP_DIR     := third_party/libwebp
+WEBP_PORT    := third_party/libwebp-port
+WEBP_GEN     := build/webp
+
+# Upstream's own layout: the generated config lands at
+# $(top_builddir)/src/webp/config.h and -I names the build root, because
+# every source that wants it writes `#include "src/webp/config.h"`.
+$(WEBP_GEN)/src/webp/config.h: $(WEBP_PORT)/config.h
+	@mkdir -p $(WEBP_GEN)/src/webp
+	@cp $< $@
+	@echo "  GEN    $@ ($(WEBP_VERSION), sse2+sse41+avx2, threads)"
+
+# The source lists are upstream's, read out of the Makefile.am files
+# rather than curated here: sharpyuv/Makefile.am, src/dec, src/utils,
+# src/dsp, src/enc and src/demux each name theirs, and the split between
+# the plain and the _sse41/_avx2 groups is upstream's too — it is what
+# decides which files get an extra -m flag.
+WEBP_SHARPYUV := sharpyuv sharpyuv_cpu sharpyuv_csp sharpyuv_dsp \
+                 sharpyuv_gamma
+WEBP_SHARPYUV_SSE2 := sharpyuv_sse2
+
+WEBP_DEC := alpha_dec buffer_dec frame_dec idec_dec io_dec quant_dec \
+            tree_dec vp8_dec vp8l_dec webp_dec
+
+WEBP_UTILS := bit_reader_utils color_cache_utils filters_utils \
+              huffman_utils palette quant_levels_dec_utils random_utils \
+              rescaler_utils thread_utils utils \
+              bit_writer_utils huffman_encode_utils quant_levels_utils
+
+WEBP_DSP := alpha_processing cpu dec dec_clip_tables filters lossless \
+            rescaler upsampling yuv \
+            cost enc lossless_enc ssim
+
+WEBP_DSP_SSE2 := alpha_processing_sse2 dec_sse2 filters_sse2 \
+                 lossless_sse2 rescaler_sse2 upsampling_sse2 yuv_sse2 \
+                 cost_sse2 enc_sse2 lossless_enc_sse2 ssim_sse2
+
+WEBP_DSP_SSE41 := alpha_processing_sse41 dec_sse41 lossless_sse41 \
+                  upsampling_sse41 yuv_sse41 enc_sse41 lossless_enc_sse41
+
+WEBP_DSP_AVX2 := lossless_avx2 lossless_enc_avx2
+
+WEBP_ENC := alpha_enc analysis_enc backward_references_cost_enc \
+            backward_references_enc config_enc cost_enc filter_enc \
+            frame_enc histogram_enc iterator_enc near_lossless_enc \
+            picture_csp_enc picture_enc picture_psnr_enc \
+            picture_rescale_enc picture_tools_enc predictor_enc \
+            quant_enc syntax_enc token_enc tree_enc vp8l_enc webp_enc
+
+WEBP_DEMUX := anim_decode demux
+
+WEBP_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+               -DHAVE_CONFIG_H -I$(WEBP_GEN) -I$(WEBP_DIR) -Ilibc/include
+
+WEBP_OBJ := \
+  $(addprefix $(WEBP_GEN)/obj/y_,$(addsuffix .o,$(WEBP_SHARPYUV))) \
+  $(addprefix $(WEBP_GEN)/obj/y2_,$(addsuffix .o,$(WEBP_SHARPYUV_SSE2))) \
+  $(addprefix $(WEBP_GEN)/obj/d_,$(addsuffix .o,$(WEBP_DEC))) \
+  $(addprefix $(WEBP_GEN)/obj/u_,$(addsuffix .o,$(WEBP_UTILS))) \
+  $(addprefix $(WEBP_GEN)/obj/s_,$(addsuffix .o,$(WEBP_DSP))) \
+  $(addprefix $(WEBP_GEN)/obj/s_,$(addsuffix .o,$(WEBP_DSP_SSE2))) \
+  $(addprefix $(WEBP_GEN)/obj/s41_,$(addsuffix .o,$(WEBP_DSP_SSE41))) \
+  $(addprefix $(WEBP_GEN)/obj/sa_,$(addsuffix .o,$(WEBP_DSP_AVX2))) \
+  $(addprefix $(WEBP_GEN)/obj/e_,$(addsuffix .o,$(WEBP_ENC)))
+
+WEBP_DEMUX_OBJ := \
+  $(addprefix $(WEBP_GEN)/obj/x_,$(addsuffix .o,$(WEBP_DEMUX)))
+
+WEBP_DEPS := $(WEBP_GEN)/src/webp/config.h
+
+$(WEBP_GEN)/obj/y_%.o: $(WEBP_DIR)/sharpyuv/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+$(WEBP_GEN)/obj/y2_%.o: $(WEBP_DIR)/sharpyuv/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+$(WEBP_GEN)/obj/d_%.o: $(WEBP_DIR)/src/dec/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+$(WEBP_GEN)/obj/u_%.o: $(WEBP_DIR)/src/utils/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+$(WEBP_GEN)/obj/s_%.o: $(WEBP_DIR)/src/dsp/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+# The two rules that exist only because of the SIMD gate. Each is the
+# other half of a WEBP_HAVE_ in the port's config.h: without the -m the
+# intrinsics in these files do not compile in, the Init functions vanish,
+# and the dispatcher calls a symbol that is not there.
+$(WEBP_GEN)/obj/s41_%.o: $(WEBP_DIR)/src/dsp/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -msse4.1 -c $< -o $@
+
+$(WEBP_GEN)/obj/sa_%.o: $(WEBP_DIR)/src/dsp/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -mavx2 -c $< -o $@
+
+$(WEBP_GEN)/obj/e_%.o: $(WEBP_DIR)/src/enc/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+$(WEBP_GEN)/obj/x_%.o: $(WEBP_DIR)/src/demux/%.c $(WEBP_DEPS)
+	@mkdir -p $(WEBP_GEN)/obj
+	$(CC) $(WEBP_CFLAGS) -c $< -o $@
+
+build/libwebp.a: $(WEBP_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  WEBP   build/libwebp.a ($(WEBP_VERSION), $(words $(WEBP_OBJ)) objects)"
+
+build/libwebpdemux.a: $(WEBP_DEMUX_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  WEBP   build/libwebpdemux.a ($(WEBP_VERSION))"
+
+.PHONY: webp
+webp: build/libwebp.a build/libwebpdemux.a
+
+$(WEBP_DIR)/src/webp/decode.h:
+	@echo "  fetching $(WEBP_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(WEBP_TARBALL) $(WEBP_URL)
+	@printf '%s  build/%s\n' "$(WEBP_SHA256)" "$(WEBP_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(WEBP_TARBALL) does not match its checksum."; \
+		     rm -f build/$(WEBP_TARBALL); exit 1; }
+	@rm -rf $(WEBP_DIR)
+	@mkdir -p $(WEBP_DIR)
+	@tar -C $(WEBP_DIR) --strip-components=1 -xzf build/$(WEBP_TARBALL)
+
+# --- PCRE2 10.48 ---
+#
+# Not a WebKit dependency. **GLib's.**
+#
+# `OptionsWPE.cmake:185` is
+# `find_package(GLIB 2.70 REQUIRED COMPONENTS gio gio-unix gobject
+# gthread gmodule)`, and GLib 2.74's own meson.build:2079 says
+#
+#     pcre2 = dependency('libpcre2-8', required : true, ...)
+#
+# -- required, not optional, because GRegex is PCRE2 and GLib stopped
+# bundling a copy after 2.72. So this is the first port in this tree
+# that WebKit's configure will never look for directly: it is a
+# prerequisite of a prerequisite, and it is here because the entry
+# above it cannot be attempted without it.
+#
+# ---- the three generated files, and where each comes from ----
+#
+# PCRE2 needs `pcre2.h`, `config.h` and `pcre2_chartables.c`, and
+# upstream ships a ready-made answer for two of the three:
+#
+#   pcre2.h              from src/pcre2.h.generic, copied. This is a
+#                        real prebuilt -- the version numbers are
+#                        already substituted -- and it is what upstream's
+#                        own NON-AUTOTOOLS-BUILD instructions say to use.
+#
+#   pcre2_chartables.c   from src/pcre2_chartables.c.dist, copied. The
+#                        C-locale character tables, which is what a
+#                        build that does not run its own dftables
+#                        generator uses, and what GLib wants: GRegex
+#                        works in Unicode rather than in a locale.
+#
+#   config.h             hand-written, in third_party/pcre2-port/, and
+#                        the long note there says why it is not
+#                        src/config.h.generic. Briefly: that file is a
+#                        floor rather than a configuration -- every
+#                        HAVE_ undefined and SUPPORT_UNICODE off -- and
+#                        GLib compiles every pattern with PCRE2_UTF and
+#                        PCRE2_UCP, which without Unicode support are
+#                        refused outright.
+PCRE2_VERSION := 10.48
+PCRE2_TARBALL := pcre2-$(PCRE2_VERSION).tar.bz2
+PCRE2_URL     := https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$(PCRE2_VERSION)/$(PCRE2_TARBALL)
+PCRE2_SHA256  := b6c68fdf6f3ac31388b50aa89ff0fc49c00c987c16e7b5146491d12003f2c8ed
+PCRE2_DIR     := third_party/pcre2
+PCRE2_PORT    := third_party/pcre2-port
+PCRE2_GEN     := build/pcre2
+
+$(PCRE2_GEN)/config.h: $(PCRE2_PORT)/config.h
+	@mkdir -p $(PCRE2_GEN)
+	@cp $< $@
+
+$(PCRE2_GEN)/pcre2.h: $(PCRE2_DIR)/src/pcre2.h.generic
+	@mkdir -p $(PCRE2_GEN)
+	@cp $< $@
+	@echo "  GEN    $@ ($(PCRE2_VERSION), upstream's generic header)"
+
+$(PCRE2_GEN)/pcre2_chartables.c: $(PCRE2_DIR)/src/pcre2_chartables.c.dist
+	@mkdir -p $(PCRE2_GEN)
+	@cp $< $@
+
+# COMMON_SOURCES from upstream's Makefile.am, read out rather than
+# curated. pcre2_jit_compile.c is in the list and stays in it: with
+# SUPPORT_JIT undefined it compiles to a handful of functions that
+# return PCRE2_ERROR_JIT_BADOPTION, which is upstream's code rather than
+# a stub, and is exactly what GLib's gregex.c expects to see -- it calls
+# pcre2_jit_compile() and carries on when it fails.
+PCRE2_NAMES := pcre2_auto_possess pcre2_chkdint pcre2_compile \
+               pcre2_compile_cgroup pcre2_compile_class pcre2_config \
+               pcre2_context pcre2_convert pcre2_dfa_match pcre2_error \
+               pcre2_extuni pcre2_find_bracket pcre2_jit_compile \
+               pcre2_maketables pcre2_match pcre2_match_data \
+               pcre2_match_next pcre2_newline pcre2_ord2utf \
+               pcre2_pattern_info pcre2_script_run pcre2_serialize \
+               pcre2_string_utils pcre2_study pcre2_substitute \
+               pcre2_substring pcre2_tables pcre2_ucd pcre2_valid_utf \
+               pcre2_xclass
+
+PCRE2_OBJ := $(addprefix $(PCRE2_GEN)/obj/,$(addsuffix .o,$(PCRE2_NAMES))) \
+             $(PCRE2_GEN)/obj/pcre2_chartables.o
+
+# PCRE2_CODE_UNIT_WIDTH is not a configuration choice, it is which
+# library this is: the same 30 sources compile three times over
+# upstream, at 8, 16 and 32 bits, into three archives. Only the 8-bit
+# one is built here, because it is the one GLib links.
+PCRE2_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+                -DHAVE_CONFIG_H -DPCRE2_CODE_UNIT_WIDTH=8 \
+                -I$(PCRE2_GEN) -I$(PCRE2_DIR)/src -Ilibc/include
+
+PCRE2_DEPS := $(PCRE2_GEN)/config.h $(PCRE2_GEN)/pcre2.h
+
+$(PCRE2_GEN)/obj/%.o: $(PCRE2_DIR)/src/%.c $(PCRE2_DEPS)
+	@mkdir -p $(PCRE2_GEN)/obj
+	$(CC) $(PCRE2_CFLAGS) -c $< -o $@
+
+$(PCRE2_GEN)/obj/pcre2_chartables.o: $(PCRE2_GEN)/pcre2_chartables.c \
+                                     $(PCRE2_DEPS)
+	@mkdir -p $(PCRE2_GEN)/obj
+	$(CC) $(PCRE2_CFLAGS) -c $< -o $@
+
+build/libpcre2-8.a: $(PCRE2_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  PCRE2  build/libpcre2-8.a ($(PCRE2_VERSION), unicode, no jit)"
+
+.PHONY: pcre2
+pcre2: build/libpcre2-8.a
+
+$(PCRE2_DIR)/src/pcre2.h.generic:
+	@echo "  fetching $(PCRE2_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(PCRE2_TARBALL) $(PCRE2_URL)
+	@printf '%s  build/%s\n' "$(PCRE2_SHA256)" "$(PCRE2_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(PCRE2_TARBALL) does not match its checksum."; \
+		     rm -f build/$(PCRE2_TARBALL); exit 1; }
+	@rm -rf $(PCRE2_DIR)
+	@mkdir -p $(PCRE2_DIR)
+	@tar -C $(PCRE2_DIR) --strip-components=1 -xjf build/$(PCRE2_TARBALL)
+
+# --- libffi 3.5.2 ---
+#
+# GObject's, not WebKit's: GLib 2.74's meson.build:2102 makes
+# `libffi >= 3.0.0` required, and gobject/gclosure.c is the only file in
+# GLib that uses it.
+#
+# **Half the library is built, and the missing half is the point.** The
+# long note in third_party/libffi-port/fficonfig.h has it in full;
+# briefly: ffi_call marshals arguments into an already-executable
+# function, while closures write machine code into memory and jump to
+# it. This kernel refuses PROT_WRITE|PROT_EXEC by name
+# (src/desktop.h:2449), so closures.c and tramp.c are not compiled and
+# ffi_closure_alloc is absent from the archive -- a link error naming
+# the symbol rather than a fault inside a heap buffer later. GLib asks
+# for ffi_prep_cif, ffi_call and the ffi_type_* descriptors and for
+# nothing else, which is measured rather than assumed.
+FFI_VERSION := 3.5.2
+FFI_TARBALL := libffi-$(FFI_VERSION).tar.gz
+FFI_URL     := https://github.com/libffi/libffi/releases/download/v$(FFI_VERSION)/$(FFI_TARBALL)
+FFI_SHA256  := f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc
+FFI_DIR     := third_party/libffi
+FFI_PORT    := third_party/libffi-port
+FFI_GEN     := build/ffi
+
+# ffi.h is a substitution template, like libxml2's xmlversion.h and for
+# the same reason: the six tokens below decide which target's ABI enum
+# the header declares, and hand-copying that is a second implementation
+# of upstream's own dependency rules.
+FFI_SUBST := \
+  -e 's/@VERSION@/$(FFI_VERSION)/g' \
+  -e 's/@TARGET@/X86_64/g' \
+  -e 's/@HAVE_LONG_DOUBLE@/1/g' \
+  -e 's/@FFI_EXEC_TRAMPOLINE_TABLE@/0/g' \
+  -e 's/@FFI_VERSION_STRING@/$(FFI_VERSION)/g' \
+  -e 's/@FFI_VERSION_NUMBER@/30502/g'
+
+$(FFI_GEN)/include/ffi.h: $(FFI_DIR)/include/ffi.h.in
+	@mkdir -p $(FFI_GEN)/include
+	@sed $(FFI_SUBST) $< > $@
+	@echo "  GEN    $@ ($(FFI_VERSION), X86_64, no trampoline table)"
+
+# ffitarget.h is per-architecture and lives in the backend directory;
+# every consumer includes it as <ffitarget.h> beside ffi.h, so it is
+# copied into the same generated include root rather than reached with a
+# second -I. That root is also what gets staged.
+$(FFI_GEN)/include/ffitarget.h: $(FFI_DIR)/src/x86/ffitarget.h
+	@mkdir -p $(FFI_GEN)/include
+	@cp $< $@
+
+$(FFI_GEN)/fficonfig.h: $(FFI_PORT)/fficonfig.h
+	@mkdir -p $(FFI_GEN)
+	@cp $< $@
+
+# The portable half plus the x86-64 backend. closures.c and tramp.c are
+# absent on purpose; ffi.c/sysv.S are the 32-bit x86 backend and win64
+# is the Microsoft ABI, which ffiw64.c also serves as FFI_EFI64 -- both
+# are in upstream's x86_64 build and are kept.
+FFI_C_NAMES  := prep_cif types raw_api java_raw_api
+FFI_X86_C    := ffi64 ffiw64
+FFI_X86_S    := unix64 win64
+
+FFI_OBJ := $(addprefix $(FFI_GEN)/obj/c_,$(addsuffix .o,$(FFI_C_NAMES))) \
+           $(addprefix $(FFI_GEN)/obj/x_,$(addsuffix .o,$(FFI_X86_C))) \
+           $(addprefix $(FFI_GEN)/obj/s_,$(addsuffix .o,$(FFI_X86_S)))
+
+FFI_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+              -DHAVE_CONFIG_H -I$(FFI_GEN) -I$(FFI_GEN)/include \
+              -I$(FFI_DIR)/include -I$(FFI_DIR)/src -Ilibc/include
+
+FFI_DEPS := $(FFI_GEN)/fficonfig.h $(FFI_GEN)/include/ffi.h \
+            $(FFI_GEN)/include/ffitarget.h
+
+$(FFI_GEN)/obj/c_%.o: $(FFI_DIR)/src/%.c $(FFI_DEPS)
+	@mkdir -p $(FFI_GEN)/obj
+	$(CC) $(FFI_CFLAGS) -c $< -o $@
+
+$(FFI_GEN)/obj/x_%.o: $(FFI_DIR)/src/x86/%.c $(FFI_DEPS)
+	@mkdir -p $(FFI_GEN)/obj
+	$(CC) $(FFI_CFLAGS) -c $< -o $@
+
+# The assembly goes through the C compiler rather than the assembler so
+# that it is preprocessed: unix64.S is full of #if on the fficonfig.h
+# and ffitarget.h macros above.
+$(FFI_GEN)/obj/s_%.o: $(FFI_DIR)/src/x86/%.S $(FFI_DEPS)
+	@mkdir -p $(FFI_GEN)/obj
+	$(CC) $(FFI_CFLAGS) -c $< -o $@
+
+build/libffi.a: $(FFI_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  FFI    build/libffi.a ($(FFI_VERSION), call side; no closures)"
+
+.PHONY: ffi
+ffi: build/libffi.a
+
+$(FFI_DIR)/include/ffi.h.in:
+	@echo "  fetching $(FFI_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(FFI_TARBALL) $(FFI_URL)
+	@printf '%s  build/%s\n' "$(FFI_SHA256)" "$(FFI_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(FFI_TARBALL) does not match its checksum."; \
+		     rm -f build/$(FFI_TARBALL); exit 1; }
+	@rm -rf $(FFI_DIR)
+	@mkdir -p $(FFI_DIR)
+	@tar -C $(FFI_DIR) --strip-components=1 -xzf build/$(FFI_TARBALL)
+
+# --- GNU libiconv 1.18 ---
+#
+# The gap this tree has been recording for three sessions. GLib 2.74's
+# meson.build:2060 makes `dependency('iconv')` required, and
+# `third_party/libxml2-port/config.h` has said since it was written that
+# "there is no iconv in this C library". Both were pointing at the same
+# missing thing, and this is it.
+#
+# ---- three objects, and 274 headers that are already generated ----
+#
+# libiconv's whole converter set is #included into one translation unit:
+# lib/iconv.c pulls in converters.h, which pulls in every encoding in
+# turn, and the alias, flag and transliteration tables ship
+# pre-generated in the tarball. So there is no generator to run and no
+# source list to curate -- upstream's lib/Makefile.in:59 names all
+# three.
+#
+# ---- and one substituted header ----
+#
+# include/iconv.h.in has five tokens. Four of them are empty or a
+# constant; the one with a decision in it is USE_MBSTATE_T, which puts
+# an mbstate_t inside iconv_allocation_t. It is 1 because <wchar.h> here
+# has the type, and a consumer that disagreed about that structure's
+# size would overflow it.
+ICONV_VERSION := 1.18
+ICONV_TARBALL := libiconv-$(ICONV_VERSION).tar.gz
+ICONV_URL     := https://ftp.gnu.org/pub/gnu/libiconv/$(ICONV_TARBALL)
+ICONV_SHA256  := 3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8
+ICONV_DIR     := third_party/libiconv
+ICONV_PORT    := third_party/libiconv-port
+ICONV_GEN     := build/iconv
+
+# EILSEQ is substituted empty because <errno.h> here already defines it
+# (84); iconv.h only fills one in when the platform has none, and an
+# empty expansion inside `#ifndef EILSEQ` is never reached.
+# ICONV_CONST is empty for the reason the port's config.h gives.
+ICONV_SUBST := \
+  -e 's/@EILSEQ@//g' \
+  -e 's/@ICONV_CONST@//g' \
+  -e 's/@USE_MBSTATE_T@/1/g' \
+  -e 's/@BROKEN_WCHAR_H@/0/g' \
+  -e 's/@DLL_VARIABLE@//g'
+
+$(ICONV_GEN)/include/iconv.h: $(ICONV_DIR)/include/iconv.h.in
+	@mkdir -p $(ICONV_GEN)/include
+	@sed $(ICONV_SUBST) $< > $@
+	@echo "  GEN    $@ ($(ICONV_VERSION), mbstate_t, no extra encodings)"
+
+$(ICONV_GEN)/config.h: $(ICONV_PORT)/config.h
+	@mkdir -p $(ICONV_GEN)
+	@cp $< $@
+
+# localcharset.h is an internal header that lib/iconv.c includes by
+# name, and it lives under libcharset/. Copied next to the generated
+# config so one -I reaches both, which is what upstream's own
+# lib/Makefile.in does with -I../libcharset/include.
+$(ICONV_GEN)/localcharset.h: $(ICONV_DIR)/libcharset/include/localcharset.h.in
+	@mkdir -p $(ICONV_GEN)
+	@sed -e 's/@HAVE_VISIBILITY@/0/g' $< > $@
+
+ICONV_CFLAGS := $(filter-out -fPIC,$(APP_CFLAGS)) -fPIC -w \
+                -DHAVE_CONFIG_H -DBUILDING_LIBICONV -DBUILDING_LIBCHARSET \
+                -DLIBDIR='"/lib"' \
+                -I$(ICONV_GEN) -I$(ICONV_GEN)/include \
+                -I$(ICONV_DIR)/lib -I$(ICONV_DIR)/include \
+                -I$(ICONV_DIR)/libcharset/include -Ilibc/include
+
+ICONV_DEPS := $(ICONV_GEN)/config.h $(ICONV_GEN)/include/iconv.h \
+              $(ICONV_GEN)/localcharset.h
+
+$(ICONV_GEN)/obj/iconv.o: $(ICONV_DIR)/lib/iconv.c $(ICONV_DEPS)
+	@mkdir -p $(ICONV_GEN)/obj
+	$(CC) $(ICONV_CFLAGS) -c $< -o $@
+
+$(ICONV_GEN)/obj/compat.o: $(ICONV_DIR)/lib/compat.c $(ICONV_DEPS)
+	@mkdir -p $(ICONV_GEN)/obj
+	$(CC) $(ICONV_CFLAGS) -c $< -o $@
+
+$(ICONV_GEN)/obj/localcharset.o: \
+		$(ICONV_DIR)/libcharset/lib/localcharset.c $(ICONV_DEPS)
+	@mkdir -p $(ICONV_GEN)/obj
+	$(CC) $(ICONV_CFLAGS) -c $< -o $@
+
+ICONV_OBJ := $(ICONV_GEN)/obj/iconv.o $(ICONV_GEN)/obj/compat.o \
+             $(ICONV_GEN)/obj/localcharset.o
+
+build/libiconv.a: $(ICONV_OBJ)
+	@rm -f $@
+	$(AR) rcs $@ $^
+	@echo "  ICONV  build/libiconv.a ($(ICONV_VERSION))"
+
+.PHONY: iconv
+iconv: build/libiconv.a
+
+$(ICONV_DIR)/include/iconv.h.in:
+	@echo "  fetching $(ICONV_TARBALL)"
+	@mkdir -p build third_party
+	@curl -fL --retry 3 -o build/$(ICONV_TARBALL) $(ICONV_URL)
+	@printf '%s  build/%s\n' "$(ICONV_SHA256)" "$(ICONV_TARBALL)" \
+		| shasum -a 256 -c - >/dev/null \
+		|| { echo "  $(ICONV_TARBALL) does not match its checksum."; \
+		     rm -f build/$(ICONV_TARBALL); exit 1; }
+	@rm -rf $(ICONV_DIR)
+	@mkdir -p $(ICONV_DIR)
+	@tar -C $(ICONV_DIR) --strip-components=1 -xzf build/$(ICONV_TARBALL)
+
 .PHONY: libs-fetch
 libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/harfbuzz.cc \
             $(ICU_DIR)/common/unicode/utypes.h $(JPEG_DIR)/jpeglib.h \
@@ -2622,7 +3147,10 @@ libs-fetch: $(SQLITE_DIR)/sqlite3.c $(FT_DIR)/include/ft2build.h $(HB_DIR)/src/h
             $(TASN1_DIR)/lib/includes/libtasn1.h \
             $(XKB_DIR)/src/xkbcomp/parser.y $(XKBCONF_DIR)/rules/merge.py \
             $(XML2_DIR)/include/libxml/xmlversion.h.in \
-            $(ZLIB_DIR)/zlib.h $(PNG_DIR)/scripts/pnglibconf.h.prebuilt
+            $(ZLIB_DIR)/zlib.h $(PNG_DIR)/scripts/pnglibconf.h.prebuilt \
+            $(WEBP_DIR)/src/webp/decode.h \
+            $(PCRE2_DIR)/src/pcre2.h.generic $(FFI_DIR)/include/ffi.h.in \
+            $(ICONV_DIR)/include/iconv.h.in
 
 # --- Fetching WPE WebKit itself ---
 #
@@ -2718,6 +3246,9 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
                           build/libgpg-error.a build/libtasn1.a \
                           build/libxkbcommon.a build/libxml2.a \
                           build/libz.a build/libpng.a \
+                          build/libwebp.a build/libwebpdemux.a \
+                          build/libpcre2-8.a build/libffi.a \
+                          build/libiconv.a \
                           $(FT_PORT)/ftoption.h $(FT_PORT)/ftmodule.h \
                           $(JPEG_PORT)/jconfig.h $(JPEG_PORT)/jconfigint.h
 	@rm -rf $(WEBKIT_SYSROOT)
@@ -2861,6 +3392,54 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	                                      $(WEBKIT_SYSROOT)/include/
 	@cp $(PNG_GEN)/pnglibconf.h           $(WEBKIT_SYSROOT)/include/
 	@cp build/libpng.a        $(WEBKIT_SYSROOT)/lib/libpng.a
+	@# WebP, and the first package here that is two archives. WebKit's
+	@# own FindWebP.cmake wants `webp/decode.h` on the include path, a
+	@# library called `webp`, and -- because OptionsWPE says
+	@# `COMPONENTS demux` -- a second one called `webpdemux`.
+	@#
+	@# **Five headers, and the omission is the point.** upstream's
+	@# src/webp/ holds seven: decode.h, encode.h, types.h, mux_types.h
+	@# and demux.h are staged, and mux.h is not, because
+	@# libwebpmux.a is not built in this port -- nothing in
+	@# Source/WebCore names WebPMux and OptionsWPE does not ask for the
+	@# component. Copying src/webp/*.h wholesale would put a header in
+	@# this directory with no archive behind it, which is exactly the
+	@# mismatch the libxkbcommon note above is about. config.h.in and
+	@# format_constants.h are internal and stay out for the same reason.
+	@mkdir -p $(WEBKIT_SYSROOT)/include/webp
+	@cp $(WEBP_DIR)/src/webp/decode.h $(WEBP_DIR)/src/webp/encode.h \
+	    $(WEBP_DIR)/src/webp/types.h $(WEBP_DIR)/src/webp/mux_types.h \
+	    $(WEBP_DIR)/src/webp/demux.h  $(WEBKIT_SYSROOT)/include/webp/
+	@cp build/libwebp.a       $(WEBKIT_SYSROOT)/lib/libwebp.a
+	@cp build/libwebpdemux.a  $(WEBKIT_SYSROOT)/lib/libwebpdemux.a
+	@# PCRE2 and libffi, which are the first two archives staged here
+	@# that WebKit's own configure will never look for. They are GLib's
+	@# dependencies -- meson.build:2079 and :2102 -- and GLib is
+	@# OptionsWPE.cmake:185. They go in this directory because the
+	@# toolchain points PKG_CONFIG_LIBDIR at it and nowhere else, so it
+	@# is where a GLib cross build will be told to look.
+	@#
+	@# libffi's two headers travel together: every consumer includes
+	@# <ffitarget.h> from inside ffi.h, and upstream installs the
+	@# architecture's copy beside it rather than under a subdirectory.
+	@cp $(PCRE2_GEN)/pcre2.h  $(WEBKIT_SYSROOT)/include/
+	@cp build/libpcre2-8.a    $(WEBKIT_SYSROOT)/lib/libpcre2-8.a
+	@cp $(FFI_GEN)/include/ffi.h $(FFI_GEN)/include/ffitarget.h \
+	                          $(WEBKIT_SYSROOT)/include/
+	@cp build/libffi.a        $(WEBKIT_SYSROOT)/lib/libffi.a
+	@# GNU libiconv, staged for two consumers rather than one. GLib's
+	@# meson.build:2060 makes `dependency('iconv')` required, and
+	@# libxml2's port turns its own iconv support off with a note saying
+	@# there is none in this C library -- which stopped being true when
+	@# this archive was built.
+	@#
+	@# localcharset.h goes in beside iconv.h because it is libiconv's
+	@# own extension header and upstream installs it; nothing in GLib
+	@# includes it, but apps/iconvtest.c does, and a consumer asking
+	@# this library which locale it thinks it is in should be able to.
+	@cp $(ICONV_GEN)/include/iconv.h $(ICONV_GEN)/localcharset.h \
+	                          $(WEBKIT_SYSROOT)/include/
+	@cp build/libiconv.a      $(WEBKIT_SYSROOT)/lib/libiconv.a
 	@# ---- and the .pc files ----
 	@#
 	@# Several of WebKit's find modules ask pkg-config first and use
@@ -2968,8 +3547,52 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng16.pc
 	@cp $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng16.pc \
 	   $(WEBKIT_SYSROOT)/lib/pkgconfig/libpng.pc
+	@# libwebp's .pc files, and a bug in FindWebP worth naming rather
+	@# than working around -- the FindEpoxy "withouit" precedent.
+	@# FindWebP.cmake:68 reads
+	@#
+	@#     set(WebP_VERSION ${PC_WEBP_CFLAGS_VERSION})
+	@#
+	@# and pkg_check_modules sets PC_WEBP_VERSION; there is no such
+	@# variable as PC_WEBP_CFLAGS_VERSION. So WebP_VERSION is empty
+	@# whether or not pkg-config is installed and whether or not these
+	@# files exist, and the module's own comment above that line --
+	@# "A version can only be found through pkg-config" -- describes
+	@# something the code does not do. It is harmless here only because
+	@# OptionsWPE asks for no minimum, so the VERSION_GREATER test is
+	@# "" against "" and takes neither branch.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libwebp\nDescription: WebP image codec, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lwebp\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(WEBP_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libwebp.pc
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libwebpdemux\nDescription: WebP container demuxer, built for Vextro ring 3\nVersion: %s\nRequires: libwebp\nLibs: -L$${libdir} -lwebpdemux\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(WEBP_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libwebpdemux.pc
+	@# PCRE2's and libffi's, and these two are *not* decoration: GLib
+	@# is a meson build, meson finds dependencies through pkg-config
+	@# first and last, and `dependency('libpcre2-8')` and
+	@# `dependency('libffi')` are both `required : true`. When GLib is
+	@# attempted these are the files that will answer.
+	@#
+	@# libffi's Cflags carries no subdirectory because ffi.h and
+	@# ffitarget.h are staged flat, and its Version is what meson's
+	@# `version : '>= 3.0.0'` is compared against.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libpcre2-8\nDescription: PCRE2, 8-bit, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lpcre2-8\nCflags: -I$${includedir} -DPCRE2_STATIC\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(PCRE2_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libpcre2-8.pc
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: libffi\nDescription: Foreign function interface, call side only, Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -lffi\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(FFI_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/libffi.pc
+	@# libiconv has no upstream .pc -- autotools installs none, and
+	@# meson finds it through its own `dependency('iconv')` logic, which
+	@# looks for the iconv_open symbol in libc first and for a libiconv
+	@# second. One is written anyway so that the archive is described
+	@# like every other in this directory, and because a cross build
+	@# cannot run the symbol probe that meson would otherwise use.
+	@printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: iconv\nDescription: GNU libiconv, built for Vextro ring 3\nVersion: %s\nLibs: -L$${libdir} -liconv\nCflags: -I$${includedir}\n' \
+	    "$(CURDIR)/$(WEBKIT_SYSROOT)" "$(ICONV_VERSION)" \
+	    > $(WEBKIT_SYSROOT)/lib/pkgconfig/iconv.pc
 	@touch $@
-	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy, gcrypt, tasn1, xkbcommon, xml2, zlib, png)"
+	@echo "  SYSROOT  $(WEBKIT_SYSROOT) (icu, harfbuzz, freetype, sqlite3, wpe, jpeg, epoxy, gcrypt, tasn1, xkbcommon, xml2, zlib, png, webp, pcre2, ffi, iconv)"
 
 # --- Building it ---
 #
@@ -2986,7 +3609,8 @@ $(WEBKIT_SYSROOT)/.stamp: $(LIBSQLITE) $(LIBFT) $(LIBHB) $(LIBWPE) \
 # WebKit's feature detection and reaches its dependency list. What
 # stands here now is the dependency list itself -- 15 unconditional
 # REQUIRED packages at the head of OptionsWPE.cmake and two more further
-# down, thirteen of which a configure run has actually found.
+# down. All fifteen at the head are found; the two further down, LibSoup
+# and GLIB, are one project and are where it stops.
 # third_party/wpe-config/README.md has the current frontier and the exact
 # error.
 .PHONY: webkit
@@ -3010,7 +3634,7 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	    echo "    descriptors in ring 3 done  src/vfs.h, 19 system calls"; \
 	    echo "    sockets in ring 3     done  over src/vxnet.h"; \
 	    echo "    the OS gate           done  third_party/wpe-config/"; \
-	    echo "    fourteen upstream libraries"; \
+	    echo "    eighteen upstream libraries"; \
 	    echo "                          done  ported, and green in ring 3"; \
 	    echo ""; \
 	    echo "  pkg-config is not optional here, unlike the rest:"; \
@@ -3019,10 +3643,10 @@ webkit: $(WEBKIT_SRC)/CMakeLists.txt $(LIBWPE) $(LIBC) $(LIBCXX) \
 	    echo ""; \
 	    echo "  What remains after installing the above is the dependency"; \
 	    echo "  list: 17 packages WebKit marks REQUIRED without a"; \
-	    echo "  condition, thirteen of which a configure run has found."; \
-	    echo "  WebP is where it stops; behind it are WPE (already ported"; \
-	    echo "  and simply never reached) and GLib with LibSoup, which is"; \
-	    echo "  a second runtime rather than a port."; \
+	    echo "  condition. All fifteen at the head of OptionsWPE.cmake"; \
+	    echo "  are found. LibSoup at line 172 is where it stops, and"; \
+	    echo "  behind it is GLib -- one project seen twice, and a"; \
+	    echo "  second runtime rather than a port."; \
 	    echo ""; \
 	    echo "  third_party/wpe-config/README.md has the full order."; \
 	    echo ""; \
@@ -3312,6 +3936,92 @@ build/pngtest: build/pngtest.o build/libpng.a build/libz.a \
                apps/app.ld $(LIBC) $(LIBC_CRT0)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
 		$(LIBC_CRT0) build/pngtest.o build/libpng.a build/libz.a \
+		$(LIBC) -o $@
+
+# --- User app: webptest ---
+#
+# Compiled with the same -I chain and the same -DHAVE_CONFIG_H the
+# library is, because section 1 asserts the SIMD gate from the port's
+# config.h and section 8 includes `src/dsp/cpu.h` -- an *internal*
+# header -- to reach VP8GetCPUInfo. That hook is how libwebp's own tests
+# force the dispatcher down a different path, and it is the only way to
+# check the SSE2 and SSE4.1 kernels against the portable C sitting in
+# the same archive. No consumer would include it; this is not a
+# consumer.
+#
+# libwebpdemux.a comes before libwebp.a on the link line: the demuxer
+# calls into the decoder to size a frame, and ld resolves an archive
+# once, in order.
+build/webptest.o: apps/webptest.c apps/webp_ref.h apps/vextro.h \
+                  $(WEBP_GEN)/src/webp/config.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -DHAVE_CONFIG_H -I$(WEBP_GEN) -I$(WEBP_DIR) \
+		-c $< -o $@
+
+build/webptest: build/webptest.o build/libwebpdemux.a build/libwebp.a \
+                apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/webptest.o build/libwebpdemux.a \
+		build/libwebp.a $(LIBC) -o $@
+
+# --- User app: pcre2test ---
+#
+# Compiled against build/pcre2 alone -- the generated pcre2.h and
+# nothing from the vendored src/ -- because that is what a consumer
+# sees. PCRE2_CODE_UNIT_WIDTH is set in the source rather than on the
+# command line, which is how a consumer is supposed to do it: the header
+# is shared by all three width libraries and refuses to compile without
+# it.
+#
+# It is *not* compiled -DHAVE_CONFIG_H. The port's config.h is the
+# library's business; a consumer that needed it would be a consumer that
+# could not use an installed PCRE2.
+build/pcre2test.o: apps/pcre2test.c apps/vextro.h $(PCRE2_GEN)/pcre2.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(PCRE2_GEN) -c $< -o $@
+
+build/pcre2test: build/pcre2test.o build/libpcre2-8.a \
+                 apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/pcre2test.o build/libpcre2-8.a \
+		$(LIBC) -o $@
+
+# --- User app: ffitest ---
+#
+# Compiled against build/ffi/include, which holds the generated ffi.h
+# and the architecture's ffitarget.h beside it -- the layout a consumer
+# sees, and the one staged into the sysroot.
+#
+# The link is where this port's shape shows: nothing here references
+# ffi_closure_alloc, and if anything did it would fail at link naming
+# the symbol, because src/closures.c is deliberately not in the archive.
+build/ffitest.o: apps/ffitest.c apps/vextro.h $(FFI_GEN)/include/ffi.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(FFI_GEN)/include -c $< -o $@
+
+build/ffitest: build/ffitest.o build/libffi.a \
+               apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/ffitest.o build/libffi.a \
+		$(LIBC) -o $@
+
+# --- User app: iconvtest ---
+#
+# Compiled against build/iconv alone: the generated iconv.h, and
+# localcharset.h beside it. That second one is not part of what GLib
+# will include -- it is libiconv's own extension, and section 1 uses it
+# to check which locale the library decided it was in, which is the only
+# question this library asks the operating system.
+build/iconvtest.o: apps/iconvtest.c apps/vextro.h \
+                   $(ICONV_GEN)/include/iconv.h $(ICONV_GEN)/localcharset.h
+	@mkdir -p build
+	$(CC) $(APP_CFLAGS) -I$(ICONV_GEN)/include -I$(ICONV_GEN) \
+		-c $< -o $@
+
+build/iconvtest: build/iconvtest.o build/libiconv.a \
+                 apps/app.ld $(LIBC) $(LIBC_CRT0)
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T apps/app.ld \
+		$(LIBC_CRT0) build/iconvtest.o build/libiconv.a \
 		$(LIBC) -o $@
 
 # --- User app: icutest ---

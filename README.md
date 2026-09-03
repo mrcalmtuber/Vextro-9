@@ -36,14 +36,14 @@ There is a Zstandard decompressor because Wikipedia archives are compressed
 with it. There is an NVMe driver because a modern machine has nowhere else
 to keep a 900 MB encyclopedia.
 
-**139,229 lines of C written here**, across 284 files, built as five kernel
+**142,618 lines of C written here**, across 289 files, built as five kernel
 objects plus one for inference, over a user-space C library of its own —
 and, since ring 3 got file descriptors and sockets, a freestanding C++
 runtime to go with it, down to the Itanium ABI's run-time type
 information. A ring-3 program can now fork, exec, signal, and wait for its
 children, in Linux's numbering as well as this system's — over pipes, with
 signals, waiting on poll. 3.7 million host checks across 17 suites on
-every build, and nineteen more on the machine itself.
+every build, and twenty-three more on the machine itself.
 
 ---
 
@@ -279,19 +279,23 @@ that asserts `UNIX`, which selects the generic-Unix branch rather than
 the Linux one, and the toolchain adds `-D__unix__` because WTF reads
 predefined macros rather than CMake variables. Configure now runs
 WebKit's whole feature-detection pass against this C library and stops
-at `OptionsWPE.cmake:20` — the thirteenth of the fifteen required
-packages that file opens with. **Thirteen are now *found* by a real
-configure run**: HarfBuzz
+at `OptionsWPE.cmake:172`. **Every one of the fifteen required
+packages that file opens with is now *found* by a real configure run**,
+and the frontier has left that block entirely: HarfBuzz
 8.5.0 with the components WebKit asks for, ICU 74.2 with `data i18n uc`,
 JPEG 62, Epoxy 1.5.10, LibGcrypt 1.10.3, Libtasn1 4.19.0, Libxkbcommon
-1.7.0, LibXml2 2.12.6, ZLIB 1.3.1, PNG 1.6.58, SQLite3 3.45.1, Threads
-and Unifdef. WebP is where it stops.
+1.7.0, LibXml2 2.12.6, ZLIB 1.3.1, PNG 1.6.58, SQLite3 3.45.1, Threads,
+Unifdef, WebP with its `demux` component, and **WPE 1.16.2** — which had
+been staged and never reached since the sysroot was written. LibSoup, on
+line 172, is where it stops now.
 
-Five of those cleared at once, which is worth knowing before guessing
-what the next port costs: `FindPNG` opens with `find_package(ZLIB)` and
-does nothing else if that fails, so zlib unblocked two lines rather than
-one — and SQLite3, Threads and Unifdef had been satisfiable for some
-time behind them, waiting for the lines above to stop erroring.
+Two ports cleared seven of those lines between them, which is worth
+knowing before guessing what the next one costs. `FindPNG` opens with
+`find_package(ZLIB)` and does nothing else if that fails, so zlib
+unblocked two lines rather than one, and SQLite3, Threads and Unifdef
+had been satisfiable for some time behind them. WebP then unblocked WPE
+in the same way — not because they are related, but because a
+`find_package` that errors stops the file.
 
 (This paragraph used to say *twenty-two* required packages, and that
 number was wrong every time it was repeated. `OptionsWPE.cmake` opens
@@ -305,11 +309,33 @@ where twenty-two came from.)
 `x86_64-elf`, no file descriptors in ring 3, and no sockets in ring 3;
 there are now a freestanding C++ runtime (`libcxx/`), twenty-four
 descriptor and socket system calls (`src/vfs.h`), and the POSIX layer
-over them in `libc/`. What remains of the required list is short and
-uneven: **WebP**, which is one tarball and two archives, and **GLib with
-LibSoup**, which is not a port but a second runtime — plus the specific
-`libc` gaps WebKit's own configure named (`langinfo.h`, `strnstr`,
-`regexec`).
+over them in `libc/`. What remains of the required list is **GLib with
+LibSoup**, which is not a port but a second runtime, and the chain
+underneath it has been measured rather than guessed at:
+
+| GLib 2.74 needs | state |
+|---|---|
+| zlib | done |
+| threads | done |
+| **libpcre2-8** | done — 61 checks in ring 3 |
+| **libffi ≥ 3.0.0** | done, calling half — 32 checks |
+| **iconv** | done — GNU libiconv 1.18, 40 checks |
+
+**Every dependency GLib's own `meson.build` declares is now satisfied.**
+What stands between here and GLib is no longer a missing library; it is
+GLib itself — roughly 400 sources across glib, gobject, gio, gmodule and
+gthread, with a meson build to reproduce by hand and a `gio-unix`
+component whose optional features (`/proc/mounts`, inotify, `SCM_RIGHTS`)
+this system does not have. Those three are optional rather than
+blocking, and measurably so: `gio/meson.build:774` compiles the inotify
+backend only when the header and `inotify_init1` are both found and
+otherwise uses the polling monitor, and `gunixmounts.c` yields an empty
+mount list rather than failing.
+
+Beyond GLib sit LibSoup 3, the `libc` gaps WebKit's own configure named
+(`langinfo.h`, `strnstr`, `regexec`), and — before any browser runs — a
+2D rasteriser (Skia or Cairo) and an OpenGL implementation, neither of
+which exists here.
 Two items are depth rather than breadth: an OpenGL implementation, and a
 real `WTF_OS_VEXTRO` for the places WTF assumes a process model this
 system has no answer for. `third_party/wpe-config/README.md` sets it out
@@ -465,7 +491,7 @@ handler was given.
 
 ## Ports, and what each one cost
 
-Fourteen libraries are built from upstream sources, unpatched, and run
+Eighteen libraries are built from upstream sources, unpatched, and run
 in ring 3. Each is fetched by checksum (`make libs-fetch`) and gitignored,
 and each is checked on the machine rather than assumed:
 
@@ -484,6 +510,10 @@ and each is checked on the machine rather than assumed:
 | libxml2 | 2.12.6 | 66 checks | nothing — the first port that needed no new interface at all |
 | zlib | 1.3.1 | 138 checks | nothing either; its configuration is two `#ifdef`s answered twice over |
 | libpng | 1.6.58 | 73 checks | `setjmp`, which had been in `libc/` for years with nothing in ring 3 using it |
+| libwebp | 1.6.0 | 103 checks | nothing — but it is two archives, and the first port to compile SIMD in |
+| PCRE2 | 10.48 | 61 checks | nothing — the first port WebKit never asks for; it is GLib's |
+| libffi | 3.5.2 | 32 checks | half the library. Closures need writable-executable memory, which this kernel refuses |
+| GNU libiconv | 1.18 | 40 checks | nothing — three objects and 274 pre-generated tables |
 | WPE | 1.16.2 | 40 checks | the backend seam in `third_party/wpe-port/` |
 
 Three of them say something about the shape of this system rather than
@@ -504,7 +534,7 @@ and `socketpair()` — neither of which existed. Both do now, along with
 ends. That was the last of the four things `libc/include/unistd.h` used
 to list as absent.
 
-libtasn1 is the smallest of the fourteen and the one whose test is the most
+libtasn1 is the smallest of the eighteen and the one whose test is the most
 specific: the ASN.1 module it compiles is a verbatim copy of the one WPE
 WebKit carries in `pal/crypto/tasn1/Utilities.cpp`, and every structure
 it decodes came out of the build machine's OpenSSL. Neither is
@@ -532,6 +562,57 @@ holds six PNGs built from the specification by `tools/mkpngref.py` and
 one re-encoded by macOS's ImageIO — and one of the six uses a different
 row filter on *every row*, which no real encoder would produce and which
 is the only way to know the Average and Paeth reconstructions are right.
+
+**WebP is the one where that could not be done, and the tree says so.**
+There is no second implementation of VP8 on this machine: macOS reads
+`.webp` through ImageIO and ImageIO bundles libwebp — which is how the
+2023 VP8L overflow became a macOS security update. So the bitstreams in
+`apps/webp_ref.h` were encoded by the same sources compiled for the
+*host*, and every check against them establishes agreement across three
+**builds** rather than across implementations. Two things recover most
+of what that costs. The lossless images are generated from a formula, and
+lossless WebP is bit-exact by definition, so that chain — formula,
+encoder, decoder, formula — depends on nothing being trusted. And the
+animation's RIFF container was assembled from the WebP specification by
+`tools/mkwebpref.py` rather than by libwebp's muxer, which is precisely
+what the RFC 1952 wrapper is to zlib, and matters more here because
+`COMPONENTS demux` is what line 20 asks for.
+
+**PCRE2 and libffi are the first two ports WebKit never asks for.**
+Neither appears anywhere in `OptionsWPE.cmake`; both are **GLib's**, and
+GLib is line 185. GLib 2.74's own `meson.build` makes `libpcre2-8` and
+`libffi >= 3.0.0` required dependencies — GRegex *is* PCRE2 since GLib
+stopped bundling a copy, and `gobject/gclosure.c` marshals every generic
+signal closure through `ffi_call`. They are staged in the same sysroot
+with `.pc` files, because meson finds dependencies through pkg-config and
+that is where the toolchain points it.
+
+Both ran into the same wall from opposite sides, and it is this system's
+own: **`src/desktop.h:2449` refuses any mapping that asks for
+`PROT_WRITE` and `PROT_EXEC` together.** `libc/include/sys/mman.h` has
+said for a long time what follows from that — "this is what makes a
+just-in-time compiler impossible here rather than merely discouraged" —
+and named WebKit's JIT tiers as the first casualty. PCRE2's JIT is the
+second and libffi's closures are the third.
+
+Neither is a loss worth paying for. GLib calls `pcre2_jit_compile` and
+has an explicit `case PCRE2_ERROR_JIT_BADOPTION:` that falls back to the
+interpreter, so the port compiles without the JIT and `apps/pcre2test.c`
+takes that branch deliberately. libffi is built as its calling half
+only: `src/closures.c` is not compiled, so `ffi_closure_alloc` is absent
+from the archive and anything wanting one fails at link naming the
+symbol rather than faulting inside a heap buffer later. GLib never wants
+one — measured, not assumed: the libffi entry points named anywhere in
+GLib are `ffi_prep_cif`, `ffi_call` and the `ffi_type_*` descriptors.
+
+It is also the first port to compile SIMD *in*. libjpeg-turbo's is NASM
+driven by upstream's own CMake and was left out; libwebp's is C
+intrinsics, so the SSE2, SSE4.1 and AVX2 kernels are built with their
+matching `-m` flags and selected at run time by CPUID. That is only
+defensible because it can be checked: `apps/webptest.c` swaps libwebp's
+own CPU-detection hook for one reporting a processor with nothing, decodes
+again, and requires the two results to be identical to the byte. An
+optimisation nobody can test is a liability.
 
 ## The interface, from utility classes
 

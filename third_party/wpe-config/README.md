@@ -65,7 +65,7 @@ with no assembler backend.
 | libjpeg-turbo, libepoxy, libgcrypt, libtasn1, libxkbcommon and libxml2 in ring 3 | `apps/jpegtest.c`, `gltest.c`, `gcrypttest.c`, `tasn1test.c`, `xkbtest.c`, `xmltest.c` |
 | the keymap data a browser needs, on the volume | `/etc/xkb`, 250 files from xkeyboard-config |
 | WebKit's OS detection, passed without patching it | `vextro-project-inject.cmake` |
-| a sysroot the find modules can see all fourteen ported libraries in | `make webkit-sysroot` |
+| a sysroot the find modules can see all eighteen ported libraries in | `make webkit-sysroot` |
 
 `apps/wpetest.c` runs all of that in ring 3 on every `APP_SELFTEST` boot.
 
@@ -173,7 +173,7 @@ smaller than expected each time, and is now in: `<inttypes.h>` and
 `<cinttypes>` and `is_standard_layout` for ICU. None of the five needed
 a patch to its own source.
 
-**7. The dependency set — thirteen found, and the count was wrong.**
+**7. The dependency set — the opening block is clear.**
 This section said for months that `Source/cmake/OptionsWPE.cmake` opens
 with **twenty-two** unconditional `find_package(... REQUIRED)`. Counted
 rather than remembered, it opens with **fifteen**, on lines 8-22, and
@@ -191,29 +191,142 @@ Ported, built, and staged into the sysroot: **SQLite**, **FreeType**,
 **WPE**, **HarfBuzz**, **ICU 74.2**, **libjpeg-turbo 3.0.4**,
 **libepoxy 1.5.10**, **libgpg-error 1.50 + libgcrypt 1.10.3**,
 **libtasn1 4.19.0**, **libxkbcommon 1.7.0**, **libxml2 2.12.6**,
-**zlib 1.3.1** and **libpng 1.6.58**.
+**zlib 1.3.1**, **libpng 1.6.58** and **libwebp 1.6.0** (two archives:
+`libwebp.a` and `libwebpdemux.a`).
 
-Thirteen packages have actually been *found by a configure run*, which
-is the only claim worth making: HarfBuzz with the `harfbuzz-icu` archive
-that satisfies `find_package(HarfBuzz COMPONENTS ICU)`, ICU with the
-`data i18n uc` components, JPEG at version 62, Epoxy at 1.5.10,
-LibGcrypt at 1.10.3, Libtasn1 at 4.19.0, Libxkbcommon at 1.7.0, LibXml2
-at 2.12.6, ZLIB at 1.3.1, PNG at 1.6.58, SQLite3 at 3.45.1, Threads, and
-Unifdef at `/usr/bin/unifdef`.
+**All fifteen packages at the head of the file are now found by a
+configure run**: HarfBuzz with the `harfbuzz-icu` archive that satisfies
+`find_package(HarfBuzz COMPONENTS ICU)`, ICU with the `data i18n uc`
+components, JPEG at version 62, Epoxy at 1.5.10, LibGcrypt at 1.10.3,
+Libtasn1 at 4.19.0, Libxkbcommon at 1.7.0, LibXml2 at 2.12.6, ZLIB at
+1.3.1, PNG at 1.6.58, SQLite3 at 3.45.1, Threads, Unifdef at
+`/usr/bin/unifdef`, WebP with its `demux` component, and WPE at 1.16.2.
 
-Five of those cleared in one run, and the reason is worth keeping. This
-section used to say that SQLite3, WPE and FreeType were staged but not
-exercised, because nothing had reached them — "staged and findable are
-not the same fact until a run says so". Porting zlib moved the frontier
-past line 16 and the claim was settled at once: **SQLite3 was found**, on
-the layout it had been staged in for months, and so were Threads and
-Unifdef, which need nothing from this tree at all. **WPE and FreeType
-are still unproven** — WPE is line 21 and configure now stops at 20, and
-CMake's own `FindFreetype` is behind a conditional further down.
+Seven of those lines cleared for two ports, and the reason is worth
+keeping. This section used to say that SQLite3, WPE and FreeType were
+staged but not exercised, because nothing had reached them — "staged and
+findable are not the same fact until a run says so". Both halves of that
+have now been settled. zlib moved the frontier past line 16 and SQLite3
+was found on the layout it had been staged in for months, along with
+Threads and Unifdef, which need nothing from this tree at all. WebP then
+moved it past line 20 and **WPE was found**, at 1.16.2, on staging that
+had never once been exercised. The staging was right; nothing had ever
+asked.
 
-Not done, and each its own project: WebP, then GLIB with LibSoup — the
-last two unconditional REQUIRED entries in the file — and Cairo and
+**FreeType is the last one still unproven**, and it always will be from
+this direction: CMake's own `FindFreetype` sits behind a conditional
+further down, which configure does not reach.
+
+Not done, and it is one project rather than two: **GLIB with LibSoup**,
+the last two unconditional REQUIRED entries in the file, plus Cairo and
 Fontconfig behind conditionals.
+
+### GStreamer is not on the list, and this was checked
+
+It gets asked for often enough to be worth writing down. `OptionsWPE.cmake`
+mentions GStreamer three times — `include(GStreamerDefinitions)`,
+`include(GStreamerDependencies)` and `include(GStreamerChecks)` — and
+none of them is a `find_package`. The first two only declare option
+dependencies. Every actual `find_package(GStreamer ...)` lives in
+`GStreamerChecks.cmake`, and its first line is
+
+    if (ENABLE_VIDEO OR ENABLE_WEB_AUDIO)
+
+Both are **OFF** in `build/webkit/CMakeCache.txt`, which is why the
+configure log prints "Disabling USE_GSTREAMER_GL since ENABLE_VIDEO is
+disabled" and never looks for the library. Porting GStreamer today would
+be work in service of two features that are switched off, and it would
+not move the frontier by a line.
+
+### What GLib actually needs, measured
+
+GLib is the entry the frontier now stands behind, and it is the largest
+single item left on this ladder. Its own `meson.build` names its
+required dependencies, and they have been read rather than guessed:
+
+| GLib 2.74.7 requires | line | state here |
+|---|---|---|
+| `threads` | 1952 | done |
+| `iconv` | 2060 | **done**, GNU libiconv 1.18, 40 checks |
+| `libpcre2-8` | 2079 | **done**, 10.48, 61 checks in ring 3 |
+| `libffi >= 3.0.0` | 2102 | **done**, 3.5.2, calling half, 32 checks |
+| `zlib` | 2104 | done, 1.3.1 |
+| `libmount`, `libselinux` | 2154, 2166 | optional, Linux-only |
+
+Two of the four that were missing are now built, tested on the machine
+and staged with `.pc` files, because meson finds dependencies through
+pkg-config and the toolchain points `PKG_CONFIG_LIBDIR` at this sysroot
+and nowhere else.
+
+**Every dependency in that table is now satisfied**, iconv included, and
+each of the four ported ones is checked on the machine rather than
+merely present. What stands between here and GLib is no longer a
+missing library — it is GLib.
+
+### gio-unix: what is optional, measured rather than assumed
+
+The survey this section used to call for has been done, against GLib
+2.74.7's own sources, and the answer is that the three things this
+system lacks are all optional and all selected at *configure* time:
+
+  **inotify.** `gio/meson.build:774` reads
+  `if glib_conf.has('HAVE_SYS_INOTIFY_H') and have_func_inotify_init1`,
+  and only then does it `subdir('inotify')`. With neither present the
+  whole backend is not compiled and GIO uses `gpollfilemonitor.c`, which
+  polls on a timeout. There is nothing to shim: the absence *is* the
+  configuration, and adding a fake `inotify_init1` would make the build
+  select a backend that then had to be faked all the way down.
+
+  **`/proc/self/mounts`.** `gunixmounts.c:557` names `/proc/mounts` for
+  the non-libmount path. It backs `g_unix_mounts_get()` and
+  `GUnixMountMonitor` — volume monitoring — and an unreadable file
+  yields an empty list rather than an error. Nothing a browser does
+  needs it.
+
+  **`SCM_RIGHTS`.** `sendmsg`, `recvmsg`, `cmsghdr` and `SCM_RIGHTS`
+  appear nowhere in this tree, so they are unmapped VLS numbers: ENOSYS,
+  and one `[VLS]` line naming the call, once per number. **That is the
+  right answer and it should not be changed to a success code.**
+  Descriptor passing either moves a descriptor or it does not; a call
+  that reported success without moving one would leave the receiving
+  process holding a descriptor number that refers to nothing, and the
+  failure would surface as a read from an unrelated file. A named
+  refusal is the diagnosis; a "safe pass" would be the bug.
+
+So none of the three blocks GLib. What does is GLib's own size —
+roughly 400 sources across glib, gobject, gio, gmodule and gthread, a
+meson build to reproduce by hand, and a `glibconfig.h` to generate.
+
+### Writable-executable memory, and the three things it has cost
+
+`src/desktop.h:2449` refuses any mmap or mprotect asking for
+`PROT_WRITE` and `PROT_EXEC` together, and `libc/include/sys/mman.h`
+states the policy: every page of every program is writable or
+executable and never both, with no sequence of ring-3 calls that reaches
+one which is both. It has now cost three things, and all three are
+written down rather than discovered:
+
+  * **WebKit's JIT tiers**, turned off in this configuration from the
+    start — that note names them.
+  * **PCRE2's JIT**, which GLib probes for on every optimised pattern
+    and which has an explicit fallback branch (`gregex.c:936`).
+  * **libffi's closures**, which is the one with a real cost. libffi
+    offers three ways to obtain executable memory (`closures.c:126,
+    161, 392`) and this kernel refuses all three: the default writes a
+    trampoline into malloc'd memory, `FFI_MMAP_EXEC_WRIT` needs one
+    physical page at two virtual addresses, and
+    `FFI_EXEC_TRAMPOLINE_TABLE` — the one strategy that *would* fit
+    W^X, because it never writes to executable memory — is implemented
+    upstream for aarch64 and arm on Darwin only.
+
+So `libffi.a` here is the calling half. `ffi_closure_alloc` is absent
+from the archive rather than present and broken, which turns a caller
+that needs one into a link error naming the symbol. GLib does not need
+one: the libffi entry points it uses are `ffi_prep_cif`, `ffi_call` and
+the `ffi_type_*` descriptors, all in `gobject/gclosure.c`.
+
+If a future consumer does need closures, the answer is known and is
+upstream work: an x86-64 `FFI_EXEC_TRAMPOLINE_TABLE`.
 
 ### ICU was easier than this file used to claim
 
@@ -556,11 +669,15 @@ on this ladder. What has changed is how much of it is left.
    checks, decoding DEFLATE Apple's libcompression produced); libpng
    1.6.58 (73 checks against PNGs written from the specification and by
    macOS's ImageIO, driven progressively the way `PNGImageDecoder.cpp`
-   drives it). Those last two cleared five lines between them: PNG's own
-   probe wanted zlib first, and SQLite3, Threads and Unifdef were
-   waiting behind them needing nothing. **WebP** is where configure
-   stops today, with four behind it — and `GLib`/`LibSoup` is the one
-   that is not small.
+   drives it); libwebp 1.6.0 with libwebpdemux beside it (103 checks,
+   including one that swaps libwebp's own CPU-detection hook to force
+   the portable C paths and requires the SIMD result to match byte for
+   byte). Those last three cleared seven lines between them: PNG's own
+   probe wanted zlib first, and SQLite3, Threads, Unifdef and finally
+   **WPE** were waiting behind the errors above them needing nothing at
+   all. The opening block is clear. **LibSoup** at line 172 is where
+   configure stops today, and `GLib`/`LibSoup` is the one that is not
+   small.
 10. The `libc/` gaps WebKit's own configure named: `langinfo.h`,
     `strnstr`, `regexec`, `statx`, `malloc_trim`. `sys/time.h`,
     `localtime_r`, `timegm`, `SIGTRAP`, `tm_gmtoff` and `tm_zone` were
